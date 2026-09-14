@@ -21,7 +21,7 @@ os.environ.setdefault("ALPHAGRAD_SKIP_COST_ANALYSIS", "1")
 os.environ.setdefault("ALPHAGRAD_SKIP_COUNT_OPS", "1")
 os.environ.setdefault("ALPHAGRAD_MAX_FACES", "16")
 os.environ.setdefault("ALPHAGRAD_MAX_DELTA_TOKENS", "1024")
-os.environ.setdefault("ALPHAGRAD_INCR_TOKEN_VOCAB", "512")
+os.environ.setdefault("ALPHAGRAD_INCR_TOKEN_VOCAB", "256")
 os.environ.setdefault("ALPHAGRAD_INCREMENTAL_TOKENS", "1")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))

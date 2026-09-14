@@ -123,7 +123,7 @@ def _four_dicts(T, v, prefix, rows, skips):
     _advance(ij, prefix)
     cfg = SimpleNamespace(jaxpr=T.jaxpr)
     A = envmod._face_dict_for_vertex(cfg, ij, v, rows, skips)
-    stream = LiveFaceStream(T.jaxpr, T.argnums, T.consts, T.xs, vocab=512)
+    stream = LiveFaceStream(T.jaxpr, T.argnums, T.consts, T.xs, vocab=256)
     _keys, B = LiveFaceStream._decided(stream, SimpleNamespace(ij=ij), v,
                                        rows, skips, MAX_FACES)
     C = PlanTokenizer.face_transforms(
@@ -252,7 +252,7 @@ def test_the_diff_probe_is_empty(monkeypatch, approx_add, face):
 def _tokens_from_wire(T, rows, skips):
     """Tokens of vertex 1 (the join) decided from the WIRE, the way the AZ
     tokenizer and the live face stream do it."""
-    pt = PlanTokenizer(T.jaxpr, T.argnums, T.consts, T.xs, vocab=512)
+    pt = PlanTokenizer(T.jaxpr, T.argnums, T.consts, T.xs, vocab=256)
     pt.base()
     pt.eliminate(2)
     toks, _ids = pt.eliminate(1, None, rows, skips)
@@ -261,7 +261,7 @@ def _tokens_from_wire(T, rows, skips):
 
 def _tokens_from_env_dict(T, rows, skips):
     """Tokens of vertex 1 driven by env's OWN face dict."""
-    pt = PlanTokenizer(T.jaxpr, T.argnums, T.consts, T.xs, vocab=512)
+    pt = PlanTokenizer(T.jaxpr, T.argnums, T.consts, T.xs, vocab=256)
     pt.base()
     pt.eliminate(2)
     ft = envmod._face_dict_for_vertex(SimpleNamespace(jaxpr=T.jaxpr),

@@ -327,8 +327,16 @@ def test_a_face_chunk_carries_the_previous_faces_approximation_echo_not_its_own(
 
 
 # --------------------------------------------------------------------------
-# 3. id dtypes
+# 3. NARROW ID DTYPES (landed 2026-09-13)
 # --------------------------------------------------------------------------
+#
+# Token ids ride as uint8, equation ids as int16, and the delta count -- which
+# fits in neither -- rides in its own little-endian int32 header at the front
+# of the token wire. The tests below pin the three things that make that
+# exact: the vocabulary fits a byte, the count survives values above 255 and
+# above 32767, and an equation id past int16 raises on the host instead of
+# wrapping negative (where the relational gate would read it as "no
+# equation").
 
 _DIGIT_BASE = 10
 
@@ -358,84 +366,318 @@ def _encoder_tokenizer(vocab_size):
         list(args), vocab_size=vocab_size)
 
 
-def test_a_byte_wide_id_space_leaves_too_few_name_symbols():
-    """The number the byte budget is computed from.
+def test_the_configured_token_vocabulary_is_two_hundred_fifty_six():
+    """THE decision, as a test.
+
+    One resolver, one default. Every producer of the token stream -- the
+    observation path, the base block, the face chunks, the AZ plan tokenizer
+    -- calls ``incr_token_vocab``, because a base tokenized at one vocabulary
+    and a delta tokenized at another do not concatenate.
+    """
+    from alphagrad.approx.common import token_vocab as _tv
+
+    assert _tv.INCR_TOKEN_VOCAB_DEFAULT == 256
+    assert _tv.incr_token_vocab() == 256
+
+
+def test_at_the_configured_vocabulary_every_token_id_fits_in_one_byte():
+    """THE POSITIVE PIN the byte budget earns.
+
+    This file used to assert the opposite -- that a byte-wide id space was
+    unreachable at the 512 the runs used. The vocabulary is 256 now, so the
+    tokenizer's own static cap is 255 and a transformer-shaped graph's base
+    block, which is where the largest ids appear before a single elimination,
+    stays inside it.
+    """
+    from alphagrad.approx.common.token_vocab import (
+        DELTA_TOKEN_MAX, incr_token_vocab,
+    )
+
+    tk = _encoder_tokenizer(incr_token_vocab())
+    assert tk.max_token_id() == DELTA_TOKEN_MAX == 255
+    base = [int(t) for t in tk.base_tokens()]
+    assert base, "the Encoder example emitted no base tokens"
+    assert max(base) <= DELTA_TOKEN_MAX
+    assert min(base) >= 0
+
+
+def test_a_byte_wide_id_space_leaves_a_small_but_legal_name_alphabet():
+    """The number the decision was made on.
 
     graphax appends vocabulary tokens by design ("New markers MUST be
     appended"), so the reserved count moves: it was 230 before the byte-only
-    catalog and is 223 after it (job 65344). The test therefore pins the
-    CONSEQUENCE, not the count: a 256-wide id space leaves fewer than 32 name
-    symbols, against 279 at the 512 the env and the launchers run, and a name
-    alphabet that small spells names out of several atoms and lengthens every
-    delta (see the ALPHAGRAD_INCR_TOKEN_VOCAB comment in ``env.py``).
+    catalog and is 223 after it. The test therefore reads the count rather
+    than spelling it, and pins the CONSEQUENCE: a 256-wide id space leaves
+    fewer than 32 name symbols but more than the 2 graphax requires, so names
+    are spelled from several atoms and the stream is longer. That is the
+    trade the owner took.
     """
-    from graphax.jaxpr import get_vocab
+    from alphagrad.approx.common.token_vocab import (
+        incr_token_vocab, reserved_token_slots,
+    )
 
-    vocab, _, _ = get_vocab(_DIGIT_BASE)
-    reserved = len(vocab) + _DIGIT_BASE
-    names_at_256 = 256 - reserved
-    names_at_512 = 512 - reserved
-    assert 0 < names_at_256 < 32, (
-        f"the reserved vocabulary is {len(vocab)} slots plus {_DIGIT_BASE} "
-        f"digits, so a byte leaves {names_at_256} name symbols")
-    assert names_at_512 >= 8 * names_at_256
-
-
-def test_the_incremental_token_ids_at_the_configured_vocabulary_do_not_fit_in_a_byte():
-    """WHY TOKEN IDS ARE NOT uint8.
-
-    The env and the campaign launchers run the tokenizer at 512
-    (``ALPHAGRAD_INCR_TOKEN_VOCAB`` default, ``--vocab-size 512``). The
-    tokenizer's own cap is then 511, and a transformer-shaped graph really
-    does emit ids above 255 in its BASE block alone -- before a single
-    elimination has added a name.
-    """
-    tk = _encoder_tokenizer(512)
-    assert tk.max_token_id() == 511
-    base = [int(t) for t in tk.base_tokens()]
-    assert max(base) > 255, (
-        f"the base block tops out at {max(base)}; this graph no longer "
-        "reaches past a byte, so it cannot stand for the transformer.")
+    reserved = reserved_token_slots(_DIGIT_BASE)
+    names = incr_token_vocab() - reserved
+    assert 2 <= names < 32, (
+        f"the reserved vocabulary is {reserved} slots including "
+        f"{_DIGIT_BASE} digits, so a byte leaves {names} name symbols")
 
 
-def test_narrowing_the_token_vocabulary_to_a_byte_lengthens_every_delta():
-    """WHY THE ANSWER IS NOT "just set the vocabulary to 256".
+def test_a_vocabulary_the_tokenizer_cannot_fit_raises_from_the_resolver():
+    """UN-SWALLOWED. graphax raises this too, but it raises from inside a
+    per-step host callback where ``LiveFaceStream._tokenizer_at`` and
+    ``env._incremental_stream_tokens`` catch ``Exception`` and turn the
+    failure into an empty chunk plus a bumped ``failures`` counter. Resolving
+    through ``incr_token_vocab`` moves the raise to the caller."""
+    from alphagrad.approx.common.token_vocab import (
+        incr_token_vocab, reserved_token_slots,
+    )
 
-    Names are positional sequences over the name alphabet. 512 leaves 272
-    symbols, 256 leaves 16, and a 16-symbol alphabet spells later names out of
-    several atoms instead of one. The stream -- which is exactly what
-    MAX_DELTA_TOKENS budgets -- gets longer, which is the opposite of what
-    narrowing the dtype was for.
-    """
-    big = _encoder_tokenizer(512)
-    small = _encoder_tokenizer(256)
-    assert small.max_token_id() == 255
-    n_big = len(list(big.base_tokens()))
-    n_small = len(list(small.base_tokens()))
-    assert n_small > n_big, (
-        f"a 256-wide vocabulary spelled the base in {n_small} tokens against "
-        f"{n_big} at 512 -- this graph is too small to show the cost.")
+    too_small = reserved_token_slots(_DIGIT_BASE) + 1
+    with pytest.raises(ValueError, match="name symbols"):
+        incr_token_vocab(too_small)
 
 
-def test_the_delta_count_header_rides_in_slot_zero_of_both_transport_buffers():
-    """WHY EQUATION IDS ARE NOT int16 AS THE CODE STANDS.
+def test_a_vocabulary_wider_than_a_byte_raises_because_the_wire_would_wrap():
+    from alphagrad.approx.common.token_vocab import incr_token_vocab
 
-    ``_delta_observation`` writes the exact host-side token count into slot 0
-    of BOTH wire arrays. ``env.step`` reads it from the token buffer only, but
-    the equation buffer carries the same value -- and at the default
-    ``MAX_DELTA_TOKENS`` of 32768 that value is one above what int16 holds.
-    Narrowing the equation buffer therefore means first taking the count out
-    of its slot 0, which is a change to the callback's shared wire form.
+    with pytest.raises(ValueError, match="uint8"):
+        incr_token_vocab(512)
+
+
+def test_the_live_face_stream_refuses_a_vocabulary_wider_than_a_byte():
+    """The face chunks are a slice of the SAME emission, so they carry the
+    same ids and must be built at the same id space."""
+    from alphagrad.approx.live_faces import LiveFaceStream
+
+    jaxpr, consts, args = _perceptron()
+    with pytest.raises(ValueError, match="uint8"):
+        LiveFaceStream(jaxpr, (2, 3, 4, 5), consts, args, vocab=512,
+                       max_faces=8, max_axes=8, window=256)
+
+
+def test_the_policy_embedding_is_checked_against_the_tokenizer_vocabulary():
+    """JAX CLAMPS an out-of-range gather instead of raising, so an embedding
+    with fewer rows than the tokenizer has ids reads the LAST row for every id
+    past the table and the policy learns from a collision it never sees.
+    ``ppo.main`` refuses that combination before it builds anything."""
+    from alphagrad.approx.common.token_vocab import incr_token_vocab
+    from alphagrad.approx.ppo import check_embedding_covers_tokenizer
+
+    tok = incr_token_vocab()
+    # Equal is enough, and wider is allowed (the surplus rows are simply
+    # never gathered).
+    assert check_embedding_covers_tokenizer(tok) == tok
+    assert check_embedding_covers_tokenizer(tok + 64) == tok
+    with pytest.raises(ValueError, match="smaller than the tokenizer"):
+        check_embedding_covers_tokenizer(tok - 1)
+
+
+def test_the_trainer_default_embedding_width_is_the_tokenizer_vocabulary():
+    """The two defaults are one number, so the check above passes by
+    construction unless somebody overrides one of them."""
+    from alphagrad.approx.common.token_vocab import incr_token_vocab
+    from alphagrad.approx.ppo import make_argparser
+
+    args = make_argparser().parse_args([])
+    assert int(args.vocab_size) == incr_token_vocab()
+
+
+def test_the_delta_count_header_is_its_own_int32_outside_both_id_buffers():
+    """THE HEADER SCHEME.
+
+    The count used to ride in slot 0 of BOTH wire buffers (``t[0] = n``,
+    ``e[0] = n``). A count up to ``MAX_DELTA_TOKENS`` fits neither uint8 nor
+    int16, so it moved out: the first ``DELTA_HEADER_SLOTS`` byte slots of the
+    TOKEN buffer are one little-endian int32, the same slots of the EQUATION
+    buffer carry the pad sentinel and are read by nobody, and the ids start at
+    ``DELTA_HEADER_SLOTS`` in both.
     """
     from alphagrad.approx import env as _env
 
     stream = list(range(20))
     seg_ids = [0] * 20
     t, e = _env._delta_observation(stream, seg_ids, 5)
-    assert int(t[0]) == 15
-    assert int(e[0]) == 15
-    assert int(e[1 + 15]) == -1          # pad sentinel, not representable in uint8
-    assert _env.MAX_DELTA_TOKENS >= 1
-    if _env.MAX_DELTA_TOKENS > np.iinfo(np.int16).max:
-        assert _env.MAX_DELTA_TOKENS == 32768, (
-            "the default budget moved; recheck the int16 header argument.")
+    t = np.asarray(t)
+    e = np.asarray(e)
+    assert t.dtype == np.uint8
+    assert e.dtype == np.int16
+    assert t.shape == e.shape == (_env.DELTA_HEADER_SLOTS
+                                 + _env.MAX_DELTA_TOKENS,)
+    # The header says 15, and it is NOT in either id stream.
+    assert int(_env.decode_delta_header(t)) == 15
+    assert list(np.asarray(e[:_env.DELTA_HEADER_SLOTS])) == [
+        _env.DELTA_EQN_PAD] * _env.DELTA_HEADER_SLOTS
+    H = _env.DELTA_HEADER_SLOTS
+    assert list(t[H:H + 15]) == list(range(5, 20))
+    assert list(e[H:H + 15]) == [0] * 15
+    assert int(e[H + 15]) == _env.DELTA_EQN_PAD
+    assert int(t[H + 15]) == _env.DELTA_TOKEN_PAD
+
+
+def test_a_delta_count_above_a_byte_and_above_int_sixteen_survives_the_header():
+    """THE ROUND TRIP THE HEADER EXISTS FOR.
+
+    256 is the first count uint8 cannot hold and 32768 is the first int16
+    cannot; both are real delta lengths at the default budget. The header must
+    return them exactly, or the encoder reads a truncated delta and its
+    recurrence desyncs from the stream for the rest of the episode.
+    """
+    from alphagrad.approx import env as _env
+
+    for n in (0, 1, 255, 256, 257, 32767, 32768,
+              int(_env.MAX_DELTA_TOKENS)):
+        if n > _env.MAX_DELTA_TOKENS:
+            continue
+        stream = [1] * n
+        seg_ids = [0] * n
+        t, e = _env._delta_observation(stream, seg_ids, 0)
+        assert int(_env.decode_delta_header(np.asarray(t))) == n, (
+            f"a delta of {n} tokens came back as "
+            f"{int(_env.decode_delta_header(np.asarray(t)))}")
+
+
+def test_the_header_codec_round_trips_every_count_the_budget_allows():
+    from alphagrad.approx import env as _env
+
+    for n in (0, 1, 255, 256, 65535, 65536, 1 << 24, (1 << 32) - 1):
+        enc = _env.encode_delta_header(n)
+        assert enc.dtype == np.uint8
+        assert enc.shape == (_env.DELTA_HEADER_SLOTS,)
+        assert int(_env.decode_delta_header(jnp.asarray(enc))) == n
+
+
+def test_token_id_zero_is_a_real_token_so_padding_is_read_from_the_count():
+    """WHY THE COUNT IS THE ONLY LENGTH.
+
+    graphax's token 0 is the literal '-', which occurs INTERIOR to real
+    streams. A reader that recovered a length by scanning for the pad value
+    would stop at the first negative number in the delta. Nothing does: the
+    header carries the tokenizer's own ``len()``, and this test shows a delta
+    whose interior is all zeros coming back at its full length.
+    """
+    from graphax.jaxpr import get_vocab
+
+    from alphagrad.approx import env as _env
+
+    vocab, n_vocab, _ = get_vocab(_DIGIT_BASE)
+    assert n_vocab[0] == "-", (
+        "token 0 is no longer '-'; recheck whether 0 can still occur inside a "
+        "real stream before relaxing anything that depends on this")
+
+    stream = [0] * 7
+    t, e = _env._delta_observation(stream, [0] * 7, 0)
+    assert int(_env.decode_delta_header(np.asarray(t))) == 7
+    H = _env.DELTA_HEADER_SLOTS
+    assert list(np.asarray(t)[H:H + 7]) == [0] * 7
+
+
+def test_an_equation_id_above_int_sixteen_raises_on_the_host():
+    """THE RAISE THAT REPLACES A SILENT WRAP.
+
+    ``IncrementalPathTokenizer._eqn_seg`` is a stream-global counter that
+    nothing bounds. Cast to int16 it would go NEGATIVE past 32767, and
+    negative means "no equation" to the relational gate -- a change of meaning,
+    not a change of precision.
+    """
+    from alphagrad.approx import env as _env
+
+    with pytest.raises(ValueError, match="exceeds 32767"):
+        _env._delta_observation([1, 2, 3], [0, 32768, 1], 0)
+
+    # 32767 itself is fine: the bound is inclusive.
+    t, e = _env._delta_observation([1, 2, 3], [0, 32767, 1], 0)
+    H = _env.DELTA_HEADER_SLOTS
+    assert int(np.asarray(e)[H + 1]) == 32767
+
+
+def test_a_token_id_above_a_byte_raises_on_the_host():
+    from alphagrad.approx import env as _env
+
+    with pytest.raises(ValueError, match="outside .0, 255."):
+        _env._delta_observation([1, 256, 3], [0, 0, 0], 0)
+
+
+def test_the_max_eqns_gate_clip_sits_far_below_the_int_sixteen_bound():
+    """HOW THE TWO BOUNDS INTERACT.
+
+    ``ppo.MAX_EQNS`` (4096 by default) clips every equation id into
+    ``[0, MAX_EQNS)`` at the relational-gate histogram, so ids past it already
+    share the top bucket. The int16 bound is eight times higher, which means
+    the clip ALWAYS bites first and the raise never changes a gate value that
+    the clip was not already collapsing. The raise still earns its place: a
+    wrapped id goes NEGATIVE, and negative is not "the top bucket", it is "no
+    equation at all".
+    """
+    from alphagrad.approx.ppo import MAX_EQNS
+    from alphagrad.approx.common.token_vocab import DELTA_EQN_MAX
+
+    assert MAX_EQNS - 1 < DELTA_EQN_MAX
+    assert DELTA_EQN_MAX >= 8 * MAX_EQNS
+
+
+# --------------------------------------------------------------------------
+# 3b. the stored buffers, both ends
+# --------------------------------------------------------------------------
+
+def test_the_env_state_delta_buffers_are_uint8_and_int16_at_reset():
+    """THE ROLLOUT STORE. ``reset`` is the one place both buffers are built
+    from nothing, so it is where a widened dtype would reappear."""
+    from alphagrad.approx import env as _env
+
+    e = _make_delta_env()
+    st = e.reset()
+    assert np.asarray(st.delta_tokens).dtype == np.uint8
+    assert np.asarray(st.delta_eqns).dtype == np.int16
+    assert np.asarray(st.delta_count).dtype == np.int32
+    assert np.asarray(st.delta_tokens).shape == (_env.MAX_DELTA_TOKENS,)
+    assert np.asarray(st.delta_eqns).shape == (_env.MAX_DELTA_TOKENS,)
+
+
+def test_the_callback_wire_declares_the_narrow_dtypes_and_the_header_width():
+    """THE WIRE, as ``io_callback`` enforces it. The Ray measurement pool
+    preallocates at ``env.obs_width`` / ``env.wire_token_dtype``, so these
+    three descriptions of one buffer are checked against each other here."""
+    from alphagrad.approx import env as _env
+
+    e = _make_delta_env()
+    assert e.obs_width == _env.DELTA_HEADER_SLOTS + _env.MAX_DELTA_TOKENS
+    assert e.wire_token_dtype is _env.DELTA_TOKEN_DTYPE
+    assert e.wire_eqn_dtype is _env.DELTA_EQN_DTYPE
+    shp = e._callback_shape
+    assert shp[0].shape == shp[1].shape == (e.obs_width,)
+    assert shp[0].dtype == jnp.uint8
+    assert shp[1].dtype == jnp.int16
+
+
+def test_the_loss_reads_the_delta_through_a_cast_so_the_gather_stays_int32():
+    """THE LOSS END. ``encode_extend`` is the single reader of both stored
+    buffers; it casts to int32 before the embedding gather and before the
+    relational comparison, so a narrow store cannot change the arithmetic."""
+    from alphagrad.approx.ppo import MAX_EQNS      # noqa: F401
+
+    import inspect
+
+    from alphagrad.approx.ppo import Agent
+
+    src = inspect.getsource(Agent.encode_extend)
+    assert 'fill_value=0).astype(jnp.int32)' in src
+    assert 'fill_value=-1).astype(jnp.int32)' in src
+
+
+def _make_delta_env():
+    """A ``delta_obs`` env over the Perceptron example, no measurement.
+
+    ``terminal_rewards_only`` keeps every non-terminal step a pure tokenizer
+    step, so nothing here compiles or times a Jacobian.
+    """
+    from alphagrad.approx.env import EnvConfig, VertexEliminationEnv
+
+    jaxpr, consts, args = _perceptron()
+    cfg = EnvConfig(
+        jaxpr=jaxpr, argnums=(2, 3, 4, 5), has_aux=False, sparse=False,
+        cmp_type="flops", mem_type="peak_memory",
+        terminal_rewards_only=True, delta_obs=True,
+    )
+    return VertexEliminationEnv(cfg, args=tuple(args), consts=list(consts),
+                                num_envs=0)

@@ -288,7 +288,7 @@ def _walk_one_graph(target, seed, slots_on=None, pass_="vertex"):
     F = MAX_FACES
 
     lf = LiveFaceStream(jaxpr, argnums, consts, args,
-                        vocab=512, max_faces=F, max_axes=N_AX)
+                        vocab=256, max_faces=F, max_axes=N_AX)
     tk = IncrementalPathTokenizer(jaxpr, argnums, list(consts), list(args),
                                   vocab_size=512)
     tk.base_tokens()
@@ -446,7 +446,7 @@ def _walk(target, seed, slots_on=None):
     specs = np.zeros((total_v, 1, 3), np.int32)
 
     lf = LiveFaceStream(jaxpr, argnums, consts, args,
-                        vocab=512, max_faces=MAX_FACES, max_axes=N_AX)
+                        vocab=256, max_faces=MAX_FACES, max_axes=N_AX)
     ij = IncrementalJaxpr(jaxpr, argnums, list(consts), list(args),
                           track_faces=False)
     config = SimpleNamespace(jaxpr=jaxpr)
@@ -615,7 +615,7 @@ def test_every_site_a_slot_hook_reaches_is_recorded_by_the_probe(tlm):
             # ONE site per slot is the invariant, not the count.
             assert all(len(x) == 1 for x in sites), (want, sites)
             flat = {x for per in sites for x in per}
-            lf = LiveFaceStream(jaxpr, argnums, consts, args, vocab=512,
+            lf = LiveFaceStream(jaxpr, argnums, consts, args, vocab=256,
                                 max_faces=MAX_FACES, max_axes=N_AX)
             specs = np.zeros((len(jaxpr.eqns), 1, 3), np.int32)
             tk = lf._tokenizer_at(np.asarray(order), specs, 0)
@@ -716,7 +716,7 @@ def _walk_join_slots(target, seed, arm):
     sites = face_slot_sites()
     S_ALL = len(sites)
 
-    lf = LiveFaceStream(jaxpr, argnums, consts, args, vocab=512,
+    lf = LiveFaceStream(jaxpr, argnums, consts, args, vocab=256,
                         max_faces=F, max_axes=N_AX)
     tk = IncrementalPathTokenizer(jaxpr, argnums, list(consts), list(args),
                                   vocab_size=512)
@@ -1090,7 +1090,7 @@ def test_the_operand_slots_were_never_stale_and_the_dependent_ones_were(tlm):
     order = markowitz_order(jaxpr, argnums, consts, args, vv)
     specs = np.zeros((len(jaxpr.eqns), 1, 3), np.int32)
     S_ALL = len(face_slot_sites())
-    lf = LiveFaceStream(jaxpr, argnums, consts, args, vocab=512,
+    lf = LiveFaceStream(jaxpr, argnums, consts, args, vocab=256,
                         max_faces=MAX_FACES, max_axes=N_AX)
     rows_hist = np.full((len(jaxpr.eqns), MAX_FACES, S_ALL, 3), -1, np.int32)
     rows_hist[..., 2] = 0
@@ -1175,7 +1175,7 @@ def test_the_decide_pass_answers_at_every_approx_add_width(tlm):
             S = envmod.wire_slots()
             sites = envmod.face_slot_sites()
             assert len(sites) == S and all(len(x) == 1 for x in sites), sites
-            lf = LiveFaceStream(jaxpr, argnums, consts, args, vocab=512,
+            lf = LiveFaceStream(jaxpr, argnums, consts, args, vocab=256,
                                 max_faces=MAX_FACES, max_axes=N_AX)
             tk = IncrementalPathTokenizer(jaxpr, argnums, list(consts),
                                           list(args), vocab_size=512)
@@ -1353,7 +1353,7 @@ def test_the_structural_contraction_is_the_apply_paths_own(target_name, tlm,
     vv = _valid_vertices(jaxpr, args, consts, argnums)
     order = markowitz_order(jaxpr, argnums, consts, args, vv)
     F = MAX_FACES
-    lf = LiveFaceStream(jaxpr, argnums, consts, args, vocab=512,
+    lf = LiveFaceStream(jaxpr, argnums, consts, args, vocab=256,
                         max_faces=F, max_axes=N_AX)
     tk = IncrementalPathTokenizer(jaxpr, argnums, list(consts), list(args),
                                   vocab_size=512)
@@ -1500,7 +1500,7 @@ def test_the_vertex_pass_runs_no_elimination(tlm):
     jaxpr, consts, args, argnums = tlm
     vv = _valid_vertices(jaxpr, args, consts, argnums)
     order = markowitz_order(jaxpr, argnums, consts, args, vv)
-    lf = LiveFaceStream(jaxpr, argnums, consts, args, vocab=512,
+    lf = LiveFaceStream(jaxpr, argnums, consts, args, vocab=256,
                         max_faces=MAX_FACES, max_axes=N_AX)
     tk = IncrementalPathTokenizer(jaxpr, argnums, list(consts), list(args),
                                   vocab_size=512)
@@ -1543,7 +1543,7 @@ def test_the_vertex_pass_refuses_the_learned_join_slots(tlm):
     from graphax import IncrementalPathTokenizer
 
     jaxpr, consts, args, argnums = tlm
-    lf = LiveFaceStream(jaxpr, argnums, consts, args, vocab=512,
+    lf = LiveFaceStream(jaxpr, argnums, consts, args, vocab=256,
                         max_faces=MAX_FACES, max_axes=N_AX)
     tk = IncrementalPathTokenizer(jaxpr, argnums, list(consts), list(args),
                                   vocab_size=512)
@@ -1588,7 +1588,7 @@ def test_the_vertex_pass_answers_under_approx_add_choose(tlm):
     jaxpr, consts, args, argnums = tlm
     vv = _valid_vertices(jaxpr, args, consts, argnums)
     order = markowitz_order(jaxpr, argnums, consts, args, vv)
-    lf = LiveFaceStream(jaxpr, argnums, consts, args, vocab=512,
+    lf = LiveFaceStream(jaxpr, argnums, consts, args, vocab=256,
                         max_faces=MAX_FACES, max_axes=N_AX)
     tk = IncrementalPathTokenizer(jaxpr, argnums, list(consts), list(args),
                                   vocab_size=512)
@@ -1672,7 +1672,7 @@ def test_the_two_passes_draw_the_same_rows(tlm):
         return _draw
 
     def _run(pass_):
-        lf = LiveFaceStream(jaxpr, argnums, consts, args, vocab=512,
+        lf = LiveFaceStream(jaxpr, argnums, consts, args, vocab=256,
                             max_faces=MAX_FACES, max_axes=N_AX)
         tk = IncrementalPathTokenizer(jaxpr, argnums, list(consts),
                                       list(args), vocab_size=512)

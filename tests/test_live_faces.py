@@ -50,7 +50,7 @@ def main():
     V = len(jaxpr.eqns)
     MR, F, S = 8, 8, 3
 
-    lfs = LiveFaceStream(jaxpr, argnums, consts, args, vocab=512,
+    lfs = LiveFaceStream(jaxpr, argnums, consts, args, vocab=256,
                          max_faces=F, max_axes=8, window=8192)
 
     order = np.zeros((V,), np.int32)

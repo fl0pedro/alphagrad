@@ -57,7 +57,10 @@ def _sentinel_callback_output(
     frob_residual_idx: int,
     fidelity_idx: int | None = None,
     sparsity_idx: int | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    token_dtype=np.int32,
+    eqn_dtype=np.int32,
+    emit_eqn_ids: bool = True,
+) -> tuple:
     """Return ``(tokens, eqn_ids, reward)`` matching the env's
     ``_callback_shape`` for a timeout / actor-death.
 
@@ -82,8 +85,13 @@ def _sentinel_callback_output(
     live channel, which is not this workstream's to change; it is recorded so
     the next person does not have to rediscover it.
     """
-    tokens = np.zeros((max_tokens,), dtype=np.int32)
-    eqn_ids = np.zeros((max_tokens,), dtype=np.int32)
+    # NARROW WIRE: under ``delta_obs`` the env declares uint8 tokens and NO
+    # equation-id buffer at all, and the callback's declared shape is what
+    # ``io_callback`` enforces. The sentinel must therefore match the wire the
+    # env declares, not a fixed int32 pair.
+    tokens = np.zeros((max_tokens,), dtype=token_dtype)
+    eqn_ids = (np.zeros((max_tokens,), dtype=eqn_dtype)
+               if emit_eqn_ids else None)
     reward = np.full((num_rewards,), _SENTINEL_REWARD_VALUE, dtype=np.float32)
     reward[cosine_sim_idx] = 0.0
     reward[frob_residual_idx] = _SENTINEL_REWARD_VALUE
@@ -96,6 +104,8 @@ def _sentinel_callback_output(
     # apparatus failure looks like from the outside.
     if sparsity_idx is not None and 0 <= int(sparsity_idx) < int(num_rewards):
         reward[int(sparsity_idx)] = -1.0
+    if not emit_eqn_ids:
+        return tokens, reward
     return tokens, eqn_ids, reward
 
 
@@ -162,6 +172,9 @@ class CpuApproxPool:
         sparsity_idx: int | None = None,
         initial_timeout_s: float | None = None,
         warm_after: int = 3,
+        token_dtype=np.int32,
+        eqn_dtype=np.int32,
+        emit_eqn_ids: bool = True,
     ):
         self._alive: collections.deque = collections.deque(actor_handles)
         self._timeout_s = float(timeout_s)
@@ -185,6 +198,16 @@ class CpuApproxPool:
         self._closed = False
         # Shape constants captured so we don't import jax here.
         self._max_tokens = max_tokens
+        # THE WIRE DTYPES, handed down from ``env.wire_token_dtype`` /
+        # ``env.wire_eqn_dtype``. The pool's preallocated buffers and the
+        # env's ``_callback_shape`` are two descriptions of one wire; the env
+        # owns the description and this is the copy.
+        self._token_dtype = np.dtype(token_dtype)
+        self._eqn_dtype = np.dtype(eqn_dtype)
+        # THE WIRE ARITY (``env.wire_arity``). False under ``delta_obs``:
+        # there is no equation-id buffer on that path, so the pool
+        # preallocates none and its rows are (tokens, reward) pairs.
+        self._emit_eqn_ids = bool(emit_eqn_ids)
         self._num_rewards = num_rewards
         self._cosine_sim_idx = cosine_sim_idx
         self._frob_residual_idx = frob_residual_idx
@@ -436,6 +459,48 @@ class CpuApproxPool:
     # which is itself called from JAX's ``io_callback`` machinery on
     # the SPMD actor process.
     # ------------------------------------------------------------------
+    def _check_arity(self, result):
+        """The measure actor's tuple must be the arity this pool serves.
+
+        Two entries under ``delta_obs`` (tokens, reward) and three on the
+        legacy full-stream path (tokens, eqn_ids, reward). A mismatch means
+        the actor's env and the trainer's env disagree about whether an
+        equation-id buffer exists, and every unpack below would take the
+        reward for an id buffer.
+        """
+        want = 3 if self._emit_eqn_ids else 2
+        if len(result) != want:
+            raise ValueError(
+                f"measure actor returned {len(result)} arrays, expected "
+                f"{want} -- the actor's env and the trainer's env disagree "
+                f"on delta_obs (the wire arity).")
+
+    def _wire(self, a, want, name):
+        """One measurement row, checked against the wire this pool serves.
+
+        SHAPE first: the pool's ``max_tokens`` comes from ``env.obs_width``,
+        and an actor built against a different budget used to broadcast or
+        truncate inside the caller's assignment. RANGE second: the narrow
+        dtypes (uint8 tokens, int16 equation ids) WRAP on a plain cast, so a
+        value outside the target's range is refused rather than folded.
+        """
+        a = np.asarray(a)
+        if a.shape != (self._max_tokens,):
+            raise ValueError(
+                f"measure actor returned {name} with shape {a.shape}, "
+                f"expected ({self._max_tokens},) -- the actor's env and the "
+                f"trainer's env disagree on the wire arity (env.obs_width).")
+        if a.dtype != want:
+            info = np.iinfo(want)
+            a64 = a.astype(np.int64)
+            if a64.size and (int(a64.min()) < info.min
+                             or int(a64.max()) > info.max):
+                raise ValueError(
+                    f"measure actor returned {name} with values outside "
+                    f"{want} [{info.min}, {info.max}]; casting to the wire "
+                    f"dtype would WRAP them.")
+        return a.astype(want)
+
     def evaluate(
         self,
         order_np: Any,
@@ -487,6 +552,9 @@ class CpuApproxPool:
                 self._frob_residual_idx,
                 self._fidelity_idx,
                 self._sparsity_idx,
+                self._token_dtype,
+                self._eqn_dtype,
+                self._emit_eqn_ids,
             )
 
         future = None
@@ -523,14 +591,16 @@ class CpuApproxPool:
             # bounds long-term memory growth.
             timeout = self._timeout_for(actor)
             result = ray.get(future) if timeout <= 0 else ray.get(future, timeout=timeout)
-            tokens, eqn_ids, reward = result
+            self._check_arity(result)
             self._mark_call(actor)
             self._put_back(actor)
-            return (
-                np.asarray(tokens, dtype=np.int32),
-                np.asarray(eqn_ids, dtype=np.int32),
-                np.asarray(reward, dtype=np.float32),
-            )
+            _tk = self._wire(result[0], self._token_dtype, "tokens")
+            _rw = np.asarray(result[-1], dtype=np.float32)
+            if not self._emit_eqn_ids:
+                return _tk, _rw
+            return (_tk,
+                    self._wire(result[1], self._eqn_dtype, "eqn_ids"),
+                    _rw)
         except GetTimeoutError:
             self._n_timeouts += 1
             print(
@@ -546,6 +616,9 @@ class CpuApproxPool:
                 self._frob_residual_idx,
                 self._fidelity_idx,
                 self._sparsity_idx,
+                self._token_dtype,
+                self._eqn_dtype,
+                self._emit_eqn_ids,
             )
         except RayActorError:
             self._n_actor_errors += 1
@@ -562,6 +635,9 @@ class CpuApproxPool:
                 self._frob_residual_idx,
                 self._fidelity_idx,
                 self._sparsity_idx,
+                self._token_dtype,
+                self._eqn_dtype,
+                self._emit_eqn_ids,
             )
         except Exception as _exc:
             # Catch-all: anything else (serialization issue, malformed
@@ -584,6 +660,9 @@ class CpuApproxPool:
                 self._frob_residual_idx,
                 self._fidelity_idx,
                 self._sparsity_idx,
+                self._token_dtype,
+                self._eqn_dtype,
+                self._emit_eqn_ids,
             )
 
     # ------------------------------------------------------------------
@@ -653,7 +732,7 @@ class CpuApproxPool:
                 face_skips_batch=face_skips_batch,
                 episode=episode,
             )
-        t_u, e_u, r_u, s_u = self._evaluate_batch_impl(
+        _u = self._evaluate_batch_impl(
             [order_batch[i] for i in uniq_idx],
             [specs_batch[i] for i in uniq_idx],
             [step_batch[i] for i in uniq_idx],
@@ -664,17 +743,23 @@ class CpuApproxPool:
                               [face_skips_batch[i] for i in uniq_idx]),
             episode=episode,
         )
+        t_u, r_u, s_u = _u[0], _u[-2], _u[-1]
+        e_u = _u[1] if self._emit_eqn_ids else None
         pos = {orig: k for k, orig in enumerate(uniq_idx)}
-        tokens_out = np.zeros((N, self._max_tokens), dtype=np.int32)
-        eqn_ids_out = np.zeros((N, self._max_tokens), dtype=np.int32)
+        tokens_out = np.zeros((N, self._max_tokens), dtype=self._token_dtype)
+        eqn_ids_out = (np.zeros((N, self._max_tokens), dtype=self._eqn_dtype)
+                       if self._emit_eqn_ids else None)
         rewards_out = np.zeros((N, self._num_rewards), dtype=np.float32)
         sentinel_mask = np.zeros((N,), dtype=bool)
         for i in range(N):
             k = pos[slot_to_rep[i]]
             tokens_out[i] = t_u[k]
-            eqn_ids_out[i] = e_u[k]
+            if self._emit_eqn_ids:
+                eqn_ids_out[i] = e_u[k]
             rewards_out[i] = r_u[k]
             sentinel_mask[i] = s_u[k]
+        if not self._emit_eqn_ids:
+            return tokens_out, rewards_out, sentinel_mask
         return tokens_out, eqn_ids_out, rewards_out, sentinel_mask
 
     def _evaluate_batch_impl(
@@ -712,8 +797,12 @@ class CpuApproxPool:
             raise ValueError(f"batch length mismatch: orders {N}, specs {len(specs_batch)}, steps {len(step_batch)}")
 
         # Pre-allocate output buffers + sentinel mask.
-        tokens_out = np.zeros((N, self._max_tokens), dtype=np.int32)
-        eqn_ids_out = np.zeros((N, self._max_tokens), dtype=np.int32)
+        tokens_out = np.zeros((N, self._max_tokens), dtype=self._token_dtype)
+        # NO EQUATION-ID BUFFER under ``delta_obs``: the wire has none, so the
+        # pool preallocates none (2 x N x max_tokens x 4 B per batch saved at
+        # the legacy int32 width).
+        eqn_ids_out = (np.zeros((N, self._max_tokens), dtype=self._eqn_dtype)
+                       if self._emit_eqn_ids else None)
         rewards_out = np.zeros((N, self._num_rewards), dtype=np.float32)
         sentinel_mask = np.zeros((N,), dtype=bool)
 
@@ -725,13 +814,17 @@ class CpuApproxPool:
             )
 
         def _sentinel_slot(i):
-            tokens_out[i], eqn_ids_out[i], rewards_out[i] = (
-                _sentinel_callback_output(
-                    self._max_tokens, self._num_rewards,
-                    self._cosine_sim_idx, self._frob_residual_idx,
-                    self._fidelity_idx, self._sparsity_idx,
-                )
+            _sv = _sentinel_callback_output(
+                self._max_tokens, self._num_rewards,
+                self._cosine_sim_idx, self._frob_residual_idx,
+                self._fidelity_idx, self._sparsity_idx,
+                self._token_dtype, self._eqn_dtype,
+                self._emit_eqn_ids,
             )
+            tokens_out[i] = _sv[0]
+            if self._emit_eqn_ids:
+                eqn_ids_out[i] = _sv[1]
+            rewards_out[i] = _sv[-1]
             sentinel_mask[i] = True
 
         # Acquire as many actors as the pool has, up to N, then serve the N
@@ -758,6 +851,8 @@ class CpuApproxPool:
                     flush=True,
                 )
                 _sentinel_slot(i)
+            if not self._emit_eqn_ids:
+                return tokens_out, rewards_out, sentinel_mask
             return tokens_out, eqn_ids_out, rewards_out, sentinel_mask
 
         # Map wave-local actor index j -> list of slots that OOM'd on it,
@@ -845,12 +940,17 @@ class CpuApproxPool:
                 future = futures[i]
                 try:
                     if wave_no_timeout:
-                        tokens, eqn_ids, reward = ray.get(future)
+                        _res = ray.get(future)
                     else:
-                        tokens, eqn_ids, reward = ray.get(future, timeout=0)
+                        _res = ray.get(future, timeout=0)
+                    self._check_arity(_res)
+                    reward = _res[-1]
                     self._mark_call(actor)
-                    tokens_out[i] = np.asarray(tokens, dtype=np.int32)
-                    eqn_ids_out[i] = np.asarray(eqn_ids, dtype=np.int32)
+                    tokens_out[i] = self._wire(_res[0], self._token_dtype,
+                                               "tokens")
+                    if self._emit_eqn_ids:
+                        eqn_ids_out[i] = self._wire(
+                            _res[1], self._eqn_dtype, "eqn_ids")
                     rewards_out[i] = np.asarray(reward, dtype=np.float32)
                     with self._lock:
                         self._measures_since_recycle[id(actor)] = (
@@ -959,10 +1059,11 @@ class CpuApproxPool:
                             episode=(None if episode is None else int(episode)),
                         )
                         rto = self._timeout_for(fresh)
-                        if rto <= 0.0:
-                            tk, eq, rw = ray.get(rf)
-                        else:
-                            tk, eq, rw = ray.get(rf, timeout=rto)
+                        _rres = (ray.get(rf) if rto <= 0.0
+                                 else ray.get(rf, timeout=rto))
+                        self._check_arity(_rres)
+                        tk, rw = _rres[0], _rres[-1]
+                        eq = _rres[1] if self._emit_eqn_ids else None
                     except Exception as _rexc:
                         print(
                             f"[POOL] oom-retry slot={i} FAILED on fresh actor: "
@@ -994,8 +1095,11 @@ class CpuApproxPool:
                         continue
                     # Retry succeeded — overwrite the sentinel with the REAL
                     # measurement and clear the sentinel mask for this slot.
-                    tokens_out[i] = np.asarray(tk, dtype=np.int32)
-                    eqn_ids_out[i] = np.asarray(eq, dtype=np.int32)
+                    tokens_out[i] = self._wire(tk, self._token_dtype,
+                                               "tokens")
+                    if self._emit_eqn_ids:
+                        eqn_ids_out[i] = self._wire(eq, self._eqn_dtype,
+                                                    "eqn_ids")
                     rewards_out[i] = np.asarray(rw, dtype=np.float32)
                     sentinel_mask[i] = False
                     self._n_oom_retry_success += 1
@@ -1005,6 +1109,8 @@ class CpuApproxPool:
             if a is not None:
                 self._put_back(a)
 
+        if not self._emit_eqn_ids:
+            return tokens_out, rewards_out, sentinel_mask
         return tokens_out, eqn_ids_out, rewards_out, sentinel_mask
 
     # ------------------------------------------------------------------

@@ -88,7 +88,7 @@ def zero_memory(total_v, embd_dim):
             jnp.zeros((int(total_v) + 2,), jnp.float32))
 
 
-def init_carry(agent, base_tokens, base_eqns, base_count, *, window,
+def init_carry(agent, base_tokens, base_count, *, window,
                total_v, embd_dim, base_owners=None):
     """``(enc_carry, base_sums, base_counts)`` -- the BASE MEMORY.
 
@@ -126,37 +126,26 @@ def init_carry(agent, base_tokens, base_eqns, base_count, *, window,
     # exact. ALPHAGRAD_FOLD_DELTA=0 restores the full-width form.
     if _FOLD:
         return _init_carry_folded(
-            agent, enc0, base_tokens, base_eqns, base_count,
+            agent, enc0, base_tokens, base_count,
             window=window, total_v=total_v, embd_dim=embd_dim,
             base_owners=base_owners)
-    enc1, rows0, valid0, eqns0 = agent.encode_extend(
-        enc0, base_tokens, base_eqns, base_count, window=window, start=0,
-        chunk=0,
+    enc1, rows0, valid0 = agent.encode_extend(
+        enc0, base_tokens, base_count, window=window, start=0, chunk=0,
     )
-    # BASE ATTRIBUTION. `eqns0` are SEGMENT ids from a stream-global running
-    # counter -- graphax.jaxpr.last_eqn_ids is explicit that they are "built
-    # for relational consumers that only compare ids", NOT vertex indices,
-    # and base_tokens emits the whole base block in ONE _emit_eqns call so
-    # every base equation token shares id 0. Reading them as vertex indices
-    # credited the entire base stream to vertex 1 (#92).
-    #
-    # The TRUE owners come from the tokenizer instead:
+    # BASE ATTRIBUTION. The owners come from the tokenizer:
     # `IncrementalPathTokenizer.last_owner_ids()` gives the 1-based vertex
     # that produced each base token (0 = no owner: headers, the input list),
     # recorded because `_build_graph` walks `jaxpr.eqns` and every traced
     # base equation therefore belongs to exactly one original equation.
     #
+    # (The stream-global SEGMENT ids never belonged here and are gone now:
+    # base_tokens emitted the whole base block in ONE _emit_eqns call, so
+    # every base equation token shared id 0 and reading them as vertex
+    # indices credited the entire base stream to vertex 1, bug #92.)
+    #
     # Fallback is the #92 behaviour (everything to the GLOBAL slot), which
-    # is always safe. Never fall back to reading `eqns0` as vertex ids.
-    if base_owners is None:
-        base_ids = jnp.full(eqns0.shape, -1, jnp.int32)
-    else:
-        _own = jnp.asarray(base_owners, jnp.int32)
-        _own = jnp.concatenate(
-            [_own, jnp.zeros(eqns0.shape, jnp.int32)])[:eqns0.shape[0]]
-        # owner is 1-based; slot index is owner-1. 0 (no owner) -> -1 ->
-        # the global slot, same destination the fallback uses.
-        base_ids = jnp.where(_own > 0, _own - 1, -1)
+    # is always safe.
+    base_ids = _base_ids(base_owners, rows0.shape[0])
     vs0, vc0 = zero_memory(total_v, embd_dim)
     vs0, vc0 = _vmem.update_ids(vs0, vc0, rows0, base_ids, valid0,
                                 global_slot=total_v)
@@ -167,9 +156,7 @@ def _base_ids(base_owners, n):
     """Per-token owning vertex SLOT, or -1 for the global slot.
 
     Extracted verbatim from `init_carry` so both paths derive the ids the
-    same way. NEVER read `eqns0` here: those are stream-global segment ids,
-    and reading them as vertex indices is bug #92 (the whole base stream
-    credited to vertex 1).
+    same way.
     """
     if base_owners is None:
         return jnp.full((n,), -1, jnp.int32)
@@ -178,7 +165,7 @@ def _base_ids(base_owners, n):
     return jnp.where(_own > 0, _own - 1, -1)
 
 
-def _init_carry_folded(agent, enc0, base_tokens, base_eqns, base_count, *,
+def _init_carry_folded(agent, enc0, base_tokens, base_count, *,
                        window, total_v, embd_dim, base_owners=None):
     """`init_carry` with the (window, E) rows folded away chunk by chunk."""
     # Pad the ids to the fold's PADDED length, not the window: the fold pads
@@ -190,7 +177,7 @@ def _init_carry_folded(agent, enc0, base_tokens, base_eqns, base_count, *,
     base_ids = _base_ids(base_owners, padded)
     vs0, vc0 = zero_memory(total_v, embd_dim)
 
-    def fold(acc, rows, valid, _eqns, off):
+    def fold(acc, rows, valid, off):
         sums, counts = acc
         ids_c = lax.dynamic_slice(base_ids, (off,), (C,))
         s2, c2 = _vmem.update_ids(sums, counts, rows, ids_c, valid,
@@ -198,12 +185,12 @@ def _init_carry_folded(agent, enc0, base_tokens, base_eqns, base_count, *,
         return _credit_summary(s2, c2, rows, valid)
 
     enc1, (vs1, vc1) = _fold.extend_fold(
-        agent, enc0, base_tokens, base_eqns, base_count,
+        agent, enc0, base_tokens, base_count,
         window=window, init_acc=(vs0, vc0), fold_fn=fold)
     return enc1, vs1, vc1
 
 
-def base_memory(agent, base_tokens, base_eqns, base_count, *, window,
+def base_memory(agent, base_tokens, base_count, *, window,
                 total_v, embd_dim, base_owners=None):
     """:func:`init_carry` without the carry -- ``(base_sums, base_counts)``.
 
@@ -213,7 +200,7 @@ def base_memory(agent, base_tokens, base_eqns, base_count, *, window,
     minibatch and a closed-over unbatched tracer is what vmap wants). It is
     the entire reason palimpsa's base encode now has a cotangent.
     """
-    return init_carry(agent, base_tokens, base_eqns, base_count,
+    return init_carry(agent, base_tokens, base_count,
                       window=window, total_v=total_v, embd_dim=embd_dim,
                       base_owners=base_owners)[1:]
 
@@ -229,7 +216,7 @@ def _credit_summary(sums, counts, rows, valid):
 
 
 def advance(agent, enc_carry, vmem_sums, vmem_counts,
-            delta_tokens, delta_eqns, delta_count, owner, *, window,
+            delta_tokens, delta_count, owner, *, window,
             chunk=None, budget=None, participants=None,
             edge_mem=None, edge_ids=None):
     """Extend the carry by one step's delta; returns the new
@@ -260,6 +247,19 @@ def advance(agent, enc_carry, vmem_sums, vmem_counts,
     ``participants=None`` keeps the old authorship crediting, which is what
     the unit tests and any caller without a face enumeration get.
 
+    EVERY VALID ROW IS AN EQUATION ROW NOW, AND THIS IS A CHANGE. The split
+    between "equation" rows (credited to the participants / the owner) and
+    "structural" rows (credited to the GLOBAL slot) was made by
+    ``delta_eqns >= 0``, and the equation-id stream was removed on
+    2026-09-13. There is no other per-token signal on the delta path, and
+    inventing one would be a guess. The collapse is the honest reading of
+    what a delta is: one elimination emits one block, punctuation included,
+    and the whole block describes that elimination -- so the whole block goes
+    to the slots the elimination touched. The global slot still receives the
+    pre-scan bootstrap delta, whose participation set is empty (see the
+    ``sum(part) > 0`` fallback below), so nothing is left without a
+    destination.
+
     ``chunk`` is forwarded to :meth:`Agent.encode_extend`: it bounds how much
     of the (mostly empty) delta window is actually scanned. ``None`` takes the
     ``ALPHAGRAD_EXTEND_CHUNK`` default. REVERSE-DIFFERENTIATED callers add
@@ -286,11 +286,11 @@ def advance(agent, enc_carry, vmem_sums, vmem_counts,
         # not run.
         return _advance_folded(
             agent, enc_carry, vmem_sums, vmem_counts, delta_tokens,
-            delta_eqns, delta_count, window=window, chunk=chunk,
+            delta_count, window=window, chunk=chunk,
             budget=budget, participants=participants,
             edge_mem=edge_mem, edge_ids=edge_ids)
-    carry2, rows, valid, eqns = agent.encode_extend(
-        enc_carry, delta_tokens, delta_eqns, delta_count,
+    carry2, rows, valid = agent.encode_extend(
+        enc_carry, delta_tokens, delta_count,
         window=window, start=0, chunk=chunk, budget=budget,
     )
     _edge_out = ()
@@ -305,7 +305,11 @@ def advance(agent, enc_carry, vmem_sums, vmem_counts,
     gid = n_slots - 2                      # the GLOBAL slot (see zero_memory)
     w = jnp.asarray(valid, jnp.float32)
     if participants is None:
-        ids = jnp.where(eqns >= 0, owner, -1)
+        # AUTHORSHIP. Every valid row goes to the owner's slot; the
+        # ``eqns >= 0`` test that used to send structural rows to the global
+        # slot went with the equation ids (see the docstring).
+        ids = jnp.full(rows.shape[:1], jnp.asarray(owner, jnp.int32),
+                       jnp.int32)
         sums2, counts2 = _vmem.update_ids(
             vmem_sums, vmem_counts, rows, ids, valid, global_slot=gid,
         )
@@ -313,37 +317,34 @@ def advance(agent, enc_carry, vmem_sums, vmem_counts,
                 + _edge_out)
     # Every row of a delta carries the SAME participation set, so the fan-out
     # is one outer product, not a (rows x slots) scatter.
-    w_eqn = w * (eqns >= 0).astype(jnp.float32)
-    w_str = w - w_eqn                       # structural rows -> global slot
-    tot_eqn = jnp.sum(rows * w_eqn[:, None], axis=0)
-    n_eqn = jnp.sum(w_eqn)
+    tot_rows = jnp.sum(rows * w[:, None], axis=0)
+    n_rows = jnp.sum(w)
     part = jnp.asarray(participants, jnp.float32)
     # A delta with no participants at all (the pre-scan bootstrap, whose
     # "owner" is -1) goes to the global slot -- the destination authorship
     # gave it, so nothing is silently dropped.
     part = jnp.where(jnp.sum(part) > 0, part,
                      jnp.eye(n_slots - 1, dtype=jnp.float32)[gid])
-    sums2 = vmem_sums.at[: n_slots - 1].add(part[:, None] * tot_eqn[None, :])
-    counts2 = vmem_counts.at[: n_slots - 1].add(part * n_eqn)
-    sums2 = sums2.at[gid].add(jnp.sum(rows * w_str[:, None], axis=0))
-    counts2 = counts2.at[gid].add(jnp.sum(w_str))
+    sums2 = vmem_sums.at[: n_slots - 1].add(part[:, None] * tot_rows[None, :])
+    counts2 = vmem_counts.at[: n_slots - 1].add(part * n_rows)
     return ((carry2,) + _credit_summary(sums2, counts2, rows, valid)
             + _edge_out)
 
 
 def _advance_folded(agent, enc_carry, vmem_sums, vmem_counts, delta_tokens,
-                    delta_eqns, delta_count, *, window, chunk=None,
+                    delta_count, *, window, chunk=None,
                     budget=None, participants=None,
                     edge_mem=None, edge_ids=None):
     """`advance`'s participation branch with the rows folded away.
 
-    Everything the branch does with `rows` is LINEAR in four running
-    quantities -- the eqn-owned row sum and count, and the structural row sum
-    and count -- plus the summary credit, which is a fifth. So the chunks
-    accumulate those and the outer product with `part` is applied ONCE at the
-    end, exactly as the full-width form applies it once. Fewer scatters than
+    Everything the branch does with `rows` is LINEAR in two running
+    quantities -- the row sum and the row count -- so the chunks accumulate
+    those and the outer product with `part` is applied ONCE at the end,
+    exactly as the full-width form applies it once. Fewer scatters than
     folding the scatter itself, and identical arithmetic up to the order of
-    the additions.
+    the additions. (It used to be four quantities: the eqn-owned and
+    structural halves were accumulated separately. There is one half now --
+    see :func:`advance`.)
 
     ``edge_mem``/``edge_ids`` (--face-edge-mem) add a (K, E)/(K,) scatter
     accumulator to the SAME fold -- `_vmem.scatter` per chunk with the ids
@@ -353,8 +354,7 @@ def _advance_folded(agent, enc_carry, vmem_sums, vmem_counts, delta_tokens,
     n_slots = vmem_sums.shape[0]
     gid = n_slots - 2
     E = vmem_sums.shape[1]
-    init = (jnp.zeros((E,), jnp.float32), jnp.zeros((), jnp.float32),
-            jnp.zeros((E,), jnp.float32), jnp.zeros((), jnp.float32))
+    init = (jnp.zeros((E,), jnp.float32), jnp.zeros((), jnp.float32))
     if edge_mem is not None:
         K = edge_mem[0].shape[0]
         C, _nb, padded = _fold.plan_chunks(window, chunk)
@@ -367,42 +367,34 @@ def _advance_folded(agent, enc_carry, vmem_sums, vmem_counts, delta_tokens,
         init = init + (jnp.zeros((K, E), jnp.float32),
                        jnp.zeros((K,), jnp.float32))
 
-    def fold(acc, rows, valid, eqns, _off):
-        tot_e, n_e, tot_s, n_s = acc[:4]
+    def fold(acc, rows, valid, _off):
+        tot_r, n_r = acc[:2]
         w = jnp.asarray(valid, jnp.float32)
-        w_eqn = w * (eqns >= 0).astype(jnp.float32)
-        w_str = w - w_eqn
-        out = (tot_e + jnp.sum(rows * w_eqn[:, None], axis=0),
-               n_e + jnp.sum(w_eqn),
-               tot_s + jnp.sum(rows * w_str[:, None], axis=0),
-               n_s + jnp.sum(w_str))
+        out = (tot_r + jnp.sum(rows * w[:, None], axis=0), n_r + jnp.sum(w))
         if edge_mem is not None:
-            es_a, ec_a = acc[4], acc[5]
+            es_a, ec_a = acc[2], acc[3]
             ids_c = lax.dynamic_slice(_eids, (_off,), (rows.shape[0],))
             e_s, e_c = _vmem.scatter(rows, ids_c, valid, K)
             out = out + (es_a + e_s, ec_a + e_c)
         return out
 
     carry2, _acc = _fold.extend_fold(
-        agent, enc_carry, delta_tokens, delta_eqns, delta_count,
+        agent, enc_carry, delta_tokens, delta_count,
         window=window, chunk=chunk, budget=budget,
         init_acc=init, fold_fn=fold)
-    tot_eqn, n_eqn, tot_str, n_str = _acc[:4]
+    tot_rows, n_rows = _acc[:2]
 
     part = jnp.asarray(participants, jnp.float32)
     part = jnp.where(jnp.sum(part) > 0, part,
                      jnp.eye(n_slots - 1, dtype=jnp.float32)[gid])
-    sums2 = vmem_sums.at[: n_slots - 1].add(part[:, None] * tot_eqn[None, :])
-    counts2 = vmem_counts.at[: n_slots - 1].add(part * n_eqn)
-    sums2 = sums2.at[gid].add(tot_str)
-    counts2 = counts2.at[gid].add(n_str)
-    # The summary slot takes EVERY valid row exactly once, which is the sum
-    # of the two disjoint weightings.
-    sums2 = sums2.at[-1].add(tot_eqn + tot_str)
-    counts2 = counts2.at[-1].add(n_eqn + n_str)
+    sums2 = vmem_sums.at[: n_slots - 1].add(part[:, None] * tot_rows[None, :])
+    counts2 = vmem_counts.at[: n_slots - 1].add(part * n_rows)
+    # The summary slot takes EVERY valid row exactly once.
+    sums2 = sums2.at[-1].add(tot_rows)
+    counts2 = counts2.at[-1].add(n_rows)
     if edge_mem is not None:
         return (carry2, sums2, counts2,
-                edge_mem[0] + _acc[4], edge_mem[1] + _acc[5])
+                edge_mem[0] + _acc[2], edge_mem[1] + _acc[3])
     return carry2, sums2, counts2
 
 

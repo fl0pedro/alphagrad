@@ -58,7 +58,7 @@ def _mlp(x, W1, W2):
 
 ARGS = (jnp.ones((2, 8)), jnp.ones((8, 32)) * 0.1, jnp.ones((32, 4)) * 0.1)
 ARGNUMS = (1, 2)
-VOCAB = 512
+VOCAB = 256
 
 
 def _mk():

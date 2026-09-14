@@ -21,6 +21,16 @@ from jax.tree_util import register_pytree_node_class
 import numpy as np
 
 from alphagrad.approx.common.relations import compute_eqn_ids_from_tokens
+from alphagrad.approx.common.token_vocab import (
+    DELTA_HEADER_SLOTS,
+    DELTA_TOKEN_DTYPE,
+    DELTA_TOKEN_MAX,
+    DELTA_TOKEN_PAD,
+    INCR_TOKEN_VOCAB_DEFAULT,
+    check_delta_ids as _check_delta_ids,
+    encode_delta_header,
+    incr_token_vocab,
+)
 from graphax.core import _build_graph, extract_jaxpr, jacve, vertex_elimination_jaxpr
 from graphax.jaxpr import get_vocab as _graphax_get_vocab
 from graphax.sparse.micro_actions import (
@@ -312,6 +322,71 @@ def consume_tokenization_truncation_stats() -> dict:
 # env var if a new target trips it; do NOT switch to clip to hide it.
 MAX_DELTA_TOKENS = int(os.environ.get("ALPHAGRAD_MAX_DELTA_TOKENS", "32768"))
 
+# ---------------------------------------------------------------------------
+# THE NARROW TOKEN WIRE (owner's decisions, 2026-09-13).
+#
+# TOKENS RIDE AS uint8, on the wire, in `EnvState`, and in every trajectory
+# leaf that stores them. The tokenizer id space is 256
+# (`common.token_vocab`), so a token is a byte by construction.
+#
+# THERE ARE NO EQUATION IDS. A parallel `(MAX_DELTA_TOKENS,)` int32 buffer of
+# graphax's stream-global segment ids used to ride beside the tokens in every
+# one of those places. It had exactly one consumer, the relational
+# forget-gate modulation in the palimpsa mixers (`rel_gate`, zero-init, one
+# scalar per token per head, no ablation), reproduced inside the recurrence as
+# a `(MAX_EQNS,)` histogram carried per step. All of it was removed. The pad
+# sentinel -1 belonged to that buffer; token padding is 0.
+#
+# THE COUNT HEADER. The exact host-side token count used to ride in slot 0 of
+# BOTH id buffers (`t[0] = n`, `e[0] = n`). A count up to MAX_DELTA_TOKENS
+# (32768 by default) does not fit in a byte, so the header had to leave the
+# token buffer's value space. It is now its OWN int32, written little-endian
+# across the first DELTA_HEADER_SLOTS byte slots of the wire; the tokens start
+# at index DELTA_HEADER_SLOTS.
+#
+# WHY FOUR BYTE SLOTS AND NOT A SEPARATE CALLBACK OUTPUT. The wire arity is
+# shared with `CpuApproximationServer.evaluate`, `CpuApproxPool.evaluate` /
+# `evaluate_batch`, the batched host shim in `VertexEliminationEnv.tokenize`,
+# and the trainers that still run the LEGACY full-stream observation (gfn,
+# gdpo, mu0, alpha0, az_gumbel, ppo_ray_worker), which keep their own
+# equation-id buffer for the DENSE encoder's pairwise T5 bias -- a different
+# mechanism, not the one that was removed. Adding an output would change that
+# protocol for every one of them. A four-byte header inside a buffer that is
+# already byte-addressed costs four bytes and changes no signature.
+# `encode_delta_header` / `decode_delta_header` are the ONLY two places that
+# know the layout, and `env.step` reads the count through the second of them.
+#
+# PADDING IS NOT A VALUE. Token padding is 0, and token id 0 is the literal
+# '-' graphax emits for a negative number -- it occurs INTERIOR to real
+# streams. Nothing may therefore recover a length by scanning for the pad: the
+# count in the header is the tokenizer's own `len()`, and every reader keys on
+# it. `tests/trajectory_layout_test.py` pins that invariant.
+#
+# The dtype, pad, header width and host-side codec live in
+# ``common.token_vocab`` (imported above and re-exported here) so the OTHER
+# producer of these tokens, ``live_faces.LiveFaceStream``, can name them
+# without importing this module and pulling JAX into a deliberately JAX-free
+# file. ``env.DELTA_TOKEN_DTYPE`` and friends therefore still resolve, and
+# there is still exactly one definition of each.
+
+
+def decode_delta_header(tokens):
+    """``() int32``: the count `encode_delta_header` wrote, off the wire.
+
+    THE ONE READER of the header layout on the device side. ``env.step`` calls
+    this and nothing else reconstructs the count.
+    """
+    h = jnp.asarray(tokens[:DELTA_HEADER_SLOTS]).astype(jnp.int32)
+    acc = jnp.zeros((), jnp.int32)
+    for i in range(DELTA_HEADER_SLOTS):
+        acc = acc + (h[i] << jnp.int32(8 * i))
+    return acc
+
+
+def delta_wire_width() -> int:
+    """Width of ONE delta wire buffer: the header plus the id budget."""
+    return DELTA_HEADER_SLOTS + MAX_DELTA_TOKENS
+
 # BASE-TOKEN budget for the delta-buffer observation path
 # (ALPHAGRAD_DELTA_TOKENS=1 in ppo.py). The base tokenized jaxpr is encoded
 # into the policy carry ONCE, at episode start, so it needs a buffer of its
@@ -396,36 +471,41 @@ def _record_delta_truncation(raw_len: int) -> None:
     _TOKENIZATION_TRUNCATION_WARNED[0] = True
 
 
-def _delta_observation(stream, seg_ids, last_start):
-    """Wire form of ONE step's token delta: ``(1 + MAX_DELTA_TOKENS,)`` pair.
+def _delta_observation(stream, last_start):
+    """Wire form of ONE step's token delta: ``(delta_wire_width(),) uint8``.
 
-    Slot 0 is a HEADER carrying the exact host-side token count; slots 1..
-    are the delta itself, pad-filled (0 for tokens, -1 for eqn ids). The
-    header rides in-band because the callback's output arity is shared with
-    the Ray measurement pool and the batched host shim -- one extra slot
-    changes no signature anywhere, and ``env.step`` splits it straight back
-    out into ``EnvState.delta_count`` / ``delta_tokens`` / ``delta_eqns``.
+    ONE buffer. The parallel equation-id buffer is gone (2026-09-13): those
+    ids fed the palimpsa relational forget-gate modulation and nothing else,
+    and the modulation went with them.
+
+    Slots ``[0, DELTA_HEADER_SLOTS)`` are the count header -- one
+    little-endian int32, see :func:`encode_delta_header`. The tokens start at
+    ``DELTA_HEADER_SLOTS`` and are pad-filled with 0.
 
     The count is the TOKENIZER'S OWN length. Nothing scans a padded buffer
     for it, so token id 0 -- the literal '-' graphax emits for a negative
     value, which occurs INTERIOR to real streams -- cannot make it short.
+
+    RAISES on a token the byte-wide buffer cannot carry. That means the
+    tokenizer was built at a vocabulary wider than ``common.token_vocab``
+    allows, and the cast would WRAP.
     """
     blk = stream[last_start:]
-    ids = seg_ids[last_start:]
     n_raw = len(blk)
     _record_delta_length(n_raw)
     # Raises unless ALPHAGRAD_DELTA_OVERFLOW=clip; the clamp below is what
     # that opt-out buys, and it is announced on stderr every time.
     _record_delta_truncation(n_raw)
     n = min(n_raw, MAX_DELTA_TOKENS)
-    t = np.zeros((1 + MAX_DELTA_TOKENS,), dtype=np.int32)
-    e = np.full((1 + MAX_DELTA_TOKENS,), -1, dtype=np.int32)
-    t[0] = n
-    e[0] = n
+    W = delta_wire_width()
+    t = np.zeros((W,), dtype=DELTA_TOKEN_DTYPE)
+    t[:DELTA_HEADER_SLOTS] = encode_delta_header(n)
     if n:
-        t[1:1 + n] = np.asarray(blk[:n], dtype=np.int32)
-        e[1:1 + n] = np.asarray(ids[:n], dtype=np.int32)
-    return jnp.asarray(t), jnp.asarray(e)
+        _tk = np.asarray(blk[:n], dtype=np.int64)
+        _check_delta_ids(_tk)
+        t[DELTA_HEADER_SLOTS:DELTA_HEADER_SLOTS + n] = _tk.astype(
+            DELTA_TOKEN_DTYPE)
+    return jnp.asarray(t)
 
 
 _INCR_TOK_CACHE: dict = {}
@@ -433,7 +513,7 @@ _INCR_TOK_CACHE_CAP = 512
 
 
 def incremental_token_delta(jaxpr, argnums, consts, args, order_prefix,
-                            vocab_size: int = 512):
+                            vocab_size: int | None = None):
     """Tokens ADDED by the last vertex of ``order_prefix`` (1-based ids).
 
     NOT AN OBSERVATION PRODUCER -- ``tests/append_only_tokens_test.py`` is its
@@ -455,6 +535,10 @@ def incremental_token_delta(jaxpr, argnums, consts, args, order_prefix,
     """
     from graphax import IncrementalPathTokenizer
 
+    # THE one resolver. `None` means "whatever the observation path uses",
+    # which is the only setting at which this function's tokens and the env's
+    # can be compared at all.
+    vocab_size = incr_token_vocab(vocab_size)
     key = (id(jaxpr), tuple(argnums), tuple(int(v) for v in order_prefix))
     hit = _INCR_TOK_CACHE.get(key)
     if hit is not None:
@@ -623,22 +707,17 @@ def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
     """
     from graphax import IncrementalPathTokenizer
 
-    # `vocab_size` is the TOTAL id space: 223 reserved structural tokens (230 before the byte-only catalog) + 10
-    # digits, leaving `vocab - 240` symbols for the NAME alphabet (the
-    # tokenizer needs >= 2); a name past the alphabet spells itself out by
-    # concatenation. 512 == the launchers' --vocab-size == the policy
-    # embedding's row count, so the tokenizer and the embedding table name
-    # the SAME id space (272 name symbols, max_token_id 511 < 512).
+    # `vocab_size` is the TOTAL id space, resolved through THE one resolver
+    # (`common.token_vocab.incr_token_vocab`): 223 reserved structural tokens
+    # plus 10 digits, leaving 23 symbols for the NAME alphabet at the 256 the
+    # owner chose. A name past the alphabet spells itself out by
+    # concatenation, so the stream is longer and every id fits in a byte --
+    # which is what lets `DELTA_TOKEN_DTYPE` be uint8.
     #
-    # It was 248, sized for a 256-row embedding constraint that no longer
-    # applies, which left an 8-symbol alphabet (9 before graphax added the
-    # `^` slot separator) and paid for it in concatenated names: measured on
-    # nn256 (ALPHAGRAD_NN_HIDDEN=256, reverse order), base 425 -> 331 tokens,
-    # full stream 13114 -> 10453 (1.25x), max single-step delta 2385 -> 2063.
-    # CONSISTENCY, not speed: `base_observation` below must resolve the same
-    # default or the base and the deltas are tokenized at different vocabs
-    # and do not concatenate.
-    vocab = int(os.environ.get("ALPHAGRAD_INCR_TOKEN_VOCAB", "512"))
+    # CONSISTENCY, not speed: `base_observation` below resolves through the
+    # same function, or the base and the deltas would be tokenized at
+    # different vocabularies and would not concatenate.
+    vocab = incr_token_vocab()
     steps = []
     for v_idx, v in enumerate(o_list):
         rows = tuple(tuple(int(x) for x in row)
@@ -2137,9 +2216,8 @@ class EnvState(NamedTuple):
     # DELTA observation (``EnvConfig.delta_obs``): the tokens THIS step's
     # elimination emitted, as a standalone buffer read from 0, plus their
     # exact count. Degenerate ``(1,)`` / 0 when delta_obs is off.
-    delta_tokens: Array   # (MAX_DELTA_TOKENS,) int32
-    delta_eqns: Array     # (MAX_DELTA_TOKENS,) int32
-    delta_count: Array    # () int32
+    delta_tokens: Array   # (MAX_DELTA_TOKENS,) uint8  (DELTA_TOKEN_DTYPE)
+    delta_count: Array    # () int32 -- the header, decoded off the wire
     # Per-vertex axis state — observation surface for the dynamic action
     # space. `axis_state` is a packed int32 array of (size, is_output,
     # is_compressed, group_id) per axis slot; `axis_valid_mask` flags
@@ -4536,6 +4614,11 @@ def _batched_host(fn, n_out: int = 3):
     The loop is SERIAL and in slot order, so this is equivalent to the per-env
     callback it replaces. It moves the call boundary; it does not change what
     happens inside it.
+
+    ``n_out`` is the callback's OUTPUT ARITY and the caller must pass the
+    env's (``VertexEliminationEnv.wire_arity``): 2 under ``delta_obs``
+    (tokens, reward), 3 on the legacy full-stream path, which still carries an
+    equation-id buffer.
     """
     def _wrapped(*a):
         # Batch width = largest leading dim among the arguments. The per-env
@@ -4559,6 +4642,11 @@ def _batched_host(fn, n_out: int = 3):
                 r = fn(*[_cb_slot(x, i, E) for x in a])
             finally:
                 _ENV_SLOT[0] = -1
+            if len(r) != n_out:
+                raise ValueError(
+                    f"batched host callback returned {len(r)} arrays, "
+                    f"expected {n_out} -- the env's wire arity and this "
+                    f"shim's must be the same object (env.wire_arity).")
             for k in range(n_out):
                 outs[k].append(np.asarray(r[k]))
         return tuple(np.stack(o, axis=0) for o in outs)
@@ -6442,7 +6530,11 @@ def _callback_measured(
                     "MAX_DELTA_TOKENS would desync the encoder's recurrence "
                     "for the whole episode."
                 )
-            tokens, eqn_ids = _delta_observation(stream, seg_ids, _last_start)
+            tokens = _delta_observation(stream, _last_start)
+            # DELTA WIRE: no equation ids exist on this path at all, so the
+            # callback's output tuple is one element shorter. `_wire` below
+            # is what every `return` in this function goes through.
+            eqn_ids = None
         else:
             _record_tokenization_truncation(len(stream))
             tokens = jnp.asarray(stream[:MAX_TOKENS], dtype=jnp.int32)
@@ -6484,9 +6576,27 @@ def _callback_measured(
         eqn_ids_np = compute_eqn_ids_from_tokens(tokens_np, _TOKEN_VOCAB)
         eqn_ids = jnp.asarray(eqn_ids_np, dtype=jnp.int32)
 
+    def _wire(_t, _e, _r):
+        """THE CALLBACK'S OUTPUT TUPLE, in one place.
+
+        ``(tokens, reward)`` under ``delta_obs`` -- there are no equation ids
+        on that path -- and ``(tokens, eqn_ids, reward)`` on the LEGACY
+        full-stream path, whose ids still feed the dense encoder's pairwise
+        T5 relational bias. ``VertexEliminationEnv._callback_shape`` declares
+        the matching arity, and `io_callback` enforces it.
+        """
+        if config.delta_obs:
+            if _e is not None:
+                raise RuntimeError(
+                    "delta_obs produced equation ids; they were removed on "
+                    "2026-09-13 and nothing may reintroduce them silently.")
+            return _t, _r
+        return _t, _e, _r
+
     _pf("cb.tokenize")
     if init:
-        return tokens, eqn_ids, jnp.zeros(NUM_REWARDS, dtype=jnp.float32)
+        return _wire(tokens, eqn_ids,
+                     jnp.zeros(NUM_REWARDS, dtype=jnp.float32))
 
     # Terminal-only fast path: every reward component is sparse — only the
     # final step (when the elimination order is complete) gets a non-zero
@@ -6496,7 +6606,8 @@ def _callback_measured(
     # last step. PPO sees a sparse-reward MDP, which GAE handles natively.
     if config.terminal_rewards_only and not is_terminal:
         _pf("cb.nonterm_tail")
-        return tokens, eqn_ids, jnp.zeros(NUM_REWARDS, dtype=jnp.float32)
+        return _wire(tokens, eqn_ids,
+                     jnp.zeros(NUM_REWARDS, dtype=jnp.float32))
 
     # ------------------------------------------------------------------
     # Compute family — graphax counters (always) → muls_adds_fmas, max_io_sum.
@@ -6609,7 +6720,7 @@ def _callback_measured(
                   f"(excluded from gradient)", flush=True)
         _tr = _truncated_reward()
         _log_refused("muls-cap", _tr)
-        return tokens, eqn_ids, _tr
+        return _wire(tokens, eqn_ids, _tr)
 
     # If no `target_fun` is supplied, we can't compile/execute. Skip every
     # execution-derived metric and return a partial reward vector.
@@ -6623,7 +6734,7 @@ def _callback_measured(
         rewards = rewards.at[REWARD_INDEX["muls_adds_fmas"]].set(-muls_adds_fmas)
         rewards = rewards.at[REWARD_INDEX["max_io_sum"]].set(-max_io_sum)
         _log_refused("no-target-fun", rewards)
-        return tokens, eqn_ids, rewards
+        return _wire(tokens, eqn_ids, rewards)
 
     # ------------------------------------------------------------------
     # Compile both the approximated and exact jacobian functions once.
@@ -6915,7 +7026,7 @@ def _callback_measured(
         _record_untraceable_plan(exc)
         _tr = _truncated_reward()
         _log_refused(f"untraceable:{where}", _tr)
-        return tokens, eqn_ids, _tr
+        return _wire(tokens, eqn_ids, _tr)
 
     def _oom_truncate(where: str, exc: BaseException):
         _record_truncated_plan()
@@ -6931,7 +7042,7 @@ def _callback_measured(
               f"{str(exc)[:160]}", flush=True)
         _tr = _truncated_reward()
         _log_refused(f"oom:{where}", _tr)
-        return tokens, eqn_ids, _tr
+        return _wire(tokens, eqn_ids, _tr)
 
     try:
         compiled_approx = cached_compile(
@@ -7676,7 +7787,7 @@ def _callback_measured(
             counts_from_trace=bool(_plan_traced[0]),
             mem_parity=_mp, paired_ref=_paired_ref_rec)
 
-    return tokens, eqn_ids, rewards
+    return _wire(tokens, eqn_ids, rewards)
 
 
 @register_pytree_node_class
@@ -7936,7 +8047,8 @@ class VertexEliminationEnv:
                     face_joins=face_joins)
             # Only the STEP callback runs under vmap; reset() is called once,
             # unbatched, and must not be wrapped.
-            return _batched_host(_fn) if (batched and _BATCHED_CALLBACK) else _fn
+            return (_batched_host(_fn, n_out=self.wire_arity)
+                    if (batched and _BATCHED_CALLBACK) else _fn)
 
         # The pool's ``evaluate`` signature is
         # ``(order, specs, step, eval_samples, *, init)`` — but
@@ -7947,6 +8059,13 @@ class VertexEliminationEnv:
         # bound args) and re-packages ``eval_samples`` as a tuple.
         pool = self._remote_pool
         _obs_w = self.obs_width
+        # The wire the pool and this shim must BOTH produce. Read off the env
+        # so the three descriptions of one buffer (here, the pool's
+        # preallocation, `_callback_shape`) cannot disagree. ``_eqn`` is False
+        # under ``delta_obs``: the equation-id buffer does not exist there.
+        _tok_dt = self.wire_token_dtype
+        _eqn = not self.config.delta_obs
+        _eqn_dt = self.wire_eqn_dtype if _eqn else None
 
         if batched:
             def _remote_callback_batched(args, consts, order, specs,
@@ -8028,9 +8147,36 @@ class VertexEliminationEnv:
                     i for i in range(E)
                     if _term_local and _sti[i] >= int(ro[i].shape[0]))
                 _remote = [i for i in range(E) if i not in _local]
-                tk = np.zeros((E, _obs_w), np.int32)
-                ei = np.zeros((E, _obs_w), np.int32)
+                tk = np.zeros((E, _obs_w), _tok_dt)
+                ei = np.zeros((E, _obs_w), _eqn_dt) if _eqn else None
                 rw = np.zeros((E, NUM_REWARDS), np.float32)
+
+                def _wire_row(a, want_dt, name):
+                    """One env's wire row, shape- and range-checked.
+
+                    The pool's buffers and this shim's are two descriptions of
+                    one wire. A width mismatch used to broadcast or truncate
+                    inside the assignment below; a value outside the narrow
+                    dtype used to wrap at the cast. Both raise now.
+                    """
+                    a = np.asarray(a)
+                    if a.shape != (_obs_w,):
+                        raise ValueError(
+                            f"measurement wire {name} has shape {a.shape}, "
+                            f"expected ({_obs_w},) -- the Ray pool and the "
+                            f"batched host shim must agree on the wire "
+                            f"arity (env.obs_width).")
+                    if a.dtype != want_dt:
+                        _info = np.iinfo(want_dt)
+                        _a64 = a.astype(np.int64)
+                        if _a64.size and (int(_a64.min()) < _info.min
+                                          or int(_a64.max()) > _info.max):
+                            raise ValueError(
+                                f"measurement wire {name} carries values "
+                                f"outside {want_dt.__name__} "
+                                f"[{_info.min}, {_info.max}]; casting would "
+                                f"WRAP them.")
+                    return a.astype(want_dt)
                 if _remote:
                     # prof/measure_wait: the host BLOCKS here until the
                     # measurement actors return. Timed separately from the
@@ -8039,8 +8185,7 @@ class VertexEliminationEnv:
                     _trace("measure_wait.enter")
                     _mw0 = time.perf_counter()
                     try:
-                        (tokens, eqn_ids, rewards,
-                         _sent) = pool.evaluate_batch(
+                        _pb = pool.evaluate_batch(
                             [ro[i] for i in _remote],
                             [rs[i] for i in _remote],
                             [_sti[i] for i in _remote],
@@ -8065,12 +8210,20 @@ class VertexEliminationEnv:
                         _prof_add("prof/measure_wait", _mwdt)
                         _prof_sample("prof/measure_wait", _mwdt)
                         _trace("measure_wait.exit")
+                    # `(tokens, rewards, sentinel)` under delta_obs,
+                    # `(tokens, eqn_ids, rewards, sentinel)` on the legacy
+                    # path -- the pool serves the arity the env declares.
+                    tokens, rewards = _pb[0], _pb[-2]
+                    eqn_ids = _pb[1] if _eqn else None
                     for k2, i in enumerate(_remote):
-                        tk[i] = np.asarray(tokens)[k2]
-                        ei[i] = np.asarray(eqn_ids)[k2]
+                        tk[i] = _wire_row(np.asarray(tokens)[k2], _tok_dt,
+                                          "tokens")
+                        if _eqn:
+                            ei[i] = _wire_row(np.asarray(eqn_ids)[k2],
+                                              _eqn_dt, "eqn_ids")
                         rw[i] = np.asarray(rewards)[k2]
                 for i in _local:
-                    t_i, e_i, r_i = _callback(
+                    _out = _callback(
                         self.config,
                         _cb_slot(args, i, E),
                         _cb_slot(consts, i, E),
@@ -8078,14 +8231,15 @@ class VertexEliminationEnv:
                         *[_cb_slot(x, i, E) for x in eval_samples],
                         init=init, face_joins=rj[i],
                     )
-                    tk[i] = np.asarray(t_i)
-                    ei[i] = np.asarray(e_i)
-                    rw[i] = np.asarray(r_i)
+                    tk[i] = _wire_row(_out[0], _tok_dt, "tokens")
+                    if _eqn:
+                        ei[i] = _wire_row(_out[1], _eqn_dt, "eqn_ids")
+                    rw[i] = np.asarray(_out[-1])
                 _cbdt = time.perf_counter() - _cb0
                 _prof_add("prof/env_cb_host", _cbdt)
                 _prof_sample("prof/env_cb_host", _cbdt)
                 _trace("cb_batched.exit")
-                return tk, ei, rw
+                return (tk, ei, rw) if _eqn else (tk, rw)
 
             return _remote_callback_batched
 
@@ -8105,7 +8259,7 @@ class VertexEliminationEnv:
             eval_samples_t = tuple(eval_samples) if eval_samples else None
             _mw0 = time.perf_counter()
             try:
-                tokens, eqn_ids, reward = pool.evaluate(
+                _pout = pool.evaluate(
                     order, specs, int(step),
                     eval_samples=eval_samples_t,
                     init=init,
@@ -8116,29 +8270,94 @@ class VertexEliminationEnv:
                 _mwdt = time.perf_counter() - _mw0
                 _prof_add("prof/measure_wait", _mwdt)
                 _prof_sample("prof/measure_wait", _mwdt)
-            return tokens, eqn_ids, reward
+            # Same wire contract as the batched shim above: the pool may hand
+            # back its own preallocation dtype, and `io_callback` demands the
+            # dtype `_callback_shape` declares. The pool returns two arrays
+            # plus the reward on the legacy path and one plus the reward under
+            # ``delta_obs`` (no equation-id buffer exists there).
+            _t = np.asarray(_pout[0])
+            _rw = _pout[-1]
+            if _t.shape != (_obs_w,):
+                raise ValueError(
+                    f"measurement wire tokens have shape {_t.shape}, expected "
+                    f"({_obs_w},) -- the Ray pool and the env must agree on "
+                    f"the wire arity (env.obs_width).")
+            if not _eqn:
+                return _t.astype(_tok_dt), _rw
+            _e = np.asarray(_pout[1])
+            if _e.shape != (_obs_w,):
+                raise ValueError(
+                    f"measurement wire eqn_ids have shape {_e.shape}, "
+                    f"expected ({_obs_w},).")
+            return _t.astype(_tok_dt), _e.astype(_eqn_dt), _rw
 
         return _remote_callback
 
     @property
     def obs_width(self) -> int:
-        """Width of the callback's token/eqn_id outputs.
+        """Width of the callback's token output (and, on the legacy path, of
+        its equation-id output).
 
-        ``1 + MAX_DELTA_TOKENS`` under ``delta_obs`` (header slot + delta),
-        ``MAX_TOKENS`` for the legacy full stream. The Ray measurement pool
-        preallocates its buffers at this width too (``CpuApproxPool(
-        max_tokens=...)``), so it must be read from the env, not assumed.
+        ``DELTA_HEADER_SLOTS + MAX_DELTA_TOKENS`` under ``delta_obs`` (count
+        header + delta), ``MAX_TOKENS`` for the legacy full stream. The Ray
+        measurement pool preallocates its buffers at this width too
+        (``CpuApproxPool(max_tokens=...)``), so it must be read from the env,
+        not assumed.
         """
-        return (1 + MAX_DELTA_TOKENS if self.config.delta_obs else MAX_TOKENS)
+        return (delta_wire_width() if self.config.delta_obs else MAX_TOKENS)
+
+    @property
+    def wire_token_dtype(self):
+        """numpy dtype of the callback's TOKEN output.
+
+        uint8 under ``delta_obs`` (the tokenizer id space is 256, see
+        ``common.token_vocab``), int32 on the legacy full-stream path, whose
+        buffer is not narrowed. Read by the Ray pool and by the batched host
+        shim so the three of them cannot name different dtypes.
+        """
+        return DELTA_TOKEN_DTYPE if self.config.delta_obs else np.int32
+
+    @property
+    def wire_eqn_dtype(self):
+        """numpy dtype of the LEGACY full-stream equation-id output.
+
+        Meaningless under ``delta_obs``, which emits no such buffer at all --
+        ``_callback_shape`` is two entries long there. Kept for the legacy
+        drivers (gfn, gdpo, mu0, alpha0, az_gumbel, ppo_ray_worker) whose
+        dense encoder still consumes the ids as a pairwise T5 bias.
+        """
+        if self.config.delta_obs:
+            raise RuntimeError(
+                "delta_obs carries no equation-id buffer; there is no wire "
+                "dtype to report. The ids were removed on 2026-09-13.")
+        return np.int32
 
     @property
     def _callback_shape(self):
+        """What the host callback returns, exactly.
+
+        TWO entries under ``delta_obs`` -- ``(tokens uint8, reward)`` -- and
+        THREE on the legacy full-stream path, which still carries an
+        equation-id buffer for the dense encoder's pairwise T5 bias. See
+        ``_callback._wire``.
+        """
         _w = self.obs_width
+        _tok = jax.ShapeDtypeStruct((_w,), jnp.dtype(self.wire_token_dtype))
+        _rw = jax.ShapeDtypeStruct((NUM_REWARDS,), jnp.float32)
+        if self.config.delta_obs:
+            return (_tok, _rw)
         return (
-            jax.ShapeDtypeStruct((_w,), jnp.int32),
-            jax.ShapeDtypeStruct((_w,), jnp.int32),
-            jax.ShapeDtypeStruct((NUM_REWARDS,), jnp.float32),
+            _tok,
+            jax.ShapeDtypeStruct((_w,), jnp.dtype(self.wire_eqn_dtype)),
+            _rw,
         )
+
+    @property
+    def wire_arity(self) -> int:
+        """Number of arrays the callback returns; 2 or 3. Read by the batched
+        host shim (``_batched_host``) and by the Ray pool, which must stack
+        exactly as many."""
+        return len(self._callback_shape)
 
     def base_observation(self):
         """The BASE token stream as a standalone constant buffer.
@@ -8150,18 +8369,19 @@ class VertexEliminationEnv:
         -- not a device-side scan over a padded buffer, which is where the
         id-0 undercount used to come from.
 
-        Returns ``(tokens, eqn_ids, count)`` with both buffers
-        ``(MAX_BASE_TOKENS,) int32`` and ``count`` a python int.
+        Returns ``(tokens, count)`` -- ``(MAX_BASE_TOKENS,) uint8`` and a
+        python int. The equation-id buffer that used to ride beside it is
+        gone (2026-09-13); ``base_owners`` is the per-token attribution the
+        base scatter actually keys on, and always was.
         """
         from graphax import IncrementalPathTokenizer
 
-        vocab = int(os.environ.get("ALPHAGRAD_INCR_TOKEN_VOCAB", "512"))
+        vocab = incr_token_vocab()
         tk = IncrementalPathTokenizer(
             self.config.jaxpr, tuple(self.config.argnums),
             list(self.consts), list(self.args), vocab_size=vocab,
         )
         toks = [int(t) for t in tk.base_tokens()]
-        ids = [int(g) for g in tk.last_eqn_ids()]
         guard = os.environ.get("ALPHAGRAD_VOCAB_SIZE")
         if guard is not None and tk.max_token_id() >= int(guard):
             raise ValueError(
@@ -8180,12 +8400,14 @@ class VertexEliminationEnv:
                 f"stream for the whole episode."
             )
         _record_token_length(n)
-        t = np.zeros((MAX_BASE_TOKENS,), dtype=np.int32)
-        e = np.full((MAX_BASE_TOKENS,), -1, dtype=np.int32)
+        t = np.zeros((MAX_BASE_TOKENS,), dtype=DELTA_TOKEN_DTYPE)
         if n:
-            t[:n] = np.asarray(toks, dtype=np.int32)
-            e[:len(ids)] = np.asarray(ids, dtype=np.int32)
-        return jnp.asarray(t), jnp.asarray(e), n
+            _tk = np.asarray(toks, dtype=np.int64)
+            # SAME raise as the delta path: a base token past the byte means
+            # the tokenizer was built at a vocabulary the wire cannot carry.
+            _check_delta_ids(_tk, where="base_observation")
+            t[:n] = _tk.astype(DELTA_TOKEN_DTYPE)
+        return jnp.asarray(t), n
 
     def base_owners(self):
         """Per-token OWNING VERTEX for the base stream, ``(MAX_BASE_TOKENS,)``.
@@ -8204,7 +8426,7 @@ class VertexEliminationEnv:
         """
         from graphax import IncrementalPathTokenizer
 
-        vocab = int(os.environ.get("ALPHAGRAD_INCR_TOKEN_VOCAB", "512"))
+        vocab = incr_token_vocab()
         tk = IncrementalPathTokenizer(
             self.config.jaxpr, tuple(self.config.argnums),
             list(self.consts), list(self.args), vocab_size=vocab,
@@ -8249,8 +8471,8 @@ class VertexEliminationEnv:
             # step 0 nothing has been eliminated and the delta is empty.
             tokens = jnp.zeros((1,), dtype=jnp.int32)
             eqn_ids = jnp.zeros((1,), dtype=jnp.int32)
-            delta_tokens = jnp.zeros((MAX_DELTA_TOKENS,), dtype=jnp.int32)
-            delta_eqns = jnp.full((MAX_DELTA_TOKENS,), -1, dtype=jnp.int32)
+            delta_tokens = jnp.zeros((MAX_DELTA_TOKENS,),
+                                     dtype=DELTA_TOKEN_DTYPE)
             delta_count = jnp.zeros((), dtype=jnp.int32)
         else:
             tokens, eqn_ids, _ = _env_callback(
@@ -8267,8 +8489,7 @@ class VertexEliminationEnv:
                 *(self.eval_args_samples
                   if self.eval_args_samples is not None else ()),
             )
-            delta_tokens = jnp.zeros((1,), dtype=jnp.int32)
-            delta_eqns = -jnp.ones((1,), dtype=jnp.int32)
+            delta_tokens = jnp.zeros((1,), dtype=DELTA_TOKEN_DTYPE)
             delta_count = jnp.zeros((), dtype=jnp.int32)
 
         max_steps_val = initial_order.shape[0]
@@ -8286,7 +8507,6 @@ class VertexEliminationEnv:
             tokens=tokens,
             eqn_ids=eqn_ids,
             delta_tokens=delta_tokens,
-            delta_eqns=delta_eqns,
             delta_count=delta_count,
             axis_state=self.axis_state_static,
             axis_valid_mask=self.axis_valid_static,
@@ -8379,7 +8599,7 @@ class VertexEliminationEnv:
         # still get the real thing.
         _drop_bound = _pool_owns_bound_operands(self._remote_pool)
         _z = jnp.zeros((1,), jnp.int32)
-        tokens, eqn_ids, reward = _env_callback(
+        _cbout = _env_callback(
             self.tokenize(batched=True),
             self._callback_shape,
             _z if _drop_bound else self.args,
@@ -8396,17 +8616,21 @@ class VertexEliminationEnv:
             batched=True,
         )
 
+        # `(tokens, reward)` under delta_obs, `(tokens, eqn_ids, reward)` on
+        # the legacy full-stream path (`_callback._wire` / `_callback_shape`).
+        reward = _cbout[-1]
         if self.config.delta_obs:
-            # Slot 0 is the exact host-side token count (see
-            # `_delta_observation`); slots 1.. are this step's delta.
-            delta_count = tokens[0].astype(jnp.int32)
-            delta_tokens = tokens[1:]
-            delta_eqns = eqn_ids[1:]
+            # The first DELTA_HEADER_SLOTS byte slots of the wire are the
+            # exact host-side count as one little-endian int32 (see
+            # `_delta_observation`); the tokens start after them.
+            # `decode_delta_header` is the only reader of that layout.
+            delta_count = decode_delta_header(_cbout[0])
+            delta_tokens = _cbout[0][DELTA_HEADER_SLOTS:]
             tokens = jnp.zeros((1,), dtype=jnp.int32)
             eqn_ids = jnp.zeros((1,), dtype=jnp.int32)
         else:
-            delta_tokens = jnp.zeros((1,), dtype=jnp.int32)
-            delta_eqns = -jnp.ones((1,), dtype=jnp.int32)
+            tokens, eqn_ids = _cbout[0], _cbout[1]
+            delta_tokens = jnp.zeros((1,), dtype=DELTA_TOKEN_DTYPE)
             delta_count = jnp.zeros((), dtype=jnp.int32)
 
         terminated = new_step >= state.max_steps
@@ -8432,7 +8656,6 @@ class VertexEliminationEnv:
             tokens=tokens,
             eqn_ids=eqn_ids,
             delta_tokens=delta_tokens,
-            delta_eqns=delta_eqns,
             delta_count=delta_count,
             axis_state=new_axis_state,
             axis_valid_mask=state.axis_valid_mask,
@@ -8549,8 +8772,7 @@ class VertexEliminationEnv:
             # Legacy sentinels, byte-identical to what `step()` writes on
             # the non-delta path (pad is -1 for eqn ids, not 0) -- this
             # state is compared against `step()`'s field by field.
-            delta_tokens=jnp.zeros((1,), dtype=jnp.int32),
-            delta_eqns=-jnp.ones((1,), dtype=jnp.int32),
+            delta_tokens=jnp.zeros((1,), dtype=DELTA_TOKEN_DTYPE),
             delta_count=jnp.zeros((), dtype=jnp.int32),
             axis_state=new_axis_state,
             axis_valid_mask=state.axis_valid_mask,
@@ -8641,8 +8863,7 @@ class VertexEliminationEnv:
             ),
             tokens=jnp.zeros((self.obs_width,), dtype=jnp.int32),
             eqn_ids=jnp.zeros((self.obs_width,), dtype=jnp.int32),
-            delta_tokens=jnp.zeros((1,), dtype=jnp.int32),
-            delta_eqns=-jnp.ones((1,), dtype=jnp.int32),
+            delta_tokens=jnp.zeros((1,), dtype=DELTA_TOKEN_DTYPE),
             delta_count=jnp.zeros((), dtype=jnp.int32),
             axis_state=self.axis_state_static,
             axis_valid_mask=self.axis_valid_static,

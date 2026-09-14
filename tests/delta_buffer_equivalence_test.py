@@ -59,7 +59,7 @@ except ImportError:                                                # pragma: no 
     _stream_len = None
 from alphagrad.approx import vertex_memory as _vmem               # noqa: E402
 
-VOCAB_TOK = 248     # ALPHAGRAD_INCR_TOKEN_VOCAB, as the env uses
+VOCAB_TOK = 256     # ALPHAGRAD_INCR_TOKEN_VOCAB, as the env uses
 EMBD = 16
 N_ENVS = 4
 SEED = 20260805

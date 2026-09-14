@@ -24,7 +24,7 @@ OUT = sys.argv[1]
 NTRAJ = int(sys.argv[2]) if len(sys.argv) > 2 else 64
 QSTEPS = [0, 20, 50, 70]
 MAXSTEP = max(QSTEPS)
-VOCAB = 512
+VOCAB = 256
 
 TGT_COLS = [DV_FILL, DV_OUT_DEG, DV_IN_DEG, DV_MARKOWITZ, DV_MAX_JAC]
 TGT_NAMES = ["fill", "out_deg", "in_deg", "markowitz", "max_jac", "static_ln",

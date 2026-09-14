@@ -46,7 +46,7 @@ QSTEPS = [int(x) for x in (ARGS[2].split(",") if len(ARGS) > 2
                            else ["0", "20", "50", "70"])]
 MAXSTEP = max(QSTEPS)
 FSTEPS = list(range(MAXSTEP + 1))
-VOCAB = 512
+VOCAB = 256
 MAXF = 64
 NDIM = 12
 

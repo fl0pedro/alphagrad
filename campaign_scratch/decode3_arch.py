@@ -38,7 +38,7 @@ from types import SimpleNamespace
 from alphagrad.approx.ppo import _build_agent
 
 
-def agent_args(embd_dim, num_layers, num_heads, pointer_blocks, vocab=512):
+def agent_args(embd_dim, num_layers, num_heads, pointer_blocks, vocab=256):
     return SimpleNamespace(
         vocab_size=vocab, embd_dim=embd_dim, op_embd_dim=8,
         num_layers=num_layers, num_heads=num_heads, hidden_dim=64,
@@ -49,7 +49,7 @@ def agent_args(embd_dim, num_layers, num_heads, pointer_blocks, vocab=512):
 
 
 def build(embd_dim, num_layers, num_heads, pointer_blocks, NV, key,
-          vocab=512):
+          vocab=256):
     return _build_agent(
         agent_args(embd_dim, num_layers, num_heads, pointer_blocks, vocab),
         NV, 1, 1, key)

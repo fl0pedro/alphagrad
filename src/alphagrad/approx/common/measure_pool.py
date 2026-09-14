@@ -29,7 +29,8 @@ def spawn_measure_pool(args_dict: dict, *, n_actors: int, exec_on_gpu: bool,
                        cosine_sim_idx: int, frob_residual_idx: int,
                        fidelity_idx: int | None = None,
                        sparsity_idx: int | None = None,
-                       first_gpu: int = 1):
+                       first_gpu: int = 1,
+                       token_dtype=None, eqn_dtype=None):
     """Create ``n_actors`` GPU-pinned measure actors and wrap them in a pool.
 
     ``first_gpu`` is the first device index handed to an actor; device 0 is
@@ -98,6 +99,11 @@ def spawn_measure_pool(args_dict: dict, *, n_actors: int, exec_on_gpu: bool,
         fidelity_idx=(None if fidelity_idx is None else int(fidelity_idx)),
         # Reward slot 10, same optionality and the same reason.
         sparsity_idx=(None if sparsity_idx is None else int(sparsity_idx)),
+        # THE WIRE DTYPES (env.wire_token_dtype / env.wire_eqn_dtype). None
+        # keeps the pool's int32 default, which is the legacy full-stream
+        # wire -- every caller that does not run ``delta_obs``.
+        **({} if token_dtype is None else {"token_dtype": token_dtype}),
+        **({} if eqn_dtype is None else {"eqn_dtype": eqn_dtype}),
     )
 
 

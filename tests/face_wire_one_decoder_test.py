@@ -92,7 +92,7 @@ def _four_dicts(T, v, prefix, rows, skips):
     ij = fresh()
     cfg = SimpleNamespace(jaxpr=T.jaxpr)
     A = envmod._face_dict_for_vertex(cfg, ij, v, rows, skips)
-    stream = LiveFaceStream(T.jaxpr, T.argnums, T.consts, T.xs, vocab=512)
+    stream = LiveFaceStream(T.jaxpr, T.argnums, T.consts, T.xs, vocab=256)
     _keys, B = LiveFaceStream._decided(stream, SimpleNamespace(ij=ij), v,
                                        rows, skips, MAX_FACES)
     C = PlanTokenizer.face_transforms(

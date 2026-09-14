@@ -22,7 +22,7 @@ from alphagrad.approx.env import (
     incremental_token_delta,
 )
 
-VOCAB = 512
+VOCAB = 256
 
 
 def _mlp(x, W1, W2):

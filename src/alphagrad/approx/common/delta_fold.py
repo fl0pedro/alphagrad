@@ -58,7 +58,7 @@ def _use_parallel() -> bool:
     return os.environ.get("ALPHAGRAD_FOLD_PARALLEL", "1") != "0"
 
 
-def _encode_chunk(agent, enc, tk, eq, c_cnt, C, parallel):
+def _encode_chunk(agent, enc, tk, c_cnt, C, parallel):
     """One chunk's encode. PARALLEL inside the chunk by default.
 
     Chunking and parallelism are ORTHOGONAL: the chunk bounds how much is
@@ -78,8 +78,8 @@ def _encode_chunk(agent, enc, tk, eq, c_cnt, C, parallel):
         if par is not None:
             valid = jnp.arange(C, dtype=jnp.int32) < jnp.asarray(c_cnt,
                                                                  jnp.int32)
-            return par(enc, tk, eq, valid, c_cnt)
-    return agent.encode_extend(enc, tk, eq, c_cnt, window=C, start=0, chunk=0)
+            return par(enc, tk, valid, c_cnt)
+    return agent.encode_extend(enc, tk, c_cnt, window=C, start=0, chunk=0)
 
 
 def plan_chunks(window, chunk=None):
@@ -112,12 +112,13 @@ def plan_chunks(window, chunk=None):
     return C, nb, nb * C
 
 
-def extend_fold(agent, carry, tokens, eqns, count, *, window, chunk=None,
+def extend_fold(agent, carry, tokens, count, *, window, chunk=None,
                 init_acc, fold_fn, budget=None, remat=None, parallel=None):
     """Extend ``carry`` over ``window`` tokens, folding rows into an acc.
 
-    ``fold_fn(acc, rows_c, valid_c, eqns_c, offset) -> acc`` sees one chunk at
-    a time. ``offset`` is the chunk's first index IN THE WINDOW and must be
+    ``fold_fn(acc, rows_c, valid_c, offset) -> acc`` sees one chunk at a time
+    (the ``eqns_c`` argument went with the equation-id stream). ``offset`` is
+    the chunk's first index IN THE WINDOW and must be
     used by any position-dependent reducer -- ``_face_replay``'s key is
     ``searchsorted(ends, position)``, and dropping the offset would silently
     misattribute every chunk after the first to the wrong face rather than
@@ -136,9 +137,7 @@ def extend_fold(agent, carry, tokens, eqns, count, *, window, chunk=None,
     pad = padded - W
     if pad:
         tokens = jnp.concatenate([tokens, jnp.zeros((pad,), tokens.dtype)])
-        eqns = jnp.concatenate([eqns, jnp.full((pad,), -1, eqns.dtype)])
     b_tok = tokens[: nb * C].reshape(nb, C)
-    b_eqn = eqns[: nb * C].reshape(nb, C)
     cnt = jnp.asarray(count, jnp.int32)
 
     # DYNAMIC TRIP COUNT, same reasoning as _extend_sequential's budget form.
@@ -164,7 +163,7 @@ def extend_fold(agent, carry, tokens, eqns, count, *, window, chunk=None,
             nb).astype(jnp.int32)
 
     def _body(state, xs):
-        i, tk, eq = xs
+        i, tk = xs
         off = i * C
         # Tokens remaining once this chunk starts, clipped into [0, C]. A
         # chunk beyond the delta gets 0 and contributes nothing.
@@ -172,9 +171,9 @@ def extend_fold(agent, carry, tokens, eqns, count, *, window, chunk=None,
 
         def _run(s):
             enc, acc = s
-            enc2, rows_c, valid_c, eqns_c = _encode_chunk(
-                agent, enc, tk, eq, c_cnt, C, par)
-            return (enc2, fold_fn(acc, rows_c, valid_c, eqns_c, off))
+            enc2, rows_c, valid_c = _encode_chunk(
+                agent, enc, tk, c_cnt, C, par)
+            return (enc2, fold_fn(acc, rows_c, valid_c, off))
 
         if budget is None:
             return _run(state), None
@@ -185,7 +184,7 @@ def extend_fold(agent, carry, tokens, eqns, count, *, window, chunk=None,
     body = jax.checkpoint(_body) if use_remat else _body
     (enc_f, acc_f), _ = lax.scan(
         body, (carry, init_acc),
-        (jnp.arange(nb, dtype=jnp.int32), b_tok, b_eqn))
+        (jnp.arange(nb, dtype=jnp.int32), b_tok))
     return enc_f, acc_f
 
 
@@ -195,36 +194,34 @@ def extend_fold(agent, carry, tokens, eqns, count, *, window, chunk=None,
 # full-width rows.
 
 def sum_reducer(embd_dim):
-    """``advance``'s two weighted sums: eqn-owned rows and structural rows."""
-    init = (jnp.zeros((embd_dim,), jnp.float32), jnp.zeros((), jnp.float32),
-            jnp.zeros((embd_dim,), jnp.float32), jnp.zeros((), jnp.float32))
+    """``advance``'s weighted row sum and count.
 
-    def fold(acc, rows, valid, eqns, off):
-        tot_e, n_e, tot_s, n_s = acc
+    TWO accumulators, not four: the eqn-owned / structural split is gone with
+    the equation ids (see ``carry_stream.advance``).
+    """
+    init = (jnp.zeros((embd_dim,), jnp.float32), jnp.zeros((), jnp.float32))
+
+    def fold(acc, rows, valid, off):
+        tot, n = acc
         w = jnp.asarray(valid, jnp.float32)
-        w_eqn = w * (eqns >= 0).astype(jnp.float32)
-        w_str = w - w_eqn
-        return (tot_e + jnp.sum(rows * w_eqn[:, None], axis=0),
-                n_e + jnp.sum(w_eqn),
-                tot_s + jnp.sum(rows * w_str[:, None], axis=0),
-                n_s + jnp.sum(w_str))
+        return (tot + jnp.sum(rows * w[:, None], axis=0), n + jnp.sum(w))
     return init, fold
 
 
 def segment_reducer(embd_dim, n_segments, key_fn):
     """Scatter-sum by a caller-supplied key.
 
-    ``key_fn(eqns_c, offset) -> (C,) int32`` receives the OFFSET so a
+    ``key_fn(n_rows, offset) -> (C,) int32`` receives the OFFSET so a
     position-dependent key (face id via searchsorted) stays correct across
     chunk boundaries.
     """
     init = (jnp.zeros((n_segments, embd_dim), jnp.float32),
             jnp.zeros((n_segments,), jnp.float32))
 
-    def fold(acc, rows, valid, eqns, off):
+    def fold(acc, rows, valid, off):
         sums, counts = acc
         w = jnp.asarray(valid, jnp.float32)
-        k = key_fn(eqns, off)
+        k = key_fn(rows.shape[0], off)
         ok = w * (k >= 0).astype(jnp.float32)
         ks = jnp.clip(k, 0, n_segments - 1)
         return (sums.at[ks].add(rows * ok[:, None]),
@@ -240,7 +237,7 @@ def face_key_fn(face_ends):
     chunking the same token sits at ``off + j``, so omitting ``off`` sends
     every chunk after the first to face 0.
     """
-    def key(_eqns, off):
-        pos = off + jnp.arange(_eqns.shape[0], dtype=jnp.int32)
+    def key(n_rows, off):
+        pos = off + jnp.arange(int(n_rows), dtype=jnp.int32)
         return jnp.searchsorted(face_ends, pos, side="right").astype(jnp.int32)
     return key

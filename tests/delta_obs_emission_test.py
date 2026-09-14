@@ -3,8 +3,13 @@
 Stage 1 proved the per-step delta buffer equals ``stream[pos : pos + W]``
 (tests/delta_buffer_equivalence_test.py). Stage 2 deleted the stream: the
 callback now returns ONLY the tokens the last elimination emitted, with the
-tokenizer's own length in a header slot, and the base is a host-side constant
-(``VertexEliminationEnv.base_observation``).
+tokenizer's own length in the wire's count HEADER, and the base is a host-side
+constant (``VertexEliminationEnv.base_observation``).
+
+Since 2026-09-13 the ids are NARROW: uint8 tokens, int16 equation ids, and the
+count -- which fits in neither -- rides in its own little-endian int32 across
+the first ``env.DELTA_HEADER_SLOTS`` byte slots of the TOKEN buffer. The ids
+start at ``DELTA_HEADER_SLOTS`` in both buffers.
 
 Two things must hold, and neither is visible in any metric we log:
 
@@ -27,10 +32,10 @@ Two things must hold, and neither is visible in any metric we log:
      ``_incremental_stream_tokens`` does -- otherwise the same symbol maps to
      a different id, i.e. a different embedding row, for the base only. Test 1
      pins this: any mismatch breaks the concatenation at the first base token
-     that differs. It says nothing about WHICH id space is right; the
-     default IS the launchers' ``--vocab-size 512`` now, so the tokenizer
-     and the policy embedding name one id space (223 reserved + 10 digits
-     + 272 name symbols, max id 511).
+     that differs. It says nothing about WHICH id space is right; the default
+     IS the launchers' ``--vocab-size 256`` now, so the tokenizer and the
+     policy embedding name one id space (223 reserved + 10 digits + 23 name
+     symbols, max id 255 -- which is what lets a token id be a byte).
 """
 import os
 
@@ -80,7 +85,8 @@ import pytest                                                     # noqa: E402
 
 from alphagrad.approx.env import (                                # noqa: E402
     MAX_DELTA_TOKENS, MAX_FACES, MAX_RULES_PER_VERTEX, FACE_SLOTS,
-    EnvConfig, VertexEliminationEnv, _callback,
+    DELTA_EQN_DTYPE, DELTA_EQN_PAD, DELTA_HEADER_SLOTS, DELTA_TOKEN_DTYPE,
+    EnvConfig, VertexEliminationEnv, _callback, decode_delta_header,
 )
 
 
@@ -135,17 +141,27 @@ _ORDER = jnp.asarray(np.arange(1, _V + 1), dtype=jnp.int32)
 
 
 def _delta_at(cfg, specs, step):
-    """One step's (tokens, eqn_ids) as the delta wire, unpacked."""
+    """One step's (tokens, eqn_ids) as the delta wire, unpacked.
+
+    THE HEADER IS NOT IN EITHER ID STREAM any more: it is one little-endian
+    int32 over the first ``DELTA_HEADER_SLOTS`` byte slots of the token
+    buffer, and the equation buffer's matching slots carry the pad sentinel.
+    """
     tok, eqn, _r = _callback(
         cfg, ARGS, _CONSTS, _ORDER, specs, _FACES, _SKIPS, step)
     t, e = np.asarray(tok), np.asarray(eqn)
-    n = int(t[0])
-    assert n == int(e[0]), "header slots disagree"
+    assert t.dtype == np.dtype(DELTA_TOKEN_DTYPE), t.dtype
+    assert e.dtype == np.dtype(DELTA_EQN_DTYPE), e.dtype
+    n = int(decode_delta_header(t))
     assert 0 <= n <= MAX_DELTA_TOKENS
-    return list(t[1:1 + n]), list(e[1:1 + n])
+    H = DELTA_HEADER_SLOTS
+    assert list(e[:H]) == [DELTA_EQN_PAD] * H, (
+        "the equation buffer's header slots carry something other than the "
+        "pad sentinel; nothing may read them")
+    return [int(x) for x in t[H:H + n]], [int(x) for x in e[H:H + n]]
 
 
-_VOCAB = int(os.environ.get("ALPHAGRAD_INCR_TOKEN_VOCAB", "512"))
+_VOCAB = int(os.environ.get("ALPHAGRAD_INCR_TOKEN_VOCAB", "256"))
 
 
 def _cold_stream(prefix, specs_np, vocab=_VOCAB):
@@ -276,16 +292,22 @@ def test_full_stream_env_is_untouched():
 
 
 def test_obs_width_matches_the_wire():
-    """The Ray measurement pool preallocates at `env.obs_width`; it must be
-    the width the callback actually declares."""
+    """The Ray measurement pool preallocates at `env.obs_width` and
+    `env.wire_token_dtype`; both must be what the callback actually declares."""
     from alphagrad.approx.env import MAX_TOKENS
 
     e_d = VertexEliminationEnv(_cfg(True), args=ARGS, consts=_CONSTS)
     e_f = VertexEliminationEnv(_cfg(False), args=ARGS, consts=_CONSTS)
-    assert e_d.obs_width == 1 + MAX_DELTA_TOKENS
+    assert e_d.obs_width == DELTA_HEADER_SLOTS + MAX_DELTA_TOKENS
     assert e_f.obs_width == MAX_TOKENS
     assert e_d._callback_shape[0].shape == (e_d.obs_width,)
     assert e_f._callback_shape[0].shape == (e_f.obs_width,)
+    # THE NARROW WIRE, declared. `io_callback` enforces the dtype, so a
+    # producer that widened would fail loudly rather than silently.
+    assert e_d._callback_shape[0].dtype == jnp.uint8
+    assert e_d._callback_shape[1].dtype == jnp.int16
+    assert e_f._callback_shape[0].dtype == jnp.int32
+    assert e_f._callback_shape[1].dtype == jnp.int32
 
 
 def test_reset_carries_an_empty_delta_and_no_callback():
@@ -297,6 +319,11 @@ def test_reset_carries_an_empty_delta_and_no_callback():
     assert int(st.delta_count) == 0
     assert st.delta_tokens.shape == (MAX_DELTA_TOKENS,)
     assert st.delta_eqns.shape == (MAX_DELTA_TOKENS,)
+    # THE ROLLOUT STORE's dtypes, at the one place both buffers are built
+    # from nothing.
+    assert st.delta_tokens.dtype == jnp.uint8
+    assert st.delta_eqns.dtype == jnp.int16
+    assert st.delta_count.dtype == jnp.int32
     assert np.all(np.asarray(st.delta_tokens) == 0)
     assert np.all(np.asarray(st.delta_eqns) == -1)
 

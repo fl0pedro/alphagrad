@@ -549,7 +549,12 @@ SHARED_CLI = [
     # trust region is on).  Named so the requirement is on the command line.
     ("--dynamic-substeps", None),
     ("--hidden-dim", "256"),
-    ("--vocab-size", "512"),
+    # THE POLICY EMBEDDING's row count. It must be at least the TOKENIZER's id
+    # space, which is 256 (owner's decision, 2026-09-13 -- see
+    # alphagrad.approx.common.token_vocab). It used to say 512, which was the
+    # tokenizer's old id space; a generated arm that still says 512 would
+    # allocate twice the embedding rows the tokenizer can ever address.
+    ("--vocab-size", "256"),
     ("--num-layers", "3"),
     ("--ray-measure", "3"),
     ("--ray-measure-timeout", "600"),
@@ -747,7 +752,7 @@ echo "===================== P1: singleton skip sweep ====================="
 CUDA_VISIBLE_DEVICES=0 uv run --no-sync python \
   src/alphagrad/approx/tools/landscape_map.py \
   --example TransformerLM --dataset wikitext2 \
-  --hidden-dim 256 --vocab-size 512 --num-layers 3 --seed 250197 \
+  --hidden-dim 256 --vocab-size 256 --num-layers 3 --seed 250197 \
   --exec-on-gpu --cmp-type latency --mem-type peak_memory \
   --num-data-points 5 --reps-per-point 4 --latency-inner-reps 50 \
   --latency-warmup 2 --warmup-trials 2 \
@@ -771,7 +776,7 @@ for MODE in none pfm pfm_diag; do
   CUDA_VISIBLE_DEVICES=0 uv run --no-sync python \
     src/alphagrad/approx/tools/landscape_map.py \
     --example TransformerLM --dataset wikitext2 \
-    --hidden-dim 256 --vocab-size 512 --num-layers 3 --seed 250197 \
+    --hidden-dim 256 --vocab-size 256 --num-layers 3 --seed 250197 \
     --exec-on-gpu --cmp-type latency --mem-type peak_memory \
     --num-data-points 5 --reps-per-point 4 --latency-inner-reps 50 \
     --quality-metric cosine \
@@ -1920,7 +1925,7 @@ ARCH="--archive v57=$W/run-20260817_113827-it05ku34/files/pareto_front.json \
  --archive v66c=$W/run-20260826_121154-s1537jdd/files/pareto_front.json"
 
 COMMON="--example TransformerLM --dataset wikitext2 \
- --hidden-dim 256 --vocab-size 512 --num-layers 3 --seed 250197 \
+ --hidden-dim 256 --vocab-size 256 --num-layers 3 --seed 250197 \
  --exec-on-gpu \
  --cmp-type latency --mem-type peak_memory \
  --num-data-points 5 --reps-per-point 4 \

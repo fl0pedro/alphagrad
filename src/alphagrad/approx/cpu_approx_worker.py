@@ -245,9 +245,12 @@ class CpuApproximationServer:
 
         Returns
         -------
-        (tokens_np, eqn_ids_np, reward_vec_np)
-            All numpy arrays, dtypes match the JAX-side counterparts
-            (int32, int32, float32). Safe to ship over Ray.
+        ``(tokens_np, reward_vec_np)`` under ``delta_obs`` and
+        ``(tokens_np, eqn_ids_np, reward_vec_np)`` on the legacy full-stream
+        path -- exactly ``env._callback``'s own output tuple (see its
+        ``_wire`` helper). The equation-id buffer was removed from the delta
+        path on 2026-09-13. All numpy arrays, dtypes matching the JAX-side
+        counterparts. Safe to ship over Ray.
         """
         import jax.numpy as jnp
         import numpy as np
@@ -287,7 +290,7 @@ class CpuApproximationServer:
             else:
                 _face_specs = np.asarray(face_specs, dtype=np.int32)
                 _face_skips = np.asarray(face_skips, dtype=np.int32)
-            tokens, eqn_ids, reward = _callback(
+            _cb_out = _callback(
                 self._config,
                 self._args,
                 self._consts,
@@ -303,7 +306,7 @@ class CpuApproximationServer:
             self._maybe_print_profile()
             if self._leak_profile is not None:
                 self._leak_profile.record_call(self._n_calls)
-            out = np.asarray(tokens), np.asarray(eqn_ids), np.asarray(reward)
+            out = tuple(np.asarray(x) for x in _cb_out)
             # Results are now host-side numpy — safe to drop the per-config
             # XLA executables that env._callback compiled onto the measure GPU.
             self._maybe_clear_compile_caches()
@@ -422,15 +425,22 @@ class CpuApproximationServer:
                     flush=True,
                 )
             # ---- end verbose diagnostics ----
-            from alphagrad.approx.env import MAX_DELTA_TOKENS as _MDT
-            # Width follows the env's observation contract: under delta_obs
-            # the wire is (1 header slot + MAX_DELTA_TOKENS), and an
-            # all-zero sentinel then reads back as an EMPTY delta -- the
+            from alphagrad.approx.env import (
+                DELTA_HEADER_SLOTS as _DHS,
+                DELTA_TOKEN_DTYPE as _DTD,
+                MAX_DELTA_TOKENS as _MDT,
+            )
+            # Width and dtype follow the env's observation contract: under
+            # delta_obs the wire is (DELTA_HEADER_SLOTS + MAX_DELTA_TOKENS)
+            # uint8 with NO equation-id buffer, and an all-zero sentinel then
+            # reads back as an EMPTY delta (the header decodes to 0) -- the
             # encoder simply does not advance, which is the right failure
-            # mode. Legacy full-stream envs keep MAX_TOKENS.
-            _sw = (1 + _MDT if getattr(self._config, "delta_obs", False)
-                   else MAX_TOKENS)
-            sentinel_tokens = np.zeros((_sw,), dtype=np.int32)
+            # mode. Legacy full-stream envs keep MAX_TOKENS int32 and their
+            # equation-id buffer.
+            _delta = bool(getattr(self._config, "delta_obs", False))
+            _sw = (_DHS + _MDT) if _delta else MAX_TOKENS
+            sentinel_tokens = np.zeros(
+                (_sw,), dtype=(_DTD if _delta else np.int32))
             sentinel_eqn_ids = np.zeros((_sw,), dtype=np.int32)
             sentinel_reward = np.full((NUM_REWARDS,), -1e10, dtype=np.float32)
             # cosine_sim is "higher is better, capped at 1" — set to 0 so the
@@ -444,6 +454,8 @@ class CpuApproximationServer:
             # more partially-compiled executables on the saturated GPU.
             self._n_calls += 1
             self._maybe_clear_compile_caches(force_on_oom=str(exc))
+            if _delta:
+                return sentinel_tokens, sentinel_reward
             return sentinel_tokens, sentinel_eqn_ids, sentinel_reward
 
     def precompile(self, order: Any, sparsity_specs: Any, step: int) -> bool:
@@ -481,8 +493,9 @@ class CpuApproximationServer:
 
         Each tuple is `(order_np, specs_np, step)` or `(order_np,
         specs_np, step, eval_samples)`; the latter overrides
-        per-element. Returns a list of `(tokens, eqn_ids, reward)`
-        triples, preserving input order.
+        per-element. Returns a list of whatever :meth:`evaluate` returns
+        (a pair under ``delta_obs``, a triple on the legacy path),
+        preserving input order.
 
         Useful when one actor owns multiple envs — the Ray RPC cost is
         ~0.5 ms / call, so batching 8 envs amortises the roundtrip.

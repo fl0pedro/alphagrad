@@ -152,10 +152,13 @@ def phase_plan(m, deepen=False, rollout_depth=0):
 def face_ce_term(face_replay_fn, ctx, enc_carry, axis_state, axis_valid,
                  fact_tables, op_override, axis_feats_fn, pi_pad,
                  sd_li, sd_vidx, sd_w, sd_fpair, sd_fcomp, sd_fvalid,
-                 sd_cnt, sd_dt, sd_de, sd_fa, sd_fends):
+                 sd_cnt, sd_dt, sd_fa, sd_fends):
     """The Sampled-AZ face cross-entropy for ONE decision:
 
         CE = - sum_v pi'_ve(v) sum_k w_hat_{v,k} log beta_theta(F_{v,k})
+
+    ``face_chunks`` is the PAIR ``(counts, tokens)``: the parallel
+    equation-id buffer was removed on 2026-09-13 with the ids themselves.
 
     over the search's stored draws, flattened to D slots (padding has
     ``sd_li == -1`` / ``sd_w == 0`` and contributes exactly 0). ``log beta``
@@ -173,7 +176,7 @@ def face_ce_term(face_replay_fn, ctx, enc_carry, axis_state, axis_valid,
 
     nv = ctx.shape[0]
 
-    def _one(vidx, fp, fc, fv, cnt, dt, de, fa_k, fend):
+    def _one(vidx, fp, fc, fv, cnt, dt, fa_k, fend):
         vi = jnp.clip(vidx, 0, nv - 1)
         features = axis_feats_fn(axis_state[vi], axis_valid[vi])
         # `ctx` and `fend` are no longer head inputs: since 2026-08-15 the
@@ -185,11 +188,11 @@ def face_ce_term(face_replay_fn, ctx, enc_carry, axis_state, axis_valid,
         # discarded here exactly as on ppo's default path (DCE'd under jit).
         lp, ent, ar, _probe_face_lat = face_replay_fn(
             features, fact_tables, fa_k, fp, fc, fv,
-            enc_carry, (cnt, dt, de), op_override)
+            enc_carry, (cnt, dt), op_override)
         return lp, ent / jnp.maximum(ar, 1.0)
 
     lp, ent_n = jax.vmap(_one)(
-        sd_vidx, sd_fpair, sd_fcomp, sd_fvalid, sd_cnt, sd_dt, sd_de, sd_fa,
+        sd_vidx, sd_fpair, sd_fcomp, sd_fvalid, sd_cnt, sd_dt, sd_fa,
         sd_fends)
     li = jnp.clip(sd_li, 0, pi_pad.shape[0] - 1)
     valid = (sd_li >= 0) & (sd_w > 0)

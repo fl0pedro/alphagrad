@@ -395,7 +395,7 @@ def _arm_live(closed, xs, argnums, mode, seed):
     live = None
     if mode == "sizes":
         live = LiveFaceStream(jaxpr, argnums, list(closed.literals), list(xs),
-                              vocab=512, max_faces=MAX_F, max_axes=N_AX)
+                              vocab=256, max_faces=MAX_F, max_axes=N_AX)
     stats: dict = {}
     n_req = 0
     # PAIRED, ALWAYS (project memory: an unpaired comparison is how

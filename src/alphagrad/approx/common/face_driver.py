@@ -28,6 +28,10 @@ import numpy as np
 
 from alphagrad.approx.common.masks import NUM_FACE_QUANT_DTYPES
 
+from alphagrad.approx.common.token_vocab import (
+    DELTA_TOKEN_DTYPE as _TOKEN_DTYPE,
+    incr_token_vocab,
+)
 from alphagrad.approx.live_faces import LiveFaceStream
 
 __all__ = [
@@ -144,8 +148,10 @@ def build_live_face_stream(jaxpr, argnums, consts, args, *, max_faces,
     becomes impossible whenever the delta itself fits, and the stored counts
     stay exact for the loss's cumsum boundaries.
     """
-    if vocab is None:
-        vocab = int(os.environ.get("ALPHAGRAD_INCR_TOKEN_VOCAB", "512"))
+    # THE one resolver (`common.token_vocab`). The face stream and the
+    # observation stream MUST be tokenized at the same id space -- a chunk is
+    # a slice of the same emission -- so neither of them names a default.
+    vocab = incr_token_vocab(vocab)
     if window is None:
         window = _default_window()
     return LiveFaceStream(
@@ -164,7 +170,9 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None,
 
     ``chunk_cb(f, order, spec_hist, step_count, vertex_idx, vertex_specs,
     face_rows, face_skips, face_hist, skip_hist)`` returns
-    ``(tokens (window,), eqn_ids (window,), count, endpoints (2,))``.
+    ``(tokens (window,) uint8, count, endpoints (2,))`` -- the narrow token
+    wire, see ``common.token_vocab``. There is no equation-id buffer any more
+    (removed 2026-09-13 with the palimpsa relational forget gate).
     ``endpoints`` is the face's own ``(in_edge, out_edge)`` vertex pair,
     1-based with 0 = "no vertex" -- the face's IDENTITY, which the head
     gathers its two endpoint contexts from. It costs nothing: the face
@@ -228,7 +236,7 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None,
             if _order.ndim == 1:
                 if edge_table is not None:
                     _sc1 = int(np.asarray(step_count))
-                    (tok, ids, cnt, _nf, ends, ekey, cvx, head,
+                    (tok, cnt, _nf, ends, ekey, cvx, head,
                      wrok) = live_faces.chunk_ex(
                         order, spec_hist, _sc1,
                         int(np.asarray(vertex_idx)) + 1, vertex_specs,
@@ -236,20 +244,20 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None,
                         face_hist, skip_hist,
                     )
                     _dist("face_chunk_len", cnt)
-                    out1 = (tok, ids, np.asarray(cnt, np.int32),
+                    out1 = (tok, np.asarray(cnt, np.int32),
                             np.asarray(ends, np.int32),
                             _einfo_host(0, _sc1, ekey, cvx, head, wrok))
                     if emit_head:
                         out1 = out1 + (np.asarray(head, np.int32),)
                     return out1
-                tok, ids, cnt, _nf, ends, head = live_faces.chunk(
+                tok, cnt, _nf, ends, head = live_faces.chunk(
                     order, spec_hist, int(np.asarray(step_count)),
                     int(np.asarray(vertex_idx)) + 1, vertex_specs,
                     face_rows, face_skips, int(np.asarray(f)),
                     face_hist, skip_hist,
                 )
                 _dist("face_chunk_len", cnt)
-                out1 = (tok, ids, np.asarray(cnt, np.int32),
+                out1 = (tok, np.asarray(cnt, np.int32),
                         np.asarray(ends, np.int32))
                 if emit_head:
                     out1 = out1 + (np.asarray(head, np.int32),)
@@ -261,8 +269,10 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None,
             # dominant share of the approx-vs-exact non-host gap). Values
             # are identical: the same per-env chunk() calls, in env order.
             B = _order.shape[0]
-            toks = np.zeros((B, W), np.int32)
-            idss = np.zeros((B, W), np.int32)
+            # NARROW WIRE: same dtype as `LiveFaceStream.chunk` produces and
+            # as the declared callback shapes below, or `pure_callback`
+            # rejects the result.
+            toks = np.zeros((B, W), _TOKEN_DTYPE)
             cnts = np.zeros((B,), np.int32)
             ends = np.zeros((B, 2), np.int32)
             einf = -np.ones((B, 4), np.int32)
@@ -274,7 +284,7 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None,
             _ff = np.asarray(f)
             for i in range(B):
                 if edge_table is not None:
-                    (tok, ids, cnt, _nf, end, ekey, cvx, head,
+                    (tok, cnt, _nf, end, ekey, cvx, head,
                      wrok) = live_faces.chunk_ex(
                         _order[i], _sh[i], int(_sc[i]), int(_vi[i]) + 1,
                         _vs[i], _fr[i], _fs[i], int(_ff[i]),
@@ -283,17 +293,17 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None,
                     einf[i] = _einfo_host(i, int(_sc[i]), ekey, cvx,
                                           head, wrok)
                 else:
-                    tok, ids, cnt, _nf, end, head = live_faces.chunk(
+                    tok, cnt, _nf, end, head = live_faces.chunk(
                         _order[i], _sh[i], int(_sc[i]), int(_vi[i]) + 1,
                         _vs[i], _fr[i], _fs[i], int(_ff[i]),
                         _fh[i], _kh[i],
                     )
-                toks[i], idss[i], cnts[i] = tok, ids, np.int32(cnt)
+                toks[i], cnts[i] = tok, np.int32(cnt)
                 ends[i] = end
                 heads[i] = np.int32(head)
                 _dist("face_chunk_len", cnt)
-            outB = ((toks, idss, cnts, ends, einf) if edge_table is not None
-                    else (toks, idss, cnts, ends))
+            outB = ((toks, cnts, ends, einf) if edge_table is not None
+                    else (toks, cnts, ends))
             if emit_head:
                 outB = outB + (heads,)
             return outB
@@ -306,8 +316,7 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None,
         # f rides as an OPERAND: inside the while_loop it is a tracer, and
         # a partial would freeze it into the callback as a python object
         # (TracerArrayConversionError at the first body run).
-        _shapes = (jax.ShapeDtypeStruct((W,), jnp.int32),
-                   jax.ShapeDtypeStruct((W,), jnp.int32),
+        _shapes = (jax.ShapeDtypeStruct((W,), jnp.dtype(_TOKEN_DTYPE)),
                    jax.ShapeDtypeStruct((), jnp.int32),
                    jax.ShapeDtypeStruct((2,), jnp.int32))
         if edge_table is not None:

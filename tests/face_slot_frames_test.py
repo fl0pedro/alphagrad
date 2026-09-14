@@ -382,7 +382,7 @@ def _exact_prefix(total_v, k):
 def _stream(closed, xs):
     return LiveFaceStream(closed.jaxpr, tuple(range(len(xs))),
                           list(closed.literals), list(xs),
-                          vocab=512, max_faces=MAX_F, max_axes=N_AX)
+                          vocab=256, max_faces=MAX_F, max_axes=N_AX)
 
 
 def test_slot_legality_is_per_slot_and_matches_the_recorded_tensors():

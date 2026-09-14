@@ -27,7 +27,7 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("ALPHAGRAD_POLICY", "palimpsa")
 os.environ.setdefault("ALPHAGRAD_SKIP_COST_ANALYSIS", "1")
 os.environ.setdefault("ALPHAGRAD_SKIP_COUNT_OPS", "1")
-os.environ.setdefault("ALPHAGRAD_INCR_TOKEN_VOCAB", "512")
+os.environ.setdefault("ALPHAGRAD_INCR_TOKEN_VOCAB", "256")
 os.environ.setdefault("ALPHAGRAD_INCREMENTAL_TOKENS", "1")
 
 import equinox as eqx  # noqa: E402

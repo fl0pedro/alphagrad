@@ -104,6 +104,7 @@ from alphagrad.approx.env import (
     MAX_FACES as ENV_MAX_FACES,
     MAX_RULES_PER_VERTEX,
     MAX_DELTA_TOKENS,
+    DELTA_TOKEN_DTYPE,
     consume_token_length_stats,
     COMPUTE_REWARD_INDICES,
     NUM_AXIS_PAIRS,
@@ -116,6 +117,7 @@ from alphagrad.approx.env import (
     micro_actions_to_rule_specs_jax,
     wire_slots as _env_wire_slots,
 )
+from alphagrad.approx.common.token_vocab import incr_token_vocab
 from alphagrad.approx.common import carry_stream as _carry_stream
 from alphagrad.approx.common.face_driver import (
     bind_sizes_callback,
@@ -1495,19 +1497,65 @@ def _zero_face_action(mode: str | None = None):
 # the stored-context ratio-1 pattern (gradient truncates at the stored
 # carry, i.e. flows through the last delta only; accepted by design).
 #
-# MAX_EQNS bounds the causal relational-gate histogram (eqn ids at or above
-# it share the top bucket — an approximation only in overflow, identical on
-# both rollout and loss so ratio-1 is unaffected).
+# THE EQUATION-ID STREAM IS GONE (2026-09-13). It fed exactly one consumer:
+# the relational forget-gate modulation in the palimpsa mixers, reproduced
+# here as a causal ``(MAX_EQNS,)`` histogram carried per step. That was one
+# zero-initialised scalar per token per head with no ablation behind it, and
+# it cost a parallel id buffer on the callback wire, in ``EnvState``, in every
+# stored trajectory leaf and in the encoder carry. Removed at the source: the
+# env emits tokens only, ``EncCarry`` has no histogram, and the mixers have no
+# ``rel_gate``.
 # ---------------------------------------------------------------------------
-MAX_EQNS = int(os.environ.get("ALPHAGRAD_MAX_EQNS", "4096"))
+if os.environ.get("ALPHAGRAD_MAX_EQNS") is not None:
+    # HARD ERROR, not a silent ignore -- the same policy ALPHAGRAD_MAX_TOKENS
+    # got when it was deleted. A knob whose name still reads like a budget but
+    # which nothing consults is how a run gets mis-read.
+    raise RuntimeError(
+        "ALPHAGRAD_MAX_EQNS is GONE -- there are no equation ids any more. "
+        "They fed only the palimpsa relational forget-gate modulation, which "
+        "was removed together with them on 2026-09-13 (zero-init, one scalar "
+        "per token per head, no ablation). Nothing bounds anything here now; "
+        "drop the variable from your launcher.")
+
+
+def check_embedding_covers_tokenizer(vocab_size) -> int:
+    """Raise unless the policy embedding has a row for every token id.
+
+    graphax's ids run ``[0, incr_token_vocab())``;
+    ``eqx.nn.Embedding(vocab_size, ...)`` has exactly ``vocab_size`` rows, and
+    JAX CLAMPS an out-of-range gather instead of raising. A shortfall would
+    therefore be SILENT: every id past the table reads the last row, several
+    distinct symbols collide onto it, and the policy learns from a collision
+    nobody can see in any metric.
+
+    A function rather than four lines inside ``main`` so the rule is testable
+    without starting a run. Returns the tokenizer id space it checked against.
+    """
+    tok = incr_token_vocab()
+    if int(vocab_size) < tok:
+        raise ValueError(
+            f"--vocab-size {int(vocab_size)} is smaller than the tokenizer "
+            f"id space {tok} (ALPHAGRAD_INCR_TOKEN_VOCAB). The policy "
+            f"embedding must have at least one row per token id; JAX CLAMPS "
+            f"an out-of-range gather, so the shortfall would be silent. "
+            f"Raise --vocab-size to {tok}, or lower "
+            f"ALPHAGRAD_INCR_TOKEN_VOCAB."
+        )
+    return tok
 
 
 class EncCarry(NamedTuple):
-    M: jax.Array        # (L, H, d, d) float32 — per-layer palimpsa numerator
-    I: jax.Array        # (L, H, d, d) float32 — per-layer palimpsa precision
-    cumhist: jax.Array  # (MAX_EQNS,) float32 — cumulative eqn-id counts (<= id)
-    nvalid: jax.Array   # () float32 — valid (eqn_id >= 0) tokens consumed
-    pos: jax.Array      # () int32 — stream position consumed so far
+    """The whole palimpsa encoder state. THREE leaves, not five.
+
+    ``cumhist`` (a ``(MAX_EQNS,)`` float histogram) and ``nvalid`` are gone
+    with the equation ids: they existed only to reproduce the relational
+    forget-gate modulation inside the recurrence, and that modulation is gone
+    from the mixers too. Every stored trajectory got 4096 floats per step
+    smaller.
+    """
+    M: jax.Array        # (L, H, d, d) float32 -- per-layer palimpsa numerator
+    I: jax.Array        # (L, H, d, d) float32 -- per-layer palimpsa precision
+    pos: jax.Array      # () int32 -- stream position consumed so far
 
 
 _FACE_MASK_FAILS = [0]
@@ -1549,15 +1597,18 @@ def _stream_end(tokens):
     return jnp.where(jnp.any(nz), last + 1, 0).astype(jnp.int32)
 
 
-def _window_copy(tokens_buf, eqn_ids_buf, pos, count, width):
-    """``stream[pos : pos + width]`` as a STANDALONE ``(width,)`` buffer pair
-    with a RELATIVE cursor (read it back with ``encode_extend(..., start=0)``).
+def _window_copy(tokens_buf, pos, count, width):
+    """``stream[pos : pos + width]`` as a STANDALONE ``(width,)`` buffer with a
+    RELATIVE cursor (read it back with ``encode_extend(..., start=0)``).
 
-    Entries at or past ``count`` are written as pad (0 / -1), so the buffer
-    holds exactly the delta and then padding. That is bitwise what the
-    absolute cursor read out of the growing stream, because an append-only
-    stream past its own length is already pad -- which is the token-for-token
-    equality tests/delta_buffer_equivalence_test.py asserts.
+    Entries at or past ``count`` are written as pad (0), so the buffer holds
+    exactly the delta and then padding. That is bitwise what the absolute
+    cursor read out of the growing stream, because an append-only stream past
+    its own length is already pad -- which is the token-for-token equality
+    tests/delta_buffer_equivalence_test.py asserts.
+
+    ONE buffer, not a pair: the parallel equation-id buffer is gone (see the
+    ALPHAGRAD_MAX_EQNS note above).
     """
     pos = jnp.asarray(pos, jnp.int32)
     count = jnp.clip(jnp.asarray(count, jnp.int32), 0, width)
@@ -1565,10 +1616,7 @@ def _window_copy(tokens_buf, eqn_ids_buf, pos, count, width):
     idx = pos + ar
     toks = jnp.take(tokens_buf, idx, mode="fill",
                     fill_value=0).astype(jnp.int32)
-    eqns = jnp.take(eqn_ids_buf, idx, mode="fill",
-                    fill_value=-1).astype(jnp.int32)
-    keep = ar < count
-    return jnp.where(keep, toks, 0), jnp.where(keep, eqns, -1)
+    return jnp.where(ar < count, toks, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -1740,16 +1788,15 @@ class Trajectory(NamedTuple):
     # PREVIOUS step's delta, the one this step's carry consumes), and it is
     # what the face chunks concatenate to -- the loss scans it once from the
     # stored carry's continuation and pools between chunk boundaries.
-    face_delta_tokens: jax.Array  # (MAX_DELTA_TOKENS,) int32
-    face_delta_eqns: jax.Array    # (MAX_DELTA_TOKENS,) int32
+    # NARROW IDS: uint8 (env.DELTA_TOKEN_DTYPE). The parallel equation-id
+    # buffer that used to sit beside this one is GONE.
+    face_delta_tokens: jax.Array  # (MAX_DELTA_TOKENS,) uint8
     # Phase 3b incremental encode (mandatory since stage 2). The PRE-step
     # encoder carry + vertex memory, and the delta's owner vertex —
     # everything the loss needs to re-derive this step's encoding by
     # extending with the delta tokens only.
     enc_M: jax.Array        # (L, H, d, d)
     enc_I: jax.Array        # (L, H, d, d)
-    enc_cumhist: jax.Array  # (MAX_EQNS,)
-    enc_nvalid: jax.Array   # ()
     enc_pos: jax.Array      # () int32
     vmem_sums: jax.Array    # (V+1, E)
     vmem_counts: jax.Array  # (V+1,)
@@ -1757,8 +1804,10 @@ class Trajectory(NamedTuple):
     # from 0 plus its EXACT length -- the same shape the face stream stores.
     # This IS the observation: there is no episode-wide token buffer any
     # more, and no absolute cursor with which to index one.
-    delta_tokens: jax.Array   # (MAX_DELTA_TOKENS,) int32
-    delta_eqns: jax.Array     # (MAX_DELTA_TOKENS,) int32
+    # NARROW IDS: uint8 (env.DELTA_TOKEN_DTYPE). The count is its own int32
+    # -- it does NOT ride in slot 0 of the buffer any more, because
+    # MAX_DELTA_TOKENS does not fit in a byte.
+    delta_tokens: jax.Array   # (MAX_DELTA_TOKENS,) uint8
     delta_count: jax.Array    # () int32
     delta_owner: jax.Array  # () int32 — vertex whose elimination emitted the delta
     # The slots that delta TOUCHES (vertex + its faces' endpoints), 0/1 over
@@ -1857,19 +1906,15 @@ class TrainBatch(NamedTuple):
     face_old_logp: jax.Array
     face_counts: jax.Array
     face_delta_tokens: jax.Array
-    face_delta_eqns: jax.Array
     enc_M: jax.Array
     enc_I: jax.Array
-    enc_cumhist: jax.Array
-    enc_nvalid: jax.Array
     enc_pos: jax.Array
     vmem_sums: jax.Array
     vmem_counts: jax.Array
     # WINDOWED (leading K axis, --grad-window; K=1 is the historical single
     # delta): the last K step deltas ending at THIS step, oldest first. The
     # enc_*/vmem_* above are the carry at the OLDEST of them.
-    delta_tokens: jax.Array        # (K, MAX_DELTA_TOKENS)
-    delta_eqns: jax.Array          # (K, MAX_DELTA_TOKENS)
+    delta_tokens: jax.Array        # (K, MAX_DELTA_TOKENS) uint8
     delta_count: jax.Array         # (K,)
     delta_owner: jax.Array         # (K,)
     delta_participants: jax.Array  # (K, total_v + 1)
@@ -2153,7 +2198,7 @@ _ATTN_ENTROPY_ON = os.environ.get("ALPHAGRAD_ATTN_ENTROPY", "1") == "1"
 
 
 @eqx.filter_jit
-def attention_entropy_diagnostic(agent, tokens, eqn_ids=None,
+def attention_entropy_diagnostic(agent, tokens,
                                  axis_state=None, axis_valid=None):
     """Mean encoder attention-row entropy, or NaN when nothing applies."""
     from alphagrad.approx.set_pointer import SetPointerVertexPolicy
@@ -2165,23 +2210,15 @@ def attention_entropy_diagnostic(agent, tokens, eqn_ids=None,
         if agent.pos_enc is not None:
             x = agent.pos_enc(x)
         enc_mask = None if agent.pos_enc is not None else token_mask
-        enc_x = agent.encoder(x, eqn_ids=eqn_ids, mask=enc_mask,
-                              key=jrand.PRNGKey(0))
+        enc_x = agent.encoder(x, mask=enc_mask, key=jrand.PRNGKey(0))
         # Same segment pooling SetPointerVertexPolicy.__call__ does, so the
         # slots this scores are the slots the pointer actually sees.
         n_slots = pol.num_vertices + 1
-        w = (token_mask > 0.5).astype(enc_x.dtype)
-        if eqn_ids is None:
-            pooled = jnp.broadcast_to(
-                jnp.mean(enc_x, axis=0), (n_slots, enc_x.shape[-1]))
-            vmask = jnp.ones((n_slots,), enc_x.dtype)
-        else:
-            ids = jnp.clip(eqn_ids, 0, n_slots - 1)
-            sums = jax.ops.segment_sum(enc_x * w[:, None], ids,
-                                       num_segments=n_slots)
-            cnts = jax.ops.segment_sum(w, ids, num_segments=n_slots)
-            pooled = sums / jnp.maximum(cnts, 1.0)[:, None]
-            vmask = (cnts > 0).astype(enc_x.dtype)
+        # The eqn-id segment pooling is gone with the ids; every caller
+        # already passed None, so this is the branch that ran.
+        pooled = jnp.broadcast_to(
+            jnp.mean(enc_x, axis=0), (n_slots, enc_x.shape[-1]))
+        vmask = jnp.ones((n_slots,), enc_x.dtype)
         # The slots are E wide -- one address, no [identity || dynamic] half
         # to zero-pad (see the VertexIdentityPool obituary above).
         parts.append(pol.attention_entropy(pooled, vmask))
@@ -2353,7 +2390,6 @@ class Agent(eqx.Module):
     def encode(
         self,
         tokens,
-        eqn_ids=None,
         preference=None,
         key=None,
     ):
@@ -2365,10 +2401,9 @@ class Agent(eqx.Module):
         if self.pos_enc is not None:
             x = self.pos_enc(x)
         enc_key = key if key is not None else jrand.PRNGKey(0)
-        # Stage B.1: when `eqn_ids` is provided, the encoder layers add
-        # learned per-relation biases derived from it. When None, the encoder
-        # falls back to vanilla self-attention so the path is preserved for
-        # callers that haven't been wired yet.
+        # The `eqn_ids` relational bias is GONE (2026-09-13). Every caller in
+        # this module already passed None, and the palimpsa backbone -- the
+        # only one the delta path runs -- no longer accepts it at all.
         # Pad-mask threading (same as ppo_ray_worker.encode_tokens): the
         # palimpsa recurrence must not accumulate the ~16k pad positions —
         # harmless for the causal variant only because trailing pads sit
@@ -2376,7 +2411,7 @@ class Agent(eqx.Module):
         # None exactly for the recurrent backbones (see _build_agent); the
         # transformer keeps mask=None so its path stays byte-identical.
         enc_mask = None if self.pos_enc is not None else token_mask
-        enc_x = self.encoder(x, eqn_ids=eqn_ids, mask=enc_mask, key=enc_key)
+        enc_x = self.encoder(x, mask=enc_mask, key=enc_key)
 
         vertex_logits, vertex_contexts = self.vertex_policy(enc_x, token_mask)
 
@@ -2405,13 +2440,11 @@ class Agent(eqx.Module):
     def value_for(
         self,
         tokens,
-        eqn_ids=None,
         preference=None,
         key=None,
     ):
         _, _, value = self.encode(
             tokens,
-            eqn_ids=eqn_ids,
             preference=preference,
             key=key,
         )
@@ -2433,20 +2466,18 @@ class Agent(eqx.Module):
             ).astype(jnp.float32)
             for l in layers
         ])
-        return EncCarry(
-            M=M0, I=I0,
-            cumhist=jnp.zeros((MAX_EQNS,), jnp.float32),
-            nvalid=jnp.zeros((), jnp.float32),
-            pos=jnp.zeros((), jnp.int32),
-        )
+        return EncCarry(M=M0, I=I0, pos=jnp.zeros((), jnp.int32))
 
-    def encode_extend(self, carry, tokens_buf, eqn_ids_buf, count, *, window,
+    def encode_extend(self, carry, tokens_buf, count, *, window,
                       start=None, chunk=None, budget=None):
         """Extend the palimpsa carry by ``count`` tokens read from
         ``tokens_buf`` at ``carry.pos`` (fixed static ``window``; pad steps
         freeze the carry, so the valid prefix is bitwise-independent of the
-        window size). Returns ``(new_carry, rows, valid, eqn_window)`` with
-        ``rows`` (window, E) zeroed on invalid steps.
+        window size). Returns ``(new_carry, rows, valid)`` with ``rows``
+        (window, E) zeroed on invalid steps.
+
+        THREE RETURN VALUES, not four: the equation-id window is gone with the
+        ids (see the ALPHAGRAD_MAX_EQNS note at the top of this module).
 
         ``chunk`` bounds how many of those pad steps are actually SCANNED --
         see :meth:`_extend_sequential`. ``None`` reads
@@ -2462,11 +2493,11 @@ class Agent(eqx.Module):
         ``jnp.max(batch.delta_count)`` computed OUTSIDE the vmap -- a budget
         below some sample's ``count`` silently drops that sample's tail.
 
-        Byte-identical math to the PalimpsaMixer/EncoderLayer stack with ONE
-        deliberate exception: the relational forget-gate features are CAUSAL
-        prefix counts from the carried histogram — the full path's whole-
-        stream counts are acausal and cannot ride a recurrence. Rollout and
-        loss share this exact computation, which is what ratio-1 needs.
+        Byte-identical math to the PalimpsaMixer/EncoderLayer stack. The one
+        deliberate exception this docstring used to carry -- the causal
+        relational forget-gate features, which the full path computed
+        acausally -- is gone: there is no relational modulation on either
+        side any more, so the two paths now agree with nothing to except.
         """
         if self.pos_enc is not None:
             raise RuntimeError(
@@ -2480,29 +2511,29 @@ class Agent(eqx.Module):
         # their own arrays, not a window into `state.tokens`.
         base = carry.pos if start is None else jnp.asarray(start, jnp.int32)
         idx = base + jnp.arange(window, dtype=jnp.int32)
-        toks = jnp.take(tokens_buf, idx, mode="fill", fill_value=0).astype(jnp.int32)
-        eqns = jnp.take(eqn_ids_buf, idx, mode="fill", fill_value=-1).astype(jnp.int32)
+        toks = jnp.take(tokens_buf, idx, mode="fill",
+                        fill_value=0).astype(jnp.int32)
         valid = jnp.arange(window, dtype=jnp.int32) < count
 
         _mode = os.environ.get("ALPHAGRAD_CHUNKED_EXTEND", "0")
         if _mode == "1" or os.environ.get(
                 "ALPHAGRAD_CHUNKED_SELFTEST", "0") == "1":
-            par = self._extend_parallel(carry, toks, eqns, valid, count)
+            par = self._extend_parallel(carry, toks, valid, count)
             if os.environ.get("ALPHAGRAD_CHUNKED_SELFTEST", "0") == "1":
-                seq = self._extend_sequential(carry, toks, eqns, valid, count)
+                seq = self._extend_sequential(carry, toks, valid, count)
                 jax.debug.print(
                     "[chunked-selftest] max|rows|={r:.3e} max|M|={m:.3e} "
-                    "max|cumhist|={c:.3e}",
+                    "max|I|={c:.3e}",
                     r=jnp.max(jnp.abs(par[1] - seq[1])),
                     m=jnp.max(jnp.abs(par[0].M - seq[0].M)),
-                    c=jnp.max(jnp.abs(par[0].cumhist - seq[0].cumhist)))
+                    c=jnp.max(jnp.abs(par[0].I - seq[0].I)))
                 if _mode != "1":
                     return seq
             return par
-        return self._extend_sequential(carry, toks, eqns, valid, count,
+        return self._extend_sequential(carry, toks, valid, count,
                                        chunk=chunk, budget=budget)
 
-    def _extend_parallel(self, carry, toks, eqns, valid, count):
+    def _extend_parallel(self, carry, toks, valid, count):
         """Blocked parallel extend: scan across fixed-size blocks, one
         associative_scan within each.
 
@@ -2527,7 +2558,6 @@ class Agent(eqx.Module):
                 [a, jnp.full((pad,) + a.shape[1:], fill, a.dtype)])
 
         b_toks = _pad(toks, 0).reshape(nb, Bk)
-        b_eqns = _pad(eqns, -1).reshape(nb, Bk)
         b_ok = _pad(valid, False).reshape(nb, Bk)
         layers = self.encoder.layers
 
@@ -2535,23 +2565,8 @@ class Agent(eqx.Module):
             return (r[0] * l[0], r[0] * l[1] + r[1])
 
         def _block(c, blk):
-            M, I, ch, nv0 = c
-            btoks, beqns, ok = blk
-            tv = (ok & (beqns >= 0)).astype(jnp.float32)
-            e = jnp.clip(beqns, 0, MAX_EQNS - 1)
-            # Causal relational feats: carried histogram supplies the prefix,
-            # one (Bk, Bk) masked comparison supplies the within-block part.
-            causal = jnp.tril(jnp.ones((Bk, Bk), jnp.float32))
-            w = causal * tv[None, :]
-            le = (e[None, :] <= e[:, None]).astype(jnp.float32)
-            lt = (e[None, :] < e[:, None]).astype(jnp.float32)
-            at = ch[e] + jnp.sum(w * le, axis=1)
-            below = (jnp.where(e > 0, ch[jnp.maximum(e - 1, 0)], 0.0)
-                     + jnp.sum(w * lt, axis=1))
-            nval = nv0 + jnp.cumsum(tv)
-            denom = jnp.maximum(nval, 1.0)
-            feats = (jnp.stack([at - below, below, nval - at], axis=-1)
-                     / denom[:, None] * tv[:, None])
+            M, I = c
+            btoks, ok = blk
 
             x = jax.vmap(self.embedding)(btoks)
             newM, newI = [], []
@@ -2567,9 +2582,7 @@ class Agent(eqx.Module):
                 b = _pal_beta(
                     jax.vmap(mixer.bias_proj)(y).reshape(Bk, H, d),
                     mixer.b_scale_raw)
-                gt = jnn.softplus(jax.vmap(mixer.gate_proj)(y)
-                                  + feats @ mixer.rel_gate.weight.T
-                                  + mixer.rel_gate.bias)
+                gt = jnn.softplus(jax.vmap(mixer.gate_proj)(y))
                 g = jnn.softplus(mixer.g_raw)
                 Ip = jnn.softplus(mixer.Ip_raw)
                 a = jnp.exp(-gt[:, :, None, None]
@@ -2596,10 +2609,7 @@ class Agent(eqx.Module):
                 newI.append(I_t[-1])
 
             rows_b = jnp.where(ok[:, None], x, 0.0)
-            cnt = jnp.zeros((MAX_EQNS,), jnp.float32).at[e].add(tv)
-            c2 = (jnp.stack(newM), jnp.stack(newI),
-                  ch + jnp.cumsum(cnt), nv0 + jnp.sum(tv))
-            return c2, rows_b
+            return (jnp.stack(newM), jnp.stack(newI)), rows_b
 
         # CHECKPOINTED blocks: without remat, reverse-mode AD saves every
         # block's per-token M_t/I_t -- O(T,H,d,n) residuals PER SAMPLE no
@@ -2608,37 +2618,19 @@ class Agent(eqx.Module):
         # backward stores only the block-boundary carries (~13 MB/sample at
         # these shapes) and recomputes each block's forward -- the classic
         # sqrt-storage trade, paying one extra forward per block.
-        (M2, I2, ch2, nv2), rows_b = lax.scan(
-            jax.checkpoint(_block),
-            (carry.M, carry.I, carry.cumhist, carry.nvalid),
-            (b_toks, b_eqns, b_ok))
+        (M2, I2), rows_b = lax.scan(
+            jax.checkpoint(_block), (carry.M, carry.I), (b_toks, b_ok))
         rows = rows_b.reshape(nb * Bk, -1)[:T]
-        new_carry = EncCarry(M=M2, I=I2, cumhist=ch2, nvalid=nv2,
-                             pos=carry.pos + count)
-        return new_carry, rows, valid, eqns
+        new_carry = EncCarry(M=M2, I=I2, pos=carry.pos + count)
+        return new_carry, rows, valid
 
-    def _extend_sequential(self, carry, toks, eqns, valid, count,
+    def _extend_sequential(self, carry, toks, valid, count,
                            chunk=None, budget=None):
         layers = self.encoder.layers
-        eq_arange = jnp.arange(MAX_EQNS, dtype=jnp.int32)
 
-        def _step(c, tev):
-            M, I, cumhist, nvalid = c
-            tok, eid, ok = tev
-            tokvalid = ok & (eid >= 0)
-            tvf = tokvalid.astype(jnp.float32)
-            e = jnp.clip(eid, 0, MAX_EQNS - 1)
-            # Causal same/earlier/later counts incl. this token (the full
-            # path's counts include self too), normalized by the running
-            # valid-token count. Structural/pad tokens contribute zero
-            # features but still see rel_gate's bias — matching the full
-            # path, which zeroes feats yet applies the (learned) bias.
-            cumhist2 = cumhist + tvf * (eq_arange >= e).astype(jnp.float32)
-            nvalid2 = nvalid + tvf
-            at = cumhist2[e]
-            below = jnp.where(e > 0, cumhist2[jnp.maximum(e - 1, 0)], 0.0)
-            denom = jnp.maximum(nvalid2, 1.0)
-            feats = jnp.stack([at - below, below, nvalid2 - at]) / denom * tvf
+        def _step(c, tv):
+            M, I = c
+            tok, ok = tv
 
             x = self.embedding(tok)
             new_M, new_I = [], []
@@ -2652,7 +2644,7 @@ class Agent(eqx.Module):
                 v = mixer.value_proj(y).reshape(H, d)
                 b = _pal_beta(mixer.bias_proj(y).reshape(H, d),
                               mixer.b_scale_raw)
-                gt = jnn.softplus(mixer.gate_proj(y) + mixer.rel_gate(feats))
+                gt = jnn.softplus(mixer.gate_proj(y))
                 g = jnn.softplus(mixer.g_raw)
                 Ip = jnn.softplus(mixer.Ip_raw)
                 decay = jnp.exp(-gt[:, None, None] * g[:, None, None])
@@ -2667,7 +2659,7 @@ class Agent(eqx.Module):
                 new_M.append(jnp.where(ok, M_l, M[li]))
                 new_I.append(jnp.where(ok, I_l, I[li]))
             row = jnp.where(ok, x, jnp.zeros_like(x))
-            return (jnp.stack(new_M), jnp.stack(new_I), cumhist2, nvalid2), row
+            return (jnp.stack(new_M), jnp.stack(new_I)), row
 
         # unroll: the per-token body is a handful of small matvecs — a
         # sequential 16k-iteration scan of those is GPU launch-latency bound
@@ -2676,7 +2668,7 @@ class Agent(eqx.Module):
         # step-identical (unrolling never reassociates), so rollout/loss
         # parity is untouched.
         unroll = int(os.environ.get("ALPHAGRAD_EXTEND_UNROLL", "8"))
-        c0 = (carry.M, carry.I, carry.cumhist, carry.nvalid)
+        c0 = (carry.M, carry.I)
         W = toks.shape[0]
         C = int(os.environ.get("ALPHAGRAD_EXTEND_CHUNK", "0")
                 if chunk is None else chunk)
@@ -2693,8 +2685,8 @@ class Agent(eqx.Module):
             C = int(os.environ.get("ALPHAGRAD_LOSS_EXTEND_CHUNK", C))
 
         if C <= 0 or C >= W:
-            (M2, I2, ch2, nv2), rows = lax.scan(
-                _step, c0, (toks, eqns, valid), unroll=unroll)
+            (M2, I2), rows = lax.scan(
+                _step, c0, (toks, valid), unroll=unroll)
         else:
             # DYNAMIC TRIP COUNT. The scan above is `window` long no matter
             # what `count` is -- on the TLM flagship a median 78-token delta
@@ -2712,8 +2704,8 @@ class Agent(eqx.Module):
             # ceil(count/C) of them.
             #
             # Bit-identical, not approximately: `_step` FREEZES the whole
-            # carry on an invalid step (`where(ok, M_l, M[li])`, `cumhist +
-            # 0*`, `nvalid + 0`, `row = 0`), so the steps this skips are
+            # carry on an invalid step (`where(ok, M_l, M[li])`, `row = 0`),
+            # so the steps this skips are
             # provably no-ops, and `rows` is written into the SAME full-width
             # zero buffer the scan produced, so every downstream reduction
             # (segment_sum, cumsum, masked mean) sees the identical array.
@@ -2731,12 +2723,10 @@ class Agent(eqx.Module):
             if pad:
                 toks_p = jnp.concatenate(
                     [toks, jnp.zeros((pad,), toks.dtype)])
-                eqns_p = jnp.concatenate(
-                    [eqns, jnp.full((pad,), -1, eqns.dtype)])
                 valid_p = jnp.concatenate(
                     [valid, jnp.zeros((pad,), valid.dtype)])
             else:
-                toks_p, eqns_p, valid_p = toks, eqns, valid
+                toks_p, valid_p = toks, valid
             _trip = count if budget is None else jnp.asarray(
                 budget, jnp.int32)
             nb = jnp.minimum(
@@ -2759,14 +2749,13 @@ class Agent(eqx.Module):
                 # zero. The zero rows are still materialised at full width, so
                 # every downstream reduction sees the identical array.
                 b_toks = toks_p.reshape(nb_max, C)
-                b_eqns = eqns_p.reshape(nb_max, C)
                 b_valid = valid_p.reshape(nb_max, C)
 
                 def _chunk_d(c, xs):
-                    i, bt, be, bv = xs
+                    i, bt, bv = xs
 
                     def _run(c):
-                        return lax.scan(_step, c, (bt, be, bv), unroll=unroll)
+                        return lax.scan(_step, c, (bt, bv), unroll=unroll)
 
                     def _skip(c):
                         return c, jnp.zeros((C, self.embd_dim), jnp.float32)
@@ -2790,37 +2779,34 @@ class Agent(eqx.Module):
                          if os.environ.get(
                              "ALPHAGRAD_LOSS_EXTEND_REMAT", "1") != "0"
                          else _chunk_d)
-                (M2, I2, ch2, nv2), rows_b = lax.scan(
+                (M2, I2), rows_b = lax.scan(
                     _body, c0,
-                    (jnp.arange(nb_max, dtype=jnp.int32),
-                     b_toks, b_eqns, b_valid))
+                    (jnp.arange(nb_max, dtype=jnp.int32), b_toks, b_valid))
                 rows = rows_b.reshape(nb_max * C, -1)[:W]
-                new_carry = EncCarry(M=M2, I=I2, cumhist=ch2, nvalid=nv2,
-                                     pos=carry.pos + count)
-                return new_carry, rows, valid, eqns
+                new_carry = EncCarry(M=M2, I=I2, pos=carry.pos + count)
+                return new_carry, rows, valid
 
             def _chunk(st):
-                i, M, I, ch, nv, rows = st
+                i, M, I, rows = st
                 off = i * C
 
                 def _sl(a):
                     return lax.dynamic_slice(a, (off,), (C,))
 
-                (M2, I2, ch2, nv2), r = lax.scan(
-                    _step, (M, I, ch, nv),
-                    (_sl(toks_p), _sl(eqns_p), _sl(valid_p)), unroll=unroll)
-                return (i + 1, M2, I2, ch2, nv2,
+                (M2, I2), r = lax.scan(
+                    _step, (M, I), (_sl(toks_p), _sl(valid_p)),
+                    unroll=unroll)
+                return (i + 1, M2, I2,
                         lax.dynamic_update_slice(rows, r, (off, 0)))
 
-            _i, M2, I2, ch2, nv2, rows = lax.while_loop(
+            _i, M2, I2, rows = lax.while_loop(
                 lambda st: st[0] < nb, _chunk,
                 (jnp.zeros((), jnp.int32),) + c0
                 + (jnp.zeros((nb_max * C, self.embd_dim), jnp.float32),))
             rows = rows[:W]
 
-        new_carry = EncCarry(M=M2, I=I2, cumhist=ch2, nvalid=nv2,
-                             pos=carry.pos + count)
-        return new_carry, rows, valid, eqns
+        new_carry = EncCarry(M=M2, I=I2, pos=carry.pos + count)
+        return new_carry, rows, valid
 
     def heads_from_memory(
         self,
@@ -2894,7 +2880,6 @@ class Agent(eqx.Module):
         factor_tables: FactorTables,
         op_legality_override,  # (NUM_OPS,) float32 — multiplied into op_legal (e.g. zeros COMPRESS)
         key,
-        eqn_ids=None,
         cached_encoding=None,
         preference=None,
         vertex_temperature=None,
@@ -2929,7 +2914,6 @@ class Agent(eqx.Module):
         else:
             vertex_logits, vertex_contexts, value = self.encode(
                 tokens,
-                eqn_ids=eqn_ids,
                 preference=preference,
                 key=net_key,
             )
@@ -3143,8 +3127,7 @@ class Agent(eqx.Module):
                 # gathers zero contexts, and the blind `sample` path above
                 # already used the vertex context for both slots.
                 f_ends = jnp.zeros((_F, 2), jnp.int32)
-                f_dt = jnp.zeros((MAX_DELTA_TOKENS,), jnp.int32)
-                f_de = -jnp.ones((MAX_DELTA_TOKENS,), jnp.int32)
+                f_dt = jnp.zeros((MAX_DELTA_TOKENS,), DELTA_TOKEN_DTYPE)
                 _fl_tail = ()   # no live-face stream -> no per-face tail
             else:
                 if self.micro_action_policy is None:
@@ -3182,8 +3165,8 @@ class Agent(eqx.Module):
                     _fctx, _rs1 = _fl_out[-2:]
                     _fl_out = _fl_out[:-2]
                 (fa, face_logp, face_ent, f_cnt, f_dt,
-                 f_de, f_ends) = _fl_out[:7]
-                _fl_tail = _fl_out[7:]  # (f_eslots, f_ewr)? + (f_heads)?
+                 f_ends) = _fl_out[:6]
+                _fl_tail = _fl_out[6:]  # (f_eslots, f_ewr)? + (f_heads)?
                 if face_decide_fn is not None:
                     # STAGE 2 (ticket .59 fault 2, finding 75). The loop above
                     # drew every slot against masks read BEFORE any decision:
@@ -3249,20 +3232,22 @@ class Agent(eqx.Module):
                     f_pair, f_comp = _pair2, _comp2
                     f_sizes, f_quant, f_nout = _sizes2, _quant2, _nout2
             face_out = (fa, face_logp, face_ent, f_pair, f_comp, f_valid,
-                        f_cnt, f_dt, f_de, f_ends)
+                        f_cnt, f_dt, f_ends)
             # --face-edge-mem appends the read slots + write metadata;
             # --face-read appends the per-face approx-echo prefix lengths,
             # always LAST. Both conditional so the flag-off tuple (and
-            # az_gumbel's 10-element unpack) is untouched.
+            # az_gumbel's leading unpack) is untouched.
             face_out = face_out + tuple(_fl_tail)
             # --per-face-masks appends the two ORACLE arrays the head masked
             # with, so the rollout can STORE them: they enter the masks, so
             # the loss must re-mask with the identical values or the PPO ratio
             # is not 1 at epoch 0 -- the same reason f_pair/f_comp/f_valid ride
             # out through this tuple. Appended after the _face_loop tail so
-            # the historical [:10] / [10:12] slices keep meaning what they did;
-            # the --face-read read moves from [-1] to [-3] and the caller
-            # computes that offset explicitly.
+            # the [:9] / [9:11] slices keep meaning what they did (they were
+            # [:10] / [10:12] before the equation-id buffer was removed from
+            # this tuple); the --face-read read sits at [-3] when
+            # --per-face-masks is on and the caller computes that offset
+            # explicitly.
             if f_sizes is not None:
                 face_out = face_out + (f_sizes, f_quant)
 
@@ -3288,7 +3273,7 @@ class Agent(eqx.Module):
     # stored decisions off the STORED chunks. They must stay gate for gate
     # identical or the ratio is not 1 at epoch 0.
     # ------------------------------------------------------------------
-    def _face_encode(self, carry, tokens, eqns, count, pool_from=None):
+    def _face_encode(self, carry, tokens, count, pool_from=None):
         """Extend the side carry by one face's chunk; ``(carry, summary)``.
 
         ``pool_from`` (--face-read own-span-mean / last-row) is the chunk's
@@ -3312,8 +3297,8 @@ class Agent(eqx.Module):
         _mode = _FACE_READ[0]
 
         def _run(c):
-            c2, rows, valid, _e = self.encode_extend(
-                c, tokens, eqns, count, window=MAX_DELTA_TOKENS, start=0)
+            c2, rows, valid = self.encode_extend(
+                c, tokens, count, window=MAX_DELTA_TOKENS, start=0)
             # THE SAME SCATTER, KEYED BY FACE. One chunk is one segment, so
             # this is `_vmem.scatter` with a single key -- the identical
             # primitive the vertex slots are built from, and it has no
@@ -3483,7 +3468,11 @@ class Agent(eqx.Module):
                jnp.array(0.0), jnp.zeros((F,), jnp.int32),
                jnp.zeros((F,), jnp.int32),
                -jnp.ones((F, S, 3), jnp.int32), wire0,
-               jnp.zeros((W,), jnp.int32), -jnp.ones((W,), jnp.int32),
+               # NARROW ID WIRE: the face stream carries the SAME ids as the
+               # step delta (a chunk is a slice of the same emission), so it
+               # carries the same dtype. ONE buffer: the parallel equation-id
+               # buffer went with the ids. See env.py's "THE NARROW ID WIRE".
+               jnp.zeros((W,), DELTA_TOKEN_DTYPE),
                jnp.asarray(0, jnp.int32), jnp.zeros((F, 2), jnp.int32))
         if _EM:
             # (F, 2) read slots [lhs, rhs] + (F, 2) write meta [res, head].
@@ -3500,8 +3489,8 @@ class Agent(eqx.Module):
             # the carry alone and returns the zero summary) plus whatever the
             # endpoint / edge reads concatenate below.
             _, _summ0 = self._face_encode(
-                enc_carry, jnp.zeros((W,), jnp.int32),
-                -jnp.ones((W,), jnp.int32), jnp.asarray(0, jnp.int32))
+                enc_carry, jnp.zeros((W,), DELTA_TOKEN_DTYPE),
+                jnp.asarray(0, jnp.int32))
             _D = int(_summ0.shape[-1])
             if getattr(pol, "endpoint_read", False):
                 _D += 2 * int(endpoint_rows.shape[1])
@@ -3515,10 +3504,10 @@ class Agent(eqx.Module):
             _hds = st[-1] if _RH else None
             _st_core = st[:-1] if _RH else st
             if _EM:
-                (f, carry, logp, ent, skips, cnts, rs, wa, ftok, feqn, off,
+                (f, carry, logp, ent, skips, cnts, rs, wa, ftok, off,
                  fends, fesl, fwr) = _st_core
             else:
-                (f, carry, logp, ent, skips, cnts, rs, wa, ftok, feqn, off,
+                (f, carry, logp, ent, skips, cnts, rs, wa, ftok, off,
                  fends) = _st_core
             # The chunk callback hands back the face's ENDPOINT VERTICES with
             # its tokens: the face enumeration that produced the chunk keyed
@@ -3531,9 +3520,9 @@ class Agent(eqx.Module):
                 # --face-edge-mem: the callback additionally resolves the
                 # face's operand edges against the host slot table --
                 # einfo = [lhs_slot, rhs_slot, res_slot, head].
-                tk_f, eq_f, ct_f, ends_f, ei_f = _cb
+                tk_f, ct_f, ends_f, ei_f = _cb
             else:
-                tk_f, eq_f, ct_f, ends_f = _cb
+                tk_f, ct_f, ends_f = _cb
             # Concatenate this chunk into the step's face stream -- the
             # EXACT tokens the head reads. The final emission is NOT a
             # substitute: chunk f's contraction is deliberately unhooked
@@ -3548,16 +3537,14 @@ class Agent(eqx.Module):
             _ar_w = jnp.arange(W, dtype=jnp.int32)
             _m = _ar_w < ct_eff
             ftok = ftok.at[off + _ar_w].set(
-                jnp.where(_m, tk_f, 0), mode="drop")
-            feqn = feqn.at[off + _ar_w].set(
-                jnp.where(_m, eq_f, -1), mode="drop")
+                jnp.where(_m, tk_f, jnp.asarray(0, ftok.dtype)), mode="drop")
             # The prefix cannot outrun the buffer clamp: if the chunk was
             # itself clamped to `ct_eff` the pool must start no later than
             # its end, or an own-span read would pool nothing where the
             # replay (which keys on the STORED count) pools something.
             hd_eff = (jnp.minimum(jnp.asarray(hd_f, jnp.int32), ct_eff)
                       if _RH else None)
-            carry, summ = self._face_encode(carry, tk_f, eq_f, ct_eff,
+            carry, summ = self._face_encode(carry, tk_f, ct_eff,
                                             pool_from=hd_eff)
             if getattr(pol, "endpoint_read", False):
                 # ENDPOINT-SLOT READ (--face-endpoint-read,
@@ -3605,7 +3592,7 @@ class Agent(eqx.Module):
             cnts = cnts.at[f].set(ct_eff)
             wa = tuple(w.at[f].set(row[k]) for w, k in zip(wa, _WK))
             out = (f + 1, carry, logp + lp, ent + e, skips, cnts, rs, wa,
-                   ftok, feqn, off + ct_eff, fends.at[f].set(ends_f))
+                   ftok, off + ct_eff, fends.at[f].set(ends_f))
             if _EM:
                 out = out + (fesl.at[f].set(ei_f[:2]),
                              fwr.at[f].set(ei_f[2:4]))
@@ -3619,17 +3606,19 @@ class Agent(eqx.Module):
         _fctx = None
         if want_stage2:
             _st, _fctx = _st[:-1], _st[-1]
-        (_f, _c, logp, ent, skips, cnts, _rs, wa, ftok, feqn,
-         _off, fends) = _st[:12]
+        (_f, _c, logp, ent, skips, cnts, _rs, wa, ftok,
+         _off, fends) = _st[:11]
         fa = FaceAction(skip=skips, **dict(zip(_WK, wa)))
         _rec.check(fa, pol.approx_add, F, where="Agent._face_loop")
-        # Layout: (fa, logp, ent, cnts, ftok, feqn, fends) then the edge-mem
-        # pair (if any) then the face heads (if any) -- heads LAST so the
-        # historical `[:7]` / edge `[7:9]` unpacks are untouched. Under
-        # ``want_stage2`` the contexts and the stage-1 rows come LAST of all
-        # and the caller pops them before it reads the tail.
-        _tail = tuple(_st[12:])
-        out = (fa, logp, ent, cnts, ftok, feqn, fends) + _tail
+        # Layout: (fa, logp, ent, cnts, ftok, fends) then the edge-mem pair
+        # (if any) then the face heads (if any) -- heads LAST. The equation-id
+        # buffer used to sit between ``ftok`` and ``fends``, so every
+        # positional unpack of this tuple shifted by one when it was removed;
+        # ``_face_loop``'s caller in ``rollout_fn`` is the only one.
+        # Under ``want_stage2`` the contexts and the stage-1 rows come LAST of
+        # all and the caller pops them before it reads the tail.
+        _tail = tuple(_st[11:])
+        out = (fa, logp, ent, cnts, ftok, fends) + _tail
         if want_stage2:
             out = out + (_fctx, _rs)
         return out
@@ -3653,7 +3642,8 @@ class Agent(eqx.Module):
         design's F scans over F stored windows. Gradient reaches palimpsa
         through this scan; truncation at the stored carry, as everywhere.
 
-        ``face_chunks`` is ``(counts (F,), tokens (W,), eqns (W,))``.
+        ``face_chunks`` is ``(counts (F,), tokens (W,))`` -- a PAIR since the
+        equation-id buffer was removed.
 
         ``face_bound`` / ``face_win_budget`` are the batch-wide (UNBATCHED,
         so the predicates stay real ``cond``s under the loss's vmap) bounds on
@@ -3664,7 +3654,7 @@ class Agent(eqx.Module):
         """
         pol = self.face_path_policy
         F = pol.max_faces
-        f_cnt, f_toks, f_eqns = face_chunks
+        f_cnt, f_toks = face_chunks
         if getattr(pol, "endpoint_read", False) and (
                 endpoint_rows is None or face_ends is None):
             raise ValueError(
@@ -3726,7 +3716,7 @@ class Agent(eqx.Module):
             _ends = jnp.cumsum(f_cnt.astype(jnp.int32))
             _C, _nb, _pad_len = _fold.plan_chunks(MAX_DELTA_TOKENS)
 
-            def _face_fold(acc, rows_c, valid_c, _eqns_c, off):
+            def _face_fold(acc, rows_c, valid_c, off):
                 s_acc, c_acc = acc
                 pos = off + jnp.arange(rows_c.shape[0], dtype=jnp.int32)
                 fid = jnp.searchsorted(_ends, pos, side="right").astype(
@@ -3739,15 +3729,15 @@ class Agent(eqx.Module):
                 return (s_acc + s_c, c_acc + c_c)
 
             _, (_fs, _fc) = _fold.extend_fold(
-                self, enc_carry, f_toks, f_eqns, total,
+                self, enc_carry, f_toks, total,
                 window=MAX_DELTA_TOKENS,
                 init_acc=(jnp.zeros((F, self.embd_dim), jnp.float32),
                           jnp.zeros((F,), jnp.float32)),
                 fold_fn=_face_fold, budget=face_win_budget)
             face_latents = _fs / jnp.maximum(_fc, 1.0)[:, None]
         else:
-            _, rows, _valid, _e = self.encode_extend(
-                enc_carry, f_toks, f_eqns, total,
+            _, rows, _valid = self.encode_extend(
+                enc_carry, f_toks, total,
                 window=MAX_DELTA_TOKENS, start=0,
                 chunk=(None if face_win_budget is not None else 0),
                 budget=face_win_budget)
@@ -3872,7 +3862,6 @@ class Agent(eqx.Module):
         axis_valid_mask,
         factor_tables: FactorTables,
         key,
-        eqn_ids=None,
         cached_encoding=None,
         preference=None,
         pair_valid=None,       # stored live DIAG mask for the chosen vertex
@@ -3890,7 +3879,7 @@ class Agent(eqx.Module):
         # trajectory stores it for `participation_mask` on the rollout side.
         face_ends=None,        # stored (F, 2) endpoint vertex ids (1-based)
         precomputed=None,      # 3b: (vertex_logits, vertex_contexts, value) from the carry path
-        face_chunks=None,      # (counts, emission tokens, emission eqns)
+        face_chunks=None,      # (counts, emission tokens)
         face_carry=None,       # carry2: where the sampling side carry branched
         face_bound=None,       # batch-wide live-face bound (unbatched)
         face_win_budget=None,  # batch-wide emission-length bound (unbatched)
@@ -3920,8 +3909,7 @@ class Agent(eqx.Module):
                 _vl, _vc, _val = precomputed
             else:
                 _vl, _vc, _val = self.encode(
-                    tokens, eqn_ids=eqn_ids,
-                    preference=preference, key=key)
+                    tokens, preference=preference, key=key)
             _vd = jnn.softmax(
                 _mask_vertex_logits(_vl, vertex_avail_mask), axis=-1)
             return (
@@ -3945,7 +3933,6 @@ class Agent(eqx.Module):
         else:
             vertex_logits, vertex_contexts, value = self.encode(
                 tokens,
-                eqn_ids=eqn_ids,
                 preference=preference,
                 key=key,
             )
@@ -5097,7 +5084,13 @@ def make_argparser() -> argparse.ArgumentParser:
     )
 
     # Network architecture
-    p.add_argument("--vocab-size", type=int, default=256)
+    # THE POLICY EMBEDDING's row count. It must be at least the TOKENIZER's
+    # id space, because an out-of-range gather does not raise in JAX -- it
+    # CLAMPS, and the policy silently reads the wrong row. The default IS the
+    # tokenizer's id space (`common.token_vocab.incr_token_vocab`), so the
+    # check in `main()` passes by construction unless somebody overrides one
+    # of the two.
+    p.add_argument("--vocab-size", type=int, default=incr_token_vocab())
     p.add_argument("--embd-dim", type=int, default=32)
     p.add_argument(
         "--op-embd-dim",
@@ -6733,6 +6726,7 @@ def main():
     # Under ALPHAGRAD_INCREMENTAL_TOKENS=1 the env's tokenizer guards its id
     # space against this embedding size (an out-of-range gather CLAMPS
     # silently); publish it where the host callback can see it.
+    check_embedding_covers_tokenizer(args.vocab_size)
     os.environ["ALPHAGRAD_VOCAB_SIZE"] = str(int(args.vocab_size))
     # QUALITY CHANNEL — published to the ENVIRONMENT, not passed as an
     # argument, because the Ray measure actors run env._callback in their own
@@ -6886,10 +6880,9 @@ def main():
     # rather than a device-side non-zero count over a padded buffer (which is
     # what token id 0, the literal '-', used to corrupt). Sliced to its exact
     # length, so the base encode scan is exactly as long as the base is.
-    _BASE_TOK, _BASE_EQN, _BASE_N = env.base_observation()
+    _BASE_TOK, _BASE_N = env.base_observation()
     _BASE_W = max(int(_BASE_N), 1)
     _BASE_TOK = _BASE_TOK[:_BASE_W]
-    _BASE_EQN = _BASE_EQN[:_BASE_W]
     # Per-token owning VERTEX for the base stream (1-based, 0 = none). It is
     # the KEY of the base scatter -- which vertex slot each base row lands in
     # -- and it is read by the rollout, the loss and AZ, so it is resolved
@@ -7113,6 +7106,13 @@ def main():
             warm_after=3,
             respawn_factory=_spawn,
             max_tokens=int(env.obs_width),
+            # THE WIRE, from the env that declares it. Under delta_obs the
+            # callback's tokens are uint8 and there is NO equation-id buffer,
+            # so a pool that preallocated an int32 pair would hand
+            # `io_callback` the wrong arity AND the wrong dtype (and a
+            # sentinel row of the wrong shape on every timeout).
+            token_dtype=env.wire_token_dtype,
+            emit_eqn_ids=not env.config.delta_obs,
             num_rewards=int(NUM_REWARDS),
             cosine_sim_idx=int(REWARD_INDEX["cosine_sim"]),
             frob_residual_idx=int(REWARD_INDEX["frob_residual"]),
@@ -7741,7 +7741,7 @@ def main():
     if getattr(args, "live_faces", False):
         _LIVE_FACES = build_live_face_stream(
             _oracle_jaxpr, _oracle_argnums, _oracle_consts, _oracle_args,
-            vocab=int(os.environ.get("ALPHAGRAD_INCR_TOKEN_VOCAB", "512")),
+            vocab=incr_token_vocab(),
             max_faces=_F_FACES, max_axes=_oracle_N,
             # A chunk is a slice of the step delta, so the delta cap is the
             # one honest window: truncation becomes impossible whenever the
@@ -8437,7 +8437,7 @@ def main():
         # base stream itself; without it every base row lands in the global
         # slot and no vertex has any content of its own.
         _enc_base = _carry_stream.init_carry(
-            agent, _BASE_TOK, _BASE_EQN, _BASE_N,
+            agent, _BASE_TOK, _BASE_N,
             window=_BASE_W, total_v=total_v, embd_dim=args.embd_dim,
             base_owners=_BASE_OWN,
         )[0]
@@ -8456,8 +8456,7 @@ def main():
         # elimination emitted it).
         _init_post = _carry_stream.advance(
             agent, *_init_pre,
-            env_state.delta_tokens, env_state.delta_eqns,
-            env_state.delta_count,
+            env_state.delta_tokens, env_state.delta_count,
             # `delta_owner` as step_fn computes it on iteration 0, spelled
             # out: `elim_order` is all zeros at scan entry, so its lookup
             # arm is 0 and the step_count == 0 arm is -1.
@@ -8516,7 +8515,6 @@ def main():
                 jnp.array(-1, jnp.int32),
             ).astype(jnp.int32)
             delta_tok = state.delta_tokens
-            delta_eqn = state.delta_eqns
             delta_count = state.delta_count
             # prof/envcb: scan glue (avail mask, key split, the delta unpack
             # above). Under the partial mark anchor this key used to absorb
@@ -8658,7 +8656,6 @@ def main():
                     factor_tables,
                     op_legality_override,
                     sample_key,
-                    eqn_ids=None,
                     preference=preference if args.preference_conditioned else None,
                     oracle_pair_all=oracle_pair_all,
                     oracle_comp_all=oracle_comp_all,
@@ -8687,9 +8684,9 @@ def main():
                 if face_out is not None:
                     (face_action, face_old_logp, _face_ent, face_pair_v,
                      face_comp_v, face_valid_v, face_cnt_v, face_dt_v,
-                     face_de_v, face_ends_v) = face_out[:10]
+                     face_ends_v) = face_out[:9]
                     if _EDGE_MEM:
-                        face_eslots_v, face_ewr_v = face_out[10:12]
+                        face_eslots_v, face_ewr_v = face_out[9:11]
                     # --per-face-masks appends its two arrays AFTER the
                     # _face_loop tail, so --face-read's "always last" becomes
                     # "last before those two". Computed, not hardcoded, so the
@@ -8741,8 +8738,8 @@ def main():
                     face_valid_v = jnp.zeros((ENV_MAX_FACES,), jnp.float32)
                     face_ends_v = jnp.zeros((ENV_MAX_FACES, 2), jnp.int32)
                     face_cnt_v = jnp.zeros((ENV_MAX_FACES,), jnp.int32)
-                    face_dt_v = jnp.zeros((MAX_DELTA_TOKENS,), jnp.int32)
-                    face_de_v = -jnp.ones((MAX_DELTA_TOKENS,), jnp.int32)
+                    face_dt_v = jnp.zeros((MAX_DELTA_TOKENS,),
+                                          DELTA_TOKEN_DTYPE)
                     if _EDGE_MEM:
                         face_eslots_v = -jnp.ones(
                             (ENV_MAX_FACES, 2), jnp.int32)
@@ -8854,7 +8851,7 @@ def main():
                 (nxt_carry, nv_s_raw, nv_c_raw, nem_s_raw,
                  nem_c_raw) = _carry_stream.advance(
                     agent, enc_carry2, vmem_s2, vmem_c2,
-                    next_state.delta_tokens, next_state.delta_eqns,
+                    next_state.delta_tokens,
                     next_state.delta_count, vertex_idx.astype(jnp.int32),
                     window=MAX_DELTA_TOKENS, participants=step_part,
                     edge_mem=(emem_s2, emem_c2), edge_ids=_wr_ids,
@@ -8862,7 +8859,7 @@ def main():
             else:
                 nxt_carry, nv_s_raw, nv_c_raw = _carry_stream.advance(
                     agent, enc_carry2, vmem_s2, vmem_c2,
-                    next_state.delta_tokens, next_state.delta_eqns,
+                    next_state.delta_tokens,
                     next_state.delta_count, vertex_idx.astype(jnp.int32),
                     window=MAX_DELTA_TOKENS, participants=step_part,
                 )
@@ -8886,12 +8883,11 @@ def main():
             # encoding by the same delta extension.
             _enc_fields = dict(
                 enc_M=enc_carry.M, enc_I=enc_carry.I,
-                enc_cumhist=enc_carry.cumhist,
-                enc_nvalid=enc_carry.nvalid, enc_pos=enc_carry.pos,
+                enc_pos=enc_carry.pos,
                 vmem_sums=vmem_s, vmem_counts=vmem_c,
                 delta_owner=delta_owner,
                 delta_participants=prev_part,
-                delta_tokens=delta_tok, delta_eqns=delta_eqn,
+                delta_tokens=delta_tok,
                 delta_count=jnp.asarray(delta_count, jnp.int32),
             )
 
@@ -8992,7 +8988,6 @@ def main():
                 face_old_logp=jnp.asarray(face_old_logp, jnp.float32),
                 face_counts=face_cnt_v,
                 face_delta_tokens=face_dt_v,
-                face_delta_eqns=face_de_v,
                 **_enc_fields,
                 **_probe_fields,
                 **_vp_fields,
@@ -9157,7 +9152,6 @@ def main():
                 ax_vm,
                 factor_tables,
                 k,
-                eqn_ids=None,
                 cached_encoding=None,
                 preference=pref_or_none(pref),
                 pair_valid=pv,
@@ -9231,18 +9225,18 @@ def main():
         # palimpsa state after the base stream, recomputed under the current
         # parameters rather than read back from the trajectory.
         _init0 = _carry_stream.init_carry(
-            agent, _BASE_TOK, _BASE_EQN, _BASE_N,
+            agent, _BASE_TOK, _BASE_N,
             window=_BASE_W, total_v=total_v, embd_dim=args.embd_dim,
             base_owners=_BASE_OWN,
         )
         _base_carry = _init0[0]
         _base_mem = _init0[1:]
 
-        def _advance_k(carry2, vs2, vc2, dtok_k, deqn_k, dcnt_k, own_k,
+        def _advance_k(carry2, vs2, vc2, dtok_k, dcnt_k, own_k,
                        part_k):
             return _carry_stream.advance(
                 agent, carry2, vs2, vc2,
-                dtok_k, deqn_k, dcnt_k, own_k,
+                dtok_k, dcnt_k, own_k,
                 window=MAX_DELTA_TOKENS, participants=part_k,
                 # The loss is reverse-differentiated through this extend,
                 # so it cannot use the rollout's while_loop -- it passes
@@ -9277,7 +9271,7 @@ def main():
             else _advance_k
         )
 
-        def _advance_k_edge(carry2, vs2, vc2, dtok_k, deqn_k, dcnt_k, own_k,
+        def _advance_k_edge(carry2, vs2, vc2, dtok_k, dcnt_k, own_k,
                             part_k, es, ec, eids):
             # `_advance_k` + the --face-edge-mem write, in the SAME fold
             # (advance's edge_mem arm) -- so the loss re-derives the edge
@@ -9286,7 +9280,7 @@ def main():
             # scatter.
             return _carry_stream.advance(
                 agent, carry2, vs2, vc2,
-                dtok_k, deqn_k, dcnt_k, own_k,
+                dtok_k, dcnt_k, own_k,
                 window=MAX_DELTA_TOKENS, participants=part_k,
                 chunk=None, budget=_delta_budget,
                 edge_mem=(es, ec), edge_ids=eids,
@@ -9298,9 +9292,9 @@ def main():
             else _advance_k_edge
         )
 
-        def _carry_heads(M, I, ch, nv, pos, owner, part, vs, vc,
-                         pref, dtok, deqn, dcnt, *em):
-            carry2 = EncCarry(M=M, I=I, cumhist=ch, nvalid=nv, pos=pos)
+        def _carry_heads(M, I, pos, owner, part, vs, vc,
+                         pref, dtok, dcnt, *em):
+            carry2 = EncCarry(M=M, I=I, pos=pos)
             vs2, vc2 = vs, vc
             if _EDGE_MEM:
                 # --face-edge-mem: (anchor sums, anchor counts, write cnt,
@@ -9321,13 +9315,13 @@ def main():
                         MAX_DELTA_TOKENS)
                     carry2, vs2, vc2, es2, ec2 = _advance_edge_step(
                         carry2, vs2, vc2,
-                        dtok[_k], deqn[_k], dcnt[_k], owner[_k], part[_k],
+                        dtok[_k], dcnt[_k], owner[_k], part[_k],
                         es2, ec2, _eids,
                     )
                 else:
                     carry2, vs2, vc2 = _advance_step(
                         carry2, vs2, vc2,
-                        dtok[_k], deqn[_k], dcnt[_k], owner[_k], part[_k],
+                        dtok[_k], dcnt[_k], owner[_k], part[_k],
                     )
             # carry2 is where the sampling side carry branched: the
             # stored pre-step carry advanced past the PREVIOUS delta.
@@ -9354,7 +9348,7 @@ def main():
                 _out = _out + (_vmem.read(es2, ec2),)
             return _out
 
-        def _episode_heads(dtok, deqn, dcnt, own, part, pref, *em):
+        def _episode_heads(dtok, dcnt, own, part, pref, *em):
             """ONE episode, ONE `lax.scan`: gradient horizon T, not K.
 
             THE RECURRENCE IS ALREADY IN THE TRAJECTORY. The rollout carries
@@ -9388,16 +9382,16 @@ def main():
             def _body(state, x):
                 if _EDGE_MEM:
                     c2, s2, n2, es, ec = state
-                    _dt, _de, _dc, _ow, _pa, _pr, _wc, _wh, _ws, _wn = x
+                    _dt, _dc, _ow, _pa, _pr, _wc, _wh, _ws, _wn = x
                     _eids = _edge_write_ids(_wc, _wh, _ws, _wn, _dc,
                                             MAX_DELTA_TOKENS)
                     c2, s2, n2, es, ec = _advance_k_edge(
-                        c2, s2, n2, _dt, _de, _dc, _ow, _pa, es, ec, _eids)
+                        c2, s2, n2, _dt, _dc, _ow, _pa, es, ec, _eids)
                 else:
                     c2, s2, n2 = state
-                    _dt, _de, _dc, _ow, _pa, _pr = x
+                    _dt, _dc, _ow, _pa, _pr = x
                     c2, s2, n2 = _advance_k(
-                        c2, s2, n2, _dt, _de, _dc, _ow, _pa)
+                        c2, s2, n2, _dt, _dc, _ow, _pa)
                 # The heads run INSIDE the scan, off this step's POST memory:
                 # the K path's `heads` call, once per step, unchanged.
                 out = _carry_stream.heads(
@@ -9423,7 +9417,7 @@ def main():
             )
             _vs0, _vc0 = _carry_stream.zero_memory(total_v, args.embd_dim)
             _st0 = (_base_carry, _vs0, _vc0)
-            _xs = (dtok, deqn, dcnt, own, part, pref)
+            _xs = (dtok, dcnt, own, part, pref)
             if _EDGE_MEM:
                 # The episode scan starts from an EMPTY edge memory (there
                 # is no anchor to read back: the whole point of grad-window
@@ -9446,14 +9440,14 @@ def main():
                      _ep_batch.delta_tokens.shape[-1]), flush=True)
             # vmap over ENVS (the sequence axis is the scan's), then flatten
             # (env, step) so everything downstream sees the flat batch it
-            # always has. The stored anchors -- enc_M / enc_I / enc_cumhist /
-            # enc_nvalid / enc_pos / vmem_sums / vmem_counts -- are NOT read
+            # always has. The stored anchors -- enc_M / enc_I / enc_pos /
+            # vmem_sums / vmem_counts -- are NOT read
             # here: that is the whole point, and `full_batch` carries them as
             # dead placeholders on this path.
             _heads_out = jax.tree_util.tree_map(
                 lambda x: x.reshape(-1, *x.shape[2:]),
                 jax.vmap(_episode_heads)(
-                    _ep_batch.delta_tokens, _ep_batch.delta_eqns,
+                    _ep_batch.delta_tokens,
                     _ep_batch.delta_count, _ep_batch.delta_owner,
                     _ep_batch.delta_participants, _ep_batch.preference,
                     *((_ep_batch.delta_wr_cnt, _ep_batch.delta_wr_head,
@@ -9463,12 +9457,11 @@ def main():
             )
         else:
             _heads_out = jax.vmap(_carry_heads)(
-                batch.enc_M, batch.enc_I, batch.enc_cumhist,
-                batch.enc_nvalid, batch.enc_pos, batch.delta_owner,
+                batch.enc_M, batch.enc_I, batch.enc_pos, batch.delta_owner,
                 batch.delta_participants,
                 batch.vmem_sums, batch.vmem_counts,
                 batch.preference,
-                batch.delta_tokens, batch.delta_eqns, batch.delta_count,
+                batch.delta_tokens, batch.delta_count,
                 *((batch.emem_sums, batch.emem_counts,
                    batch.delta_wr_cnt, batch.delta_wr_head,
                    batch.delta_wr_slot, batch.delta_wr_n)
@@ -9553,7 +9546,7 @@ def main():
                 batch.face_endpoints,
                 pc_logits, pc_ctx, pc_value,
                 batch.face_counts,
-                batch.face_delta_tokens, batch.face_delta_eqns,
+                batch.face_delta_tokens,
                 pc_carry,
                 *((pc_eprows,) if _EP_READ else ()),
                 *((pc_emrows, batch.face_eslots) if _EDGE_MEM else ()),
@@ -9709,7 +9702,6 @@ def main():
                     pc_carry,
                     batch.face_counts,
                     batch.face_delta_tokens,
-                    batch.face_delta_eqns,
                     *((pc_eprows,) if _EP_READ else ()),
                     *((pc_emrows, batch.face_eslots) if _EDGE_MEM else ()),
                     *((batch.face_heads,) if _FACE_HEADS else ()),
@@ -10569,12 +10561,11 @@ def main():
         _FULL_SCAN_EP = int(getattr(args, "grad_window", 1)) == 0
         if _FULL_SCAN_EP:
             _w_dtok = traj.delta_tokens
-            _w_deqn = traj.delta_eqns
             _w_dcnt = traj.delta_count
             _w_down = traj.delta_owner
             _w_dpart = traj.delta_participants
             _dead = jnp.zeros(traj.delta_count.shape + (1,), jnp.float32)
-            _w_encM = _w_encI = _w_ench = _w_encn = _w_encp = _dead
+            _w_encM = _w_encI = _w_encp = _dead
             _w_vs = _w_vc = _dead
             # --face-edge-mem: the episode scan re-derives the edge memory
             # from zeros, so there is no anchor; the write metadata rides
@@ -10592,15 +10583,12 @@ def main():
             _w_live = (_w_t >= 0)
             _w_anchor = _w_idx[:, 0]                            # (T,)
             _w_dtok = traj.delta_tokens[:, _w_idx]
-            _w_deqn = traj.delta_eqns[:, _w_idx]
             _w_dcnt = jnp.where(_w_live[None], traj.delta_count[:, _w_idx], 0)
             _w_down = traj.delta_owner[:, _w_idx]
             _w_dpart = jnp.where(_w_live[None, ..., None],
                                  traj.delta_participants[:, _w_idx], 0.0)
             _w_encM = traj.enc_M[:, _w_anchor]
             _w_encI = traj.enc_I[:, _w_anchor]
-            _w_ench = traj.enc_cumhist[:, _w_anchor]
-            _w_encn = traj.enc_nvalid[:, _w_anchor]
             _w_encp = traj.enc_pos[:, _w_anchor]
             _w_vs = traj.vmem_sums[:, _w_anchor]
             _w_vc = traj.vmem_counts[:, _w_anchor]
@@ -10653,7 +10641,6 @@ def main():
             face_old_logp=traj.face_old_logp,
             face_counts=traj.face_counts,
             face_delta_tokens=traj.face_delta_tokens,
-            face_delta_eqns=traj.face_delta_eqns,
             # --face-read: per-step, sliced by the same shuffle as
             # face_counts (both are (num_envs, T, MAX_FACES)); None when off.
             face_heads=traj.face_heads,
@@ -10663,13 +10650,10 @@ def main():
             face_quant=traj.face_quant,
             enc_M=_w_encM,
             enc_I=_w_encI,
-            enc_cumhist=_w_ench,
-            enc_nvalid=_w_encn,
             enc_pos=_w_encp,
             vmem_sums=_w_vs,
             vmem_counts=_w_vc,
             delta_tokens=_w_dtok,
-            delta_eqns=_w_deqn,
             delta_count=_w_dcnt,
             delta_owner=_w_down,
             delta_participants=_w_dpart,
@@ -11067,7 +11051,6 @@ def main():
             _attn_ent = attention_entropy_diagnostic(
                 agent,
                 _BASE_TOK,
-                _BASE_EQN,
                 traj.axis_state[0, 0],
                 traj.axis_valid_mask[0, 0],
             )
@@ -13255,7 +13238,7 @@ def main():
         # both are `base_memory(theta_old)` -- the loss recomputes the same
         # function, it does not read a stale copy of it.
         base_mem = _carry_stream.base_memory(
-            agent, _BASE_TOK, _BASE_EQN, _BASE_N,
+            agent, _BASE_TOK, _BASE_N,
             window=_BASE_W, total_v=total_v, embd_dim=args.embd_dim,
             base_owners=_BASE_OWN,
         )

@@ -121,7 +121,13 @@ class PalimpsaMixer(eqx.Module):
         nature of linear-attention; flag-gated so it is opt-in only.
       * ``bias`` (T5 relational bias on QK^T logits) has no analogue in the
         recurrence and is ignored. The relational structure is not injected in
-        the Palimpsa path.
+        the Palimpsa path AT ALL any more: the equation-id forget-gate
+        modulation (``rel_gate`` / ``_relational_gate_mod``) was REMOVED on
+        2026-09-13 together with the equation-id stream that fed it. It was
+        one zero-initialised scalar per token per head with no ablation
+        behind it, and it cost a whole parallel id buffer on the wire, in the
+        env state and in every stored trajectory. See
+        ``alphagrad.approx.common.token_vocab``.
       * ``mask`` is treated as a *padding* mask: a key/value token j that is
         masked-out for all queries (a padding column) is zeroed so it never
         contributes to the running state. The full pairwise (S,T) structure of
@@ -136,7 +142,6 @@ class PalimpsaMixer(eqx.Module):
     bias_proj: eqx.nn.Linear
     gate_proj: eqx.nn.Linear
     output_proj: eqx.nn.Linear
-    rel_gate: eqx.nn.Linear   # (3,) structural degree feats -> (H,) gate mod; zero-init
 
     g_raw: Array      # (H,) raw param; g = softplus(g_raw)
     Ip_raw: Array     # (H,) raw param; Ip = softplus(Ip_raw)
@@ -166,6 +171,10 @@ class PalimpsaMixer(eqx.Module):
         self.head_dim = embd_dim // num_heads
         self.chunk_size = chunk_size
 
+        # SEVEN keys, six used: `keys[6]` fed the deleted `rel_gate`. The split
+        # width is kept so every other projection draws the SAME initial
+        # weights it drew before the removal, which is what lets an old and a
+        # new run be compared at all.
         # D_K == D_V == head_dim, so the four projections all map embd->embd.
         self.query_proj = eqx.nn.Linear(embd_dim, embd_dim, key=keys[0])
         self.key_proj = eqx.nn.Linear(embd_dim, embd_dim, key=keys[1])
@@ -173,16 +182,6 @@ class PalimpsaMixer(eqx.Module):
         self.bias_proj = eqx.nn.Linear(embd_dim, embd_dim, key=keys[3])
         self.gate_proj = eqx.nn.Linear(embd_dim, num_heads, key=keys[4])
         self.output_proj = eqx.nn.Linear(embd_dim, embd_dim, key=keys[5])
-
-        # Relational gate modulation (same construction as BiPalimpsaMixer):
-        # 3 per-token DAG structural-degree features (same/earlier/later,
-        # normalised) -> per-head additive forget-gate term. ZERO-init
-        # (weight+bias) so the mixer starts as pure paper-Palimpsa and only
-        # deviates once the structural modulation learns to.
-        rg = eqx.nn.Linear(3, num_heads, key=keys[6])
-        rg = eqx.tree_at(lambda m: m.weight, rg, jnp.zeros_like(rg.weight))
-        rg = eqx.tree_at(lambda m: m.bias, rg, jnp.zeros_like(rg.bias))
-        self.rel_gate = rg
 
         # softplus(g_raw) ~= 0.05 -> slow forgetting / long memory at init.
         self.g_raw = jnp.full((num_heads,), -3.0, dtype=jnp.float32)
@@ -193,28 +192,6 @@ class PalimpsaMixer(eqx.Module):
         # where the unbounded one did and differs only in its tail.
         self.b_scale_raw = jnp.full((num_heads,), 1.1, dtype=jnp.float32)
 
-    def _relational_gate_mod(self, eqn_ids: Array, S: int) -> Array:
-        """Per-token additive gate modulation (S, H) from DAG relation degrees.
-
-        Identical construction to :meth:`BiPalimpsaMixer._relational_gate_mod`:
-        row-reduction of the same same/earlier/later relations the transformer
-        uses as a pairwise bias, reduced to a per-token structural feature
-        vector and mapped (zero-init) to a per-head gate term.
-        """
-        valid = (eqn_ids >= 0)
-        valid_pair = valid[:, None] & valid[None, :]
-        same = ((eqn_ids[:, None] == eqn_ids[None, :]) & valid_pair).astype(jnp.float32)
-        earlier = ((eqn_ids[:, None] > eqn_ids[None, :]) & valid_pair).astype(jnp.float32)
-        later = ((eqn_ids[:, None] < eqn_ids[None, :]) & valid_pair).astype(jnp.float32)
-        nvalid = jnp.maximum(jnp.sum(valid.astype(jnp.float32)), 1.0)
-        feats = jnp.stack([
-            jnp.sum(same, axis=1) / nvalid,
-            jnp.sum(earlier, axis=1) / nvalid,
-            jnp.sum(later, axis=1) / nvalid,
-        ], axis=-1)                                          # (S, 3)
-        feats = feats * valid.astype(jnp.float32)[:, None]   # pad tokens -> 0
-        return jax.vmap(self.rel_gate)(feats)                # (S, H)
-
     def __call__(
         self,
         query: Array,
@@ -223,7 +200,6 @@ class PalimpsaMixer(eqx.Module):
         *,
         bias: Optional[Array] = None,   # ignored (no recurrence analogue)
         mask: Optional[Array] = None,   # treated as a padding mask, see docstring
-        eqn_ids: Optional[Array] = None,  # used for the relational gate proxy
         key: Optional[PRNGKey] = None,
     ) -> Array:
         x = query                       # self-attention: query is the token seq
@@ -245,13 +221,10 @@ class PalimpsaMixer(eqx.Module):
         # precision semantics require.
         b = palimpsa_beta(
             jax.vmap(self.bias_proj)(x).reshape(S, H, d), self.b_scale_raw)
-        # Relational structural prior folded into the forget gate (mirrors
-        # BiPalimpsaMixer, but injected PRE-softplus — the cleaner form the
-        # bi docstring itself notes — so a zero gate_mod is an EXACT no-op:
-        # softplus(raw + 0) == softplus(raw), pure paper-Palimpsa at init).
+        # PURE paper-Palimpsa: the forget gate is a function of the token
+        # embedding and nothing else. The equation-id structural modulation
+        # that used to be added here is gone (see the class docstring).
         gt_raw = jax.vmap(self.gate_proj)(x)                # (S, H)
-        if eqn_ids is not None:
-            gt_raw = gt_raw + self._relational_gate_mod(eqn_ids, S)
         # forget magnitude >= 0 so decay = exp(-gt*g) in (0, 1].
         gt = jnn.softplus(gt_raw)                            # (S, H)
 
@@ -284,7 +257,7 @@ class PalimpsaMixer(eqx.Module):
 
 
 class BiPalimpsaMixer(eqx.Module):
-    """Bidirectional, relationally-modulated variant of :class:`PalimpsaMixer`.
+    """Bidirectional variant of :class:`PalimpsaMixer`.
 
     Motivation (step-2 modeling caveat). The unidirectional ``PalimpsaMixer`` is
     a *causal* left-to-right gated-linear-attention recurrence: token ``t`` only
@@ -311,45 +284,26 @@ class BiPalimpsaMixer(eqx.Module):
           across the two directions; only the per-head kernel scalars
           (``g``/``Ip``) are separate per direction, so each direction can learn
           its own decay-rate / prior-precision. Param delta vs unidirectional:
-          +2*H scalars for the reverse (g,Ip) + the optional relational gate-mod
-          map below; the bulk (the 4 embd->embd projections + output_proj) is
-          identical. So param count is essentially the same.
+          +2*H scalars for the reverse (g, Ip); the bulk (the 4 embd->embd
+          projections + output_proj) is identical. So param count is
+          essentially the same.
 
-      (2) RELATIONAL SIGNAL (best-effort proxy). The T5 relational bias is a
-          pairwise ``(H,S,T)`` logit added before softmax — inherently O(S^2)
-          and tied to an explicit attention matrix, so it CANNOT enter the
-          linear recurrence as a pairwise term (linear attention never
-          materialises the SxT logit matrix). A faithful injection is therefore
-          not feasible. Instead we inject a faithful *per-token row-reduction*
-          of the same relation structure into the forget gate ``gt`` (the only
-          per-token knob the recurrence exposes that controls how information
-          propagates):
-
-            For each (valid) token i over the same three relations the
-            transformer uses (same_eqn / earlier / later in topo order), we
-            count how many valid tokens it relates to:
-              n_same[i]    = #{ j : eqn_id[j]==eqn_id[i] }
-              n_earlier[i] = #{ j : eqn_id[j] <  eqn_id[i] }   (topo rank)
-              n_later[i]   = #{ j : eqn_id[j] >  eqn_id[i] }
-            normalised by the valid-token count. These three structural degree
-            features (a per-token reduction of the pairwise relation masks; the
-            earlier/later counts are exactly a normalised topological rank) are
-            mapped by a small learned ``rel_gate`` linear (3 -> H, ZERO-init) to
-            an additive per-head modulation of ``gt``. Zero-init => at start the
-            mixer is byte-identical to plain bidirectional Palimpsa; the layer
-            only deviates once the structural modulation learns to. This is a
-            genuine, lightweight structural prior on the recurrence (it tells
-            each head how much to remember/forget depending on a token's DAG
-            centrality and topological position) without any O(S^2) logit.
+      (2) NO RELATIONAL SIGNAL. This mixer used to add a per-token
+          row-reduction of the same/earlier/later equation relations into the
+          forget gate through a zero-initialised ``rel_gate`` linear. That
+          modulation, and the equation-id stream that fed it, were REMOVED on
+          2026-09-13: it was one zero-init scalar per token per head with no
+          ablation behind it, and carrying it cost a full parallel id buffer
+          on the callback wire, in ``EnvState``, in every stored trajectory
+          and in the palimpsa carry (a ``(MAX_EQNS,)`` histogram per step).
+          Structure reaches the policy through the token stream itself.
 
     Interface contract is identical to :class:`RelationalMultiheadAttention` /
     :class:`PalimpsaMixer`:
-        __call__(query, key_, value, *, bias=None, mask=None, eqn_ids=None,
-                 key=None) -> (S, embd_dim)
-    (``eqn_ids`` is an EXTRA optional kwarg used only for the relational gate
-    proxy; the base mixers ignore it / never receive it. ``bias`` is still
-    ignored here — the proxy is derived from ``eqn_ids`` directly, exactly as
-    the transformer's ``_bias_from_eqn_ids`` derives its pairwise bias.)
+        __call__(query, key_, value, *, bias=None, mask=None, key=None)
+            -> (S, embd_dim)
+    (``bias`` is ignored here: a pairwise T5 logit has no analogue in a linear
+    recurrence, which is what the removed gate proxy was standing in for.)
     """
 
     query_proj: eqx.nn.Linear
@@ -358,7 +312,6 @@ class BiPalimpsaMixer(eqx.Module):
     bias_proj: eqx.nn.Linear
     gate_proj: eqx.nn.Linear
     output_proj: eqx.nn.Linear
-    rel_gate: eqx.nn.Linear          # (3,) structural degree feats -> (H,) gate mod; zero-init
 
     g_raw_fwd: Array      # (H,) forward decay-rate;  g = softplus(g_raw)
     Ip_raw_fwd: Array     # (H,) forward prior precision
@@ -397,14 +350,9 @@ class BiPalimpsaMixer(eqx.Module):
         self.gate_proj = eqx.nn.Linear(embd_dim, num_heads, key=keys[4])
         self.output_proj = eqx.nn.Linear(embd_dim, embd_dim, key=keys[5])
 
-        # Relational gate modulation: 3 per-token structural-degree features
-        # (same/earlier/later, normalised) -> per-head additive gate term.
-        # ZERO-init (weight+bias) so it starts as a no-op (cf. relation_biases).
-        rg = eqx.nn.Linear(3, num_heads, key=keys[6])
-        rg = eqx.tree_at(lambda m: m.weight, rg, jnp.zeros_like(rg.weight))
-        rg = eqx.tree_at(lambda m: m.bias, rg, jnp.zeros_like(rg.bias))
-        self.rel_gate = rg
-
+        # SEVEN keys, six used: `keys[6]` fed the deleted `rel_gate`. The
+        # split width is kept so every other projection draws the SAME
+        # initial weights it drew before the removal.
         # Forward + reverse per-head scalars. softplus(-3)~=0.05 (long memory),
         # softplus(0)~=0.69 (moderate prior precision). Both directions start
         # symmetric.
@@ -412,27 +360,6 @@ class BiPalimpsaMixer(eqx.Module):
         self.Ip_raw_fwd = jnp.zeros((num_heads,), dtype=jnp.float32)
         self.g_raw_rev = jnp.full((num_heads,), -3.0, dtype=jnp.float32)
         self.Ip_raw_rev = jnp.zeros((num_heads,), dtype=jnp.float32)
-
-    def _relational_gate_mod(self, eqn_ids: Array, S: int) -> Array:
-        """Per-token additive gate modulation (S, H) from DAG relation degrees.
-
-        Row-reduction of the same same/earlier/later relations the transformer
-        uses as a pairwise bias; here reduced to a per-token structural feature
-        vector and mapped (zero-init) to a per-head gate term.
-        """
-        valid = (eqn_ids >= 0)
-        valid_pair = valid[:, None] & valid[None, :]
-        same = ((eqn_ids[:, None] == eqn_ids[None, :]) & valid_pair).astype(jnp.float32)
-        earlier = ((eqn_ids[:, None] > eqn_ids[None, :]) & valid_pair).astype(jnp.float32)
-        later = ((eqn_ids[:, None] < eqn_ids[None, :]) & valid_pair).astype(jnp.float32)
-        nvalid = jnp.maximum(jnp.sum(valid.astype(jnp.float32)), 1.0)
-        feats = jnp.stack([
-            jnp.sum(same, axis=1) / nvalid,
-            jnp.sum(earlier, axis=1) / nvalid,
-            jnp.sum(later, axis=1) / nvalid,
-        ], axis=-1)                                          # (S, 3)
-        feats = feats * valid.astype(jnp.float32)[:, None]   # pad tokens -> 0
-        return jax.vmap(self.rel_gate)(feats)                # (S, H)
 
     def __call__(
         self,
@@ -442,7 +369,6 @@ class BiPalimpsaMixer(eqx.Module):
         *,
         bias: Optional[Array] = None,   # ignored (no recurrence analogue)
         mask: Optional[Array] = None,   # treated as a padding mask (see PalimpsaMixer)
-        eqn_ids: Optional[Array] = None,  # used for the relational gate proxy
         key: Optional[PRNGKey] = None,
     ) -> Array:
         x = query
@@ -455,13 +381,6 @@ class BiPalimpsaMixer(eqx.Module):
         v = jax.vmap(self.value_proj)(x).reshape(S, H, d)
         b = jax.vmap(self.bias_proj)(x).reshape(S, H, d)
         gt = jnn.softplus(jax.vmap(self.gate_proj)(x))      # (S, H)
-
-        # Relational structural prior folded into the forget gate (additive,
-        # pre-softplus would be cleaner but gate is already softplus'd; we add a
-        # non-negative-ish modulation post-hoc and re-clamp >= 0).
-        if eqn_ids is not None:
-            gate_mod = self._relational_gate_mod(eqn_ids, S)  # (S, H), zero at init
-            gt = jnn.softplus(gt + gate_mod)                  # keep gt >= 0
 
         if mask is not None:
             if mask.ndim == 3:
@@ -506,9 +425,9 @@ class PalimpsaEncoderLayer(eqx.Module):
     """Encoder block whose token mixer is the Palimpsa linear-attention kernel.
 
     The Palimpsa recurrence has no QK^T-logit analogue, so there is no pairwise
-    relational bias here. Structure instead enters through ``eqn_ids``, which the
-    mixers consume as a DAG-degree forget-gate modulation (zero-init, so an
-    untrained layer is exactly plain Palimpsa).
+    relational bias here, and since 2026-09-13 there is no equation-id
+    forget-gate modulation either (see :class:`BiPalimpsaMixer`). The layer is
+    plain Palimpsa: a token stream in, a token stream out.
     """
     attn_norm: eqx.nn.LayerNorm
     attn_layer: object  # PalimpsaMixer | BiPalimpsaMixer
@@ -543,15 +462,13 @@ class PalimpsaEncoderLayer(eqx.Module):
     def __call__(
         self,
         x: Array,
-        eqn_ids: Optional[Array] = None,
         mask: Optional[Array] = None,
         *,
         key: PRNGKey,
     ) -> Array:
         keys = jrand.split(key, 3)
         y = jax.vmap(self.attn_norm)(x)
-        y = self.attn_layer(y, y, y, bias=None, mask=mask,
-                            eqn_ids=eqn_ids, key=keys[0])
+        y = self.attn_layer(y, y, y, bias=None, mask=mask, key=keys[0])
         x = x + y
 
         y = jax.vmap(self.mlp_norm)(x)
@@ -590,11 +507,14 @@ class PalimpsaEncoder(eqx.Module):
     def __call__(
         self,
         xs: Array,
-        eqn_ids: Optional[Array] = None,
         mask: Optional[Array] = None,
         *,
         key: PRNGKey,
     ) -> Array:
+        """NOTE: the signature no longer matches ``encoder.Encoder``, which
+        keeps its ``eqn_ids`` pairwise T5 bias. A caller that still hands this
+        encoder equation ids gets a TypeError, which is the point: the ids do
+        not exist any more on the palimpsa path."""
         for i, layer in enumerate(self.layers):
-            xs = layer(xs, eqn_ids=eqn_ids, mask=mask, key=jrand.fold_in(key, i))
+            xs = layer(xs, mask=mask, key=jrand.fold_in(key, i))
         return xs

@@ -112,7 +112,7 @@ os.environ["ALPHAGRAD_MAX_FACES"] = "16"
 # RAISES on (correctly -- a dropped delta desyncs the recurrence). Raising the
 # harness budget is the fix; clipping would have hidden it.
 os.environ["ALPHAGRAD_MAX_DELTA_TOKENS"] = "4096"
-os.environ["ALPHAGRAD_INCR_TOKEN_VOCAB"] = "512"
+os.environ["ALPHAGRAD_INCR_TOKEN_VOCAB"] = "256"
 os.environ["ALPHAGRAD_INCREMENTAL_TOKENS"] = "1"
 os.environ["ALPHAGRAD_FACE_ENUM_CACHE"] = "1"
 os.environ["ALPHAGRAD_UNIFIED_FACE_ENUM"] = "1"

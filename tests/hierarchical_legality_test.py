@@ -395,7 +395,7 @@ def test_tlm_sampled_action_zero_rejection():
 
     lf = LiveFaceStream(
         closed.jaxpr, tuple(range(len(args))), list(closed.literals), list(args),
-        vocab=512, max_faces=16, max_axes=N_AX)
+        vocab=256, max_faces=16, max_axes=N_AX)
     total_v = len(closed.jaxpr.eqns)
     order = np.arange(total_v, dtype=np.int32)
     specs = np.zeros((total_v, 1, 3), dtype=np.int32)

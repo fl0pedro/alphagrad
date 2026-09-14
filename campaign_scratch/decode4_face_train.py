@@ -108,7 +108,7 @@ print(f"data N={N} L={L} NV={NV} nsteps={NSTEP} faces={len(f_traj)} "
 #   old token p  -> p + #{sentinels with split <= p}
 #   sentinel r (0-based in stable split order) -> split_r + r
 SUMTOK = 512          # max real token id on this tokenizer is 511 (measured)
-VOCAB = 512
+VOCAB = 256
 f_sum = np.zeros(len(f_traj), np.int32)      # unused unless pool == sumtok
 if A.pool == "sumtok":
     VOCAB = 513

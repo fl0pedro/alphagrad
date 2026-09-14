@@ -50,7 +50,7 @@ MAXSTEP = max(QSTEPS)
 # tensor stays on the four checkpoints Part B is comparable on.
 FSTEPS = list(range(MAXSTEP + 1)) if os.environ.get("D2_FACE_EVERY", "1") == "1" \
     else list(QSTEPS)
-VOCAB = 512
+VOCAB = 256
 MAXF = 64                    # face slots kept per query step
 KPART = 24                   # participation fan-out cap per delta
 NDIM = 12                    # extent slots kept per face

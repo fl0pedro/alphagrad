@@ -37,6 +37,8 @@ import os
 
 import numpy as np
 
+from alphagrad.approx.common.token_vocab import incr_token_vocab
+
 __all__ = ["PlanTokenizer"]
 
 
@@ -53,8 +55,10 @@ class PlanTokenizer:
                  max_faces=None):
         from graphax import IncrementalPathTokenizer
 
-        if vocab is None:
-            vocab = int(os.environ.get("ALPHAGRAD_INCR_TOKEN_VOCAB", "512"))
+        # THE one resolver (`common.token_vocab`). An explicit `vocab` is
+        # checked by it too, so a caller cannot pass an id space the
+        # tokenizer cannot fit or the uint8 wire cannot carry.
+        vocab = incr_token_vocab(vocab)
         self.jaxpr = jaxpr
         self.argnums = tuple(int(a) for a in argnums)
         self.consts = list(consts)

@@ -54,6 +54,15 @@ from typing import NamedTuple
 import numpy as np
 
 from alphagrad.approx.common.masks import NUM_FACE_QUANT_DTYPES
+# THE NARROW ID WIRE. Imported from ``common.token_vocab`` and not from
+# ``env``: this module stays JAX-free at import time (the measure actors load
+# it), and ``token_vocab`` is numpy + graphax only. ``env`` re-exports the
+# same objects, so there is one definition, not two.
+from alphagrad.approx.common.token_vocab import (
+    DELTA_TOKEN_DTYPE as _TOKEN_DTYPE,
+    check_delta_ids as _check_delta_ids,
+    incr_token_vocab as _incr_token_vocab,
+)
 
 
 # Sized from the MEASURED distribution on the MNIST xent graph, not guessed:
@@ -218,7 +227,12 @@ class LiveFaceStream:
         self.argnums = tuple(argnums)
         self.consts = list(consts)
         self.args = list(args)
-        self.vocab = int(vocab)
+        # THE one resolver (`common.token_vocab`): checked here, at
+        # construction, so a vocabulary the tokenizer cannot fit raises from
+        # the CALLER rather than from `_tokenizer_at`, whose
+        # `except Exception` soft-failure path would turn it into an empty
+        # chunk and a bumped `failures` counter.
+        self.vocab = _incr_token_vocab(vocab)
         self.max_faces = int(max_faces)
         self.max_axes = int(max_axes)
         self.window = int(window)
@@ -512,9 +526,9 @@ class LiveFaceStream:
     def chunk(self, order, specs, n, vertex, vertex_specs,
               face_rows, face_skips, f,
               face_rows_hist=None, face_skips_hist=None):
-        """``(tokens, eqn_ids, count, n_faces, ends, head)``.
+        """``(tokens, count, n_faces, ends, head)``.
 
-        :meth:`chunk_ex`'s first five plus ``head`` -- the approx-echo PREFIX
+        :meth:`chunk_ex`'s first four plus ``head`` -- the approx-echo PREFIX
         length of this chunk, i.e. how many of its leading tokens belong to
         face ``f-1``'s APPROXIMATION rather than to face ``f``'s own
         contraction (``docs/FACE_READ_POINT_TRACE.md`` (E)(i)). It is
@@ -526,13 +540,17 @@ class LiveFaceStream:
         r = self.chunk_ex(order, specs, n, vertex, vertex_specs,
                           face_rows, face_skips, f,
                           face_rows_hist, face_skips_hist)
-        return r[:5] + (r[7],)
+        return r[:4] + (r[6],)
 
     def chunk_ex(self, order, specs, n, vertex, vertex_specs,
                  face_rows, face_skips, f,
                  face_rows_hist=None, face_skips_hist=None):
-        """``(tokens (W,), eqn_ids (W,), count, n_faces, ends (2,),
+        """``(tokens (W,), count, n_faces, ends (2,),
         ekey (2,), cvx (EDGE_CVX_WIDTH,), head, wrok)``.
+
+        ONE token buffer: the parallel equation-id buffer was removed on
+        2026-09-13 with the ids themselves (they fed only the palimpsa
+        relational forget gate, which went too).
 
         The last four are the --face-edge-mem wires (section 8), all cheap
         reads of state the enumeration already computed: ``ekey`` is the
@@ -578,7 +596,11 @@ class LiveFaceStream:
         _no_edge = (-np.ones((2,), np.int32),
                     -np.ones((EDGE_CVX_WIDTH,), np.int32),
                     np.int32(0), np.int32(0))
-        empty = (np.zeros((W,), np.int32), -np.ones((W,), np.int32),
+        # NARROW WIRE: the chunk buffers carry the SAME ids as the step delta
+        # (a chunk is a slice of the same emission), so they carry the same
+        # dtypes -- uint8 tokens, int16 equation ids. See env.py's
+        # "THE NARROW ID WIRE" note.
+        empty = (np.zeros((W,), _TOKEN_DTYPE),
                  np.int32(0), np.int32(0), np.zeros((2,), np.int32)
                  ) + _no_edge
 
@@ -633,7 +655,9 @@ class LiveFaceStream:
             try:
                 self.stats["elims"] += 1
                 toks = [int(t) for t in tk.eliminate(vertex, vhooks, ft)]
-                ids = [int(g) for g in tk.last_eqn_ids()]
+                # `tk.last_eqn_ids()` is NOT read: the equation-id stream was
+                # removed on 2026-09-13. graphax still produces it; alphagrad
+                # no longer asks.
                 segs = tk.last_face_segments()
                 # Everything the checks below need that dies with the
                 # snapshot. Pure reads -- they must not raise in here or
@@ -745,7 +769,7 @@ class LiveFaceStream:
             # readable); wrok=0 -- its res edge is never emitted, so it
             # must not claim a write slot.
             self.stats["face_dropped"] += 1
-            res = (empty[0], empty[1], empty[2], np.int32(n_faces),
+            res = (empty[0], empty[1], np.int32(n_faces),
                    _ends(keys[f], self._vertex_of(tk)),
                    _ekey, _cvx, np.int32(0), np.int32(0))
             self._chunks[ck] = res
@@ -768,20 +792,17 @@ class LiveFaceStream:
                 f"be reading another face's contraction.")
 
         chunk: list[int] = []
-        cids: list[int] = []
         if gi > 0:
             # face f-1's approximation: `approx <TYPE> <args>` + the equations
             # it produced. Empty when that face ran exact.
             _s, split, end = segs[gi - 1]
             chunk += toks[split:end]
-            cids += ids[split:end]
         # --face-edge-mem: the approx-echo PREFIX length of this chunk. The
         # write path subtracts it from the cumsum boundary to recover face
         # f's OWN `last_face_segments` span in the true emission.
         head = len(chunk)
         start, split, _e = segs[gi]
         chunk += toks[start:split]
-        cids += ids[start:split]
 
         cnt = len(chunk)
         self.stats["tok_total"] += cnt
@@ -793,13 +814,16 @@ class LiveFaceStream:
             # silently drops the contraction would read as a healthy run.
             self.stats["truncated"] += 1
             head = max(0, head - (cnt - W))
-            chunk, cids, cnt = chunk[-W:], cids[-W:], W
-        tok_a = np.zeros((W,), np.int32)
-        ids_a = -np.ones((W,), np.int32)
-        tok_a[:cnt] = np.asarray(chunk, np.int32)
-        ids_a[:cnt] = np.asarray(cids, np.int32)
+            chunk, cnt = chunk[-W:], W
+        tok_a = np.zeros((W,), _TOKEN_DTYPE)
+        if cnt:
+            _tk64 = np.asarray(chunk, np.int64)
+            # SAME raise as the observation path, at the OTHER producer of
+            # these tokens. A face chunk is a slice of the step emission.
+            _check_delta_ids(_tk64, where="LiveFaceStream.chunk_ex")
+            tok_a[:cnt] = _tk64.astype(_TOKEN_DTYPE)
 
-        res = (tok_a, ids_a, np.int32(cnt), np.int32(n_faces),
+        res = (tok_a, np.int32(cnt), np.int32(n_faces),
                _ends(keys[f], self._vertex_of(tk)),
                _ekey, _cvx, np.int32(head), np.int32(1))
         if len(self._chunks) >= 4096:

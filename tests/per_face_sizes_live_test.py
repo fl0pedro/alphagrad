@@ -48,7 +48,7 @@ except ImportError:                                        # pragma: no cover
 
 N_AX = 8
 MAX_F = 8
-VOCAB = 512
+VOCAB = 256
 
 
 # The same split-gcd fixture per_face_masks_test.py uses: the two faces of the
