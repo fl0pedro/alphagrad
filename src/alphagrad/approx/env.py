@@ -1606,6 +1606,178 @@ def current_env_slot() -> int:
     """The env row of the callback running right now, or -1."""
     return int(_ENV_SLOT[0])
 
+
+# ---------------------------------------------------------------------------
+# THE PIPELINED TERMINAL MEASUREMENT (owner ruling 2026-09-14).
+#
+# The terminal rewards of episode e are read by exactly one thing, the PPO
+# update of episode e. Nothing in the rollout of e needs them: `done` is 1 at
+# the terminal step, so GAE masks the bootstrap value the terminal tokens feed,
+# and the terminal delta is never written to the episode stream (a step writes
+# the PREVIOUS elimination's delta, and there is no step after the last one).
+# So the terminal step can SUBMIT its plans to the measure pool and return a
+# placeholder, and the driver can put device work in front of the wait.
+#
+# A TICKET is an int the DRIVER opens before a rollout attempt and closes
+# after it. The terminal callback submits under whichever ticket is open and
+# records the environment rows it submitted for; the driver later collects the
+# ticket (blocking) or drops it (a discarded attempt). The ticket is the join
+# key beside `env_index`: one ticket is one attempt at one episode, and the
+# rows under it are that attempt's environments.
+#
+# THERE IS AT MOST ONE OPEN TICKET AND AT MOST ONE SUBMISSION PER TICKET.
+# Both are checked rather than assumed, because a second submission would
+# silently discard the first attempt's measurement.
+# ---------------------------------------------------------------------------
+_MEASURE_TICKETS: dict = {}
+_MEASURE_TICKET_SEQ = [0]
+_MEASURE_TICKET_OPEN = [None]
+
+
+class MeasureTicketError(RuntimeError):
+    """Misuse of the pipelined-measurement ticket protocol."""
+
+
+def open_measure_ticket() -> int:
+    """Open a ticket for the rollout attempt that is about to run.
+
+    Returns the ticket. Raises if one is already open -- two open tickets
+    would mean two attempts in flight, and the pool serves one batch at a
+    time.
+    """
+    if _MEASURE_TICKET_OPEN[0] is not None:
+        raise MeasureTicketError(
+            f"measurement ticket {_MEASURE_TICKET_OPEN[0]} is still open; "
+            f"close it before opening another (one rollout attempt at a "
+            f"time).")
+    _MEASURE_TICKET_SEQ[0] += 1
+    t = int(_MEASURE_TICKET_SEQ[0])
+    _MEASURE_TICKET_OPEN[0] = t
+    _MEASURE_TICKETS[t] = {"future": None, "env_index": [], "n_envs": 0,
+                           "step": -1}
+    return t
+
+
+def current_measure_ticket():
+    """The ticket the terminal callback should submit under, or None."""
+    return _MEASURE_TICKET_OPEN[0]
+
+
+def close_measure_ticket():
+    """Stop routing terminal plans to the open ticket. Returns it, or None.
+
+    The ticket stays in the table until it is collected or dropped: closing
+    it only says that the rollout that fills it has finished.
+    """
+    t, _MEASURE_TICKET_OPEN[0] = _MEASURE_TICKET_OPEN[0], None
+    return t
+
+
+def measure_ticket_rows(ticket) -> list:
+    """The environment rows submitted under ``ticket``, in submission order."""
+    return list(_MEASURE_TICKETS[int(ticket)]["env_index"])
+
+
+def pending_measure_tickets() -> list:
+    """Every ticket that has been opened and neither collected nor dropped."""
+    return sorted(int(t) for t in _MEASURE_TICKETS)
+
+
+def _record_measure_submission(ticket, future, env_index, n_envs, step):
+    """Remember one pool submission so the driver can collect or drop it."""
+    rec = _MEASURE_TICKETS.get(int(ticket))
+    if rec is None:
+        raise MeasureTicketError(
+            f"measurement ticket {ticket} is not open; the driver must open "
+            f"one before the rollout that submits under it.")
+    if rec["future"] is not None:
+        raise MeasureTicketError(
+            f"measurement ticket {ticket} already carries a submission for "
+            f"rows {rec['env_index']}; a rollout submits its terminal plans "
+            f"exactly once.")
+    rec["future"] = future
+    rec["env_index"] = [int(i) for i in env_index]
+    rec["n_envs"] = int(n_envs)
+    rec["step"] = int(step)
+
+
+def collect_measurement(ticket) -> dict:
+    """BLOCK until ``ticket``'s terminal measurement is back; return it.
+
+    ``{"rewards": (E, NUM_REWARDS) float32, "sentinel": (E,) bool,
+    "env_index": [...], "step": int}`` -- the rewards in ENVIRONMENT ROW
+    order, which is the order the trajectory stores them in.
+
+    Every environment must have submitted exactly one terminal plan. A
+    missing or repeated row would put one environment's measurement on
+    another's trajectory, so it raises instead of filling a gap.
+    """
+    t = int(ticket)
+    rec = _MEASURE_TICKETS.pop(t, None)
+    if rec is None:
+        raise MeasureTicketError(
+            f"measurement ticket {t} was never opened, or has already been "
+            f"collected or dropped.")
+    fut = rec["future"]
+    if fut is None:
+        raise MeasureTicketError(
+            f"measurement ticket {t} carries no submission: the rollout "
+            f"never reached a terminal step with the pipeline armed.")
+    rows = list(rec["env_index"])
+    n = int(rec["n_envs"])
+    if sorted(rows) != list(range(n)):
+        raise MeasureTicketError(
+            f"measurement ticket {t} submitted rows {sorted(rows)} but the "
+            f"rollout has {n} environments; every environment must submit "
+            f"exactly one terminal plan.")
+    _pb = fut.result()
+    rewards = np.asarray(_pb[-2], dtype=np.float32)
+    sentinel = np.asarray(_pb[-1]).astype(bool)
+    if rewards.shape != (len(rows), NUM_REWARDS):
+        raise MeasureTicketError(
+            f"measurement ticket {t} came back with rewards of shape "
+            f"{rewards.shape}, expected ({len(rows)}, {NUM_REWARDS}).")
+    out = np.zeros((n, NUM_REWARDS), dtype=np.float32)
+    smask = np.zeros((n,), dtype=bool)
+    for k, i in enumerate(rows):
+        out[i] = rewards[k]
+        smask[i] = bool(sentinel[k])
+    return {"rewards": out, "sentinel": smask, "env_index": rows,
+            "step": int(rec["step"]), "ticket": t}
+
+
+def drop_measurement(ticket) -> dict:
+    """DRAIN ``ticket``'s measurement and throw it away (a discarded attempt).
+
+    The attempt that submitted it is gone, so its rewards must not reach any
+    trajectory. The submission is still DRAINED rather than abandoned: the
+    actors are measuring it, Ray runs one task per actor, and the repeat's own
+    tokenization queues behind whatever is still running. Abandoning the
+    future would leave the actors busy with work nobody will ever read, and
+    `ray.cancel` on an actor task needs `force=True`, which kills the actor
+    and its plan records with it.
+
+    Returns ``{"rows": [...], "drained": bool}``; never raises on a ticket
+    that carries no submission (a rollout can overflow before its terminal
+    step).
+    """
+    t = int(ticket)
+    rec = _MEASURE_TICKETS.pop(t, None)
+    if rec is None:
+        return {"rows": [], "drained": False}
+    fut = rec["future"]
+    if fut is None:
+        return {"rows": [], "drained": False}
+    try:
+        fut.result()
+    except Exception as _exc:                                  # noqa: BLE001
+        # A discarded attempt's measurement failing is not this run's
+        # problem: the result is thrown away either way. Say so and move on.
+        print(f"[measure-pipeline] discarded attempt's measurement (ticket "
+              f"{t}) failed while draining: {type(_exc).__name__}: "
+              f"{str(_exc)[:160]}", flush=True)
+    return {"rows": list(rec["env_index"]), "drained": True}
+
 # The four telemetry buckets the per-face hook maintains, per approximation
 # class. ``other`` exists because ``masks._kind_of`` emits it for a rule that
 # is none of the three -- dropping it here would make the record's totals
@@ -8423,6 +8595,22 @@ class VertexEliminationEnv:
                     i for i in range(E)
                     if _term_local and _sti[i] >= int(ro[i].shape[0]))
                 _remote = [i for i in range(E) if i not in _local]
+                # THE PIPELINED TERMINAL ROWS (owner ruling 2026-09-14). With
+                # a ticket open, a terminal row is SUBMITTED and left to the
+                # actors; its tokens and its reward come back as zeros and the
+                # driver fills the reward into the trajectory when it collects
+                # the ticket. Non-terminal rows are unaffected: they carry the
+                # tokenization the next step's encoder reads, so they are
+                # still measured synchronously here.
+                _ticket = current_measure_ticket()
+                _pipe = []
+                if _ticket is not None:
+                    _pipe = [i for i in _remote
+                             if _sti[i] >= int(ro[i].shape[0])]
+                    if _pipe:
+                        _pipe_set = set(_pipe)
+                        _remote = [i for i in _remote
+                                   if i not in _pipe_set]
                 tk = np.zeros((E, _obs_w), _tok_dt)
                 ei = np.zeros((E, _obs_w), _eqn_dt) if _eqn else None
                 rw = np.zeros((E, NUM_REWARDS), np.float32)
@@ -8511,6 +8699,40 @@ class VertexEliminationEnv:
                     if _eqn:
                         ei[i] = _wire_row(_out[1], _eqn_dt, "eqn_ids")
                     rw[i] = np.asarray(_out[-1])
+                if _pipe:
+                    # SUBMIT AND RETURN. `tk` and `rw` are already zeros for
+                    # these rows and they stay that way: a zero delta header
+                    # decodes to count 0, so the terminal step contributes an
+                    # empty delta to the bootstrap carry (masked by done=1 in
+                    # GAE) and nothing to either bin, and the zero reward
+                    # vector is overwritten on the host when the driver
+                    # collects the ticket.
+                    _trace("measure_submit.enter")
+                    _ms0 = time.perf_counter()
+                    try:
+                        _fut = pool.submit_batch(
+                            [ro[i] for i in _pipe],
+                            [rs[i] for i in _pipe],
+                            [_sti[i] for i in _pipe],
+                            eval_samples=_ev,
+                            init=init,
+                            face_specs_batch=(
+                                [rf[i] for i in _pipe] if _any_faces
+                                else None),
+                            face_skips_batch=(
+                                [rk[i] for i in _pipe] if _any_faces
+                                else None),
+                            episode=(walk_episode() if walk_rotate_enabled()
+                                     else None),
+                        )
+                    finally:
+                        _msdt = time.perf_counter() - _ms0
+                        _prof_add("prof/measure_submit", _msdt)
+                        _prof_sample("prof/measure_submit", _msdt)
+                        _trace("measure_submit.exit")
+                    _record_measure_submission(
+                        _ticket, _fut, _pipe, E,
+                        int(_sti[_pipe[0]]))
                 _cbdt = time.perf_counter() - _cb0
                 _prof_add("prof/env_cb_host", _cbdt)
                 _prof_sample("prof/env_cb_host", _cbdt)

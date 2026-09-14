@@ -4824,6 +4824,22 @@ def make_argparser() -> argparse.ArgumentParser:
         "--ray-measure-timeout", type=float, default=600.0,
         help="Per-call timeout for a --ray-measure actor, seconds.")
     p.add_argument(
+        "--measure-pipeline", type=int, default=0, choices=(0, 1),
+        metavar="0|1",
+        help="PIPELINE THE TERMINAL MEASUREMENT (owner ruling 2026-09-14). "
+             "0 (default) is the synchronous path: the terminal step blocks "
+             "inside the callback until the measure actors return, exactly "
+             "as before. 1 makes the terminal step SUBMIT its plans and "
+             "return a placeholder, so the rollout finishes at once; the "
+             "driver then dispatches the PREVIOUS episode's PPO update, "
+             "waits for this episode's rewards while the trainer GPU runs "
+             "it, and updates this episode next time round. The update of "
+             "episode e therefore starts from the policy that has absorbed "
+             "e-1, while e's trajectory was drawn under the policy that had "
+             "absorbed e-2: PPO's ratio is exact (the stored old log-probs "
+             "are the behaviour policy's) but it is no longer identically 1 "
+             "at epoch 0. Needs --ray-measure > 0.")
+    p.add_argument(
         "--pareto-dump-every", type=int, default=50, metavar="N",
         help="Write the Pareto FRONT (objectives + the sequences that "
              "achieved them) to the wandb run dir every N episodes, plus once "
@@ -7164,6 +7180,22 @@ def main():
               f"scan prefix-proportional; otherwise the delta budget is "
               f"paid in full every step.", flush=True)
 
+    # ---- --measure-pipeline: overlap the measurement with the update ----
+    # Armed here, before the pool is built, so every refusal is a startup
+    # error rather than something the first terminal step discovers.
+    _MPIPE = bool(int(getattr(args, "measure_pipeline", 0) or 0))
+    if _MPIPE:
+        if int(getattr(args, "ray_measure", 0) or 0) <= 0:
+            raise ValueError(
+                "--measure-pipeline 1 has nothing to submit to: the "
+                "in-process measurement path runs inside the callback and "
+                "cannot be left in flight. Pass --ray-measure N.")
+        if os.environ.get("ALPHAGRAD_POOL_TERMINAL_LOCAL", "0") == "1":
+            raise ValueError(
+                "--measure-pipeline 1 with ALPHAGRAD_POOL_TERMINAL_LOCAL=1: "
+                "the terminal rows are measured in the TRAINER process "
+                "there, so there is no pool submission to defer. Choose one.")
+
     # ---- --ray-measure: fan the measurement callback out over Ray actors ----
     if int(getattr(args, "ray_measure", 0) or 0) > 0:
         _n_actors = int(args.ray_measure)
@@ -7305,6 +7337,15 @@ def main():
             """
             rt = {"py_executable": _sys.executable}
             if _gpu:
+                # THE FIRST MEASUREMENT DEVICE. 1 by default -- device 0 is
+                # the trainer's. ALPHAGRAD_MEASURE_FIRST_GPU=0 hands the
+                # trainer's own device to an actor as well, which is what the
+                # "one actor per GPU, the trainer's included" probe asks for
+                # (owner question 4, 2026-09-14). It is a knob and not the
+                # default because two processes on one device destroy the
+                # timing isolation the measurement depends on.
+                _first = int(os.environ.get(
+                    "ALPHAGRAD_MEASURE_FIRST_GPU", "1"))
                 # num_gpus=0 makes Ray MASK the GPUs (it sets
                 # CUDA_VISIBLE_DEVICES="" for workers that request none),
                 # which overrode our pin and dropped the actor to CPU. The
@@ -7312,7 +7353,7 @@ def main():
                 # our explicit pin stands; it must also be exported in the
                 # DRIVER environment so it reaches Ray's worker startup.
                 rt["env_vars"] = {
-                    "CUDA_VISIBLE_DEVICES": str(idx + 1),
+                    "CUDA_VISIBLE_DEVICES": str(idx + _first),
                     "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
                     # Dedicated measure process: no trainer shares this
                     # actor, so its single pinned GPU IS the measure device
@@ -7372,9 +7413,13 @@ def main():
         object.__setattr__(env, "_remote_pool", _pool)
         object.__setattr__(env, "_remote_timeout_s",
                            float(args.ray_measure_timeout))
+        _first_gpu = int(os.environ.get("ALPHAGRAD_MEASURE_FIRST_GPU", "1"))
         print(f"[ray-measure] {_n_actors} actors on gpus "
-              f"{[i + 1 for i in range(_n_actors)] if _gpu else 'cpu'} "
-              f"(trainer keeps gpu 0), timeout={args.ray_measure_timeout}s",
+              f"{[i + _first_gpu for i in range(_n_actors)] if _gpu else 'cpu'}"
+              f" (trainer uses gpu 0"
+              f"{', SHARED with an actor' if _first_gpu == 0 else ''}), "
+              f"timeout={args.ray_measure_timeout}s, "
+              f"measure-pipeline={int(_MPIPE)}",
               flush=True)
 
     # DIAG per-face masking. The dynamic policy's DIAG head must be masked by the
@@ -10764,28 +10809,27 @@ def main():
             f_val.reshape(-1, _vprobe.N_SLOTS),
             vctx, v_tgt, v_val)
 
-    def train_episode(
+    # THE EPISODE IN TWO HALVES (owner ruling 2026-09-14, "pipeline the
+    # measurement"). `_episode_rollout` draws the trajectory; `_episode_update`
+    # consumes it. They are PLAIN PYTHON functions, and `train_episode` below
+    # is their composition under ONE `eqx.filter_jit` -- the same single jit,
+    # over the same traced operations, that this file has always had. That is
+    # what makes `--measure-pipeline 0` bit-identical rather than merely
+    # equivalent: it runs `train_episode`, and `train_episode` is one program.
+    #
+    # Under `--measure-pipeline 1` the driver jits the two halves SEPARATELY
+    # and puts the collect between them, so the trainer's GPU runs the update
+    # of episode e-1 while the measure actors are still timing episode e's
+    # terminal plans.
+    def _episode_rollout(
         agent,
-        opt_state,
         env_states,
         env_obj,
         base_mem,
         preferences_per_env,
-        global_step,
         key,
-        freeze_mask,
         op_legality_override_arg,
-        vertex_mult_arg,
         pin_rules_to_exact_arg,
-        micro_mult_arg,
-        popart_m1,
-        popart_m2,
-        popart_w,
-        probes,
-        probe_opt_state,
-        vprobes,
-        vprobe_opt_state,
-        kl_ref_coef_arg,
         ep_log2,
         # THE WINDOW BIN, beside the stream bin. Both are plain Python ints
         # and `eqx.filter_jit` treats a non-array argument as static, so the
@@ -10842,6 +10886,49 @@ def main():
             _ep_ftok0,
             _EP_ENV_IDX,
         )
+        # THE ROLLOUT'S WHOLE OUTPUT, as one tuple. `subkey` rides along
+        # because the update's epoch keys are split from it and the split
+        # order has to stay exactly what it was: `subkey` first, the rollout
+        # key second.
+        return (env_states, traj, total_rewards_full,
+                ep_tokens, ep_face_tokens, ep_used_per_env,
+                ep_over_len_per_env, ep_over_step_per_env,
+                win_over_len_per_env, win_over_step_per_env,
+                win_over_kind_per_env,
+                win_used_per_env, face_used_per_env, subkey)
+
+    def _episode_update(
+        agent,
+        opt_state,
+        roll,
+        global_step,
+        freeze_mask,
+        op_legality_override_arg,
+        vertex_mult_arg,
+        pin_rules_to_exact_arg,
+        micro_mult_arg,
+        popart_m1,
+        popart_m2,
+        popart_w,
+        probes,
+        probe_opt_state,
+        vprobes,
+        vprobe_opt_state,
+        kl_ref_coef_arg,
+        ep_log2,
+        win_log2,
+    ):
+        """The PPO update from one episode's trajectory.
+
+        `roll` is `_episode_rollout`'s tuple, with the terminal rewards
+        already filled in when the driver pipelines the measurement.
+        """
+        (env_states, traj, total_rewards_full,
+         ep_tokens, ep_face_tokens, ep_used_per_env,
+         ep_over_len_per_env, ep_over_step_per_env,
+         win_over_len_per_env, win_over_step_per_env,
+         win_over_kind_per_env,
+         win_used_per_env, face_used_per_env, subkey) = roll
 
         # GAE on the (E, T, NUM_VALUE_HEADS) reward tensor.
         #
@@ -11823,8 +11910,62 @@ def main():
             face_used_per_env,
         )
 
+    def train_episode(
+        agent,
+        opt_state,
+        env_states,
+        env_obj,
+        base_mem,
+        preferences_per_env,
+        global_step,
+        key,
+        freeze_mask,
+        op_legality_override_arg,
+        vertex_mult_arg,
+        pin_rules_to_exact_arg,
+        micro_mult_arg,
+        popart_m1,
+        popart_m2,
+        popart_w,
+        probes,
+        probe_opt_state,
+        vprobes,
+        vprobe_opt_state,
+        kl_ref_coef_arg,
+        ep_log2,
+        win_log2,
+    ):
+        """Rollout then update, in ONE traced program. The synchronous path.
+
+        This is the function `--measure-pipeline 0` runs and the function the
+        policy regression gate records against. Composing the two halves here
+        rather than duplicating their bodies is what makes "bit-identical"
+        a property of the code rather than a claim about it: tracing inlines
+        both, so the jaxpr is the one this file produced before the split.
+        """
+        roll = _episode_rollout(
+            agent, env_states, env_obj, base_mem, preferences_per_env, key,
+            op_legality_override_arg, pin_rules_to_exact_arg,
+            ep_log2, win_log2)
+        return _episode_update(
+            agent, opt_state, roll, global_step, freeze_mask,
+            op_legality_override_arg, vertex_mult_arg,
+            pin_rules_to_exact_arg, micro_mult_arg,
+            popart_m1, popart_m2, popart_w,
+            probes, probe_opt_state, vprobes, vprobe_opt_state,
+            kl_ref_coef_arg, ep_log2, win_log2)
+
     if not args.no_jit:
         train_episode = eqx.filter_jit(train_episode)
+        # THE PIPELINED PAIR. Two jits keyed on the same (stream bin, window
+        # bin) pair, so the driver can put the host's wait for the measurement
+        # between them. Built unconditionally: an unused `eqx.filter_jit`
+        # wrapper costs nothing until it is called.
+        _episode_rollout_jit = eqx.filter_jit(_episode_rollout)
+        _episode_update_jit = eqx.filter_jit(_episode_update)
+    else:
+        _episode_rollout_jit = _episode_rollout
+        _episode_update_jit = _episode_update
 
     # Reporting.
     # BEFORE any jit tracing: the transforms capture this as a constant.
@@ -12196,12 +12337,17 @@ def main():
         # no pool, a dead actor, or an actor too old to have the method
         # contributes nothing and never raises.
         _POOL_CS = {}
-        try:
-            from alphagrad.approx.common.measure_pool import (
-                merge_pool_collapse_stats as _merge_cs)
-            _POOL_CS = _merge_cs(getattr(env, "_remote_pool", None), {})
-        except Exception:
-            pass
+        if _POOL_DRAIN[0] is not None:
+            # Pipelined: drained at collect time, when the actors held this
+            # episode's work and not the next one's.
+            _POOL_CS = dict(_POOL_DRAIN[0].get("pool_collapse") or {})
+        else:
+            try:
+                from alphagrad.approx.common.measure_pool import (
+                    merge_pool_collapse_stats as _merge_cs)
+                _POOL_CS = _merge_cs(getattr(env, "_remote_pool", None), {})
+            except Exception:
+                pass
 
         log_dict = {
             "best_return": host_state["best_global_return"],
@@ -12522,17 +12668,23 @@ def main():
         # stack is on (empty dict -> NaN fractions, never a stale value).
         _pf_stats: dict = {}
         if args.per_face or args.face_actions:
-            pf = consume_per_face_stats()
             # The per-face legality hooks run INSIDE the Ray measure actors,
             # so the trainer's own counters are always empty when the pool is
             # active -- poll the actors and merge, or approx_applied/* never
             # appears at all. No-op (and never raises) without a pool.
-            try:
+            if _POOL_DRAIN[0] is not None:
                 from alphagrad.approx.common.measure_pool import (
-                    merge_pool_face_stats as _merge_pf)
-                pf = _merge_pf(getattr(env, "_remote_pool", None), pf)
-            except Exception:
-                pass
+                    fold_face_stats as _fold_pf)
+                pf = _fold_pf(dict(_POOL_DRAIN[0].get("local_face") or {}),
+                              _POOL_DRAIN[0].get("pool_face") or {})
+            else:
+                pf = consume_per_face_stats()
+                try:
+                    from alphagrad.approx.common.measure_pool import (
+                        merge_pool_face_stats as _merge_pf)
+                    pf = _merge_pf(getattr(env, "_remote_pool", None), pf)
+                except Exception:
+                    pass
             # UNCONDITIONAL. The `if applied or skipped` gate this replaces
             # meant that a flat 0 -- the ONE reading that proves the face wires
             # never reached the measurement -- was logged as an ABSENT key
@@ -12676,7 +12828,11 @@ def main():
                     append_records as _plog_append)
                 from alphagrad.approx.env import (
                     consume_plan_records as _plog_consume)
-                _plog_local = _plog_consume()
+                _plog_local = (
+                    _POOL_DRAIN[0]["local_plan"]
+                    if (_POOL_DRAIN[0] is not None
+                        and _POOL_DRAIN[0].get("local_plan") is not None)
+                    else _plog_consume())
                 _plog_pool = None
                 _plog_recs = list(_plog_local["records"])
                 _plog_dropped = int(_plog_local["dropped"])
@@ -12706,8 +12862,12 @@ def main():
                 try:
                     from alphagrad.approx.common.measure_pool import (
                         merge_pool_plan_records as _plog_merge)
-                    _plog_pool = _plog_merge(
-                        getattr(env, "_remote_pool", None))
+                    _plog_pool = (
+                        _POOL_DRAIN[0]["pool_plan"]
+                        if (_POOL_DRAIN[0] is not None
+                            and _POOL_DRAIN[0].get("pool_plan") is not None)
+                        else _plog_merge(
+                            getattr(env, "_remote_pool", None)))
                     _plog_recs.extend(_plog_pool["records"])
                     _plog_dropped += int(_plog_pool["dropped"])
                     _plog_actors = int(_plog_pool["actors_polled"])
@@ -12759,9 +12919,16 @@ def main():
                     {"records": list(_plog_local.get("records") or ())},
                     dict(_plog_pool or {}))
                 _plog_n0 = int(host_state.get("_plan_log_written", 0))
+                _plog_tkt = (_POOL_DRAIN[0] or {}).get("ticket")
                 for _plog_j, _plog_r in enumerate(_plog_recs):
                     _plog_r["episode"] = int(ep)
                     _plog_r["plan_index"] = _plog_n0 + _plog_j
+                    if _plog_tkt is not None:
+                        # THE MEASUREMENT TICKET (--measure-pipeline). One
+                        # ticket is one attempt at one episode; a pooled
+                        # record has no `env_index` to join on because the
+                        # actor is a separate process, so this is the join.
+                        _plog_r["measure_ticket"] = int(_plog_tkt)
                 _plog_nw = _plog_append(_plog_path, _plog_recs)
                 host_state["_plan_log_written"] = _plog_n0 + _plog_nw
                 log_dict["plan_log/records_this_ep"] = int(_plog_nw)
@@ -13872,6 +14039,300 @@ def main():
     # COMMITTED, which is the point -- see the loop body.
     _train_dev = jax.local_devices()[0]
 
+    # THE MEASURE ACTORS' PER-EPISODE TELEMETRY, TAKEN ONCE (measure-pipeline).
+    # `host_log` normally drains the actors itself, which is right while the
+    # actors still hold exactly that episode's work. Pipelined, `host_log` for
+    # episode e runs after episode e+1's measurement has already come back, so
+    # the drain is taken at COLLECT time and parked here for `host_log` to
+    # read. None = drain in `host_log`, exactly as before.
+    _POOL_DRAIN = [None]
+
+    def _drain_measure_telemetry(ticket=None):
+        """Drain the trainer's AND the actors' per-episode telemetry, once.
+
+        Called right after a ticket is collected, so the actors hold this
+        episode's terminal plans and nothing later. Returns the dict
+        `host_log` reads out of `_POOL_DRAIN`.
+
+        `ticket` is stamped on every record this drain produces. It is the
+        join key the pooled rows have and `env_index` is not: a measure actor
+        is a separate process and never sees the trainer's env slot, so a
+        pooled record's `env_index` is -1 and always has been. The ticket says
+        which ATTEMPT at which episode a record came from, which is what
+        separates a repeat's records from the attempt it replaced.
+        """
+        from alphagrad.approx.common.measure_pool import (
+            merge_pool_collapse_stats as _mcs,
+            merge_pool_face_stats as _mpf,
+            merge_pool_plan_records as _mpr)
+        from alphagrad.approx.env import (
+            consume_per_face_stats as _cpf,
+            consume_plan_records as _cpr)
+        _p = getattr(env, "_remote_pool", None)
+        out = {"pool_collapse": {}, "pool_face": {}, "pool_plan": None,
+               "local_face": {}, "local_plan": None,
+               "ticket": (None if ticket is None else int(ticket))}
+        try:
+            out["pool_collapse"] = _mcs(_p, {})
+        except Exception:
+            pass
+        if args.per_face or args.face_actions:
+            out["local_face"] = _cpf()
+            try:
+                out["pool_face"] = _mpf(_p, {})
+            except Exception:
+                out["pool_face"] = {}
+        if _PLAN_LOG_PATH is not None:
+            from alphagrad.approx.env import (
+                MeasureToolchainFault as _MTF)
+            out["local_plan"] = _cpr()
+            try:
+                out["pool_plan"] = _mpr(_p)
+            except _MTF:
+                # A measure actor whose apparatus is faulted stops the run,
+                # here as in `host_log`. A skip is a failure.
+                raise
+            except Exception as _exc:                          # noqa: BLE001
+                print(f"[plan-log] pool drain failed at collect time "
+                      f"({_exc!r}) -- pooled plans are MISSING",
+                      file=sys.stderr, flush=True)
+                # The skeleton of an empty drain, so the logging below reports
+                # "no pool" rather than draining again a whole episode late.
+                out["pool_plan"] = _mpr(None)
+        return out
+
+    def _finish_episode(_fe):
+        """Everything an episode does once its PPO UPDATE has been dispatched.
+
+        Synchronously this runs on the episode that has just finished. Under
+        `--measure-pipeline 1` it runs ONE EPISODE LATE, on the episode whose
+        terminal rewards had just arrived, so every number in it belongs to
+        `_fe["ep"]` and not to the rollout the driver has meanwhile taken.
+        The two host-side duals it advances (the Lagrangian lambda and the
+        KL-reference coefficient) therefore also move one episode later,
+        which is the same lag the policy update itself takes.
+        """
+        nonlocal lag_lambda, _kl_ref_coef
+        ep = int(_fe["ep"])
+        agent = _fe["agent"]
+        opt_state = _fe["opt_state"]
+        global_step = _fe["global_step"]
+        metrics = _fe["metrics"]
+        total_rewards_full = _fe["total_rewards_full"]
+        actions_pack = _fe["actions_pack"]
+        diag_pack = _fe["diag_pack"]
+        popart_m1 = _fe["popart_m1"]
+        popart_m2 = _fe["popart_m2"]
+        popart_w = _fe["popart_w"]
+        attn_ent = _fe["attn_ent"]
+        true_scalar_return = _fe["true_scalar_return"]
+        probe_metrics = _fe["probe_metrics"]
+        vp_metrics = _fe["vp_metrics"]
+        _win_max = int(_fe["win_max"])
+        _face_max = int(_fe["face_max"])
+        _xtr_on = bool(_fe["xtr_on"])
+        _POOL_DRAIN[0] = _fe.get("pool_drain")
+        if _xtr_on:
+            # The trace has to stay open until the device is drained or the
+            # timeline stops at the first output that happens to be ready.
+            jax.block_until_ready(
+                (agent, opt_state, metrics, total_rewards_full,
+                 global_step, popart_m1, popart_m2, popart_w))
+            jax.profiler.stop_trace()
+        # --kl-ref-target: DUAL ASCENT, once per episode, host-side, AFTER
+        # the update -- the same placement and the same containment as the
+        # Lagrangian dual (`_lag_dual_ascent`). Slot 7 of the per-component
+        # KL array is this episode's mean kl_ref; the loss appends it only
+        # when the trust region is on.
+        if _KL_REF_ON:
+            _kl_ref_ep = float(np.asarray(metrics[9])[7])
+            _kl_ref_coef = _kl_ref_dual_update(
+                _kl_ref_coef, _kl_ref_ep,
+                float(args.kl_ref_target), float(args.kl_ref_eta),
+                float(args.kl_ref_coef_min), float(args.kl_ref_coef_max))
+        # SEEDED EQUIVALENCE DUMP (ALPHAGRAD_EQ_DUMP=<prefix>, off by default).
+        # Any change to the env / callback / rollout path has to be proven
+        # trajectory-identical against its parent commit, and the only honest
+        # way to do that is to pickle the post-episode state and diff it leaf
+        # by leaf (see ~/dsnn/campaign_scratch/_eq137_cmp.py). Pure instrumentation: nothing
+        # downstream reads the file, and the branch is dead without the var.
+        _eqp = os.environ.get("ALPHAGRAD_EQ_DUMP", "")
+        if _eqp:
+            import pickle as _pk
+            _leaves = lambda t: [np.asarray(l) for l in
+                                 jax.tree_util.tree_leaves(t)]
+            with open(f"{_eqp}.ep{ep}.pkl", "wb") as _fh:
+                _pk.dump({
+                    "params": _leaves(eqx.filter(agent, eqx.is_array)),
+                    "opt": _leaves(opt_state),
+                    "metrics": _leaves(metrics),
+                    "actions": _leaves(actions_pack),
+                    "rewards": np.asarray(total_rewards_full),
+                    "step": int(global_step),
+                    "ret": float(true_scalar_return),
+                }, _fh)
+        lag_extra = None
+        if args.reward_mode == "lagrangian":
+            # Dual ascent: ONCE PER EPISODE, AFTER the PPO update, from the
+            # episode's measured terminal qualities (total_rewards_full is
+            # the raw per-env reward-vector sum; quality is sparse-terminal,
+            # so the sum IS the terminal measurement, diverged -1.0 intact).
+            _lag_q = np.asarray(total_rewards_full)[:, REWARD_INDEX["cosine_sim"]]
+            _lag_v = np.maximum(
+                0.0, args.lag_tau - np.clip(_lag_q, -0.5, 1.0))
+            _lag_frozen = bool(
+                args.popart_basin_freeze
+                and args.advantage_norm == "popart"
+                and float(np.mean(
+                    np.clip(_lag_q, -0.5, 1.0) <= 0.05)) > 0.5)
+            lag_lambda = _lag_dual_ascent(
+                lag_lambda, float(np.mean(_lag_v)), args.lag_eta,
+                args.lag_min, args.lag_max,
+                violation_target=float(getattr(args, "lag_target", 0.0)))
+            # stdout mirror of the wandb keys: v61's log never carried
+            # lambda anywhere, which made the collapse post-mortem blind.
+            # diag_pack tail: (..., mask_frac, wz_clip_frac,
+            # raw_adv_mean, raw_adv_min) -- sec 12.9 appended two entries,
+            # so mask_frac moved from [-2] to [-4].
+            _lag_mask_f = (float(np.asarray(diag_pack[-4]))
+                           if diag_pack is not None else -1.0)
+            _lag_raw_a = (float(np.asarray(diag_pack[-2]))
+                          if diag_pack is not None else float("nan"))
+            print("[lagrangian] ep=%d lambda=%.4f mean_violation=%.4f "
+                  "frac_violating=%.3f mean_raw_q=%.4f frozen=%d "
+                  "mask_frac=%.3f raw_adv=%.3f"
+                  % (ep, lag_lambda, float(np.mean(_lag_v)),
+                     float(np.mean(_lag_v > 0.0)), float(np.mean(_lag_q)),
+                     int(_lag_frozen), _lag_mask_f, _lag_raw_a),
+                  flush=True)
+            lag_extra = {
+                "lagrangian/lambda": float(lag_lambda),
+                "lagrangian/mean_violation": float(np.mean(_lag_v)),
+                "lagrangian/frac_violating": float(np.mean(_lag_v > 0.0)),
+                # 2026-08-21 dashboard confusion: the reward-channel
+                # quality slot stores -violation, so a HEALTHY run
+                # (q >= tau, violation 0) plots at 0 and reads like
+                # collapse. This is the RAW terminal quality, pre-clip,
+                # mean over envs -- the number actually to read.
+                "lagrangian/mean_raw_q": float(np.mean(_lag_q)),
+                "lagrangian/popart_frozen": float(_lag_frozen),
+            }
+        # THE WINDOW BIN'S TELEMETRY, from the DEVICE. `tokens/delta_max`
+        # beside it is the host counter, which is process-local and reads 0
+        # under --ray-measure -- keep it, because it is the human-readable
+        # number and now has a sibling to be checked against, but the bin
+        # walks on these.
+        _win_extra = {
+            "tokens/delta_max_device": int(_win_max),
+            "tokens/face_total_max": int(_face_max),
+            "tokens/window_bin": int(1 << _WIN_BIN.log2),
+            "tokens/window_bin_log2": int(_WIN_BIN.log2),
+            "tokens/window_occupancy": (
+                float(max(_win_max, _face_max)) / float(1 << _WIN_BIN.log2)),
+            "tokens/episode_bin_log2": int(_EP_BIN.log2),
+        }
+        lag_extra = (_win_extra if lag_extra is None
+                     else dict(lag_extra, **_win_extra))
+        # THE PIPELINE'S OWN TELEMETRY (--measure-pipeline 1). How long the
+        # host actually waited for this episode's terminal rewards AFTER the
+        # previous episode's update was already on the GPU. `prof/measure_wait`
+        # is ~0 under the pipeline, so without this key the wait is invisible.
+        if _fe.get("collect_wait") is not None:
+            lag_extra = dict(lag_extra, **{
+                "measure/pipeline/collect_wait_s":
+                    float(_fe["collect_wait"]),
+                "measure/pipeline/sentinelled":
+                    int(_fe.get("sentinelled", 0)),
+                "measure/pipeline/ticket": int(_fe.get("ticket", -1)),
+            })
+        host_log(
+            ep,
+            total_rewards_full,
+            actions_pack,
+            jnp.mean(total_rewards_full, axis=0),
+            metrics,
+            diag_pack,
+            popart_stats=_popart_derive(
+                popart_m1, popart_m2, popart_w,
+                args.popart_sigma_min, 1e12),
+            attn_entropy=attn_ent,
+            true_return=float(true_scalar_return),
+            probe_metrics=probe_metrics,
+            vp_metrics=vp_metrics,
+            extra_log=lag_extra,
+        )
+        # Mid-training top-N snapshot. Skips the wandb table log so we
+        # don't pollute the offline run with duplicate tables — only the
+        # post-training / post-calibration dumps land in wandb.
+        if (
+            args.print_top_every > 0
+            and (ep + 1) % args.print_top_every == 0
+            and ep + 1 < args.episodes
+        ):
+            pbar.write(
+                f"\n=== top-{args.top_n} after episode {ep + 1}/{args.episodes} ==="
+            )
+            print_top_n(
+                "Total Reward",
+                host_state["top_n_total"],
+                log_to_wandb=False,
+            )
+        _POOL_DRAIN[0] = None
+
+    # ---- the pipelined episode (--measure-pipeline 1) --------------------
+    # One slot, holding the episode whose trajectory is complete and whose
+    # update has not run yet. `None` on the synchronous path, always.
+    _PIPE_PENDING = [None]
+
+    def _pipe_fill_rewards(roll, rewards):
+        """Put a collected terminal measurement into a rollout's trajectory.
+
+        The terminal step returned zeros for its reward vector, so this is the
+        one place the measurement enters the episode. `total_rewards_full` is
+        the LAST step's raw reward row (`all_raw_rewards[-1]` in `rollout_fn`)
+        and under `--terminal-rewards-only` every earlier row is zero, so the
+        trajectory's terminal slice and the episode's reward total are the
+        same array and are set from it together.
+        """
+        _rw = jnp.asarray(np.asarray(rewards, dtype=np.float32))
+        _traj = roll[1]
+        _traj = _traj._replace(reward=_traj.reward.at[:, -1, :].set(_rw))
+        return (roll[0], _traj, _rw) + tuple(roll[3:])
+
+    def _pipe_update_dispatch(prev):
+        """Dispatch the pending episode's PPO update; do NOT wait for it.
+
+        JAX is asynchronous, so this returns once the work is queued. That is
+        the overlap: the trainer's GPU runs this update while the host blocks
+        on the measure actors for the episode just rolled out.
+        """
+        (_fm, _ovr, _vm, _pin, _mm, _kl, _e2, _w2) = prev["args"]
+        return _episode_update_jit(
+            agent, opt_state, prev["roll"], global_step, _fm, _ovr, _vm,
+            _pin, _mm, popart_m1, popart_m2, popart_w, probes,
+            probe_opt_state, vprobes, vprobe_opt_state, _kl, _e2, _w2)
+
+    def _pipe_finish(prev, out):
+        """Rebind from the pending episode's update and run its epilogue."""
+        nonlocal agent, opt_state, global_step
+        nonlocal popart_m1, popart_m2, popart_w
+        nonlocal probes, probe_opt_state, vprobes, vprobe_opt_state
+        (agent, opt_state, _unused_states, _metrics, _tot_rew, _acts,
+         global_step, _diag, popart_m1, popart_m2, popart_w, _attn,
+         _true_ret, probes, probe_opt_state, _probe_mets,
+         vprobes, vprobe_opt_state, _vp_mets,
+         _u1, _u2, _u3, _u4, _u5, _u6, _u7, _u8) = out
+        _ctx = prev["ctx"]
+        _ctx.update(
+            agent=agent, opt_state=opt_state, global_step=global_step,
+            metrics=_metrics, total_rewards_full=_tot_rew,
+            actions_pack=_acts, diag_pack=_diag,
+            popart_m1=popart_m1, popart_m2=popart_m2, popart_w=popart_w,
+            attn_ent=_attn, true_scalar_return=_true_ret,
+            probe_metrics=_probe_mets, vp_metrics=_vp_mets,
+        )
+        _finish_episode(_ctx)
+
     for ep in range(args.episodes):
         # (A3) Publish the episode index for the loss-drop probe rotation.
         # Inert unless --walk-rotate; one env-var write per episode.
@@ -14273,6 +14734,66 @@ def main():
                 jax.profiler.start_trace(_xtr_path())
 
         _ep_new_episode()
+        _EP_CTX = {"ep": ep}
+
+        def _ep_rollout_attempt(_ep_n, _win_n):
+            """ONE ROLLOUT attempt, with the terminal measurement in flight.
+
+            The ticket is opened before the rollout and closed after it, so
+            the terminal callback has exactly one place to submit to and a
+            rollout that never reaches a terminal step leaves an empty ticket
+            rather than a stray submission.
+
+            Reading the overflow arrays blocks on the rollout, which means the
+            terminal callback has already run when this returns: the plans are
+            with the measure actors and the ticket carries the future.
+            """
+            _ep_begin_attempt()
+            _tkt = _ep_env_mod.open_measure_ticket()
+            try:
+                _env_w = env_episode.with_delta_window(1 << int(_win_n))
+                _roll = _episode_rollout_jit(
+                    agent,
+                    reset_envs(_env_w),
+                    _env_w,
+                    base_mem,
+                    preferences_per_env,
+                    ep_key,
+                    stage_override,
+                    stage_pin_rules,
+                    _ep_n,
+                    int(_win_n),
+                )
+                _wov = _epstream.window_overflow_from(
+                    _roll[8], _roll[9], _win_n, _roll[10])
+                _ov = (_wov if _wov is not None
+                       else _epstream.overflow_from(
+                           _roll[6], _roll[7], _ep_n))
+            except BaseException:
+                # A rollout that died leaves no attempt to collect, and an
+                # open ticket would refuse every later one. Drop it and let
+                # the original error out.
+                _ep_env_mod.close_measure_ticket()
+                _ep_env_mod.drop_measurement(_tkt)
+                raise
+            _ep_env_mod.close_measure_ticket()
+            return (_roll, _tkt), _ov
+
+        def _ep_discard_rollout(result):
+            """Throw one ROLLOUT attempt away, its measurement included.
+
+            A discarded attempt's terminal plans must reach no trajectory and
+            its plan records must reach no log. The submission is DRAINED
+            rather than abandoned -- the repeat's own per-step tokenization
+            queues behind it on the same actors either way -- and everything
+            the actors recorded for it is then drained and dropped, which is
+            the half of the rollback the trainer's own snapshot cannot reach
+            (the actors are separate processes).
+            """
+            _roll_d, _tkt_d = result
+            _ep_env_mod.drop_measurement(_tkt_d)
+            _drain_measure_telemetry()
+            _ep_discard_episode(_roll_d)
 
         def _ep_attempt(_ep_n, _win_n):
             """ONE attempt at this episode, at the PAIR `(2^_ep_n, 2^_win_n)`.
@@ -14319,6 +14840,72 @@ def main():
             if _wov is not None:
                 return _out, _wov
             return _out, _epstream.overflow_from(_out[-7], _out[-6], _ep_n)
+
+        if _MPIPE:
+            # ---- THE PIPELINE. Rollout now, update one episode late. ----
+            _roll, _tkt = _epstream.run_episode(
+                _EP_BIN,
+                "episode %d" % ep,
+                _ep_rollout_attempt,
+                log=lambda line: print(line, flush=True),
+                on_discard=_ep_discard_rollout,
+                window_policy=_WIN_BIN,
+            )
+            # The bins are chosen from the ROLLOUT, and they choose the NEXT
+            # episode's, so they are recorded here rather than in the epilogue.
+            _EP_BIN.record(int(np.max(np.asarray(_roll[5]))))
+            _win_max = int(np.max(np.asarray(_roll[11])))
+            _face_max = int(np.max(np.asarray(_roll[12])))
+            _WIN_BIN.record(max(_win_max, _face_max))
+            if _xtr_on:
+                # This episode's update runs in the NEXT iteration, so a trace
+                # left open here would span two episodes. It covers the
+                # rollout, which is the half the measurement lives in.
+                jax.block_until_ready(
+                    [x for x in jax.tree_util.tree_leaves(_roll)
+                     if isinstance(x, jax.Array)])
+                jax.profiler.stop_trace()
+                _xtr_on = False
+            # 1. DISPATCH the previous episode's update (asynchronous).
+            _prev = _PIPE_PENDING[0]
+            _prev_out = (None if _prev is None
+                         else _pipe_update_dispatch(_prev))
+            # 2. WAIT for THIS episode's terminal rewards. The host blocks on
+            #    the measure actors here instead of inside the rollout, and
+            #    the update dispatched above is what fills the wait.
+            _t_wait0 = _prof_time.perf_counter()
+            _meas = _ep_env_mod.collect_measurement(_tkt)
+            _t_wait = _prof_time.perf_counter() - _t_wait0
+            # THE NUMBER THE WHOLE TICKET IS ABOUT. `prof/measure_wait` now
+            # reads ~0 (nothing blocks inside the callback); this is where the
+            # wait went, and how much of it the update in front of it hid.
+            print(f"[measure-pipeline] ep={ep} ticket={_tkt} "
+                  f"collect_wait={_t_wait:.1f}s "
+                  f"update_ahead={int(_prev is not None)}", flush=True)
+            _drain = _drain_measure_telemetry(_tkt)
+            if bool(np.any(_meas["sentinel"])):
+                print(f"[measure-pipeline] ep{ep}: "
+                      f"{int(np.sum(_meas['sentinel']))} of "
+                      f"{_meas['rewards'].shape[0]} terminal plans came back "
+                      f"sentinelled", flush=True)
+            # 3. FILL them into the trajectory this update will read.
+            _roll = _pipe_fill_rewards(_roll, _meas["rewards"])
+            # 4. FINISH the previous episode, whose update has now run.
+            if _prev is not None:
+                _pipe_finish(_prev, _prev_out)
+            _EP_CTX.update(win_max=_win_max, face_max=_face_max,
+                           xtr_on=False, pool_drain=_drain,
+                           collect_wait=_t_wait, ticket=_tkt,
+                           sentinelled=int(np.sum(_meas["sentinel"])))
+            _PIPE_PENDING[0] = {
+                "roll": _roll,
+                "ctx": _EP_CTX,
+                "args": (default_freeze_mask, stage_override,
+                         stage_vertex_mult, stage_pin_rules,
+                         stage_micro_mult, _kl_ref_coef_arg,
+                         _EP_BIN.last_used, int(_WIN_BIN.last_used)),
+            }
+            continue
         (
             agent,
             opt_state,
@@ -14367,139 +14954,25 @@ def main():
         _win_max = int(np.max(np.asarray(_win_used)))
         _face_max = int(np.max(np.asarray(_face_used)))
         _WIN_BIN.record(max(_win_max, _face_max))
-        if _xtr_on:
-            # The trace has to stay open until the device is drained or the
-            # timeline stops at the first output that happens to be ready.
-            jax.block_until_ready(
-                (agent, opt_state, metrics, total_rewards_full,
-                 global_step, popart_m1, popart_m2, popart_w))
-            jax.profiler.stop_trace()
-        # --kl-ref-target: DUAL ASCENT, once per episode, host-side, AFTER
-        # the update -- the same placement and the same containment as the
-        # Lagrangian dual (`_lag_dual_ascent`). Slot 7 of the per-component
-        # KL array is this episode's mean kl_ref; the loss appends it only
-        # when the trust region is on.
-        if _KL_REF_ON:
-            _kl_ref_ep = float(np.asarray(metrics[9])[7])
-            _kl_ref_coef = _kl_ref_dual_update(
-                _kl_ref_coef, _kl_ref_ep,
-                float(args.kl_ref_target), float(args.kl_ref_eta),
-                float(args.kl_ref_coef_min), float(args.kl_ref_coef_max))
-        # SEEDED EQUIVALENCE DUMP (ALPHAGRAD_EQ_DUMP=<prefix>, off by default).
-        # Any change to the env / callback / rollout path has to be proven
-        # trajectory-identical against its parent commit, and the only honest
-        # way to do that is to pickle the post-episode state and diff it leaf
-        # by leaf (see ~/dsnn/campaign_scratch/_eq137_cmp.py). Pure instrumentation: nothing
-        # downstream reads the file, and the branch is dead without the var.
-        _eqp = os.environ.get("ALPHAGRAD_EQ_DUMP", "")
-        if _eqp:
-            import pickle as _pk
-            _leaves = lambda t: [np.asarray(l) for l in
-                                 jax.tree_util.tree_leaves(t)]
-            with open(f"{_eqp}.ep{ep}.pkl", "wb") as _fh:
-                _pk.dump({
-                    "params": _leaves(eqx.filter(agent, eqx.is_array)),
-                    "opt": _leaves(opt_state),
-                    "metrics": _leaves(metrics),
-                    "actions": _leaves(actions_pack),
-                    "rewards": np.asarray(total_rewards_full),
-                    "step": int(global_step),
-                    "ret": float(true_scalar_return),
-                }, _fh)
-        lag_extra = None
-        if args.reward_mode == "lagrangian":
-            # Dual ascent: ONCE PER EPISODE, AFTER the PPO update, from the
-            # episode's measured terminal qualities (total_rewards_full is
-            # the raw per-env reward-vector sum; quality is sparse-terminal,
-            # so the sum IS the terminal measurement, diverged -1.0 intact).
-            _lag_q = np.asarray(total_rewards_full)[:, REWARD_INDEX["cosine_sim"]]
-            _lag_v = np.maximum(
-                0.0, args.lag_tau - np.clip(_lag_q, -0.5, 1.0))
-            _lag_frozen = bool(
-                args.popart_basin_freeze
-                and args.advantage_norm == "popart"
-                and float(np.mean(
-                    np.clip(_lag_q, -0.5, 1.0) <= 0.05)) > 0.5)
-            lag_lambda = _lag_dual_ascent(
-                lag_lambda, float(np.mean(_lag_v)), args.lag_eta,
-                args.lag_min, args.lag_max,
-                violation_target=float(getattr(args, "lag_target", 0.0)))
-            # stdout mirror of the wandb keys: v61's log never carried
-            # lambda anywhere, which made the collapse post-mortem blind.
-            # diag_pack tail: (..., mask_frac, wz_clip_frac,
-            # raw_adv_mean, raw_adv_min) -- sec 12.9 appended two entries,
-            # so mask_frac moved from [-2] to [-4].
-            _lag_mask_f = (float(np.asarray(diag_pack[-4]))
-                           if diag_pack is not None else -1.0)
-            _lag_raw_a = (float(np.asarray(diag_pack[-2]))
-                          if diag_pack is not None else float("nan"))
-            print("[lagrangian] ep=%d lambda=%.4f mean_violation=%.4f "
-                  "frac_violating=%.3f mean_raw_q=%.4f frozen=%d "
-                  "mask_frac=%.3f raw_adv=%.3f"
-                  % (ep, lag_lambda, float(np.mean(_lag_v)),
-                     float(np.mean(_lag_v > 0.0)), float(np.mean(_lag_q)),
-                     int(_lag_frozen), _lag_mask_f, _lag_raw_a),
-                  flush=True)
-            lag_extra = {
-                "lagrangian/lambda": float(lag_lambda),
-                "lagrangian/mean_violation": float(np.mean(_lag_v)),
-                "lagrangian/frac_violating": float(np.mean(_lag_v > 0.0)),
-                # 2026-08-21 dashboard confusion: the reward-channel
-                # quality slot stores -violation, so a HEALTHY run
-                # (q >= tau, violation 0) plots at 0 and reads like
-                # collapse. This is the RAW terminal quality, pre-clip,
-                # mean over envs -- the number actually to read.
-                "lagrangian/mean_raw_q": float(np.mean(_lag_q)),
-                "lagrangian/popart_frozen": float(_lag_frozen),
-            }
-        # THE WINDOW BIN'S TELEMETRY, from the DEVICE. `tokens/delta_max`
-        # beside it is the host counter, which is process-local and reads 0
-        # under --ray-measure -- keep it, because it is the human-readable
-        # number and now has a sibling to be checked against, but the bin
-        # walks on these.
-        _win_extra = {
-            "tokens/delta_max_device": int(_win_max),
-            "tokens/face_total_max": int(_face_max),
-            "tokens/window_bin": int(1 << _WIN_BIN.log2),
-            "tokens/window_bin_log2": int(_WIN_BIN.log2),
-            "tokens/window_occupancy": (
-                float(max(_win_max, _face_max)) / float(1 << _WIN_BIN.log2)),
-            "tokens/episode_bin_log2": int(_EP_BIN.log2),
-        }
-        lag_extra = (_win_extra if lag_extra is None
-                     else dict(lag_extra, **_win_extra))
-        host_log(
-            ep,
-            total_rewards_full,
-            actions_pack,
-            jnp.mean(total_rewards_full, axis=0),
-            metrics,
-            diag_pack,
-            popart_stats=_popart_derive(
-                popart_m1, popart_m2, popart_w,
-                args.popart_sigma_min, 1e12),
-            attn_entropy=attn_ent,
-            true_return=float(true_scalar_return),
-            probe_metrics=probe_metrics,
-            vp_metrics=vp_metrics,
-            extra_log=lag_extra,
+        _EP_CTX.update(
+            agent=agent, opt_state=opt_state, global_step=global_step,
+            metrics=metrics, total_rewards_full=total_rewards_full,
+            actions_pack=actions_pack, diag_pack=diag_pack,
+            popart_m1=popart_m1, popart_m2=popart_m2, popart_w=popart_w,
+            attn_ent=attn_ent, true_scalar_return=true_scalar_return,
+            probe_metrics=probe_metrics, vp_metrics=vp_metrics,
+            win_max=_win_max, face_max=_face_max, xtr_on=_xtr_on,
         )
-        # Mid-training top-N snapshot. Skips the wandb table log so we
-        # don't pollute the offline run with duplicate tables — only the
-        # post-training / post-calibration dumps land in wandb.
-        if (
-            args.print_top_every > 0
-            and (ep + 1) % args.print_top_every == 0
-            and ep + 1 < args.episodes
-        ):
-            pbar.write(
-                f"\n=== top-{args.top_n} after episode {ep + 1}/{args.episodes} ==="
-            )
-            print_top_n(
-                "Total Reward",
-                host_state["top_n_total"],
-                log_to_wandb=False,
-            )
+        _finish_episode(_EP_CTX)
+
+    # THE LAST EPISODE'S UPDATE. Pipelined, every episode's update runs one
+    # iteration after its rollout, so the final one has nobody to ride behind:
+    # it is dispatched and finished here. Without this the run would train on
+    # `--episodes - 1` episodes and log one fewer.
+    if _MPIPE and _PIPE_PENDING[0] is not None:
+        _prev = _PIPE_PENDING[0]
+        _PIPE_PENDING[0] = None
+        _pipe_finish(_prev, _pipe_update_dispatch(_prev))
 
     pbar.close()
 

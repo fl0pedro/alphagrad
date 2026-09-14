@@ -108,14 +108,22 @@ def test_campaign_defaults_do_attenuate_the_terminal_signal():
 # ---------------------------------------------------------------------------
 
 def _train_episode_ast():
-    """The AST of ppo.main's inner ``train_episode`` (where the advantage
-    dispatch lives)."""
+    """The AST of the function the advantage dispatch lives in.
+
+    That used to be ``train_episode``. Since the measurement was pipelined
+    (2026-09-14) the episode is two functions: ``_episode_rollout`` draws the
+    trajectory and ``_episode_update`` consumes it, and ``train_episode`` is
+    their composition under one jit. The GAE and everything after it moved into
+    ``_episode_update``, so that is where these three tests have to look. The
+    name is kept because the three callers read as "the episode's own code".
+    """
     src = inspect.getsource(ppo)
     tree = ast.parse(src)
     for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == "train_episode":
+        if (isinstance(node, ast.FunctionDef)
+                and node.name == "_episode_update"):
             return node
-    raise AssertionError("train_episode not found in ppo.py")
+    raise AssertionError("_episode_update not found in ppo.py")
 
 
 def _adv_dispatch(fn_ast):
