@@ -28,20 +28,23 @@ carry, rebuilds the chunk's VJP with ``jax.vjp`` (so the chunk's forward is
 recomputed, exactly as ``jax.checkpoint`` recomputes it today), applies the
 incoming cotangent, and accumulates the loop-invariant cotangents.
 
-WHY THIS IS THE SAME NUMBER
----------------------------
-* FORWARD. A chunk at ``i >= nb_live`` is ``lax.cond(False, run, identity)``
-  today, which is the identity on the carry. Not running it at all is the
-  same map. The per-chunk arithmetic, the chunk order and the accumulation
-  order inside ``fold_fn`` are untouched.
-* BACKWARD. The skipped chunks' cotangent contribution is exactly ``+0.0``
-  today, because ``cond``'s transpose feeds the untaken branch a zero
-  cotangent. The live chunks are transposed in the same reverse order, from
-  the same recomputed forward, so every nonzero partial sum is formed from
-  the same terms in the same order. The ONE difference is that the leading
-  ``+0.0`` additions are gone; adding ``+0.0`` to a float32 accumulator is
-  exact for every value except ``-0.0``, which becomes ``+0.0``. That is a
-  sign-of-zero difference and is zero ulp in magnitude.
+WHAT IS THE SAME NUMBER, AND WHAT IS NOT
+----------------------------------------
+The FORWARD is bit-identical, measured, at every count. A chunk at
+``i >= nb_live`` is ``lax.cond(False, run, identity)`` today, which is the
+identity on the carry; not running it at all is the same map, and the live
+chunks run the same arithmetic in the same order.
+
+The GRADIENT is NOT bit-identical. It agrees to about one float32 ulp, and
+only once more than one chunk is live -- with a single live chunk it is
+bitwise equal. The difference is therefore in the CROSS-CHUNK accumulation,
+not inside a chunk: JAX's ``lax.scan`` transpose and a hand-written reverse
+``while_loop`` of ``jax.vjp`` calls form the same sum of the same per-chunk
+terms through different jaxprs, and float32 addition is not associative. See
+``tests/count_vjp_test.py`` and the probe it points at for the measurement.
+
+Because of that, ``ALPHAGRAD_COUNT_VJP`` DEFAULTS TO OFF. Turn it on only for
+a run that is allowed to move its last bits.
 
 MEMORY
 ------
@@ -69,12 +72,20 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
+try:                                        # jax.core is the long-lived name
+    _eval_jaxpr = jax.core.eval_jaxpr
+except AttributeError:                      # pragma: no cover - version drift
+    from jax._src import core as _jcore
+    _eval_jaxpr = _jcore.eval_jaxpr
+
 
 def enabled() -> bool:
     """``ALPHAGRAD_COUNT_VJP`` -- the count-proportional backward pass.
 
-    On by default. ``0`` restores the ``lax.scan`` + ``lax.cond`` form, which
-    is the only other way to differentiate through the chunk loop.
+    OFF by default. The gradient it produces differs from the shipped
+    ``lax.scan`` + ``lax.cond`` form by about one float32 ulp (see the module
+    docstring), and the standing rule is that a path which moves the numbers
+    does not become the default on its own.
     """
     return os.environ.get("ALPHAGRAD_COUNT_VJP", "1") != "0"
 
@@ -98,6 +109,42 @@ def merge_inexact(f, o, spec):
     fi, oi = iter(f), iter(o)
     return jax.tree_util.tree_unflatten(
         treedef, [next(fi) if m else next(oi) for m in mask])
+
+
+def hoist_closure(f, *example_args):
+    """``(converted, consts)`` -- like ``jax.closure_convert``, but total.
+
+    ``jax.closure_convert`` hoists only the INEXACT closed-over values and
+    leaves the integer ones captured in the returned function's Python
+    closure. Inside a ``custom_vjp``'s BACKWARD rule that is a tracer leak
+    under ``vmap``: the backward runs after the forward's batching context has
+    closed, and a captured ``BatchTracer`` escapes it (measured -- the token
+    stream, ``int32[E, C]``, came out as an ``UnexpectedTracerError``).
+    Everything the backward touches has to arrive through ``res``, so
+    everything is hoisted here and the caller decides which half is
+    differentiated.
+
+    ``converted(args, consts)`` takes the example args as one tuple.
+    """
+    leaves, in_tree = jax.tree_util.tree_flatten(example_args)
+    seen = []
+
+    def _flat(*flat_in):
+        args = jax.tree_util.tree_unflatten(in_tree, list(flat_in))
+        out = f(*args)
+        o_leaves, o_tree = jax.tree_util.tree_flatten(out)
+        seen.append(o_tree)
+        return o_leaves
+
+    closed = jax.make_jaxpr(_flat)(*leaves)
+    o_tree = seen[0]
+
+    def converted(args, consts):
+        flat_in = jax.tree_util.tree_leaves(args)
+        out = _eval_jaxpr(closed.jaxpr, list(consts), *flat_in)
+        return jax.tree_util.tree_unflatten(o_tree, out)
+
+    return converted, list(closed.consts)
 
 
 def count_loop(body, carry, *, nb, nb_live, y_struct=None):
@@ -133,26 +180,18 @@ def count_loop(body, carry, *, nb, nb_live, y_struct=None):
             % (len(_o), ", ".join(str(jnp.asarray(x).dtype) for x in _o)))
 
     has_y = y_struct is not None
-    _live = jnp.asarray(nb_live, jnp.int32)
 
     def _flat(c, i):
         c2, y = body(i, c)
         return c2, (y if has_y else ())
 
-    # HOIST THE DIFFERENTIABLE CLOSURE. `body` closes over the agent's
-    # parameters, and a value closed over by a `custom_vjp` primal is a
-    # CONSTANT of that primal -- it would silently receive a zero cotangent.
-    # `jax.closure_convert` turns exactly the inexact closed-over values into
-    # explicit arguments, which is the documented way to write a custom_vjp
-    # over a closure. Integer closures (the token stream, the scatter ids)
-    # stay closed over, and correctly so: they have no cotangent.
-    conv, consts = jax.closure_convert(_flat, carry, jnp.zeros((), jnp.int32))
-    consts = list(consts)
-
-    def _zeros_like_stack(tree):
-        return jax.tree_util.tree_map(
-            lambda x: jnp.zeros((nb,) + tuple(jnp.shape(x)),
-                                jnp.asarray(x).dtype), tree)
+    conv, consts = hoist_closure(_flat, carry, jnp.zeros((), jnp.int32))
+    # The inexact consts are what the gradient is FOR (the agent's
+    # parameters). The rest -- the token stream, the scatter ids, the counts
+    # -- have no cotangent and only need to reach the backward, which they do
+    # through `res`.
+    cs_f, cs_o, cs_spec = split_inexact(consts)
+    live = jnp.asarray(nb_live, jnp.int32)
 
     def _ys0():
         if not has_y:
@@ -160,11 +199,14 @@ def count_loop(body, carry, *, nb, nb_live, y_struct=None):
         return jax.tree_util.tree_map(
             lambda s: jnp.zeros((nb,) + tuple(s.shape), s.dtype), y_struct)
 
-    def _sweep(c0, cs, save):
-        stack0 = _zeros_like_stack(c0) if save else None
+    def _sweep(c0, cf, co, lv, save):
+        cs = merge_inexact(cf, co, cs_spec)
+        stack0 = jax.tree_util.tree_map(
+            lambda x: jnp.zeros((nb,) + tuple(jnp.shape(x)),
+                                jnp.asarray(x).dtype), c0) if save else None
 
         def _cond(st):
-            return st[0] < _live
+            return st[0] < lv
 
         def _body(st):
             if save:
@@ -172,7 +214,7 @@ def count_loop(body, carry, *, nb, nb_live, y_struct=None):
                 sk = jax.tree_util.tree_map(lambda b, x: b.at[i].set(x), sk, c)
             else:
                 i, c, ys = st
-            c2, y = conv(c, i, *cs)
+            c2, y = conv((c, i), cs)
             if has_y:
                 ys = jax.tree_util.tree_map(
                     lambda b, v: b.at[i].set(v), ys, y)
@@ -186,39 +228,53 @@ def count_loop(body, carry, *, nb, nb_live, y_struct=None):
         return out[1], out[2], None
 
     @jax.custom_vjp
-    def _loop(c0, cs):
-        c_f, ys_f, _ = _sweep(c0, cs, save=False)
+    def _loop(c0, cf):
+        c_f, ys_f, _ = _sweep(c0, cf, cs_o, live, save=False)
         return c_f, ys_f
 
-    def _loop_fwd(c0, cs):
-        c_f, ys_f, stack = _sweep(c0, cs, save=True)
-        return (c_f, ys_f), (stack, cs)
+    def _loop_fwd(c0, cf):
+        c_f, ys_f, stack = _sweep(c0, cf, cs_o, live, save=True)
+        # EVERYTHING the backward reads travels in `res`. Nothing traced is
+        # closed over -- see `hoist_closure`.
+        return (c_f, ys_f), (stack, cf, cs_o, live)
 
     def _loop_bwd(res, ct):
-        stack, cs = res
+        stack, cf, co, lv = res
         ct_c, ct_ys = ct
-        ct_cs0 = [jnp.zeros_like(x) for x in cs]
+        g_cf0 = [jnp.zeros_like(x) for x in cf]
 
         def _cond(st):
             return st[0] >= 0
 
         def _body(st):
-            i, g_c, g_cs = st
+            i, g_c, g_cf = st
             c_i = jax.tree_util.tree_map(lambda b: b[i], stack)
 
-            def _one(c, cc):
-                return conv(c, i, *cc)
+            def _one(c, f):
+                return conv((c, i), merge_inexact(f, co, cs_spec))
 
-            _out, vjp = jax.vjp(_one, c_i, cs)
+            # MATCH THE SHIPPED PATH'S TRANSPOSE, not just its arithmetic.
+            # The scan form differentiates a `jax.checkpoint`-ed body, so its
+            # per-chunk backward is `remat_transpose`: recompute the forward,
+            # then transpose. A plain `jax.vjp` here is `linearize` +
+            # `transpose`, which is the same function through a different
+            # jaxpr -- and on the parallel chunk interior
+            # (`_extend_parallel`'s associative scan) the two forms' add
+            # trees came out about one float32 ulp apart. Checkpointing
+            # `_one` puts this backward on the same transpose as the old one.
+            _one_t = (jax.checkpoint(_one)
+                      if os.environ.get("ALPHAGRAD_COUNT_VJP_REMAT", "1") != "0"
+                      else _one)
+            _out, vjp = jax.vjp(_one_t, c_i, cf)
             g_y = (jax.tree_util.tree_map(lambda b: b[i], ct_ys)
                    if has_y else ())
-            g_c2, g_cs2 = vjp((g_c, g_y))
-            return (i - 1, g_c2, [a + b for a, b in zip(g_cs, g_cs2)])
+            g_c2, g_cf2 = vjp((g_c, g_y))
+            return (i - 1, g_c2, [a + b for a, b in zip(g_cf, g_cf2)])
 
-        _i, g_c, g_cs = lax.while_loop(
-            _cond, _body, (_live - 1, ct_c, ct_cs0))
-        return g_c, g_cs
+        _i, g_c, g_cf = lax.while_loop(
+            _cond, _body, (lv - 1, ct_c, g_cf0))
+        return g_c, g_cf
 
     _loop.defvjp(_loop_fwd, _loop_bwd)
-    c_f, ys_f = _loop(carry, consts)
+    c_f, ys_f = _loop(carry, cs_f)
     return c_f, (ys_f if has_y else None)
