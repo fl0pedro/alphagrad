@@ -14682,23 +14682,32 @@ def main():
             """
             _ep_begin_attempt()
             _tkt = _ep_env_mod.open_measure_ticket()
-            _env_w = env_episode.with_delta_window(1 << int(_win_n))
-            _roll = _episode_rollout_jit(
-                agent,
-                reset_envs(_env_w),
-                _env_w,
-                base_mem,
-                preferences_per_env,
-                ep_key,
-                stage_override,
-                stage_pin_rules,
-                _ep_n,
-                int(_win_n),
-            )
-            _wov = _epstream.window_overflow_from(
-                _roll[8], _roll[9], _win_n, _roll[10])
-            _ov = (_wov if _wov is not None
-                   else _epstream.overflow_from(_roll[6], _roll[7], _ep_n))
+            try:
+                _env_w = env_episode.with_delta_window(1 << int(_win_n))
+                _roll = _episode_rollout_jit(
+                    agent,
+                    reset_envs(_env_w),
+                    _env_w,
+                    base_mem,
+                    preferences_per_env,
+                    ep_key,
+                    stage_override,
+                    stage_pin_rules,
+                    _ep_n,
+                    int(_win_n),
+                )
+                _wov = _epstream.window_overflow_from(
+                    _roll[8], _roll[9], _win_n, _roll[10])
+                _ov = (_wov if _wov is not None
+                       else _epstream.overflow_from(
+                           _roll[6], _roll[7], _ep_n))
+            except BaseException:
+                # A rollout that died leaves no attempt to collect, and an
+                # open ticket would refuse every later one. Drop it and let
+                # the original error out.
+                _ep_env_mod.close_measure_ticket()
+                _ep_env_mod.drop_measurement(_tkt)
+                raise
             _ep_env_mod.close_measure_ticket()
             return (_roll, _tkt), _ov
 
@@ -14796,7 +14805,15 @@ def main():
             # 2. WAIT for THIS episode's terminal rewards. The host blocks on
             #    the measure actors here instead of inside the rollout, and
             #    the update dispatched above is what fills the wait.
+            _t_wait0 = _prof_time.perf_counter()
             _meas = _ep_env_mod.collect_measurement(_tkt)
+            _t_wait = _prof_time.perf_counter() - _t_wait0
+            # THE NUMBER THE WHOLE TICKET IS ABOUT. `prof/measure_wait` now
+            # reads ~0 (nothing blocks inside the callback); this is where the
+            # wait went, and how much of it the update in front of it hid.
+            print(f"[measure-pipeline] ep={ep} ticket={_tkt} "
+                  f"collect_wait={_t_wait:.1f}s "
+                  f"update_ahead={int(_prev is not None)}", flush=True)
             _drain = _drain_measure_telemetry()
             if bool(np.any(_meas["sentinel"])):
                 print(f"[measure-pipeline] ep{ep}: "
