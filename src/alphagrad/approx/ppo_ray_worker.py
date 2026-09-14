@@ -349,16 +349,25 @@ class MicroPPOAgent(eqx.Module):
     def encode_tokens(self, tokens, key, eqn_ids=None):
         """Per-token encoder pass. Returns ``(enc_x (S, E), token_mask (S,))``.
 
-        Same eqn_ids + pad-mask threading as the encoder pass (the
-        palimpsa recurrence must not accumulate the ~16k pad positions),
-        but WITHOUT the mean-pool — the pointer / value heads consume the
-        per-token embeddings directly.
+        Same pad-mask threading as the encoder pass (the palimpsa recurrence
+        must not accumulate the ~16k pad positions), but WITHOUT the
+        mean-pool -- the pointer / value heads consume the per-token
+        embeddings directly.
+
+        ``eqn_ids`` reaches the DENSE transformer only. It is that encoder's
+        pairwise T5 relational bias, and it survives; the palimpsa mixers'
+        own equation-id forget-gate modulation was removed on 2026-09-13 and
+        those classes no longer accept the argument at all. Passing it to
+        them would be a TypeError, so the branch below is the routing, not a
+        silent drop: on a palimpsa backbone there IS no consumer.
         """
         x = jax.vmap(self.embedding)(tokens)
         x = self.pos_enc(x)
         pad_tok = tokens > 0
-        enc_mask = pad_tok if self.policy in ("palimpsa", "palimpsa_bi") else None
-        enc_x = self.encoder(x, eqn_ids=eqn_ids, mask=enc_mask, key=key)
+        _palimpsa = self.policy in ("palimpsa", "palimpsa_bi")
+        enc_mask = pad_tok if _palimpsa else None
+        _rel = {} if _palimpsa else {"eqn_ids": eqn_ids}
+        enc_x = self.encoder(x, mask=enc_mask, key=key, **_rel)
         enc_x = jax.vmap(self.final_norm)(enc_x)
         return enc_x, pad_tok
 
