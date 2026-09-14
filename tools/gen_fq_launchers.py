@@ -58,6 +58,30 @@ import tempfile
 REPO = "/Users/assmuth/dsnn/alphagrad"
 HOME_DSNN = "/Users/assmuth/dsnn"
 
+# ---------------------------------------------------------------------------
+# THE CAMPAIGN STACK (finding 57).  The pgi15 GPU nodes mount NO home
+# directory (/Users/assmuth is ENOENT on gpu15..20 and cpu2); /Scratch is the
+# one writable filesystem every node and the head share.  So no launcher
+# generated here -- campaign arm or wave arm alike -- `cd`s to ~/dsnn/alphagrad
+# or runs `uv run`: every one of them runs the relocated venv of finding 57
+# against alphagrad/graphax worktrees staged under CAMPAIGN_STACK, with a
+# node-local $HOME that receives the two wandb credential files.  The
+# pre-flight refuses (exit 66) when any of these is missing.  Moved above
+# REPO/HOME_DSNN (owner ruling 2026-09-14, ticket dsnn-3qm.45.wave): the wave
+# 0-4 arms and fq_face_attrib used to `cd ~/dsnn/alphagrad` too, back when
+# that checkout was current; it is now 281 commits stale AND the home export
+# it lives on is read-only, so every arm moved onto this stack instead.  The
+# owner stages the stack once per campaign commit:
+#   git -C ~/dsnn/alphagrad worktree add --detach CAMPAIGN_STACK/alphagrad <sha>
+#   git -C ~/dsnn/graphax   worktree add --detach CAMPAIGN_STACK/graphax   <sha>
+# ---------------------------------------------------------------------------
+CAMPAIGN_ROOT = "/Scratch/assmuth/campaign"
+CAMPAIGN_STACK = f"{CAMPAIGN_ROOT}/stack"
+CAMPAIGN_RUNS = f"{CAMPAIGN_ROOT}/runs"
+CAMPAIGN_PY = "/Scratch/assmuth/t57/stack/venv/bin/python"
+CAMPAIGN_WANDB_HOME = "/Scratch/assmuth/t57/home"     # .netrc + .config/wandb
+CAMPAIGN_CACHE = "/Scratch/assmuth/mrg/cache"          # dsnn_wikitext, dsnn_mnist
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(os.path.dirname(_HERE), "src")
 
@@ -129,7 +153,7 @@ FACE_HEAD_WIDTH, FACE_QUANT_DTYPES = _face_head_geometry(APPROX_ADD)
 # 4ea0bf8 -- which is recorded in UNBIASED_PARETO_AND_MEASUREMENT.md.  They are
 # loss_drop rows and are NOT comparable with anything this arm produces.
 # ---------------------------------------------------------------------------
-LANDSCAPE_TOOL = f"{REPO}/src/alphagrad/approx/tools/landscape_map.py"
+LANDSCAPE_TOOL = f"{CAMPAIGN_STACK}/alphagrad/src/alphagrad/approx/tools/landscape_map.py"
 
 # GATE G1 (ticket .45) reads the sweep winners from a table that depends on
 # the arm's ELIMINATION ORDER: a plan applied at vertex v on the Markowitz
@@ -305,7 +329,7 @@ _DELETE = _Delete()
 SHARED_ENV = [
     ("RAY_TMPDIR", "/tmp/ray_$SLURM_JOB_ID"),
     ("PATH", '"$HOME/.local/bin:$PATH"'),
-    ("PYTHONPATH", '"$HOME/dsnn/graphax/src:$HOME/dsnn/alphagrad/src"'),
+    ("PYTHONPATH", f'"{CAMPAIGN_STACK}/graphax/src:{CAMPAIGN_STACK}/alphagrad/src"'),
     ("PYTHONDONTWRITEBYTECODE", "1"),
     # NO XLA FLAGS, and no preallocation switch (owner ruling 2026-09-12 on
     # ticket .43): the arms measure with temp memory, so a preallocation
@@ -348,11 +372,21 @@ SHARED_ENV = [
     ("ALPHAGRAD_DEBUG_MEASURE", "1"),
     ("ALPHAGRAD_DEBUG_DEGEN", "1"),
     ("ALPHAGRAD_PROFILE", "1"),
-    ("ALPHAGRAD_EXTEND_CHUNK", "128"),
+    # 256, not the unset 0: canary job 65443 (fq_p1a on gpu19, stack at
+    # 12ed4936) printed ppo.py's own warning ("ALPHAGRAD_EXTEND_CHUNK is 0,
+    # so every encode_extend scans all 32768 window steps ... 256 measured
+    # well") and an episode took 275 s at 0.  ppo.py has no --extend-chunk
+    # flag (2026-09-14 audit).
+    ("ALPHAGRAD_EXTEND_CHUNK", "256"),
     ("ALPHAGRAD_EXTEND_UNROLL", "32"),
     ("ALPHAGRAD_MULS_SENTINEL_CAP", "5e12"),
     # Project memory: ALWAYS skip the count pass (77% of host time) and use the
-    # spec-native direct measurement.
+    # spec-native direct measurement.  Canary job 65443 is why this one may
+    # never be dropped: with only ALPHAGRAD_SKIP_COST_ANALYSIS=1 set (this
+    # var absent, as it is on every campaign arm today) the symbolic count
+    # pass ran, and env.py's ALPHAGRAD_MULS_SENTINEL_CAP refusal
+    # ("muls-cap") rejected every one of the 48 plans two episodes produced
+    # -- the arm measured nothing (2026-09-14 audit).
     ("ALPHAGRAD_SKIP_COUNT_OPS", "1"),
     ("ALPHAGRAD_DIRECT_MEASURE", "1"),
     # --- hostperf stack
@@ -650,12 +684,12 @@ export ALPHAGRAD_SKIP_COUNT_OPS=1
 export JAX_COMPILATION_CACHE_DIR=$HOME/.jaxcache_$(hostname -s)
 
 echo "=== GATE 1/3: tools/ratio_gates.sh ==="
-PY="uv run --no-sync python" tools/ratio_gates.sh
+PY="$PY" tools/ratio_gates.sh
 RG=$?
 echo "ratio_gates rc=$RG"
 
 echo "=== GATE 2/3: tools/smoke.sh NeuralNetwork ==="
-SMOKE_OUT=$HOME/dsnn/run_analysis/w0_smoke uv run --no-sync tools/smoke.sh NeuralNetwork
+SMOKE_OUT=@CAMPAIGN_ROOT@/run_analysis/w0_smoke tools/smoke.sh NeuralNetwork
 SM=$?
 echo "smoke rc=$SM"
 
@@ -663,9 +697,9 @@ echo "smoke rc=$SM"
 # rc 2 = the gate could not run (harness misconfigured).  BOTH are failures --
 # a gate that did not run pins nothing (116c540).
 echo "=== GATE 3/3: tools/pool_liveness_gate.sh ==="
-POOL_GATE_OUT=$HOME/dsnn/run_analysis/w0_pool_liveness \
+POOL_GATE_OUT=@CAMPAIGN_ROOT@/run_analysis/w0_pool_liveness \
 RAY_TMPDIR=/tmp/ray_poolgate_$SLURM_JOB_ID \
-PY="uv run --no-sync python" tools/pool_liveness_gate.sh
+PY="$PY" tools/pool_liveness_gate.sh
 PL=$?
 echo "pool_liveness rc=$PL"
 
@@ -675,7 +709,7 @@ if [ $RG -ne 0 ] || [ $SM -ne 0 ] || [ $PL -ne 0 ]; then
   exit 1
 fi
 echo "W0 CPU GATES GREEN"
-""",
+""".replace("@CAMPAIGN_ROOT@", CAMPAIGN_ROOT),
 )
 
 arm(
@@ -744,7 +778,7 @@ instruction) and no later wave may credit it with anything.""",
 # --- P1/P2/P3 all run as measure actors on ONE visible device.
 export ALPHAGRAD_MEASURE_ACTOR=1
 export ALPHAGRAD_MEASURE_WARMUP=1
-OUT=$HOME/dsnn/run_analysis/w0
+OUT=@CAMPAIGN_ROOT@/run_analysis/w0
 mkdir -p $OUT
 
 echo "===================== P1: singleton skip sweep ====================="
@@ -754,7 +788,7 @@ echo "===================== P1: singleton skip sweep ====================="
 # resolves to grad_cosine (env.py:3489), which is exactly the settled channel.
 # It warns once and loudly.  Passing loss_drop here would measure a different
 # channel from every training arm.
-CUDA_VISIBLE_DEVICES=0 uv run --no-sync python \
+CUDA_VISIBLE_DEVICES=0 $PY \
   src/alphagrad/approx/tools/landscape_map.py \
   --example TransformerLM --dataset wikitext2 \
   --hidden-dim 256 --vocab-size 256 --num-layers 3 --seed 250197 \
@@ -778,7 +812,7 @@ for MODE in none pfm pfm_diag; do
     pfm)      export ALPHAGRAD_PER_FACE_MASKS=1 ALPHAGRAD_DIAG_PER_FACE=0 ;;
     pfm_diag) export ALPHAGRAD_PER_FACE_MASKS=1 ALPHAGRAD_DIAG_PER_FACE=1 ;;
   esac
-  CUDA_VISIBLE_DEVICES=0 uv run --no-sync python \
+  CUDA_VISIBLE_DEVICES=0 $PY \
     src/alphagrad/approx/tools/landscape_map.py \
     --example TransformerLM --dataset wikitext2 \
     --hidden-dim 256 --vocab-size 256 --num-layers 3 --seed 250197 \
@@ -796,7 +830,7 @@ echo "===================== P3: post-744fc3d re-baseline =================="
 for EX in LIF_SNN ADALIF_SNN ADALIF_SNN_SEQ LIF_SNN_SHD \
           Simple Lighthouse RobotArm_6DOF RoeFlux_1d BlackScholes_Jacobian; do
   echo "--- P3 example=$EX ---"
-  CUDA_VISIBLE_DEVICES=0 uv run --no-sync python \
+  CUDA_VISIBLE_DEVICES=0 $PY \
     src/alphagrad/approx/tools/landscape_map.py \
     --example $EX --dataset none --seed 250197 \
     --exec-on-gpu --cmp-type latency --mem-type peak_memory \
@@ -807,7 +841,7 @@ for EX in LIF_SNN ADALIF_SNN ADALIF_SNN_SEQ LIF_SNN_SHD \
   echo "P3 $EX exited with $?"
 done
 echo "W0 PROBE COMPLETE"
-""",
+""".replace("@CAMPAIGN_ROOT@", CAMPAIGN_ROOT),
 )
 
 
@@ -1306,24 +1340,6 @@ CAMPAIGN_MEM = "800G"          # the nodes have 1.5 TB; 100 G per GPU
 CAMPAIGN_RAY_MEASURE = "1"
 CAMPAIGN_RAY_MEASURE_TIMEOUT = "600"
 
-# ---------------------------------------------------------------------------
-# THE CAMPAIGN STACK (finding 57).  The pgi15 GPU nodes mount NO home
-# directory (/Users/assmuth is ENOENT on gpu15..20 and cpu2); /Scratch is the
-# one writable filesystem every node and the head share.  So a campaign
-# launcher does not `cd ~/dsnn/alphagrad` and does not `uv run`: it runs the
-# relocated venv of finding 57 against alphagrad/graphax worktrees staged
-# under CAMPAIGN_STACK, with a node-local $HOME that receives the two wandb
-# credential files.  The pre-flight refuses (exit 66) when any of these is
-# missing.  The owner stages the stack once per campaign commit:
-#   git -C ~/dsnn/alphagrad worktree add --detach CAMPAIGN_STACK/alphagrad <sha>
-#   git -C ~/dsnn/graphax   worktree add --detach CAMPAIGN_STACK/graphax   <sha>
-# ---------------------------------------------------------------------------
-CAMPAIGN_ROOT = "/Scratch/assmuth/campaign"
-CAMPAIGN_STACK = f"{CAMPAIGN_ROOT}/stack"
-CAMPAIGN_RUNS = f"{CAMPAIGN_ROOT}/runs"
-CAMPAIGN_PY = "/Scratch/assmuth/t57/stack/venv/bin/python"
-CAMPAIGN_WANDB_HOME = "/Scratch/assmuth/t57/home"     # .netrc + .config/wandb
-CAMPAIGN_CACHE = "/Scratch/assmuth/mrg/cache"          # dsnn_wikitext, dsnn_mnist
 # GATE G1 (ticket .45) on a node without a home: the sweep winners are read
 # from /Scratch.  THE TABLE IS THE SWEEP64 ONE, BY ORDER (owner ruling
 # 2026-09-13): 4029 rows at q >= 0.80 on Markowitz, 2969 on reverse.  The
@@ -1387,6 +1403,25 @@ NO_FLAG_ENV = [
      "episode of C++ HloCostAnalysis state (env.py), which over 250 "
      "episodes kills the job; the flops / bytes_accessed channels it feeds "
      "are LOGGED, never trained (--rewards cmp mem acc).  No flag exists."),
+    ("ALPHAGRAD_SKIP_COUNT_OPS", "1",
+     "skip the symbolic muls-count pass.  Canary job 65443 "
+     "(fq_p1a_skip_hinge_tau09_lq16 on gpu19, stack at 12ed4936) wrote 48 "
+     "plan records over two episodes and every one was refused, reason "
+     "muls-cap: with only ALPHAGRAD_SKIP_COST_ANALYSIS=1 set, env.py's "
+     "count pass runs and its ALPHAGRAD_MULS_SENTINEL_CAP (5e13) refuses "
+     "the exact Markowitz plan on TransformerLM outright, so the arm can "
+     "never earn a reward.  The validated smoke "
+     "(/Scratch/assmuth/mrg/runs/smoke_merged.sbatch) sets this and drains "
+     "clean; the reward channels these arms train (cmp mem acc) do not "
+     "need the count pass.  env.py has no --skip-count-ops flag."),
+    ("ALPHAGRAD_EXTEND_CHUNK", "256",
+     "chunk the encode_extend scan instead of walking the whole window.  "
+     "The same canary job (65443) printed ppo.py's own warning "
+     "('ALPHAGRAD_EXTEND_CHUNK is 0, so every encode_extend scans all "
+     "32768 window steps ... 256 measured well') and an episode took "
+     "275 s with it unset; the rendered fq_p1a launcher exports neither "
+     "this nor ALPHAGRAD_SKIP_COUNT_OPS today.  ppo.py has no "
+     "--extend-chunk flag."),
 ]
 
 STACK_ENV_NAMES = ("HOME", "PYTHONPATH", "DSNN_WIKITEXT_DIR", "DSNN_MNIST_DIR",
@@ -1866,13 +1901,13 @@ _FACE_ATTRIB_BODY = r"""
 # verified the imports landed there.  This arm imports the live trees, so the
 # equivalent guard is: say exactly which files were imported and exactly which
 # commits they are, and refuse if a stale editable install is shadowing them.
-uv run --no-sync python - <<'PYEOF'
+$PY - <<'PYEOF'
 import sys
 import graphax, alphagrad
 gx, ag = graphax.__file__, alphagrad.__file__
 print("graphax.__file__  =", gx)
 print("alphagrad.__file__=", ag)
-ok = gx.startswith("@HOME_DSNN@/graphax/") and ag.startswith("@REPO@/")
+ok = gx.startswith("@GX_REPO@/") and ag.startswith("@AG_REPO@/")
 if not ok:
     print("ABORT: imports did NOT resolve to the live working trees --")
     print("       an editable-install finder is beating PYTHONPATH.")
@@ -1888,7 +1923,7 @@ fi
 # A DIRTY LIBRARY IS A PROVENANCE HOLE.  Not fatal (graphax is routinely
 # mid-edit here) but it must be visible in the log beside the numbers, and
 # the diffstat is recorded so the run can be reconstructed.
-for R in @REPO@ @HOME_DSNN@/graphax; do
+for R in @AG_REPO@ @GX_REPO@; do
   D=$(git -C $R status --porcelain | wc -l)
   echo "TREE $R HEAD=$(git -C $R rev-parse --short HEAD) dirty=$D"
   if [ "$D" != "0" ]; then
@@ -1900,16 +1935,16 @@ done
 
 TOOL=@TOOL@
 echo "TOOL $TOOL sha256=$(sha256sum $TOOL | cut -c1-16)"
-COMMITTED=$(git -C @REPO@ rev-parse HEAD:src/alphagrad/approx/tools/landscape_map.py 2>/dev/null || echo none)
-ONDISK=$(git -C @REPO@ hash-object "$TOOL" 2>/dev/null || echo none)
+COMMITTED=$(git -C @AG_REPO@ rev-parse HEAD:src/alphagrad/approx/tools/landscape_map.py 2>/dev/null || echo none)
+ONDISK=$(git -C @AG_REPO@ hash-object "$TOOL" 2>/dev/null || echo none)
 if [ "$COMMITTED" = "$ONDISK" ]; then
   echo "TOOL PROVENANCE: instrument IS the committed HEAD blob $COMMITTED"
 else
   echo "TOOL PROVENANCE: WARNING -- instrument is NOT the committed HEAD blob"
   echo "                 on-disk=$ONDISK committed=$COMMITTED"
 fi
-AG_SHA=$(git -C @REPO@ rev-parse --short HEAD)
-GX_SHA=$(git -C @HOME_DSNN@/graphax rev-parse --short HEAD)
+AG_SHA=$(git -C @AG_REPO@ rev-parse --short HEAD)
+GX_SHA=$(git -C @GX_REPO@ rev-parse --short HEAD)
 NOTE="ag=$AG_SHA gx=$GX_SHA live tool=$(sha256sum $TOOL | cut -c1-8)"
 
 # A NEW OUTPUT DIRECTORY, DELIBERATELY.  run_analysis/landscape holds the
@@ -1917,9 +1952,9 @@ NOTE="ag=$AG_SHA gx=$GX_SHA live tool=$(sha256sum $TOOL | cut -c1-8)"
 # grad_cosine rows on the live stack and the two must not share a --report-only
 # glob.  (landscape_map keys its combined report on the quality metric as
 # well, so pooling is prevented twice.)
-OUT=@HOME_DSNN@/run_analysis/landscape_gradcos
+OUT=@OUT_ROOT@/run_analysis/landscape_gradcos
 mkdir -p $OUT
-W=@REPO@/wandb
+W=@AG_REPO@/wandb
 ARCH="--archive v57=$W/run-20260817_113827-it05ku34/files/pareto_front.json \
  --archive v60=$W/run-20260817_181647-ygm8n2jy/files/pareto_front.json \
  --archive v63=$W/run-20260822_165942-as9s5yrl/files/pareto_front.json \
@@ -1942,7 +1977,7 @@ run_on () {   # $1 = gpu index, $2 = label, rest = args
   echo "=========================================================="
   echo "PHASE $lbl  gpu=$g  start $(date +%H:%M:%S)  PULLDOWN=$GRAPHAX_QUANT_PULLDOWN"
   echo "=========================================================="
-  CUDA_VISIBLE_DEVICES=$g uv run --no-sync python "$TOOL" "$@"
+  CUDA_VISIBLE_DEVICES=$g $PY "$TOOL" "$@"
   echo "PHASE $lbl exited rc=$? at $(date +%H:%M:%S)"
 }
 
@@ -1976,8 +2011,9 @@ echo "=========================================================="
 echo "FACE ATTRIBUTION DONE $(date). alphagrad $AG_SHA graphax $GX_SHA"
 ls -la $OUT
 echo "=========================================================="
-""".replace("@TOOL@", LANDSCAPE_TOOL).replace("@REPO@", REPO) \
-   .replace("@HOME_DSNN@", HOME_DSNN).replace("@APPROX_ADD@", APPROX_ADD)
+""".replace("@TOOL@", LANDSCAPE_TOOL).replace("@AG_REPO@", f"{CAMPAIGN_STACK}/alphagrad") \
+   .replace("@GX_REPO@", f"{CAMPAIGN_STACK}/graphax").replace("@OUT_ROOT@", CAMPAIGN_ROOT) \
+   .replace("@APPROX_ADD@", APPROX_ADD)
 
 
 arm(
@@ -2158,21 +2194,29 @@ def is_scratch(a: dict) -> bool:
 
 
 def _python(a: dict) -> str:
-    """The interpreter invocation of this arm's runtime."""
-    return "$PY" if is_scratch(a) else "uv run --no-sync python"
+    """The interpreter invocation of this arm's runtime.  Every arm -- wave,
+    cpu, tool or campaign -- runs the campaign stack's venv now (owner ruling
+    2026-09-14): $HOME/dsnn is 281 commits stale and the export it lives on
+    is read-only.  `$PY` is bound by `_stack_exists_check` below."""
+    return "$PY"
 
 
 def _repo_paths(a: dict) -> tuple[str, str]:
-    """(alphagrad checkout, graphax checkout) the launcher runs against."""
-    if is_scratch(a):
-        return f"{CAMPAIGN_STACK}/alphagrad", f"{CAMPAIGN_STACK}/graphax"
-    return "~/dsnn/alphagrad", "~/dsnn/graphax"
+    """(alphagrad checkout, graphax checkout) the launcher runs against.
+
+    Every arm runs the same staged worktrees under CAMPAIGN_STACK (owner
+    ruling 2026-09-14); there is no longer a second, ~/dsnn-rooted tree."""
+    return f"{CAMPAIGN_STACK}/alphagrad", f"{CAMPAIGN_STACK}/graphax"
 
 
-def _scratch_stack_block() -> list[str]:
-    """The environment of a campaign arm: the stack, the plumbing, the TLM
-    shape, the measurement vars, the no-flag knobs.  Nothing else."""
-    L = [
+def _stack_exists_check() -> list[str]:
+    """ABORT(66) if the campaign stack (finding 57) is not staged, then bind
+    a node-local $HOME carrying the wandb credentials.  Every arm now runs
+    from CAMPAIGN_STACK (owner ruling 2026-09-14: the wave 0-4 arms and
+    fq_face_attrib used to `cd ~/dsnn/alphagrad`, but that checkout is 281
+    commits stale and the home export it lives on is read-only), so this is
+    shared by the campaign arms and the wave/cpu/tool arms alike."""
+    return [
         "# ---------------------- THE STACK (finding 57) ------------------------",
         "# The pgi15 GPU nodes mount NO home directory; /Scratch is the one",
         "# filesystem every node and the head share.  66 = the stack, the venv,",
@@ -2191,6 +2235,13 @@ def _scratch_stack_block() -> list[str]:
         'mkdir -p "$HOME"',
         f'cp -r {CAMPAIGN_WANDB_HOME}/. "$HOME/"',
         'chmod 600 "$HOME/.netrc"',
+    ]
+
+
+def _scratch_stack_block() -> list[str]:
+    """The environment of a campaign arm: the stack, the plumbing, the TLM
+    shape, the measurement vars, the no-flag knobs.  Nothing else."""
+    L = _stack_exists_check() + [
         f"export PYTHONPATH={CAMPAIGN_STACK}/graphax/src:{CAMPAIGN_STACK}/alphagrad/src",
         f"export DSNN_WIKITEXT_DIR={CAMPAIGN_CACHE}/dsnn_wikitext",
         f"export DSNN_MNIST_DIR={CAMPAIGN_CACHE}/dsnn_mnist",
@@ -2220,7 +2271,11 @@ def render(a: dict) -> str:
     py = _python(a)
     ag_repo, gx_repo = _repo_paths(a)
     L = ["#!/bin/bash"]
-    L.append("#SBATCH -p " + ("pgi15-cpu" if kind == "cpu" else "pgi15"))
+    # The partition is keyed on the NODE, not the kind: pgi15-cpu1 is a
+    # member only of the pgi15-cpu partition, never of pgi15 (a head node is
+    # in neither).  pgi15-cpu2 sits in both; it takes the ordinary GPU-node
+    # partition, pgi15, like every other non-head node here.
+    L.append("#SBATCH -p " + ("pgi15-cpu" if a["node"] == "pgi15-cpu1" else "pgi15"))
     L.append(f"#SBATCH -w {a['node']}")
     if scratch:
         # THE CAMPAIGN HARDWARE: the whole Blackwell node, by its gres name.
@@ -2236,15 +2291,13 @@ def render(a: dict) -> str:
         L.append("#SBATCH --mem=64G")
     L.append(f"#SBATCH -t {a['time']}")
     L.append(f"#SBATCH -J {a['job']}")
-    if scratch:
-        # -D and -o on /Scratch: a launcher whose -o names the missing home
-        # fails at launch with ExitCode 0:53 (finding 57).  CAMPAIGN_RUNS
-        # must exist before sbatch (slurm opens the log first): the owner
-        # creates it once when staging the stack.
-        L.append(f"#SBATCH -D {CAMPAIGN_STACK}/alphagrad")
-        L.append(f"#SBATCH -o {CAMPAIGN_RUNS}/{a['name']}_%j.log")
-    else:
-        L.append(f"#SBATCH -o {HOME_DSNN}/{a['name']}_%j.log")
+    # -D and -o on /Scratch, for every arm (owner ruling 2026-09-14): a
+    # launcher whose -o names the missing/stale home fails at launch with
+    # ExitCode 0:53 (finding 57).  CAMPAIGN_RUNS must exist before sbatch
+    # (slurm opens the log first): the owner creates it once when staging
+    # the stack.
+    L.append(f"#SBATCH -D {CAMPAIGN_STACK}/alphagrad")
+    L.append(f"#SBATCH -o {CAMPAIGN_RUNS}/{a['name']}_%j.log")
     L.append("#")
     L.append("# " + "=" * 72)
     L.append(_wrap_comment(a["purpose"]))
@@ -2299,16 +2352,17 @@ def render(a: dict) -> str:
         L.append("")
 
     if kind == "cpu" and not a.get("needs_tool"):
-        L.append(PREAMBLE.format(repo=REPO).rstrip())
-        L.append('export PATH="$HOME/.local/bin:$PATH"')
-        L.append('export PYTHONPATH="$HOME/dsnn/graphax/src:$HOME/dsnn/alphagrad/src"')
+        L.append("export RAY_TMPDIR=/tmp/ray_$SLURM_JOB_ID")
+        L.extend(_stack_exists_check())
+        L.append(f"export PYTHONPATH={CAMPAIGN_STACK}/graphax/src:{CAMPAIGN_STACK}/alphagrad/src")
         L.append("export PYTHONDONTWRITEBYTECODE=1")
+        L.append(f"cd {CAMPAIGN_STACK}/alphagrad")
         L.append("")
         L.append(_toolchain_block(kind))
         L.append("")
         L.append('echo "HOST=$(hostname) JOB=$SLURM_JOB_ID"')
-        L.append('echo "ag=$(git -C ~/dsnn/alphagrad rev-parse --short HEAD)'
-                 ' gx=$(git -C ~/dsnn/graphax rev-parse --short HEAD)"')
+        L.append(f'echo "ag=$(git -C {ag_repo} rev-parse --short HEAD)'
+                 f' gx=$(git -C {gx_repo} rev-parse --short HEAD)"')
         L.append(a["body"])
         return "\n".join(L) + "\n"
 
@@ -2320,7 +2374,12 @@ def render(a: dict) -> str:
                 f"(got {sorted(a['env'])}); every knob is an argument")
         L.extend(_scratch_stack_block())
     else:
-        L.append(PREAMBLE.format(repo=REPO).rstrip())
+        # A wave/cpu/tool arm (owner ruling 2026-09-14): the same stack, the
+        # same node-local $HOME for wandb, and the same ABORT(66) check as a
+        # campaign arm, but its OWN per-arm environment -- not args-only.
+        L.append("export RAY_TMPDIR=/tmp/ray_$SLURM_JOB_ID")
+        L.extend(_stack_exists_check())
+        L.append(f"cd {CAMPAIGN_STACK}/alphagrad")
         over = a.get("env", {})
         for k, v in SHARED_ENV:
             if k == "RAY_TMPDIR":
@@ -2379,8 +2438,7 @@ def render(a: dict) -> str:
     L.append("")
     _approx_add = dict(_merge_cli(a.get("cli", {}))).get("--approx-add", APPROX_ADD)
     if kind != "cpu":
-        _twoop = (f"{gx_repo}/tests/misc/test_face_two_op_form.py" if scratch
-                  else "$HOME/dsnn/graphax/tests/misc/test_face_two_op_form.py")
+        _twoop = f"{gx_repo}/tests/misc/test_face_two_op_form.py"
         L.append(f"# --approx-add {_approx_add} emits the res-slot two-op face form.")
         L.append("# On a graphax that rejects it, EVERY plan putting a rule in the")
         L.append("# res/new slot dies in _trace_truncate SILENTLY -- no counter, no")

@@ -708,17 +708,48 @@ def test_an_order_without_a_sweep_raises_instead_of_borrowing_one(gen):
         gen.CAMPAIGN_GATE_WINNERS_TABLES.update(saved)
 
 
-def test_the_wave_arms_keep_the_home_runtime_and_the_shared_env(gen):
+def test_the_wave_arms_keep_their_own_env_but_run_the_campaign_stack(gen):
+    """Owner ruling 2026-09-14: the wave arms and fq_face_attrib no longer
+    `cd ~/dsnn/alphagrad` or `uv run` -- $HOME/dsnn is 281 commits stale and
+    the export it lives on is read-only, so every arm now stages against
+    CAMPAIGN_STACK like the campaign arms.  They keep their OWN per-arm
+    SHARED_ENV (not args-only: `is_scratch` -- and the full-node Blackwell
+    hardware and env-purity check that comes with it -- stays False), and
+    their own 4-GPU hardware request."""
     waves = [a for a in gen.ARMS if a["kind"] == "train" and not a.get("phase")]
     assert waves
     for a in waves:
         assert not gen.is_scratch(a), a["name"]
         text = gen.render(a)
-        assert "uv run --no-sync python" in text, a["name"]
+        assert "uv run" not in text, a["name"]
+        assert "$HOME/dsnn" not in text and "~/dsnn" not in text, a["name"]
+        assert f"PY={gen.CAMPAIGN_PY}\n" in text, a["name"]
+        assert f"cd {gen.CAMPAIGN_STACK}/alphagrad\n" in text, a["name"]
+        assert f"#SBATCH -D {gen.CAMPAIGN_STACK}/alphagrad\n" in text, a["name"]
+        assert f"#SBATCH -o {gen.CAMPAIGN_RUNS}/" in text, a["name"]
+        assert "ABORT(66)" in text, a["name"]
+        assert "#SBATCH --gres=gpu:4\n" in text, a["name"]
         assert "CUDA_VISIBLE_DEVICES=0,1,2,3" in text, a["name"]
         assert f"  --approx-add {gen.APPROX_ADD}\n" in text, a["name"]
         assert "  --fixed-order " in text, a["name"]
         assert "ALPHAGRAD_FORCE_REV_ORDER" not in text, a["name"]
+
+
+def test_no_rendered_launcher_of_any_kind_references_home_dsnn(gen):
+    """The 2026-09-14 audit found 19 wave/cpu/tool launchers still pointed at
+    $HOME/dsnn (281 commits stale, and the export it lives on is read-only)
+    while the 17 campaign arms already ran the /Scratch stack of finding 57.
+    Every arm runs that stack now; this is the whole-fleet guard the
+    per-family tests above do not give."""
+    for a in gen.ARMS:
+        text = gen.render(a)
+        assert "$HOME/dsnn" not in text, a["name"]
+        assert "~/dsnn" not in text, a["name"]
+        assert "/Users/assmuth" not in text, a["name"]
+        for line in text.splitlines():
+            if line.lstrip().startswith("#"):
+                continue
+            assert "uv run" not in line, (a["name"], line)
 
 
 # ------------------------------------------- 10. --dry-run writes outside
