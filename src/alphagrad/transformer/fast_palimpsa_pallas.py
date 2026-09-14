@@ -446,7 +446,7 @@ _READ_LOGGED = [False]
 
 
 def palimpsa_read() -> str:
-    """``"exact"`` or ``"fast"`` -- ``ALPHAGRAD_PALIMPSA_READ``, default exact.
+    """``"exact"`` or ``"fast"`` -- ``ALPHAGRAD_PALIMPSA_READ``, default fast.
 
     ONE flag for every reader, and every reader must consult THIS function
     rather than the environment directly. The rollout extend, the loss extend
@@ -456,11 +456,13 @@ def palimpsa_read() -> str:
     switch, or a call site that forgot to ask, would show up as a ratio that
     drifts from 1 with no other symptom.
 
-    Default ``exact`` until the owner re-records the policy regression gate:
-    ``fast`` is a different operator, so it produces a different (and
-    correct) golden, not a failure.
+    Default ``fast`` (owner ruling 2026-09-14: "just adopt the fast read").
+    The policy regression gate's live golden was recorded under ``fast``;
+    the exact operator's golden is archived as
+    ``tests/golden/policy_gate_golden_pre_fastread.json``. ``fast`` is a
+    different operator, so the two goldens differ by design.
     """
-    mode = os.environ.get("ALPHAGRAD_PALIMPSA_READ", "exact")
+    mode = os.environ.get("ALPHAGRAD_PALIMPSA_READ", "fast")
     if mode not in ("exact", "fast"):
         raise ValueError(
             "ALPHAGRAD_PALIMPSA_READ must be 'exact' or 'fast', got "

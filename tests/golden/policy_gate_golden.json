@@ -53,8 +53,8 @@
       2
      ]
     ],
-    "entropy": "3f2b8a94",
-    "logp": "beffa0a6",
+    "entropy": "3f2c31c4",
+    "logp": "bf026064",
     "n_live": 1,
     "pair_valid": [
      [
@@ -203,9 +203,9 @@
    "step": 0,
    "target_vertex": 1,
    "value": [
-    "be105860",
-    "3d15405e",
-    "3d93b981"
+    "be08f936",
+    "3d02fd86",
+    "3d74bf0b"
    ],
    "vertex": 0,
    "vertex_mask_fill": [
@@ -215,27 +215,27 @@
    "vertex_probs_live": [
     [
      0,
-     "3e23a058"
+     "3e25293e"
     ],
     [
      1,
-     "3e2fe0f2"
+     "3e332c0c"
     ],
     [
      2,
-     "3e1ca9f2"
+     "3e1aafa6"
     ],
     [
      3,
-     "3e2d01db"
+     "3e2ed219"
     ],
     [
      4,
-     "3e1bc830"
+     "3e1a66e3"
     ],
     [
      5,
-     "3e470aba"
+     "3e43c212"
     ]
    ]
   },
@@ -285,8 +285,8 @@
       7
      ]
     ],
-    "entropy": "40dcc152",
-    "logp": "c0e62687",
+    "entropy": "40dcec27",
+    "logp": "c0e47c34",
     "n_live": 1,
     "pair_valid": [
      [
@@ -436,9 +436,9 @@
    "step": 1,
    "target_vertex": 6,
    "value": [
-    "bde571e2",
-    "3c8e67fa",
-    "3d818e4e"
+    "bdd72aea",
+    "3c5e87ad",
+    "3d5b904e"
    ],
    "vertex": 5,
    "vertex_mask_fill": [
@@ -448,23 +448,23 @@
    "vertex_probs_live": [
     [
      1,
-     "3e5f0180"
+     "3e5d9b97"
     ],
     [
      2,
-     "3e37c494"
+     "3e381aaf"
     ],
     [
      3,
-     "3e41985d"
+     "3e4570c6"
     ],
     [
      4,
-     "3e3d1d01"
+     "3e3c3738"
     ],
     [
      5,
-     "3e6a848e"
+     "3e68a1c1"
     ]
    ]
   },
@@ -509,8 +509,8 @@
       4
      ]
     ],
-    "entropy": "3fab49d3",
-    "logp": "bf7dbd76",
+    "entropy": "3fab3440",
+    "logp": "bf7d2120",
     "n_live": 2,
     "pair_valid": [
      [
@@ -772,9 +772,9 @@
    "step": 2,
    "target_vertex": 3,
    "value": [
-    "be8a8033",
-    "bdfb20a1",
-    "3d67d59e"
+    "be85118a",
+    "be0b75a8",
+    "3d709d88"
    ],
    "vertex": 2,
    "vertex_mask_fill": [
@@ -784,19 +784,19 @@
    "vertex_probs_live": [
     [
      1,
-     "3e80bed6"
+     "3e803b17"
     ],
     [
      2,
-     "3e7fb1b8"
+     "3e7eba02"
     ],
     [
      3,
-     "3e794f16"
+     "3e78c8e5"
     ],
     [
      4,
-     "3e82c0c5"
+     "3e840376"
     ]
    ]
   },
@@ -852,8 +852,8 @@
       7
      ]
     ],
-    "entropy": "41176610",
-    "logp": "c1154aed",
+    "entropy": "41172aef",
+    "logp": "c113b319",
     "n_live": 2,
     "pair_valid": [
      [
@@ -1124,9 +1124,9 @@
    "step": 3,
    "target_vertex": 5,
    "value": [
-    "be813e20",
-    "bdffa816",
-    "3d63fe39"
+    "be7810a6",
+    "be0d46c3",
+    "3d6f0504"
    ],
    "vertex": 4,
    "vertex_mask_fill": [
@@ -1136,15 +1136,15 @@
    "vertex_probs_live": [
     [
      1,
-     "3eaa5bd2"
+     "3ea96ce6"
     ],
     [
      3,
-     "3eae328e"
+     "3eacc7fe"
     ],
     [
      4,
-     "3ea7719f"
+     "3ea9cb1c"
     ]
    ]
   },
@@ -1197,9 +1197,9 @@
    "step": 4,
    "target_vertex": 4,
    "value": [
-    "be936f56",
-    "be045165",
-    "3dc05564"
+    "be902904",
+    "be10cbfb",
+    "3dc3f0aa"
    ],
    "vertex": 3,
    "vertex_mask_fill": [
@@ -1209,11 +1209,11 @@
    "vertex_probs_live": [
     [
      1,
-     "3efe8f9d"
+     "3effcd93"
     ],
     [
      3,
-     "3f00b833"
+     "3f001937"
     ]
    ]
   }
