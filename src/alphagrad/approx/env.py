@@ -3839,12 +3839,47 @@ def _time_one_rep(ex, eval_args, unique_devices, inner):
     with _get_resource_monitor(unique_devices) as monitor:
         # Accumulation loop (spec, default 50 when opted in): the
         # executions queue back-to-back inside one monitor window and
-        # the exit barrier drains them all, so time/inner is a
-        # per-execution latency with dispatch + timer overhead
-        # amortized. Peak memory is unaffected (same executable, same
-        # buffers each pass).
+        # the BLOCK BELOW drains them, so time/inner is a per-execution
+        # latency with dispatch + timer overhead amortized. Peak memory
+        # is unaffected (same executable, same buffers each pass).
         for _k in range(inner):
             out = ex(*eval_args)
+        # DRAIN THE DEVICE QUEUE INSIDE THE TIMED WINDOW. JAX dispatch is
+        # ASYNCHRONOUS: ``ex(*eval_args)`` returns as soon as the work is
+        # ENQUEUED, so without this the timer stops when the host finishes
+        # DISPATCHING, not when the device finishes EXECUTING.
+        #
+        # ``ResourceMonitor.__exit__`` is NOT a drain, whatever its name
+        # suggests: it runs ``jax.effects_barrier()``, which waits only for
+        # computations carrying ORDERED EFFECTS. A pure jitted Jacobian has
+        # none, so the barrier returns immediately and the window closes
+        # over an empty device queue.
+        #
+        # This read CORRECTLY for the whole fixed-count era by ACCIDENT.
+        # At ``inner`` 50 the host cannot enqueue 50 executions of a big
+        # program without blocking -- the PJRT queue saturates and each
+        # execution's output buffer (780 MB on the transformer arm) makes
+        # the allocator wait for an earlier one to be freed -- so the
+        # enqueue loop itself became the barrier and the reading landed
+        # near the truth. The budget rule of 2026-09-14 gives an 18 ms
+        # program ``inner`` 5, five executions fit in the queue, the host
+        # never blocks, and the SAME code reported DISPATCH TIME.
+        #
+        # MEASURED (canary job 65720, the campaign arm on the merged tip):
+        # the 18.22 ms candidate read 119 us -- BELOW its own 135 us
+        # rev-exact reference, which still saturated at inner 50 -- so
+        # ``paired_log_costs`` floored the candidate at the reference and
+        # the paired latency reward was EXACTLY 0 on every plan. The memory
+        # channel was untouched (-3.1357 nats throughout) because
+        # ``MemoryTracker`` polls the allocator from a native thread and
+        # sees the real 781 MB watermark either way. Memory right, latency
+        # wrong, is the signature of a missing drain.
+        #
+        # Blocking on the LAST output is sufficient and is what the
+        # ``ALPHAGRAD_DIRECT_MEASURE`` branch above has always done:
+        # executions of one executable on one device issue in order, so
+        # waiting for the last one waits for all of them.
+        jax.block_until_ready(out)
     # Key by name instead of unpacking ``.values()`` so this stays
     # robust to dict-order / API tweaks in jax_memory_monitor.
     _lat_s = float(monitor.stats.get("time", 0.0)) / inner
@@ -8155,10 +8190,11 @@ def _callback_measured(
         # earns only three windows still sees three different samples rather
         # than three repetitions of sample 0.
         #
-        # ResourceMonitor already runs ``jax.effects_barrier()`` in
-        # ``__enter__`` / ``__exit__``, so we don't need an extra
-        # ``block_until_ready`` on the result -- the barriers drain the
-        # device queue both for the timer and the memory tracker.
+        # THE DRAIN LIVES IN ``_time_one_rep``, inside the timed window
+        # (see the block there). It used to say here that ResourceMonitor's
+        # ``jax.effects_barrier()`` drained the queue for us; it does not --
+        # that barrier waits only for ORDERED EFFECTS, and a jitted Jacobian
+        # has none. Job 65720 measured what the belief cost.
         #
         # ``ALPHAGRAD_BYPASS_RESOURCE_MONITOR=1`` skips the construction +
         # context manager entirely (vs. the lighter
