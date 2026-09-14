@@ -812,6 +812,8 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *, seed: int = 0)
         # --ref-reps-per-point silently inert in every pooled run.
         ref_num_data_points=int(getattr(args, "ref_num_data_points", 5)),
         ref_reps_per_point=int(getattr(args, "ref_reps_per_point", 32)),
+        measure_budget_secs=float(getattr(args, "measure_budget_secs", 1.0)),
+        measure_window_secs=float(getattr(args, "measure_window_secs", 0.05)),
         percentile_keep=float(getattr(args, "percentile_keep", 0.60)),
         # Latency-measurement knobs — THIS env (inside the CpuApproximationActor)
         # does the actual pooled measurement, so the flags must be forwarded

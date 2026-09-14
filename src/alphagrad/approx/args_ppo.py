@@ -180,6 +180,23 @@ def add_ppo_args(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--latency-inner-reps stays SHARED between the two halves.",
     )
     p.add_argument(
+        "--measure-budget-secs", type=float, default=1.0,
+        help="THE PER-PLAN EXECUTION BUDGET in seconds (owner ruling "
+        "2026-09-14). The candidate's timed windows are chosen from one "
+        "warm-up execution so the plan costs about this much GPU time "
+        "whatever it costs per execution; --num-data-points and "
+        "--reps-per-point become the CAP on the window count, not the "
+        "count. A slow plan gets fewer windows, by design.",
+    )
+    p.add_argument(
+        "--measure-window-secs", type=float, default=0.05,
+        help="TARGET DURATION of one timed window (owner ruling "
+        "2026-09-14). Executions per window = clamp(ceil(this / one "
+        "execution), 5, --latency-inner-reps), which keeps the window off "
+        "the dispatch floor: at 0.05 s a 121 us reference takes 50 and an "
+        "18 ms candidate takes 5.",
+    )
+    p.add_argument(
         "--percentile-keep", type=float, default=0.60,
         help="Percentile (in [0, 1]) used to aggregate the noisy-channel "
         "pool. 0.60 = P60: 'slowest 60%% latency / highest 60%% memory / "

@@ -264,6 +264,12 @@ REQUIRED_FLAGS = [
     "--unified-face-head",
     "--live-faces",
     "--dynamic-substeps",
+    # The per-plan time budget (owner ruling 2026-09-14). Every training arm
+    # passes both explicitly, so a tree without them would fail at argparse
+    # after the preflight said yes -- the same failure --paired-cost-floor
+    # was added here for.
+    "--measure-budget-secs",
+    "--measure-window-secs",
 ]
 
 # The files the pre-flight greps REQUIRED_FLAGS in.  ppo.py defines every
@@ -501,6 +507,23 @@ SHARED_CLI = [
     # INNER reps stay shared at 50 above (owner ruling).
     ("--ref-num-data-points", "5"),
     ("--ref-reps-per-point", "32"),
+    # THE PER-PLAN TIME BUDGET (owner ruling 2026-09-14).  Named explicitly
+    # on every training arm, for the same reason every other measurement flag
+    # is: a launcher must say what it measured.  --num-data-points and
+    # --reps-per-point above are now the CAP on the candidate's timed
+    # windows; how many of them a plan earns comes from one warm-up
+    # execution, so that a plan costs about ONE SECOND of executions whatever
+    # it costs per execution.  Before the ruling a plan ran a fixed
+    # 5 x 4 x 50 = 1005 executions, which on the transformer arm is 18.3 s
+    # per plan and 293 s of an episode's 405 s, to sample a reading whose
+    # coefficient of variation is 0.56 percent.  A SLOW PLAN NOW GETS FEWER
+    # WINDOWS, which the owner accepts: slow runs do not matter, they are too
+    # large anyway.  The 50 ms window is what keeps a window off the dispatch
+    # floor (5 executions per window read 20.7 percent high against 50; 20
+    # already read within 3 percent of 50), and --latency-inner-reps 50 above
+    # is its ceiling.
+    ("--measure-budget-secs", "1.0"),
+    ("--measure-window-secs", "0.05"),
     ("--incremental-encode", None),
     # REAL measured latency and REAL measured peak memory. Non-negotiable.
     ("--cmp-type", "latency"),

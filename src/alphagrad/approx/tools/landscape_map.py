@@ -167,7 +167,21 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument("--mem-type", default="xla_peak_memory")
     p.add_argument("--num-data-points", type=int, default=5)
     p.add_argument("--reps-per-point", type=int, default=4)
-    p.add_argument("--latency-inner-reps", type=int, default=5)
+    p.add_argument("--latency-inner-reps", type=int, default=5,
+                   help="The CEILING on executions per timed window (owner "
+                        "ruling 2026-09-14). The window rule picks the "
+                        "actual count between 5 and this; at the default 5 "
+                        "the interval collapses and the count is fixed at "
+                        "5, which is what this tool always ran.")
+    p.add_argument("--measure-budget-secs", type=float, default=1.0,
+                   help="Per-plan execution budget in seconds (owner ruling "
+                        "2026-09-14). --num-data-points x --reps-per-point "
+                        "is now the CAP on the timed windows, and the budget "
+                        "picks how many of them a plan of this cost earns. "
+                        "Every row stamps the counts it actually used.")
+    p.add_argument("--measure-window-secs", type=float, default=0.05,
+                   help="Target duration of one timed window (owner ruling "
+                        "2026-09-14); see --latency-inner-reps.")
     p.add_argument("--num-eval-samples", type=int, default=5)
     # 2, as the launchers pass (--latency-warmup 2). Warmup is a BIAS
     # knob, not a precision knob: one untimed execution leaves first-touch
@@ -369,6 +383,14 @@ os.environ.setdefault("ALPHAGRAD_SKIP_COUNT_OPS", "1")
 os.environ.setdefault("ALPHAGRAD_DIRECT_MEASURE", "1")
 os.environ.setdefault("ALPHAGRAD_CLEAR_JIT_CACHES_EVERY", "0")
 os.environ.setdefault("ALPHAGRAD_UNIFIED_FACE_ENUM", "1")
+# THE PER-EPISODE DUPLICATE CACHE IS OFF IN THIS TOOL, always, and not by
+# setdefault: env._callback serves a repeat of a plan it has already measured
+# from a cache (owner ruling 2026-09-14), which is exactly right for a trainer
+# whose 16 envs keep emitting one program and exactly wrong here. `--reps`
+# exists to measure the SPREAD of repeated measurements of one plan; with the
+# cache armed every repeat after the first would return the first one's
+# numbers and the spread would read zero.
+os.environ["ALPHAGRAD_MEASURE_DEDUPE"] = "0"
 # The quality channel is configured through the ENVIRONMENT in this codebase
 # (one env var, one reader, so two paths cannot disagree) -- mirror ppo.py.
 os.environ["ALPHAGRAD_QUALITY_METRIC"] = str(ARGS.quality_metric)
@@ -478,6 +500,8 @@ def build_env(args):
         num_data_points=int(args.num_data_points),
         reps_per_point=int(args.reps_per_point),
         latency_inner_reps=int(args.latency_inner_reps),
+        measure_budget_secs=float(args.measure_budget_secs),
+        measure_window_secs=float(args.measure_window_secs),
         latency_warmup=int(args.latency_warmup),
         # --face-actions implies per-face legality masking (a per-vertex rule
         # that does not fit ONE face's operand would otherwise hit graphax's
@@ -1241,6 +1265,11 @@ def measure(env, eval_samples, order, plan):
     # co-requested QUANT is filling up.
     detail = {k: int(v) for k, v in st.items()
               if k.startswith(("applied_", "skipped_"))}
+    # THE PROTOCOL THIS ROW WAS MEASURED UNDER. Since the owner's ruling of
+    # 2026-09-14 it is a property of the PLAN -- a slow plan earns fewer
+    # windows than a fast one out of the same second of budget -- so it
+    # belongs on the row, not only in the config stamp.
+    _mc = envmod.last_measure_counts()
     return {
         "latency_ns": float(-r[REWARD_INDEX["latency_ns"]]),
         "peak_memory": runtime_watermark,
@@ -1248,6 +1277,9 @@ def measure(env, eval_samples, order, plan):
         "quality": float(r[REWARD_INDEX["quality"]]),
         "frob_residual": float(r[REWARD_INDEX["frob_residual"]]),
         "wall_s": wall,
+        "measure_inner": int(_mc.get("inner", 0)),
+        "measure_windows": int(_mc.get("windows", 0)),
+        "measure_secs": float(_mc.get("secs", 0.0)),
         "applied": int(st.get("applied", 0)),
         "skipped": int(st.get("skipped", 0)),
         "applied_detail": json.dumps(detail, sort_keys=True),
@@ -1291,6 +1323,17 @@ CSV_FIELDS = [
     "approx_add",
     "order",
     "ref_order",
+    # THE PROTOCOL THIS ROW ACTUALLY RAN (owner ruling 2026-09-14). Under the
+    # time budget the window count and the executions per window are chosen
+    # per plan from one warm-up execution, so `inner_reps` above is only the
+    # ceiling and these three are what the row was measured with.
+    # `measure_secs` is the seconds of execution inside the timed windows.
+    # Rows written before this date lack all three.
+    "measure_inner",
+    "measure_windows",
+    "measure_secs",
+    "measure_budget_secs",
+    "measure_window_secs",
 ]
 
 
@@ -1302,7 +1345,13 @@ def config_stamp(args):
         "pulldown": ("removed:" + os.environ["GRAPHAX_QUANT_PULLDOWN"]
                      if os.environ.get("GRAPHAX_QUANT_PULLDOWN")
                      else "removed"),
+        # THE CEILING, not necessarily the count: since the owner's ruling of
+        # 2026-09-14 the window rule picks the executions per window between
+        # 5 and this value. Each ROW carries the count it actually used, in
+        # `measure_inner` / `measure_windows`.
         "inner_reps": int(args.latency_inner_reps),
+        "measure_budget_secs": float(args.measure_budget_secs),
+        "measure_window_secs": float(args.measure_window_secs),
         # BOTH warmups, named. `script` = this tool's whole-plan pass, which
         # pays the COMPILE. `env` = agent B's _resolve_warmup, untimed
         # executions inside the measure loop, which pays first-touch on an

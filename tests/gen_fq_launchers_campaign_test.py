@@ -222,6 +222,12 @@ def test_every_campaign_arm_carries_the_required_flags(gen, campaign):
                      # The inner reps stay SHARED at 50, above.
                      " --ref-num-data-points 5 ",
                      " --ref-reps-per-point 32 ",
+                     # THE PER-PLAN TIME BUDGET (owner ruling 2026-09-14).
+                     # --num-data-points x --reps-per-point is the CAP on
+                     # the candidate's timed windows now, and these two say
+                     # how many of them a plan of a given cost earns.
+                     " --measure-budget-secs 1.0 ",
+                     " --measure-window-secs 0.05 ",
                      " --cmp-type latency ", " --mem-type peak_memory ",
                      " --cost-form paired-log ", " --mem-channel temp ",
                      " --quality-metric grad_cosine ",
