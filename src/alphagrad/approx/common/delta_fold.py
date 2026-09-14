@@ -62,7 +62,7 @@ def _use_parallel() -> bool:
     return os.environ.get("ALPHAGRAD_FOLD_PARALLEL", "1") != "0"
 
 
-def _encode_chunk(agent, enc, tk, c_cnt, C, parallel):
+def _encode_chunk(agent, enc, tk, c_cnt, C, parallel, fast):
     """One chunk's encode. PARALLEL inside the chunk by default.
 
     UNDER THE FAST READ the parallel/serial choice does not apply and is
@@ -85,12 +85,12 @@ def _encode_chunk(agent, enc, tk, c_cnt, C, parallel):
     the same `valid` mask `encode_extend` would have built. Falls back to
     `encode_extend` when the agent has no parallel path (test stubs).
     """
-    if _fast_read():
-        fast = getattr(agent, "_extend_fast", None)
-        if fast is not None:
+    if fast:
+        run_fast = getattr(agent, "_extend_fast", None)
+        if run_fast is not None:
             valid = jnp.arange(C, dtype=jnp.int32) < jnp.asarray(
                 c_cnt, jnp.int32)
-            return fast(enc, tk, valid, c_cnt)
+            return run_fast(enc, tk, valid, c_cnt)
         if getattr(agent, "_extend_parallel", None) is not None:
             # A palimpsa agent with the associative-scan path but no fast one.
             # Falling through would read the EXACT recurrence here and the fast
@@ -107,7 +107,7 @@ def _encode_chunk(agent, enc, tk, c_cnt, C, parallel):
         # nothing to fall back FROM, so it takes the ordinary path below. A
         # real agent reaches `encode_extend` too, and that honours the flag
         # through `_extend_sequential`'s `_walk`, so this is not a back door.
-    if parallel and not _fast_read():
+    if parallel and not fast:
         par = getattr(agent, "_extend_parallel", None)
         if par is not None:
             valid = jnp.arange(C, dtype=jnp.int32) < jnp.asarray(c_cnt,
@@ -246,6 +246,11 @@ def extend_fold(agent, carry, tokens, count, *, window, chunk=None,
     # instead of lowering it to `select_n` over both branches, which would
     # compute the skipped chunk anyway and save nothing.
     par = _use_parallel() if parallel is None else bool(parallel)
+    # ASKED ONCE, HERE. `count_vjp`'s backward re-runs `_make_run` when it
+    # rebuilds a chunk's VJP, and that happens LATER than this trace -- after
+    # a `read_override` block has already closed. Capturing the answer now
+    # means the backward cannot read a different operator from the forward.
+    _fast = _fast_read()
 
     if budget is None:
         nb_live = nb
@@ -271,7 +276,7 @@ def extend_fold(agent, carry, tokens, count, *, window, chunk=None,
             # therefore already free.
             tk_c = _chunk_tokens(off) if tk is None else tk
             enc2, rows_c, valid_c = _encode_chunk(
-                agent, enc, tk_c, c_cnt, C, par)
+                agent, enc, tk_c, c_cnt, C, par, _fast)
             return (enc2, fold_fn(acc, rows_c, valid_c, off))
 
         return _run

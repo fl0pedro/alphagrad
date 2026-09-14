@@ -114,6 +114,7 @@ DIFFERENCES FROM THE UPSTREAM TRITON KERNEL, DELIBERATE
 """
 from __future__ import annotations
 
+import contextlib
 import functools
 import os
 
@@ -443,6 +444,36 @@ def _chunk_backward(qs, kc, vc, bc, gt_c, g_s, Ip_s, M, I, vmaskf, kvmaskf,
 # 2b. THE FLAG.  One env var, read at every call site that reads palimpsa.
 # =============================================================================
 _READ_LOGGED = [False]
+
+#: Set by :func:`read_override` while a caller that owns its own chunk grid is
+#: being TRACED. Not a second flag: it cannot be reached from the environment
+#: and it is always paired with a comment at the call site saying why that
+#: caller cannot use the shipped read.
+_READ_OVERRIDE = [None]
+
+
+@contextlib.contextmanager
+def read_override(mode: str):
+    """Force the read for everything traced inside the block.
+
+    ONE caller uses this: the per-face pipeline in ``ppo.py``, whose rollout
+    side extends the carry once per face and whose loss side reads all the
+    faces as one contiguous span. Those two give the same chunk grid only for
+    the exact recurrence, which has no grid at all (see ``_face_encode``).
+
+    It affects TRACING, not execution, so a caller must capture the answer
+    once inside the block rather than asking again from a backward pass that
+    runs later. ``extend_fold`` and ``_extend_sequential`` both do.
+    """
+    if mode not in ("exact", "fast"):
+        raise ValueError(
+            f"read_override takes 'exact' or 'fast', got {mode!r}")
+    prev = _READ_OVERRIDE[0]
+    _READ_OVERRIDE[0] = mode
+    try:
+        yield
+    finally:
+        _READ_OVERRIDE[0] = prev
 
 
 def palimpsa_read() -> str:

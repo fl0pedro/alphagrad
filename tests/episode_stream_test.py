@@ -170,10 +170,25 @@ def test_the_tail_also_covers_the_folds_padded_window_not_only_the_write():
     chunk short would return SHIFTED tokens in silence. The tail is the
     larger of the write window and the fold's padded window."""
     W = 32768
-    for chunk in (1024, 3000, 7, W):
+    # THE CHUNKS ARE MULTIPLES OF 32, including the awkward one. 3008 is
+    # 32 x 94 and still does not divide the window, which is the case this
+    # test is about -- a chunk that pads. Under the shipped
+    # ALPHAGRAD_PALIMPSA_READ=fast a multi-block fold refuses anything else
+    # (see `delta_fold.plan_chunks`), which the next test pins.
+    for chunk in (1024, 3008, 32, W):
         _C, _nb, padded = plan_chunks(W, chunk)
         assert ES.stream_tail(W, chunk) >= padded
         assert ES.stream_tail(W, chunk) >= W
+
+
+def test_the_tail_refuses_a_chunk_that_would_misalign_the_fast_grid(
+        monkeypatch):
+    """The sizes above are multiples of 32 because of this. A stream row is
+    sized from `plan_chunks`, so a misaligned fold chunk has to be caught
+    before a row is ever built on it."""
+    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ", "fast")
+    with pytest.raises(ValueError, match="not a multiple of the fast-palimpsa"):
+        plan_chunks(32768, 3000)
 
 
 def test_a_row_that_is_not_a_power_of_two_plus_the_tail_is_refused():
