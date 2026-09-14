@@ -30,21 +30,31 @@ incoming cotangent, and accumulates the loop-invariant cotangents.
 
 WHAT IS THE SAME NUMBER, AND WHAT IS NOT
 ----------------------------------------
-The FORWARD is bit-identical, measured, at every count. A chunk at
-``i >= nb_live`` is ``lax.cond(False, run, identity)`` today, which is the
-identity on the carry; not running it at all is the same map, and the live
-chunks run the same arithmetic in the same order.
+The FORWARD is bit-identical, measured, at every count -- folded and
+unfolded, scalar and vmapped. A chunk at ``i >= nb_live`` is
+``lax.cond(False, run, identity)`` today, which is the identity on the carry;
+not running it at all is the same map, and the live chunks run the same
+arithmetic in the same order.
 
-The GRADIENT is NOT bit-identical. It agrees to about one float32 ulp, and
-only once more than one chunk is live -- with a single live chunk it is
-bitwise equal. The difference is therefore in the CROSS-CHUNK accumulation,
-not inside a chunk: JAX's ``lax.scan`` transpose and a hand-written reverse
-``while_loop`` of ``jax.vjp`` calls form the same sum of the same per-chunk
-terms through different jaxprs, and float32 addition is not associative. See
-``tests/count_vjp_test.py`` and the probe it points at for the measurement.
+The GRADIENT is bit-identical on the SEQUENTIAL chunk interior
+(``ALPHAGRAD_FOLD_PARALLEL=0``) and on ``_extend_sequential``'s budget form,
+at every count. On the PARALLEL chunk interior, which is the shipped default,
+it differs by a few float32 ulp once more than one chunk is live.
 
-Because of that, ``ALPHAGRAD_COUNT_VJP`` DEFAULTS TO OFF. Turn it on only for
-a run that is allowed to move its last bits.
+That last difference is a reassociation and it is not removable from this
+side. A toy probe with no alphagrad in it (``probe_cvjp.py``, job 65517
+section C) shows that ``lax.scan`` of a body and the SAME ``lax.scan`` with a
+``lax.cond`` inside it already disagree in the gradient's last bits. The two
+loop forms are different jaxprs, JAX's transpose of each forms the same sum of
+the same terms in a different shape, and float32 addition is not associative.
+A ``while_loop`` form therefore cannot be made to reproduce the ``scan`` +
+``cond`` form bit for bit; matching the transpose (``jax.checkpoint`` on the
+chunk in the backward, ``ALPHAGRAD_COUNT_VJP_REMAT``) was tried and does not
+close it.
+
+So ``ALPHAGRAD_COUNT_VJP`` DEFAULTS TO OFF and the shipped path is unchanged.
+Turn it on for a run that is allowed to move its last bits, and expect the
+loss time to stop tracking the window bin.
 
 MEMORY
 ------
@@ -82,12 +92,12 @@ except AttributeError:                      # pragma: no cover - version drift
 def enabled() -> bool:
     """``ALPHAGRAD_COUNT_VJP`` -- the count-proportional backward pass.
 
-    OFF by default. The gradient it produces differs from the shipped
-    ``lax.scan`` + ``lax.cond`` form by about one float32 ulp (see the module
-    docstring), and the standing rule is that a path which moves the numbers
+    OFF by default. On the shipped parallel chunk interior the gradient it
+    produces differs from the ``lax.scan`` + ``lax.cond`` form by a few
+    float32 ulp (see the module docstring), and a path that moves the numbers
     does not become the default on its own.
     """
-    return os.environ.get("ALPHAGRAD_COUNT_VJP", "1") != "0"
+    return os.environ.get("ALPHAGRAD_COUNT_VJP", "0") != "0"
 
 
 def _is_inexact(x) -> bool:
