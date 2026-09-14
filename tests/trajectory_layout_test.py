@@ -564,15 +564,16 @@ def test_a_delta_count_above_a_byte_and_above_int_sixteen_survives_the_header():
 def test_the_header_codec_round_trips_every_count_the_budget_allows():
     from alphagrad.approx import env as _env
 
-    for n in (0, 1, 255, 256, 65535, 65536, 1 << 24, (1 << 31) - 1):
+    for n in (0, 1, 255, 256, 65535, 65536, 1 << 24, (1 << 31) - 1, 1 << 31,
+              (1 << 32) - 1):
         enc = _env.encode_delta_header(n)
         assert enc.dtype == np.uint8
         assert enc.shape == (_env.DELTA_HEADER_SLOTS,)
         assert int(_env.decode_delta_header(jnp.asarray(enc))) == n
-    # The header is a SIGNED int32 on the device side, so 2**31 is refused
-    # rather than returned as a negative length.
-    with pytest.raises(ValueError, match="signed int32 header"):
-        _env.encode_delta_header(1 << 31)
+    # The header is an UNSIGNED 32-bit count (owner ruling 2026-09-14), so
+    # 2**32 is the first value refused, on the host, before anything is sent.
+    with pytest.raises(ValueError, match="uint32 header"):
+        _env.encode_delta_header(1 << 32)
 
 
 def test_token_id_zero_is_a_real_token_so_padding_is_read_from_the_count():

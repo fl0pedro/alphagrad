@@ -153,20 +153,20 @@ DELTA_HEADER_SLOTS = 4
 
 
 def encode_delta_header(n: int) -> np.ndarray:
-    """``(DELTA_HEADER_SLOTS,) uint8``: ``n`` as a little-endian int32.
+    """``(DELTA_HEADER_SLOTS,) uint8``: ``n`` as a little-endian uint32.
 
     Spelled with shifts rather than ``np.int32(n).tobytes()`` so the layout is
     the same on a big-endian host as on a little-endian one.
     """
     n = int(n)
-    if n < 0 or n > 0x7FFFFFFF:
-        # SIGNED int32: `decode_delta_header` reassembles the four bytes with
-        # int32 arithmetic on device, so the top bit is the sign bit and a
-        # count at or above 2**31 would come back NEGATIVE. Refused here
-        # rather than discovered as a delta of length -1.
+    if n < 0 or n > 0xFFFFFFFF:
+        # UNSIGNED 32-bit (owner ruling 2026-09-14): `decode_delta_header`
+        # reassembles the four bytes with uint32 arithmetic on device, so the
+        # whole 32-bit range is a count. Refused here rather than discovered
+        # as a wrapped length.
         raise ValueError(
-            f"delta count {n} does not fit the signed int32 header "
-            f"(max {0x7FFFFFFF})")
+            f"delta count {n} does not fit the uint32 header "
+            f"(max {0xFFFFFFFF})")
     return np.asarray([(n >> (8 * i)) & 0xFF
                        for i in range(DELTA_HEADER_SLOTS)], DELTA_TOKEN_DTYPE)
 
