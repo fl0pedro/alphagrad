@@ -247,14 +247,16 @@ TOTAL_V = len(jaxpr.eqns)
 # search plans on one graph while the tokens describe another.
 PT = PlanTokenizer(jaxpr, ARGN, list(closed.literals), list(xs),
                    max_faces=int(ENV_MAX_FACES))
+# `PT.base()` still returns the tokenizer's segment ids; alphagrad no longer
+# uses them (the equation-id stream was removed on 2026-09-13), so they are
+# read and dropped here rather than threaded any further.
 _BASE_TOKS, _BASE_IDS = PT.base()
 BASE_N = len(_BASE_TOKS)
 BASE_W = max(BASE_N, 1)
 BASE_TOK = jnp.asarray(np.asarray(_BASE_TOKS[:BASE_W], dtype=np.int32))
-BASE_EQN = jnp.asarray(np.asarray(_BASE_IDS[:BASE_W], dtype=np.int32))
 # Cross-check against the env's own producer: the two must agree bitwise or
 # the search reads a different base than the measurement tokenizes.
-_ebt, _ebe, _ebn = env.base_observation()
+_ebt, _ebn = env.base_observation()
 # Per-token owning VERTEX, from the SAME env method PPO uses -- keying the
 # per-vertex memory differently on the two arms is exactly the class of
 # divergence this file exists to avoid.
@@ -268,9 +270,7 @@ if not (int(_ebn) == BASE_N):
 if not (np.array_equal(np.asarray(_ebt)[:BASE_N], np.asarray(_BASE_TOKS))):
     raise RuntimeError("base token stream disagrees between PlanTokenizer and "
     "env.base_observation()")
-if not (np.array_equal(np.asarray(_ebe)[:BASE_N], np.asarray(_BASE_IDS))):
-    raise RuntimeError("base eqn ids disagree between PlanTokenizer and env.base_observation()")
-del _ebt, _ebe, _ebn
+del _ebt, _ebn
 print(f"[gaz] path tokenizer: base={BASE_N} tokens "
       f"(per-step delta budget {MAX_DELTA_TOKENS}, total_v={TOTAL_V})",
       flush=True)
@@ -443,22 +443,21 @@ def state_to_json(state):
             for a, fr, fs in state]
 
 
-def _wire_delta(toks, ids):
-    """A tokenizer block -> the ``(MAX_DELTA_TOKENS,)`` device buffers.
+def _wire_delta(toks):
+    """A tokenizer block -> the ``(MAX_DELTA_TOKENS,)`` device buffer.
 
     Same clip-don't-raise policy as ``env._delta_observation`` (and the same
-    truncation counter), minus its in-band header slot: AZ hands the count
-    directly to ``encode_extend`` instead of shipping it through a callback.
+    truncation counter), minus its count header: AZ hands the count directly
+    to ``encode_extend`` instead of shipping it through a callback. ONE
+    buffer, since the equation-id stream was removed.
     """
     n_raw = len(toks)
     _record_delta_truncation(n_raw)
     n = min(n_raw, MAX_DELTA_TOKENS)
     t = np.zeros((MAX_DELTA_TOKENS,), dtype=np.int32)
-    e = np.full((MAX_DELTA_TOKENS,), -1, dtype=np.int32)
     if n:
         t[:n] = np.asarray(toks[:n], dtype=np.int32)
-        e[:n] = np.asarray(ids[:n], dtype=np.int32)
-    return t, e, n
+    return t, n
 
 _MS = os.environ.get("ALPHAGRAD_MEASURE_SERVER", "0") == "1"
 _ms_client = None
@@ -655,7 +654,7 @@ W4 = az_w4(_WNS)          # W2: [-w_cmp, -w_mem, 0, +w_acc]
 @eqx.filter_jit
 def _base_init(agent):
     """``(enc_carry, base_sums, base_counts)`` -- carry + base scatter."""
-    return _cs.init_carry(agent, BASE_TOK, BASE_EQN, BASE_N,
+    return _cs.init_carry(agent, BASE_TOK, BASE_N,
                           window=BASE_W, total_v=TOTAL_V, embd_dim=EMBD,
                           base_owners=BASE_OWN)
 
@@ -668,8 +667,8 @@ def _zero_mem():
 
 
 @eqx.filter_jit
-def _carry_advance(agent, enc, vs, vc, dtok, deqn, dcount, owner):
-    return _cs.advance(agent, enc, vs, vc, dtok, deqn, dcount, owner,
+def _carry_advance(agent, enc, vs, vc, dtok, dcount, owner):
+    return _cs.advance(agent, enc, vs, vc, dtok, dcount, owner,
                        window=MAX_DELTA_TOKENS)
 
 
@@ -683,7 +682,7 @@ def _carry_heads(agent, vs, vc):
 class Carry:
     """The DEVICE half of a search node (~35 KB on nn256).
 
-    EncCarry(M, I, cumhist, nvalid, pos) + the per-vertex memory
+    EncCarry(M, I, pos) + the per-vertex memory
     (sums/counts). Params-DEPENDENT, unlike the
     old `_tok_cache`: a carry cached across a `train_step` is silently STALE,
     not wrong-shaped, so carries live for exactly one `gumbel_search` call
@@ -859,7 +858,7 @@ def _face_plan(agent, precomputed, enc_carry, avail,
         face_chunk_fn=face_chunk_fn, face_count_fn=face_count_fn,
     )
     (fa, face_logp, face_ent, f_pair, f_comp, f_valid,
-     f_cnt, f_dt, f_de, f_ends) = face_out
+     f_cnt, f_dt, f_ends) = face_out
     # THE WIRE, from `to_env_action_dynamic`'s own translator -- so AZ and PPO
     # emit identical bytes for identical FaceActions. AZ's `measure()` already
     # passed correctly-shaped face arrays; they were filled with -1.
@@ -879,7 +878,7 @@ def _face_plan(agent, precomputed, enc_carry, avail,
             "a value that FIXES the join semantics (ticket dsnn-3qm.56).")
     features = _axis_feats(AXIS_STATE[vertex_idx], AXIS_VALID[vertex_idx])
     return (env_action.face_rows, env_action.face_skip, fa, f_pair, f_comp,
-            f_valid, f_cnt, f_dt, f_de, f_ends, v_context, features, face_ent,
+            f_valid, f_cnt, f_dt, f_ends, v_context, features, face_ent,
             vertex_idx)
 
 
@@ -936,16 +935,17 @@ def _step(node, vertex, face_rows=None, face_skips=None, face_keys=None):
     # a vertex can make OTHER vertices non-eliminable — plus a guard asserting
     # the prediction against the graph afterwards. Both are gone with the
     # gate.)
-    toks, ids = PT.eliminate(vertex, spec_row, face_rows, face_skips,
-                             face_keys=face_keys)
-    dt, de, dc = _wire_delta(toks, ids)
+    # `PT.eliminate` still returns the tokenizer's segment ids; dropped here.
+    toks, _ids = PT.eliminate(vertex, spec_row, face_rows, face_skips,
+                              face_keys=face_keys)
+    dt, dc = _wire_delta(toks)
     enc2, vs2, vc2 = _carry_advance(
         agent, carry.enc, carry.vs, carry.vc,
-        jnp.asarray(dt), jnp.asarray(de), jnp.asarray(dc, jnp.int32),
+        jnp.asarray(dt), jnp.asarray(dc, jnp.int32),
         jnp.asarray(a, jnp.int32))
     st2 = list(state) + [(a, face_rows, face_skips)]
     return (st2, Carry(enc2, vs2, vc2),
-            {"tokens": toks, "eqn_ids": ids, "delta": (dt, de, dc),
+            {"tokens": toks, "delta": (dt, dc),
              "owner": a, "spec_row": spec_row, "face_rows": face_rows,
              "face_skips": face_skips})
 
@@ -1124,7 +1124,7 @@ _GOLD_CHECK = _GOLD_EPISODES > 0
 _GOLD_FAILS = [0]
 
 
-def _golden_equivalence(state, stream, seg_ids, ep):
+def _golden_equivalence(state, stream, ep):
     """Compare the streamed episode against the env's own full-stream builder."""
     global _GOLD_CHECK
     if ep > _GOLD_EPISODES:
@@ -1157,8 +1157,11 @@ def _golden_equivalence(state, stream, seg_ids, ep):
         face_key=_face_wire_keys(face_rows, face_skips, n),
     )
     ok_t = list(ref) == list(stream)
-    ok_i = list(ref_ids) == list(seg_ids)
-    if ok_t and ok_i:
+    # `ref_ids` are the env builder's segment ids. Nothing consumes them any
+    # more (the equation-id stream was removed on 2026-09-13), so the golden
+    # check compares TOKENS only.
+    del ref_ids
+    if ok_t:
         print(f"[gaz][gold] ep={ep} BITWISE OK: {len(stream)} tokens, "
               f"{n} decisions (base {BASE_N} + deltas)", flush=True)
         return
@@ -1167,9 +1170,8 @@ def _golden_equivalence(state, stream, seg_ids, ep):
                  if ref[i] != stream[i]), min(len(ref), len(stream)))
     raise AssertionError(
         f"[gaz][gold] ep={ep} STREAM MISMATCH: streamed {len(stream)} tokens "
-        f"vs env {len(ref)}; first differing index {_bad}; "
-        f"eqn_ids match={ok_i}. The search reads a different graph than the "
-        f"measurement tokenizes.")
+        f"vs env {len(ref)}; first differing index {_bad}. The search reads "
+        f"a different graph than the measurement tokenizes.")
 
 
 CVISIT = float(os.environ.get("ALPHAGRAD_GAZ_CVISIT", "50.0"))
@@ -1327,7 +1329,7 @@ def _draw_face_sequence(vertex, head_out, carry, prefix_arrays, rng,
             _ag = _agent_for_face_width(_fb)
             _f_use = np.ascontiguousarray(_f_h[:, :_fb])
             _s_use = np.ascontiguousarray(_s_h[:, :_fb])
-    (fr, fs, fa, f_pair, f_comp, f_valid, f_cnt, f_dt, f_de, f_ends,
+    (fr, fs, fa, f_pair, f_comp, f_valid, f_cnt, f_dt, f_ends,
      _vctx, _feat, face_ent, _vi) = _face_plan(
         _ag, head_out, carry.enc, jnp.asarray(_avail),
         jnp.asarray(_o_arr), jnp.asarray(_sp_h),
@@ -1363,7 +1365,6 @@ def _draw_face_sequence(vertex, head_out, carry, prefix_arrays, rng,
             "f_valid": f_valid,
             "f_cnt": f_cnt,
             "f_dt": np.asarray(f_dt, np.int32),
-            "f_de": np.asarray(f_de, np.int32),
             "f_ends": np.asarray(f_ends, np.int32),
             "face_ent": float(face_ent)}
 
@@ -1386,7 +1387,7 @@ def _pack_search_draws(cands):
     _z = lambda a: np.zeros((D,) + a.shape, a.dtype)
     fpair, fcomp = _z(rows[0]["f_pair"]), _z(rows[0]["f_comp"])
     fvalid, fcnt = _z(rows[0]["f_valid"]), _z(rows[0]["f_cnt"])
-    fdt, fde = _z(rows[0]["f_dt"]), _z(rows[0]["f_de"])
+    fdt = _z(rows[0]["f_dt"])
     fends = _z(rows[0]["f_ends"])
     fa_list = []
     i = 0
@@ -1397,7 +1398,7 @@ def _pack_search_draws(cands):
             w[i] = float(dd["w_hat"])
             fpair[i] = dd["f_pair"]; fcomp[i] = dd["f_comp"]
             fvalid[i] = dd["f_valid"]; fcnt[i] = dd["f_cnt"]
-            fdt[i] = dd["f_dt"]; fde[i] = dd["f_de"]
+            fdt[i] = dd["f_dt"]
             fends[i] = dd["f_ends"]
             fa_list.append(dd["fa"])
             i += 1
@@ -1406,7 +1407,7 @@ def _pack_search_draws(cands):
     fa = jax.tree_util.tree_map(lambda *xs: np.stack(xs), *fa_list)
     return {"sd_li": li, "sd_vidx": vidx, "sd_w": w, "sd_fpair": fpair,
             "sd_fcomp": fcomp, "sd_fvalid": fvalid, "sd_cnt": fcnt,
-            "sd_dt": fdt, "sd_de": fde, "sd_fa": fa,
+            "sd_dt": fdt, "sd_fa": fa,
             "sd_fends": fends}
 
 
@@ -1491,8 +1492,7 @@ def gumbel_search(state, carry, rng, prefix_arrays, face_keys_of):
                                       d["face_rows"].tobytes(),
                                       d["face_skips"].tobytes())
                         c["_tokbytes"] = (
-                            np.asarray(d["tokens"], np.int32).tobytes(),
-                            np.asarray(d["eqn_ids"], np.int32).tobytes())
+                            np.asarray(d["tokens"], np.int32).tobytes(),)
                     qk = rollout_value(st2, cy2, depth)
                 if dr is not None:
                     dr["q"] = float(qk)
@@ -1501,7 +1501,6 @@ def gumbel_search(state, carry, rng, prefix_arrays, face_keys_of):
                     # so the caller can ASSERT the committed step re-produces
                     # them bitwise (search dynamics == measured graph).
                     dr["d_tokens"] = np.asarray(d["tokens"], np.int32)
-                    dr["d_eqns"] = np.asarray(d["eqn_ids"], np.int32)
                     c["draws"].append(dr)
                 c["q"].append(float(qk))
                 c["q_depths"].append(depth)
@@ -1643,7 +1642,6 @@ def gumbel_search(state, carry, rng, prefix_arrays, face_keys_of):
                     dr["q"] = float(rollout_value(st2, cy2, 0))
                 dr["depth"] = 0
                 dr["d_tokens"] = np.asarray(d["tokens"], np.int32)
-                dr["d_eqns"] = np.asarray(d["eqn_ids"], np.int32)
                 chosen["draws"].append(dr)
         # Normalized draw weights w_hat per candidate (the CE's targets).
         for c in cands:
@@ -1681,10 +1679,10 @@ _FACE_ENT_COEF = float(os.environ.get("ALPHAGRAD_GAZ_FACE_ENT_COEF", "0.01"))
 _W4J = jnp.asarray(np.asarray(W4, dtype=np.float32))
 
 
-def loss_fn(agent, enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c,
-            dtok, deqn, dcnt, owner, vsel, la_pad, la_mask, pi_pad,
+def loss_fn(agent, enc_M, enc_I, enc_pos, vmem_s, vmem_c,
+            dtok, dcnt, owner, vsel, la_pad, la_mask, pi_pad,
             vtgt, vmask, sd_li, sd_vidx, sd_w, sd_fpair, sd_fcomp, sd_fvalid,
-            sd_cnt, sd_dt, sd_de, sd_fa, sd_fends):
+            sd_cnt, sd_dt, sd_fa, sd_fends):
     """Vertex CE + value MSE + the Sampled-AZ face CE, all re-derived from
     the STORED PRE-step carry.
 
@@ -1703,17 +1701,17 @@ def loss_fn(agent, enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c,
     # global `BASE_MEM` here would hand the loss an encoder output computed
     # outside `filter_grad`, and palimpsa's base encode would get a cotangent
     # of exactly zero. Computed ONCE per loss call, outside the vmap below.
-    _base_mem = _cs.base_memory(agent, BASE_TOK, BASE_EQN, BASE_N,
+    _base_mem = _cs.base_memory(agent, BASE_TOK, BASE_N,
                                 window=BASE_W, total_v=TOTAL_V, embd_dim=EMBD,
                                 base_owners=BASE_OWN)
 
-    def per(M, I, ch, nv, pos, vs, vc, dt, de, dc, ow, vsl,
+    def per(M, I, pos, vs, vc, dt, dc, ow, vsl,
             la, lam, pi, vt, vm, s_li, s_vidx, s_w, s_fp, s_fc, s_fv,
-            s_cnt, s_dt, s_de, s_fa, s_fend):
-        carry = EncCarry(M=M, I=I, cumhist=ch, nvalid=nv, pos=pos)
+            s_cnt, s_dt, s_fa, s_fend):
+        carry = EncCarry(M=M, I=I, pos=pos)
         # chunk=0: AZ's loss is reverse-differentiated through this extend
         # too, and the dynamic trip count is a lax.while_loop.
-        c2, vs2, vc2 = _cs.advance(agent, carry, vs, vc, dt, de, dc, ow,
+        c2, vs2, vc2 = _cs.advance(agent, carry, vs, vc, dt, dc, ow,
                                    window=MAX_DELTA_TOKENS, chunk=0)
         vlog, ctx, v3 = _cs.heads(agent, vs2, vc2, base_mem=_base_mem,
                                   preference=None)
@@ -1740,16 +1738,16 @@ def loss_fn(agent, enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c,
         face_ce, face_ent_norm = face_ce_term(
             agent._face_replay, ctx, c2, AXIS_STATE, AXIS_VALID, FACT_TABLES,
             OP_OVERRIDE, _axis_feats, pi,
-            s_li, s_vidx, s_w, s_fp, s_fc, s_fv, s_cnt, s_dt, s_de, s_fa,
+            s_li, s_vidx, s_w, s_fp, s_fc, s_fv, s_cnt, s_dt, s_fa,
             s_fend)
         face_loss = _FACE_COEF * face_ce - _FACE_ENT_COEF * face_ent_norm
         return ce + 0.5 * vl + face_loss, (face_ent_norm, vl, ce)
 
     losses, (ents, vls, ces) = jax.vmap(per)(
-        enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c,
-        dtok, deqn, dcnt, owner, vsel, la_pad, la_mask, pi_pad, vtgt, vmask,
+        enc_M, enc_I, enc_pos, vmem_s, vmem_c,
+        dtok, dcnt, owner, vsel, la_pad, la_mask, pi_pad, vtgt, vmask,
         sd_li, sd_vidx, sd_w, sd_fpair, sd_fcomp, sd_fvalid,
-        sd_cnt, sd_dt, sd_de, sd_fa, sd_fends)
+        sd_cnt, sd_dt, sd_fa, sd_fends)
     return jnp.mean(losses), (jnp.mean(ents), jnp.mean(vls),
                              jnp.mean(ces))
 
@@ -2011,7 +2009,6 @@ def _run(args) -> int:
         _dstep = 0
         # Golden-equivalence accumulator: base ++ concat(per-decision deltas).
         _gold_stream = list(_BASE_TOKS)
-        _gold_ids = list(_BASE_IDS)
         # The (carry, delta) pair the LOSS re-runs. PPO's step_fn scores step t
         # off the carry BEFORE step t-1's delta plus that delta; storing the
         # post-advance carry with THIS step's delta instead is an off-by-one
@@ -2119,10 +2116,8 @@ def _run(args) -> int:
             # same wires, same face keys; a mismatch means the search scored
             # a different graph than the measurement will tokenize.
             if exec_draw is not None:
-                if not (np.array_equal(np.asarray(d["tokens"], np.int32),
-                                       exec_draw["d_tokens"])
-                        and np.array_equal(np.asarray(d["eqn_ids"], np.int32),
-                                           exec_draw["d_eqns"])):
+                if not np.array_equal(np.asarray(d["tokens"], np.int32),
+                                      exec_draw["d_tokens"]):
                     raise AssertionError(
                         f"vertex {v}: committed step tokens diverge from the "
                         f"search branch that evaluated the executed face "
@@ -2130,20 +2125,17 @@ def _run(args) -> int:
                         f"{len(exec_draw['d_tokens'])} tokens) -- the search "
                         f"dynamics and the measured graph disagree")
             _gold_stream += list(d["tokens"])
-            _gold_ids += list(d["eqn_ids"])
             if _dtl:
                 print(f"[gaz][dtime] ep={ep} d={_dstep} v={v} nf={_nf} "
                       f"{time.perf_counter() - _t_dec:.3f}s", flush=True)
             steps.append({
                 "enc_M": np.asarray(_pre_for_loss[0].enc.M),
                 "enc_I": np.asarray(_pre_for_loss[0].enc.I),
-                "enc_ch": np.asarray(_pre_for_loss[0].enc.cumhist),
-                "enc_nv": np.asarray(_pre_for_loss[0].enc.nvalid),
                 "enc_pos": np.asarray(_pre_for_loss[0].enc.pos),
                 "vmem_s": np.asarray(_pre_for_loss[0].vs),
                 "vmem_c": np.asarray(_pre_for_loss[0].vc),
-                "dtok": _pre_for_loss[1][0], "deqn": _pre_for_loss[1][1],
-                "dcnt": np.int32(_pre_for_loss[1][2]),
+                "dtok": _pre_for_loss[1][0],
+                "dcnt": np.int32(_pre_for_loss[1][1]),
                 "owner": np.int32(_pre_for_loss[2]),
                 "vsel": np.int32(v - 1),
                 "la": la.copy(), "pi": pi.copy(),
@@ -2172,7 +2164,7 @@ def _run(args) -> int:
               f"{_ep_faces} faces, {_ep_chunks} non-empty chunks "
               f"(NV x mean_faces = {_ep_faces})", flush=True)
         if _GOLD_CHECK:
-            _golden_equivalence(state, _gold_stream, _gold_ids, ep)
+            _golden_equivalence(state, _gold_stream, ep)
         raw = measure(state)
         n_meas += 1
         if raw is None:
@@ -2229,9 +2221,9 @@ def _run(args) -> int:
             def stk(k):
                 return np.stack([s[k] for s in flat])
             enc_M, enc_I = stk("enc_M"), stk("enc_I")
-            enc_ch, enc_nv, enc_pos = stk("enc_ch"), stk("enc_nv"), stk("enc_pos")
+            enc_pos = stk("enc_pos")
             vmem_s, vmem_c = stk("vmem_s"), stk("vmem_c")
-            dtok, deqn = stk("dtok"), stk("deqn")
+            dtok = stk("dtok")
             dcnt, owner, vsel = stk("dcnt"), stk("owner"), stk("vsel")
             # The search-draw columns for the Sampled-AZ face CE. On the
             # exact arm there are no draws: None is a leafless pytree, so
@@ -2239,13 +2231,13 @@ def _run(args) -> int:
             # the loss's _EXACT_ARM branch never reads it.
             if _EXACT_ARM:
                 sd_li = sd_vidx = sd_w = sd_fpair = sd_fcomp = None
-                sd_fvalid = sd_cnt = sd_dt = sd_de = sd_fa = None
+                sd_fvalid = sd_cnt = sd_dt = sd_fa = None
                 sd_fends = None
             else:
                 sd_li, sd_vidx, sd_w = stk("sd_li"), stk("sd_vidx"), stk("sd_w")
                 sd_fpair, sd_fcomp = stk("sd_fpair"), stk("sd_fcomp")
                 sd_fvalid, sd_cnt = stk("sd_fvalid"), stk("sd_cnt")
-                sd_dt, sd_de = stk("sd_dt"), stk("sd_de")
+                sd_dt = stk("sd_dt")
                 sd_fends = stk("sd_fends")
                 sd_fa = jax.tree_util.tree_map(
                     lambda *xs: np.stack(xs),
@@ -2255,10 +2247,10 @@ def _run(args) -> int:
             pi_p = np.stack([pad(s["pi"], MAXLA) for s in flat])
             vt = np.stack([(s["raw4"] - popart.mu) / popart.sigma for s in flat])  # PopArt-normalised
             vm = np.broadcast_to(np.abs(W4) > 0, (len(flat), 4)).astype(np.float32)
-            _cols = (enc_M, enc_I, enc_ch, enc_nv, enc_pos, vmem_s, vmem_c,
-                     dtok, deqn, dcnt, owner, vsel, la_p, la_m, pi_p,
+            _cols = (enc_M, enc_I, enc_pos, vmem_s, vmem_c,
+                     dtok, dcnt, owner, vsel, la_p, la_m, pi_p,
                      vt, vm, sd_li, sd_vidx, sd_w, sd_fpair, sd_fcomp,
-                     sd_fvalid, sd_cnt, sd_dt, sd_de, sd_fa, sd_fends)
+                     sd_fvalid, sd_cnt, sd_dt, sd_fa, sd_fends)
             # M5: resample the minibatch EVERY epoch. Taking one fixed 64-sample
             # draw and hitting it ``train_epochs`` times overfits that draw and
             # discards the rest of the replay for this update.
@@ -2528,7 +2520,7 @@ def _run(args) -> int:
                 if _ATTN_ENTROPY_ON:
                     try:
                         _pe = float(_attn_ent_diag(
-                            agent, BASE_TOK, BASE_EQN,
+                            agent, BASE_TOK,
                             env.axis_state_static, env.axis_valid_static))
                         if _pe == _pe:      # not NaN
                             _log["entropy/palimpsa"] = _pe
