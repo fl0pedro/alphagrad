@@ -604,8 +604,15 @@ def validate_window_against_row(window, row_length, where="", chunk=None):
     The row is `2^n + TAIL(window)`. A reader whose window is larger than
     the one the row was built for runs its last chunk off the end, and
     `dynamic_slice` CLAMPS an out-of-range start instead of raising, so it
-    would return SHIFTED tokens in silence. This is the one place the two
-    numbers meet, so it is checked here.
+    would return SHIFTED tokens in silence.
+
+    IT IS A PARTIAL CHECK AND SAYS SO. The row carries no record of the
+    window its tail was sized from, so a row that happens to be `2^m +
+    TAIL(w')` for some other pair passes -- it merely answers a different
+    `n`. The REAL guarantee is structural and lives in the caller: the
+    rollout's stream and the loss's window both come from the one
+    `win_log2` argument `train_episode` takes, and `train_episode` checks
+    that against the env's own bin. This catches the rest.
     """
     try:
         return log2_of_row(int(row_length), int(window), chunk)

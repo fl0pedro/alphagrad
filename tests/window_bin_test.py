@@ -545,10 +545,15 @@ def test_the_env_state_delta_buffer_follows_the_config_window_and_not_the_module
 
     default = _small_env()
     assert default.delta_window == MAX_DELTA_TOKENS
-    assert default.reset().delta_tokens.shape == (MAX_DELTA_TOKENS,)
     binned = _small_env(4096)
     assert binned.delta_window == 4096
-    assert binned.reset().delta_tokens.shape == (4096,)
+    # The buffer's WIDTH is the only thing the bin changes; whatever leading
+    # axes `reset` gives it are the same on both.
+    wide = default.reset().delta_tokens.shape
+    narrow = binned.reset().delta_tokens.shape
+    assert wide[-1] == MAX_DELTA_TOKENS
+    assert narrow[-1] == 4096
+    assert wide[:-1] == narrow[:-1]
 
 
 def test_the_callback_output_shape_follows_the_env_obs_width_and_the_wire_arity_does_not_change():
@@ -616,10 +621,16 @@ def test_the_episode_stream_row_tail_shrinks_with_the_window_bin():
     # At the small bin the Helmholtz smoke runs, the row is nearly halved.
     assert ES.stream_length(15, 32768) == 65536
     assert ES.stream_length(15, 4096) == 36864
-    # And the reader's window must match the row it was handed.
+    # AND THE READER'S WINDOW MUST MATCH THE ROW IT WAS HANDED. This is the
+    # hazard the check exists for: the SAME row read at the wrong window
+    # answers a different bin, quietly, because the tail it subtracts is a
+    # different number. 36864 is 2^15 + tail(4096); read at the 32768
+    # window it looks like 2^12 + tail(32768).
     assert ES.validate_window_against_row(4096, 36864) == 15
+    assert ES.validate_window_against_row(32768, 36864) == 12
+    # A row that is not 2^n + tail at either window is refused outright.
     with pytest.raises(ValueError) as exc:
-        ES.validate_window_against_row(32768, 36864)
+        ES.validate_window_against_row(4096, 36000)
     assert "must be the same number" in str(exc.value)
 
 
