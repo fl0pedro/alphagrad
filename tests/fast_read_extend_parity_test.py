@@ -88,6 +88,19 @@ def _rollout(agent, carry, toks, count, chunk):
                                window=WINDOW, start=0, chunk=chunk)
 
 
+def _rollout_diff(agent, carry, toks, count, chunk):
+    """The rollout extend in the form a DIFFERENTIATED caller gets.
+
+    Without a budget the chunked extend is a ``lax.while_loop``, which has no
+    transpose rule -- that is the whole reason ``budget`` exists (see
+    ``encode_extend``'s docstring). The loss always passes one, so this is the
+    form whose gradient has to match the fold's.
+    """
+    return agent.encode_extend(carry, toks, jnp.asarray(count, jnp.int32),
+                               window=WINDOW, start=0, chunk=chunk,
+                               budget=jnp.asarray(count, jnp.int32))
+
+
 def _folded(agent, carry, toks, count, chunk):
     """What the loss runs: ``extend_fold`` reducing the rows as it goes."""
     init, fold = _fold.sum_reducer(agent.embd_dim)
@@ -175,7 +188,7 @@ def test_the_gradient_agrees_between_the_two_paths(
 
     def loss_rollout(d):
         a = eqx.combine(d, static)
-        _c, rows, valid = _rollout(a, c0, tokens, COUNT, 2 * CHUNK_C)
+        _c, rows, valid = _rollout_diff(a, c0, tokens, COUNT, 2 * CHUNK_C)
         s, _n = _reduce(rows, valid)
         return jnp.sum(s ** 2)
 
