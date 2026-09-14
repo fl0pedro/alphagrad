@@ -1571,10 +1571,39 @@ def _plan_log_max_faces() -> int:
     return _plan_log_int_env(_PLAN_LOG_MAX_FACES_ENV, 0)
 
 
+# WHICH ATTEMPT AT THIS EPISODE THE RECORD BELONGS TO. An episode whose
+# token stream overflows its bin is DISCARDED and repeated one bin up, and
+# both attempts stamp the same ``episode``. Verification jobs 65410 and
+# 65413 found three record PAIRS that were byte-identical, with no field
+# telling them apart, which makes the plan log unreadable exactly where it
+# matters most. The driver rolls the discarded attempt's records back (see
+# ``episode_telemetry_snapshot``), and this stamp says which attempt the
+# surviving ones came from, so a reader never has to infer it.
+#
+# NOT part of the telemetry snapshot, on purpose: it has to keep counting
+# ACROSS a rollback, which is the one thing a rollback must not undo.
+_PLAN_LOG_ATTEMPT = [0]
+
+
+def set_plan_log_attempt(attempt: int) -> None:
+    """Say which attempt at the current episode is running (0 = the first).
+
+    Called by the episode driver at the top of every attempt, including the
+    repeats.
+    """
+    _PLAN_LOG_ATTEMPT[0] = int(attempt)
+
+
+def plan_log_attempt() -> int:
+    """The attempt index records are being stamped with right now."""
+    return int(_PLAN_LOG_ATTEMPT[0])
+
+
 def _record_plan(rec: dict) -> None:
     if len(_PLAN_RECORDS) >= _plan_log_cap():
         _PLAN_LOG_DROPPED[0] += 1
         return
+    rec["attempt"] = int(_PLAN_LOG_ATTEMPT[0])
     _PLAN_RECORDS.append(rec)
 
 
@@ -8936,3 +8965,111 @@ class VertexEliminationEnv:
             tokens=jnp.asarray(tokens, dtype=jnp.int32),
             eqn_ids=jnp.asarray(eqn_ids, dtype=jnp.int32),
         )
+
+
+# ---------------------------------------------------------------------------
+# THE EPISODE TELEMETRY SNAPSHOT (review finding 5, 2026-09-14).
+#
+# An episode whose token stream overflows its bin is DISCARDED and repeated
+# one bin up (`common.episode_stream.run_episode`). The device side of the
+# discarded attempt vanishes on its own -- the driver rebinds the agent, the
+# optimiser state and the env states only on RETURN. The HOST side does not:
+# every step of the failed attempt already ran its env callback, so the plan
+# log, the truncation counters and every other per-episode accumulator in
+# this module saw it. An overflow at a late step therefore DOUBLE-COUNTED
+# that episode's terminal plans, which is the very artifact the
+# trustworthiness claims are built on.
+#
+# These two functions bound it. The driver takes a snapshot before an
+# attempt and restores it when the attempt is thrown away, so a discarded
+# attempt leaves exactly nothing behind in this module. They cover the
+# containers that a per-episode `consume_*` drain empties, which is the same
+# set the trainer logs to wandb once per episode.
+#
+# NOT RESTORED, on purpose: `_TOKENIZATION_TRUNCATION_WARNED` and
+# `_UNTRACEABLE_SEEN` are "have we already printed this warning" latches, not
+# measurements. Rolling them back would print the same warning twice.
+# ---------------------------------------------------------------------------
+_EPISODE_TELEMETRY_NAMES = (
+    # tokenization and delta lengths
+    "_TOKENIZATION_TRUNCATION_COUNT",
+    "_TOKENIZATION_TRUNCATION_MAX_LEN",
+    "_TOKENIZATION_TRUNCATION_OVERFLOW_SUM",
+    "_TOKLEN_SUM", "_TOKLEN_MAX", "_TOKLEN_COUNT",
+    "_DELTALEN_SUM", "_DELTALEN_MAX", "_DELTALEN_COUNT",
+    # host phase profiling
+    "_PROF", "_PROF_SAMPLES", "_PROF_DIST", "_PROF_TRACE",
+    # plan health counters
+    "_DEGENERATE_PLANS", "_TRUNCATED_PLANS", "_ZERO_WORK_PLANS",
+    "_UNTRACEABLE_PLANS",
+    # reward-channel telemetry
+    "_FIDELITY_STATS", "_COS_LOG_SEEN",
+    "_SPARSITY_STATS", "_APPROX_STORE_BYTES", "_EXACT_STORE_BYTES",
+    "_PER_FACE_STATS", "_FACE_CAP_STATS",
+    "_XLA_MEM_APPROX", "_XLA_MEM_EXACT",
+    # the A6 plan log and the two drains that ride with it
+    "_PLAN_RECORDS", "_PLAN_LOG_DROPPED", "_PLAN_LOG_TERMINALS",
+    "_PAIRED_REF", "_PAIRED_REF_DROPPED",
+    "_MEM_PARITY", "_MEM_PARITY_MEASURED", "_MEM_PARITY_DROPPED",
+)
+
+# Fail at IMPORT, not at the first discarded episode: a renamed container
+# that silently drops out of the snapshot is exactly the kind of quiet gap
+# this exists to close.
+for _name in _EPISODE_TELEMETRY_NAMES:
+    if _name not in globals():
+        raise RuntimeError(
+            f"_EPISODE_TELEMETRY_NAMES lists {_name}, which env.py does not "
+            f"define. Rename it there too, or drop it from the list.")
+    if not isinstance(globals()[_name], (list, dict)):
+        raise RuntimeError(
+            f"_EPISODE_TELEMETRY_NAMES lists {_name}, which is a "
+            f"{type(globals()[_name]).__name__}. The snapshot restores IN "
+            f"PLACE, so every entry has to be a list or a dict.")
+del _name
+
+
+def _telemetry_copy(value):
+    """Copy the list/dict SHELLS and share everything else.
+
+    Not `copy.deepcopy`: a plan record's values are numpy and jax arrays,
+    and deep-copying those is both expensive and, for a device array, a
+    different object than the one the drain expects. Nothing rebinds a
+    value inside a record once it is appended, so sharing the leaves is
+    exact; what has to be copied is every container the callbacks APPEND to
+    or COUNT in, which is precisely the shells.
+    """
+    if isinstance(value, list):
+        return [_telemetry_copy(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _telemetry_copy(v) for k, v in value.items()}
+    return value
+
+
+def episode_telemetry_snapshot() -> dict:
+    """Copy every per-episode host accumulator. See the block comment."""
+    g = globals()
+    return {n: _telemetry_copy(g[n]) for n in _EPISODE_TELEMETRY_NAMES}
+
+
+def episode_telemetry_restore(snapshot: dict) -> None:
+    """Put the accumulators back as :func:`episode_telemetry_snapshot` found
+    them. IN PLACE, because `_callback` closes over the containers."""
+    g = globals()
+    unknown = set(snapshot) - set(_EPISODE_TELEMETRY_NAMES)
+    if unknown:
+        raise ValueError(
+            f"episode_telemetry_restore: {sorted(unknown)} is not a "
+            f"per-episode accumulator of this module")
+    missing = set(_EPISODE_TELEMETRY_NAMES) - set(snapshot)
+    if missing:
+        raise ValueError(
+            f"episode_telemetry_restore: {sorted(missing)} is missing from "
+            f"the snapshot; pass the whole dict back, not a slice of it")
+    for name, value in snapshot.items():
+        container = g[name]
+        if isinstance(container, list):
+            container[:] = value
+        else:
+            container.clear()
+            container.update(value)
