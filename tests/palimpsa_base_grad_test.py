@@ -75,28 +75,26 @@ def setup():
 
     rng = np.random.default_rng(0)
     base_tok = jnp.asarray((rng.integers(1, 200, BASE_W)).astype(np.int32))
-    base_eqn = jnp.zeros((BASE_W,), jnp.int32)
     # 1-based owning vertex per base token; 0 = header/input (no owner).
     own = np.zeros((BASE_W,), np.int32)
     own[4:] = (np.arange(BASE_W - 4) % TOTAL_V) + 1
     base_own = jnp.asarray(own)
 
     d_tok = jnp.asarray((rng.integers(1, 200, DELTA_W)).astype(np.int32))
-    d_eqn = jnp.zeros((DELTA_W,), jnp.int32)
     part = jnp.zeros((TOTAL_V + 1,), jnp.float32).at[2].set(1.0)
-    return dict(agent=agent, base_tok=base_tok, base_eqn=base_eqn,
-                base_own=base_own, d_tok=d_tok, d_eqn=d_eqn, part=part)
+    return dict(agent=agent, base_tok=base_tok,
+                base_own=base_own, d_tok=d_tok, part=part)
 
 
 def _base(a, s):
-    return CS.base_memory(a, s["base_tok"], s["base_eqn"],
+    return CS.base_memory(a, s["base_tok"],
                           jnp.asarray(BASE_W, jnp.int32), window=BASE_W,
                           total_v=TOTAL_V, embd_dim=EMBD,
                           base_owners=s["base_own"])
 
 
 def _enc0(a, s):
-    return CS.init_carry(a, s["base_tok"], s["base_eqn"],
+    return CS.init_carry(a, s["base_tok"],
                          jnp.asarray(BASE_W, jnp.int32), window=BASE_W,
                          total_v=TOTAL_V, embd_dim=EMBD,
                          base_owners=s["base_own"])[0]
@@ -113,7 +111,7 @@ def _step(a_head, a_base, s, *, legacy_base=None):
     enc = _enc0(a_head, s)
     vs, vc = CS.zero_memory(TOTAL_V, EMBD)
     _c, vs, vc = CS.advance(
-        a_head, enc, vs, vc, s["d_tok"], s["d_eqn"],
+        a_head, enc, vs, vc, s["d_tok"],
         jnp.asarray(DELTA_W, jnp.int32), jnp.asarray(2, jnp.int32),
         window=DELTA_W, participants=s["part"], chunk=0)
     bm = legacy_base if legacy_base is not None else _base(a_base, s)
@@ -186,13 +184,13 @@ def test_base_and_dynamic_memories_add_to_one_readout(setup):
     enc = _enc0(a, s)
     vs, vc = CS.zero_memory(TOTAL_V, EMBD)
     _c, ds, dc = CS.advance(
-        a, enc, vs, vc, s["d_tok"], s["d_eqn"],
+        a, enc, vs, vc, s["d_tok"],
         jnp.asarray(DELTA_W, jnp.int32), jnp.asarray(2, jnp.int32),
         window=DELTA_W, participants=s["part"], chunk=0)
     joint = _vmem.read(bs + ds, bc + dc)
     # Same thing computed the accumulating way: fold the delta into the base.
     _c2, js, jc = CS.advance(
-        a, enc, bs, bc, s["d_tok"], s["d_eqn"],
+        a, enc, bs, bc, s["d_tok"],
         jnp.asarray(DELTA_W, jnp.int32), jnp.asarray(2, jnp.int32),
         window=DELTA_W, participants=s["part"], chunk=0)
     np.testing.assert_allclose(np.asarray(joint), np.asarray(_vmem.read(js, jc)),

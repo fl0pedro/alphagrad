@@ -84,45 +84,46 @@ def setup():
     return dict(
         agent=agent,
         d_tok=jnp.asarray(rng.integers(1, 200, (T, DELTA_W)).astype(np.int32)),
-        d_eqn=jnp.asarray(rng.integers(0, 4, (T, DELTA_W)).astype(np.int32)),
         d_cnt=jnp.asarray(rng.integers(4, DELTA_W, (T,)).astype(np.int32)),
         owner=jnp.asarray(rng.integers(1, TOTAL_V, (T,)).astype(np.int32)),
         part=jnp.asarray(rng.random((T, TOTAL_V + 1)).astype(np.float32)),
     )
 
 
-def _step(agent, carry, vs, vc, dt, de, dc, ow, pa):
+def _step(agent, carry, vs, vc, dt, dc, ow, pa):
     return CS.advance(
-        agent, carry, vs, vc, dt, de, dc, ow,
+        agent, carry, vs, vc, dt, dc, ow,
         window=DELTA_W, participants=pa,
         chunk=None, budget=jnp.asarray(DELTA_W, jnp.int32),
     )
 
 
 def _out(carry, vs, vc):
-    return (jnp.sum(carry.M) + jnp.sum(carry.I) + jnp.sum(carry.cumhist)
-            + jnp.sum(vs) + jnp.sum(vc))
+    # EncCarry has three leaves since 2026-09-13; `cumhist` went with the
+    # equation ids. `pos` is an int32 cursor and carries no derivative, so
+    # the reachable scalar is the two float leaves plus the memory.
+    return jnp.sum(carry.M) + jnp.sum(carry.I) + jnp.sum(vs) + jnp.sum(vc)
 
 
 def _full_scan_out(agent, part, s):
     """--grad-window 0: ONE chained scan from the base carry."""
     def body(state, x):
         c, vs, vc = state
-        dt, de, dc, ow, pa = x
-        c, vs, vc = _step(agent, c, vs, vc, dt, de, dc, ow, pa)
+        dt, dc, ow, pa = x
+        c, vs, vc = _step(agent, c, vs, vc, dt, dc, ow, pa)
         return (c, vs, vc), 0.0
 
     vs0, vc0 = CS.zero_memory(TOTAL_V, EMBD)
     (c, vs, vc), _ = jax.lax.scan(
         jax.checkpoint(body), (agent.carry_init(), vs0, vc0),
-        (s["d_tok"], s["d_eqn"], s["d_cnt"], s["owner"], part))
+        (s["d_tok"], s["d_cnt"], s["owner"], part))
     return _out(c, vs, vc)
 
 
 def _window_out(agent, part, s, anchor):
     """--grad-window 1: step T-1 advanced from a STORED (constant) carry."""
     c, vs, vc = anchor
-    c, vs, vc = _step(agent, c, vs, vc, s["d_tok"][T - 1], s["d_eqn"][T - 1],
+    c, vs, vc = _step(agent, c, vs, vc, s["d_tok"][T - 1],
                       s["d_cnt"][T - 1], s["owner"][T - 1], part[T - 1])
     return _out(c, vs, vc)
 
@@ -131,7 +132,7 @@ def _anchor(agent, s):
     c = agent.carry_init()
     vs, vc = CS.zero_memory(TOTAL_V, EMBD)
     for k in range(T - 1):
-        c, vs, vc = _step(agent, c, vs, vc, s["d_tok"][k], s["d_eqn"][k],
+        c, vs, vc = _step(agent, c, vs, vc, s["d_tok"][k],
                           s["d_cnt"][k], s["owner"][k], s["part"][k])
     return jax.lax.stop_gradient((c, vs, vc))
 
