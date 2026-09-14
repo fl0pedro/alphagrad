@@ -763,3 +763,133 @@ def _make_delta_env():
     )
     return VertexEliminationEnv(cfg, args=tuple(args), consts=list(consts),
                                 num_envs=0)
+
+
+# --------------------------------------------------------------------------
+# 4. BF16 LEAVES (owner ruling 2026-09-14)
+#
+# The ruling: store in bf16 only what the loss reads as a CONSTANT and whose
+# rounding cannot move a pinned invariant -- above all the PPO ratio being
+# exactly 1 at epoch 0 (ratio = exp(new_logp - old_logp); a bf16 old_logp has
+# ~3 significant digits, so a stored LOG-PROBABILITY read directly into that
+# difference would bias the ratio by ~1e-3 with no weight change at all).
+#
+# Two leaves cross that bar: `value` / `next_value` (read only as the GAE
+# bootstrap in `_episode_update`, never inside the ratio or a KL) and the
+# legacy `pair_dists` / `factor_dists` (always the zero-filled arrays under
+# `--dynamic-substeps`, the only path `loss_fn` runs, and never read back out
+# of `TrainBatch` at all). Every other candidate the ruling named --
+# `old_vertex_dist`, the per-sub-step `old_micro_*_dists`,
+# `old_micro_quant_logp`, `face_old_logp` -- is a probability or a raw
+# log-prob read DIRECTLY (via `log()` or by direct addition) into
+# `old_log_probs`, so it stays float32. Tests below pin both halves: the
+# leaves that moved, and that the ratio-feeding leaves did not.
+# --------------------------------------------------------------------------
+
+def test_value_and_next_value_round_trip_bf16_within_precision():
+    """`value` / `next_value` are per-head critic predictions, O(1) pre-PopArt
+    and up to O(1e2) once de-normalised (`v_raw = value * popart_sigma +
+    popart_mu`). Neither the ratio nor a KL ever reads them (see
+    `_episode_update`: they feed only `get_advantages` / PopArt), so the bar
+    is "close enough for a bootstrap", not "exact" -- bfloat16's ~2^-8
+    relative precision, not bit-identity."""
+    rng = np.random.default_rng(0)
+    for scale in (1.0, 10.0, 100.0):
+        x = jnp.asarray(rng.normal(size=(4, 8, 3)) * scale, jnp.float32)
+        back = x.astype(jnp.bfloat16).astype(jnp.float32)
+        rel = np.abs(np.asarray(back) - np.asarray(x)) / np.maximum(
+            np.abs(np.asarray(x)), 1e-6)
+        assert np.max(rel) < 1e-2, (
+            f"scale={scale}: max relative error {np.max(rel):.4g} exceeds "
+            "bfloat16's ~2^-8 precision budget")
+
+
+def test_pair_dists_and_factor_dists_round_trip_bf16_exactly():
+    """The legacy fields are the CONSTANT zero arrays
+    (`_legacy_zero_pair_dists` / `_legacy_zero_factor_dists`) under
+    `--dynamic-substeps`; 0.0 is exactly representable in bfloat16, so the
+    round trip is bit-exact, not merely close."""
+    for shape in ((16, 5), (16, 12)):
+        z = jnp.zeros(shape, jnp.float32)
+        back = z.astype(jnp.bfloat16).astype(jnp.float32)
+        np.testing.assert_array_equal(np.asarray(back), np.asarray(z))
+
+
+def test_the_trajectory_store_site_casts_value_and_legacy_dists_to_bfloat16():
+    """THE STORE. `inspect.getsource` on `main` (everything here is nested
+    inside it) rather than on the scan body directly, because the scan body
+    is a closure with no module-level name of its own -- the same reason
+    ``test_the_loss_reads_the_delta_through_a_cast_so_the_gather_stays_int32``
+    reads `Agent.encode_extend`'s source instead of the call site."""
+    import inspect
+
+    from alphagrad.approx import ppo
+
+    src = inspect.getsource(ppo.main)
+    assert "value=jnp.atleast_1d(value).astype(jnp.bfloat16)" in src
+    assert "next_value=jnp.atleast_1d(next_value).astype(jnp.bfloat16)" in src
+    assert "pair_dists=pair_dists.astype(jnp.bfloat16)" in src
+    assert "factor_dists=factor_dists.astype(jnp.bfloat16)" in src
+
+
+def test_episode_update_decodes_value_and_next_value_back_to_float32_once():
+    """THE READ SITE. One `traj._replace(...)` right after `traj` is
+    unpacked from `roll`, before any of `_episode_update`'s many downstream
+    reads of `traj.value` / `traj.next_value` (the PopArt de-normalisation,
+    `get_advantages`, the neutral-target substitution, the T3/T-ADV
+    diagnostics) -- so every one of them sees float32 exactly as before this
+    leaf was ever cast down, matching the `unpack_mask_bits`-once-per-
+    minibatch precedent."""
+    import inspect
+
+    from alphagrad.approx import ppo
+
+    src = inspect.getsource(ppo.main)
+    assert "traj = traj._replace(" in src
+    assert "value=traj.value.astype(jnp.float32)," in src
+    assert "next_value=traj.next_value.astype(jnp.float32)," in src
+
+
+def test_train_batch_decodes_legacy_dists_back_to_float32():
+    """THE OTHER READ SITE. `old_pair_dists` / `old_factor_dists` are never
+    read again once inside `TrainBatch` (grep confirms it), but the decode
+    still happens at the seam where the leaf crosses from `Trajectory` into
+    `TrainBatch`, so a future reader is handed float32 exactly as every
+    other `old_*` leaf is."""
+    import inspect
+
+    from alphagrad.approx import ppo
+
+    src = inspect.getsource(ppo.main)
+    assert "old_pair_dists=traj.pair_dists.astype(jnp.float32)," in src
+    assert "old_factor_dists=traj.factor_dists.astype(jnp.float32)," in src
+
+
+def test_the_ratio_feeding_leaves_were_not_touched():
+    """THE NEGATIVE SPACE. `old_vertex_dist` is `log()`-ed directly into
+    `old_log_probs` (both the unified-head branch and
+    `old_micro_log_prob_for_action`); the per-sub-step `old_micro_*_dists`
+    feed the same reconstruction under `--no-unified-head` (the CLI
+    default); `old_micro_quant_logp` and `face_old_logp` are raw log-probs
+    ADDED directly into `old_log_probs`, unconditionally. Rounding any of
+    these to bfloat16 would bias the PPO ratio away from exactly 1 at epoch
+    0 with no weight change at all, so none of them may carry a bfloat16
+    cast at the store site."""
+    import inspect
+
+    from alphagrad.approx import ppo
+
+    src = inspect.getsource(ppo.main)
+    for line in (
+        "vertex_dist=vertex_dist,",
+        "micro_op_dists=micro_op_dists,",
+        "micro_i_dists=micro_i_dists,",
+        "micro_j_dists=micro_j_dists,",
+        "micro_exp_dists=micro_exp_dists,",
+        "micro_kind_dists=micro_kind_dists,",
+        "micro_quant_logp=micro_quant_logp,",
+        "face_old_logp=jnp.asarray(face_old_logp, jnp.float32),",
+    ):
+        assert line in src, f"store-site line not found verbatim: {line!r}"
+        assert (line[:-1] + ".astype(jnp.bfloat16),") not in src, (
+            f"a bfloat16 cast crept onto a ratio-feeding leaf: {line!r}")
