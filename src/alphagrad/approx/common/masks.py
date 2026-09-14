@@ -2295,6 +2295,15 @@ def masked_face_transforms(face_keys, *, pre=None, post=None, res=None,
     Each slot's rules are checked against that slot's own operand at apply
     time, so an illegal rule is skipped rather than raising -- and because the
     three slots see three different tensors, they mask independently.
+
+    IT APPLIES RATHER THAN DECIDES, so what it puts on a slot leaves NO
+    ``approx`` block: graphax records a slot callable's work only when the
+    callable returns the ACTION (finding 64). The wire path does not come
+    through here -- it comes through ``env.make_slot_frame_hook``, which is a
+    chooser -- and a slot here can hold SEVERAL rules, which one chooser result
+    cannot carry. Nothing in the trainer calls this; a caller that wants the
+    marker must give each rule its own slot and use
+    :func:`make_live_masked_chooser`.
     """
     def _wrap(rules):
         if not rules:
