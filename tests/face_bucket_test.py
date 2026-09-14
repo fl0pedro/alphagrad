@@ -42,6 +42,8 @@ from _scale_guard import request_scale  # noqa: E402
 
 W, MAXF, pytestmark = request_scale(max_delta_tokens=128,
                                     max_faces=64)
+from alphagrad.approx.env import (  # noqa: E402
+    DELTA_TOKEN_DTYPE as _TOKEN_DTYPE)
 
 import equinox as eqx  # noqa: E402
 import jax  # noqa: E402
@@ -128,7 +130,11 @@ def _chunk_fns(n):
     def face_chunk_fn(f, vertex_idx, vertex_specs, rows, skips):
         ct = (f % 3) + 1
         ar = jnp.arange(W, dtype=jnp.int32)
-        tok = jnp.where(ar < ct, (f + ar) % 50 + 1, 0).astype(jnp.int32)
+        # uint8, like the real wire (``env.DELTA_TOKEN_DTYPE``): an int32
+        # stand-in scatters into the face loop's byte buffer with a cast JAX
+        # warns about today and will refuse tomorrow.
+        tok = jnp.where(ar < ct, (f + ar) % 50 + 1, 0).astype(
+            jnp.dtype(_TOKEN_DTYPE))
         # 4th output: the face's ENDPOINT vertices (1-based, 0 = none).
         # Deterministic stand-in, same shape the real callback returns.
         ends = jnp.stack([(f % 3) + 1, (f % 2) + 1]).astype(jnp.int32)
