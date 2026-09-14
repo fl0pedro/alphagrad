@@ -14227,18 +14227,6 @@ def main():
     # read. None = drain in `host_log`, exactly as before.
     _POOL_DRAIN = [None]
 
-    def _telemetry_zero():
-        """A snapshot with every per-episode accumulator emptied.
-
-        Restoring it is what a fresh process's containers look like, which is
-        exactly the state the next episode has to start its counting from. The
-        shapes come from `episode_telemetry_snapshot`, and env.py checks at
-        IMPORT that every entry is a list or a dict, so emptying is total.
-        """
-        return {n: ([] if isinstance(v, list) else {})
-                for n, v in
-                _ep_env_mod.episode_telemetry_snapshot().items()}
-
     def _drain_measure_telemetry(ticket=None, park=False):
         """Drain the trainer's AND the actors' per-episode telemetry, once.
 
@@ -14322,7 +14310,11 @@ def main():
             # the next episode counts from zero.
             out["attempt"] = int(_EP_ATTEMPT[0])
             out["trainer_tel"] = _ep_env_mod.episode_telemetry_snapshot()
-            _ep_env_mod.episode_telemetry_restore(_telemetry_zero())
+            # env.py owns what "zero" means for its own containers. Nine of
+            # them are one-element counters every reader indexes, so a driver
+            # that emptied every list would leave `_PLAN_LOG_TERMINALS[0]` to
+            # raise IndexError on the next drain. Canary job 65715 died there.
+            _ep_env_mod.episode_telemetry_reset()
         return out
 
     def _finish_episode(_fe):
