@@ -319,3 +319,56 @@ def test_the_count_proportional_backward_agrees_with_the_scan_form(
     pairs = list(zip(jax.tree.leaves(g_loop), jax.tree.leaves(g_scan)))
     worst = max(_rel(a, b) for a, b in pairs if np.max(np.abs(b)) > 0)
     assert worst < 1e-4, f"count_loop gradient gap {worst:.3e}"
+
+
+# --------------------------------------------------------------------------
+# the per-face escape hatch
+# --------------------------------------------------------------------------
+def test_the_read_override_actually_changes_what_the_readers_see(monkeypatch):
+    """The face pipeline rests on this, so it is pinned on its own.
+
+    It shipped once as a context manager that set a variable nothing read.
+    Every caller went on using the shipped read, the face rollout and the
+    face replay went on disagreeing, and the only symptom was a log-prob
+    8.4e-3 out at three faces. A context manager that does nothing looks
+    exactly like one that works.
+    """
+    from alphagrad.transformer.fast_palimpsa_pallas import (
+        palimpsa_read, read_override)
+    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ", "fast")
+    assert palimpsa_read() == "fast"
+    assert _fold._fast_read() is True
+    with read_override("exact"):
+        assert palimpsa_read() == "exact"
+        assert _fold._fast_read() is False
+    assert palimpsa_read() == "fast"
+
+
+def test_the_read_override_is_restored_when_the_body_raises(monkeypatch):
+    from alphagrad.transformer.fast_palimpsa_pallas import (
+        palimpsa_read, read_override)
+    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ", "fast")
+    with pytest.raises(RuntimeError):
+        with read_override("exact"):
+            raise RuntimeError("boom")
+    assert palimpsa_read() == "fast"
+
+
+def test_the_read_override_refuses_a_mode_it_does_not_know():
+    from alphagrad.transformer.fast_palimpsa_pallas import read_override
+    with pytest.raises(ValueError, match="takes 'exact' or 'fast'"):
+        with read_override("approximate"):
+            pass
+
+
+def test_the_override_reaches_the_fold_through_plan_chunks(monkeypatch):
+    """`plan_chunks` refuses a misaligned chunk under the fast read. The face
+    replay folds a window whose chunk it does not choose, so the override has
+    to lift that refusal too, or the face path would raise instead of reading
+    exact."""
+    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ", "fast")
+    from alphagrad.transformer.fast_palimpsa_pallas import read_override
+    with pytest.raises(ValueError, match="not a multiple of the fast-palimpsa"):
+        _fold.plan_chunks(4096, 100)
+    with read_override("exact"):
+        assert _fold.plan_chunks(4096, 100)[0] == 100

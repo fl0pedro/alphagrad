@@ -493,6 +493,12 @@ def palimpsa_read() -> str:
     ``tests/golden/policy_gate_golden_pre_fastread.json``. ``fast`` is a
     different operator, so the two goldens differ by design.
     """
+    if _READ_OVERRIDE[0] is not None:
+        # A caller inside a `read_override` block, which is the per-face
+        # pipeline and nothing else. It does not log and it does not consult
+        # the environment: the block exists precisely because that caller
+        # cannot use whatever the environment says.
+        return _READ_OVERRIDE[0]
     mode = os.environ.get("ALPHAGRAD_PALIMPSA_READ", "fast")
     if mode not in ("exact", "fast"):
         raise ValueError(
