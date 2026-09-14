@@ -6,15 +6,16 @@ callback now returns ONLY the tokens the last elimination emitted, with the
 tokenizer's own length in the wire's count HEADER, and the base is a host-side
 constant (``VertexEliminationEnv.base_observation``).
 
-Since 2026-09-13 the ids are NARROW: uint8 tokens, int16 equation ids, and the
-count -- which fits in neither -- rides in its own little-endian int32 across
-the first ``env.DELTA_HEADER_SLOTS`` byte slots of the TOKEN buffer. The ids
-start at ``DELTA_HEADER_SLOTS`` in both buffers.
+Since 2026-09-13 the wire is ONE buffer: uint8 tokens, with the count in its
+own little-endian int32 across the first ``env.DELTA_HEADER_SLOTS`` byte slots
+and the tokens starting after them. The parallel equation-id buffer is gone --
+it fed only the palimpsa relational forget gate, which went with it -- so the
+callback returns ``(tokens, reward)`` on this path, not a triple.
 
 Two things must hold, and neither is visible in any metric we log:
 
   1. CONCATENATION. base + delta_1 + ... + delta_k is the length-k stream,
-     token for token and eqn-id for eqn-id. If it were not, the encoder's
+     token for token. If it were not, the encoder's
      recurrence would be reading a different graph than the one the
      measurement builds -- silently.
 
@@ -85,7 +86,7 @@ import pytest                                                     # noqa: E402
 
 from alphagrad.approx.env import (                                # noqa: E402
     MAX_DELTA_TOKENS, MAX_FACES, MAX_RULES_PER_VERTEX, FACE_SLOTS,
-    DELTA_EQN_DTYPE, DELTA_EQN_PAD, DELTA_HEADER_SLOTS, DELTA_TOKEN_DTYPE,
+    DELTA_HEADER_SLOTS, DELTA_TOKEN_DTYPE, DELTA_TOKEN_PAD,
     EnvConfig, VertexEliminationEnv, _callback, decode_delta_header,
 )
 
@@ -141,24 +142,24 @@ _ORDER = jnp.asarray(np.arange(1, _V + 1), dtype=jnp.int32)
 
 
 def _delta_at(cfg, specs, step):
-    """One step's (tokens, eqn_ids) as the delta wire, unpacked.
+    """One step's tokens as the delta wire, unpacked.
 
-    THE HEADER IS NOT IN EITHER ID STREAM any more: it is one little-endian
-    int32 over the first ``DELTA_HEADER_SLOTS`` byte slots of the token
-    buffer, and the equation buffer's matching slots carry the pad sentinel.
+    THE HEADER IS NOT IN THE TOKEN STREAM: it is one little-endian int32 over
+    the first ``DELTA_HEADER_SLOTS`` byte slots, and the tokens start after
+    them. The callback returns a PAIR on this path -- there is no equation-id
+    buffer to return.
     """
-    tok, eqn, _r = _callback(
+    _out = _callback(
         cfg, ARGS, _CONSTS, _ORDER, specs, _FACES, _SKIPS, step)
-    t, e = np.asarray(tok), np.asarray(eqn)
+    assert len(_out) == 2, (
+        f"the delta wire returned {len(_out)} arrays; it is (tokens, reward) "
+        f"since the equation-id buffer was removed")
+    t = np.asarray(_out[0])
     assert t.dtype == np.dtype(DELTA_TOKEN_DTYPE), t.dtype
-    assert e.dtype == np.dtype(DELTA_EQN_DTYPE), e.dtype
     n = int(decode_delta_header(t))
     assert 0 <= n <= MAX_DELTA_TOKENS
     H = DELTA_HEADER_SLOTS
-    assert list(e[:H]) == [DELTA_EQN_PAD] * H, (
-        "the equation buffer's header slots carry something other than the "
-        "pad sentinel; nothing may read them")
-    return [int(x) for x in t[H:H + n]], [int(x) for x in e[H:H + n]]
+    return [int(x) for x in t[H:H + n]]
 
 
 _VOCAB = int(os.environ.get("ALPHAGRAD_INCR_TOKEN_VOCAB", "256"))
@@ -174,13 +175,13 @@ def _cold_stream(prefix, specs_np, vocab=_VOCAB):
     tk = IncrementalPathTokenizer(
         _CJ.jaxpr, (0, 1), list(_CONSTS), list(ARGS), vocab_size=vocab)
     stream = [int(t) for t in tk.base_tokens()]
-    seg = [int(g) for g in tk.last_eqn_ids()]
     for v in prefix:
         rules = decode_vertex_rule_specs(
             _CJ.jaxpr, int(v), specs_np[int(v) - 1])
         stream += [int(t) for t in tk.eliminate(int(v), tuple(rules))]
-        seg += [int(g) for g in tk.last_eqn_ids()]
-    return stream, seg
+    # `tk.last_eqn_ids()` is deliberately NOT read: the equation-id stream was
+    # removed on 2026-09-13, so there is nothing to compare it against.
+    return stream
 
 
 def _check_reconstruction(diag, require_clip=False):
@@ -204,41 +205,34 @@ def _check_reconstruction(diag, require_clip=False):
     cfg = _cfg(True)
     env = VertexEliminationEnv(cfg, args=ARGS, consts=_CONSTS)
 
-    btok, beqn, bn = env.base_observation()
+    btok, bn = env.base_observation()
     rebuilt_t = list(np.asarray(btok)[:bn])
-    rebuilt_e = list(np.asarray(beqn)[:bn])
 
-    prev_t, prev_e = _cold_stream([], specs_np)
+    prev_t = _cold_stream([], specs_np)
     assert rebuilt_t == prev_t, "base tokens differ from the stream's base"
-    assert rebuilt_e == prev_e, "base eqn ids differ from the stream's base"
 
-    exp_t, exp_e = list(prev_t), list(prev_e)
+    exp_t = list(prev_t)
     clipped = 0
     # NON-TERMINAL steps only: the terminal step would run the measurement.
     for k in range(1, _V):
-        cur_t, cur_e = _cold_stream(list(range(1, k + 1)), specs_np)
+        cur_t = _cold_stream(list(range(1, k + 1)), specs_np)
         assert cur_t[:len(prev_t)] == prev_t, (
             f"step {k}: the reference replay lost the prefix property")
         blk_t = cur_t[len(prev_t):]
-        blk_e = cur_e[len(prev_e):]
         if len(blk_t) > MAX_DELTA_TOKENS:
             clipped += 1
-        blk_t, blk_e = blk_t[:MAX_DELTA_TOKENS], blk_e[:MAX_DELTA_TOKENS]
+        blk_t = blk_t[:MAX_DELTA_TOKENS]
 
-        dt, de = _delta_at(cfg, specs, k)
+        dt = _delta_at(cfg, specs, k)
         assert dt == blk_t, (
             f"step {k}: the emitted delta is not this elimination's block "
             f"({len(dt)} vs {len(blk_t)} tokens)")
-        assert de == blk_e, f"step {k}: delta eqn ids are not the block's"
 
         rebuilt_t += dt
-        rebuilt_e += de
         exp_t += blk_t
-        exp_e += blk_e
-        prev_t, prev_e = cur_t, cur_e
+        prev_t = cur_t
 
     assert rebuilt_t == exp_t, "base + deltas != the (clip-aware) stream"
-    assert rebuilt_e == exp_e, "eqn ids diverged"
     if require_clip:
         assert clipped, (
             f"this graph no longer exercises the MAX_DELTA_TOKENS clip at the "
@@ -255,7 +249,7 @@ def test_base_plus_deltas_reconstructs_the_stream(diag):
     belongs to whichever module imported ``env`` first (module header), so on a
     32768-wide budget this graph's diag block simply fits. What this
     case does pin, at every budget, is that base + deltas is the stream token
-    for token and eqn-id for eqn-id.
+    for token.
     ``test_the_clip_is_exercised_at_the_old_budget_in_its_own_interpreter``
     covers the clip itself, on every run.
     """
@@ -270,8 +264,8 @@ def test_the_delta_describes_the_APPROXIMATED_graph():
     reading the exact graph while the measurement built the approximated one.
     """
     cfg = _cfg(True)
-    exact = [_delta_at(cfg, _specs(False), k)[0] for k in range(1, _V)]
-    diagd = [_delta_at(cfg, _specs(True), k)[0] for k in range(1, _V)]
+    exact = [_delta_at(cfg, _specs(False), k) for k in range(1, _V)]
+    diagd = [_delta_at(cfg, _specs(True), k) for k in range(1, _V)]
     assert any(a != b for a, b in zip(exact, diagd)), (
         "the delta is IDENTICAL with and without a DIAG on every vertex -- "
         "the observation no longer carries the approximation decisions")
@@ -286,8 +280,11 @@ def test_full_stream_env_is_untouched():
     tok, eqn, _r = _callback(
         _cfg(False), ARGS, _CONSTS, _ORDER, _specs(True), _FACES, _SKIPS, 2)
     assert np.asarray(tok).shape == (MAX_TOKENS,)
+    # The LEGACY path keeps its equation-id buffer: those ids feed the DENSE
+    # encoder's pairwise T5 relational bias, which is a different mechanism
+    # from the palimpsa forget gate that was removed.
     assert np.asarray(eqn).shape == (MAX_TOKENS,)
-    ref_t, _ref_e = _cold_stream([1, 2], np.asarray(_specs(True)))
+    ref_t = _cold_stream([1, 2], np.asarray(_specs(True)))
     assert list(np.asarray(tok)[:len(ref_t)]) == ref_t
 
 
@@ -302,10 +299,14 @@ def test_obs_width_matches_the_wire():
     assert e_f.obs_width == MAX_TOKENS
     assert e_d._callback_shape[0].shape == (e_d.obs_width,)
     assert e_f._callback_shape[0].shape == (e_f.obs_width,)
+    # THE ARITY. Two arrays on the delta wire (tokens, reward), three on the
+    # legacy full-stream wire, which keeps its equation-id buffer for the
+    # dense encoder's pairwise T5 bias.
+    assert e_d.wire_arity == 2
+    assert e_f.wire_arity == 3
     # THE NARROW WIRE, declared. `io_callback` enforces the dtype, so a
     # producer that widened would fail loudly rather than silently.
     assert e_d._callback_shape[0].dtype == jnp.uint8
-    assert e_d._callback_shape[1].dtype == jnp.int16
     assert e_f._callback_shape[0].dtype == jnp.int32
     assert e_f._callback_shape[1].dtype == jnp.int32
 
@@ -318,14 +319,12 @@ def test_reset_carries_an_empty_delta_and_no_callback():
     st = env.reset()
     assert int(st.delta_count) == 0
     assert st.delta_tokens.shape == (MAX_DELTA_TOKENS,)
-    assert st.delta_eqns.shape == (MAX_DELTA_TOKENS,)
-    # THE ROLLOUT STORE's dtypes, at the one place both buffers are built
-    # from nothing.
+    assert not hasattr(st, "delta_eqns")
+    # THE ROLLOUT STORE's dtype, at the one place the buffer is built from
+    # nothing.
     assert st.delta_tokens.dtype == jnp.uint8
-    assert st.delta_eqns.dtype == jnp.int16
     assert st.delta_count.dtype == jnp.int32
-    assert np.all(np.asarray(st.delta_tokens) == 0)
-    assert np.all(np.asarray(st.delta_eqns) == -1)
+    assert np.all(np.asarray(st.delta_tokens) == DELTA_TOKEN_PAD)
 
 
 # --------------------------------------------------------------------------

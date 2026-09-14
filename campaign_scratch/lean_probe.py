@@ -79,9 +79,9 @@ def main():
     W = case["window"]
 
     state = env.reset()
-    base_tok, base_eqn, base_n = env.base_observation()
+    base_tok, base_n = env.base_observation()
     base_w = max(int(base_n), 1)
-    base_tok, base_eqn = base_tok[:base_w], base_eqn[:base_w]
+    base_tok = base_tok[:base_w]
     try:
         base_own = env.base_owners()
     except Exception:
@@ -100,7 +100,7 @@ def main():
             print(f"[probe]   {name:14s} {n}")
 
     def _base(a):
-        return CS.init_carry(a, base_tok, base_eqn, base_n, window=base_w,
+        return CS.init_carry(a, base_tok, base_n, window=base_w,
                              total_v=total_v, embd_dim=EMBD,
                              base_owners=base_own)
 
@@ -109,7 +109,7 @@ def main():
         vs0, vc0 = m0s, m0c                 # old: init_carry seeds the memory
         base_mem = None
         ident = CS.base_identity_stream(
-            agent, base_tok, base_eqn, base_n, window=base_w,
+            agent, base_tok, base_n, window=base_w,
             total_v=total_v, base_owners=base_own)
     else:
         vs0, vc0 = CS.zero_memory(total_v, EMBD)
@@ -123,7 +123,6 @@ def main():
     # real tokens, the real `advance` path, a realistic count.
     _dw = int(case["window"])
     dtok = jnp.concatenate([base_tok, jnp.zeros((_dw,), jnp.int32)])[:_dw]
-    deqn = jnp.concatenate([base_eqn, -jnp.ones((_dw,), jnp.int32)])[:_dw]
     dcnt = jnp.asarray(min(int(base_n), _dw), jnp.int32)
     owner = jnp.asarray(0, jnp.int32)
 
@@ -146,7 +145,7 @@ def main():
         # LEAN: the production loss recomputes the base memory under gradient.
         _e, bs, bc = _base(agent_b)
         c2, vs2, vc2 = CS.advance(
-            agent, enc0, vs0, vc0, dtok, deqn, dcnt, owner,
+            agent, enc0, vs0, vc0, dtok, dcnt, owner,
             window=_dw, participants=part, chunk=0)
         return _scalar(_heads(agent, vs2, vc2, (bs, bc), None))
 
@@ -154,11 +153,11 @@ def main():
     def f_inside(agent_b):
         if LEGACY:
             idt = CS.base_identity_stream(
-                agent_b, base_tok, base_eqn, base_n, window=base_w,
+                agent_b, base_tok, base_n, window=base_w,
                 total_v=total_v, base_owners=base_own)
             _e, bs, bc = _base(agent_b)
             c2, vs2, vc2 = CS.advance(
-                agent, enc0, bs, bc, dtok, deqn, dcnt, owner,
+                agent, enc0, bs, bc, dtok, dcnt, owner,
                 window=_dw, participants=part, chunk=0)
             return _scalar(_heads(agent, vs2, vc2, None, idt))
         return f_prod(agent_b)
@@ -166,7 +165,7 @@ def main():
     # --------------------------------------------------------------- DELTA
     def f_delta(agent_d):
         c2, vs2, vc2 = CS.advance(
-            agent_d, enc0, vs0, vc0, dtok, deqn, dcnt, owner,
+            agent_d, enc0, vs0, vc0, dtok, dcnt, owner,
             window=_dw, participants=part, chunk=0)
         return _scalar(_heads(agent, vs2, vc2, base_mem, ident))
 

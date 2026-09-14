@@ -307,7 +307,7 @@ def run_trace(case=None, steps=None):
     steps = max(1, int(steps))
 
     state = env.reset()
-    base_tok, base_eqn, base_n = env.base_observation()
+    base_tok, base_n = env.base_observation()
     base_w = max(int(base_n), 1)
     try:
         base_own = env.base_owners()
@@ -319,7 +319,7 @@ def run_trace(case=None, steps=None):
     # head time (carry_stream's docstring says why: the loss has to be able
     # to recompute the base half inside the gradient).
     enc_carry, base_s, base_c = CS.init_carry(
-        agent, base_tok[:base_w], base_eqn[:base_w], base_n,
+        agent, base_tok[:base_w], base_n,
         window=base_w, total_v=total_v, embd_dim=EMBD, base_owners=base_own)
     base_mem = (base_s, base_c)
     vmem_s, vmem_c = CS.zero_memory(total_v, EMBD)
@@ -337,7 +337,7 @@ def run_trace(case=None, steps=None):
             jnp.asarray(-1, jnp.int32)).astype(jnp.int32)
         enc_carry, vmem_s, vmem_c = CS.advance(
             agent, enc_carry, vmem_s, vmem_c,
-            state.delta_tokens, state.delta_eqns, state.delta_count,
+            state.delta_tokens, state.delta_count,
             delta_owner, window=case["window"], participants=part)
         precomputed = CS.heads(agent, vmem_s, vmem_c,
                                base_mem=base_mem, preference=None)
@@ -363,7 +363,6 @@ def run_trace(case=None, steps=None):
          v_context) = agent.sample_action_dynamic(
             None, avail, state.axis_state, state.axis_valid_mask,
             case["factor_tables"], case["op_legality"], keys[t],
-            eqn_ids=None,
             preference=None, precomputed=precomputed,
             face_chunk_fn=chunk_fn, face_count_fn=count_fn,
             face_sizes_fn=sizes_fn, face_decide_fn=decide_fn,
@@ -409,9 +408,9 @@ def run_trace(case=None, steps=None):
             # with (sizes (F, S, N), quant (F, S, K)); since 2026-09-13 those
             # are the STAGE-2 masks, so they are pinned below as well.
             (fa, f_logp, f_ent, f_pair, f_comp, f_valid, f_cnt, f_dt,
-             f_de, f_ends) = face_out[:10]
-            f_slot_sizes = face_out[10] if len(face_out) > 10 else None
-            f_slot_quant = face_out[11] if len(face_out) > 11 else None
+             f_ends) = face_out[:9]
+            f_slot_sizes = face_out[9] if len(face_out) > 9 else None
+            f_slot_quant = face_out[10] if len(face_out) > 10 else None
             n_live = int(np.sum(np.asarray(f_valid) > 0.5))
             cnt = np.asarray(f_cnt, np.int32)
             tot = int(cnt[:n_live].sum()) if n_live else 0
@@ -460,7 +459,6 @@ def run_trace(case=None, steps=None):
                 # of the emission window only, never the padded tail).
                 "chunk_counts": [int(x) for x in cnt[:n_live]],
                 "chunk_tokens_sha": _sha(np.asarray(f_dt)[:tot]),
-                "chunk_eqns_sha": _sha(np.asarray(f_de)[:tot]),
                 # the face's own ENDPOINT vertices -- the identity the head
                 # gathers its two contexts from. A face-index shift or a
                 # key-order change moves these before it moves a wire.
@@ -505,7 +503,7 @@ def run_trace(case=None, steps=None):
         part = agent.participation_mask(
             total_v, jnp.asarray(v, jnp.int32),
             (jnp.zeros((case["max_faces"], 2), jnp.int32)
-             if face_out is None else face_out[9]),
+             if face_out is None else face_out[8]),
             (jnp.zeros((case["max_faces"],), jnp.float32)
              if face_out is None else face_out[5]))
         rec["participants"] = _idx(part)

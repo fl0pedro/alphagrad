@@ -18,12 +18,12 @@ from alphagrad.approx.common import carry_stream as CS
 
 case = G.build_case()
 agent, env, total_v = case["agent"], case["env"], case["total_v"]
-bt, be, bn = env.base_observation()
+bt, bn = env.base_observation()
 bw = max(int(bn), 1)
 own = env.base_owners()
-enc, vs, vc = CS.init_carry(agent, bt[:bw], be[:bw], bn, window=bw,
+enc, vs, vc = CS.init_carry(agent, bt[:bw], bn, window=bw,
                             total_v=total_v, embd_dim=G.EMBD, base_owners=own)
-stream = CS.base_identity_stream(agent, bt[:bw], be[:bw], bn, window=bw,
+stream = CS.base_identity_stream(agent, bt[:bw], bn, window=bw,
                                  total_v=total_v, base_owners=own)
 rows, ids, valid = stream
 print("base rows:", rows.shape, "owned rows:", int(jnp.sum(ids >= 0)),
