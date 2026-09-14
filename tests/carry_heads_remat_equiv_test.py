@@ -72,20 +72,18 @@ def setup():
     # residual-vs-recompute discrepancy would show up if there were one.
     counts = np.array([DELTA_W, DELTA_W // 2, DELTA_W - 3, 1], np.int32)
     d_tok = jnp.asarray(rng.integers(1, 200, (KMAX, DELTA_W)).astype(np.int32))
-    d_eqn = jnp.asarray(
-        (rng.integers(0, 4, (KMAX, DELTA_W))).astype(np.int32))
     owner = jnp.asarray(np.array([1, 3, 2, 4], np.int32))
     part = jnp.asarray(
         np.eye(TOTAL_V + 1, dtype=np.float32)[[2, 0, 5, 1]])
-    return dict(agent=agent, d_tok=d_tok, d_eqn=d_eqn,
+    return dict(agent=agent, d_tok=d_tok,
                 d_cnt=jnp.asarray(counts), owner=owner, part=part)
 
 
-def _loop(agent, K, d_tok, d_eqn, d_cnt, owner, part, *, remat):
+def _loop(agent, K, d_tok, d_cnt, owner, part, *, remat):
     """The production loop, with and without the wrapper."""
-    def _advance_k(carry, vs, vc, dt, de, dc, ow, pa):
+    def _advance_k(carry, vs, vc, dt, dc, ow, pa):
         return CS.advance(
-            agent, carry, vs, vc, dt, de, dc, ow,
+            agent, carry, vs, vc, dt, dc, ow,
             window=DELTA_W, participants=pa,
             chunk=None, budget=jnp.asarray(DELTA_W, jnp.int32),
         )
@@ -94,27 +92,26 @@ def _loop(agent, K, d_tok, d_eqn, d_cnt, owner, part, *, remat):
     carry = agent.carry_init()
     vs, vc = CS.zero_memory(TOTAL_V, EMBD)
     for k in range(K):
-        carry, vs, vc = step(carry, vs, vc, d_tok[k], d_eqn[k], d_cnt[k],
+        carry, vs, vc = step(carry, vs, vc, d_tok[k], d_cnt[k],
                              owner[k], part[k])
     return carry, vs, vc
 
 
 def _scalar(agent, K, s, remat):
-    carry, vs, vc = _loop(agent, K, s["d_tok"], s["d_eqn"], s["d_cnt"],
+    carry, vs, vc = _loop(agent, K, s["d_tok"], s["d_cnt"],
                           s["owner"], s["part"], remat=remat)
-    # A scalar that touches every output: the carry (M, I, cumhist, nvalid),
-    # the vertex sums and the counts.
+    # A scalar that touches every output: the carry (M, I), the vertex sums
+    # and the counts. `cumhist` and `nvalid` are gone with the equation ids.
     return (jnp.sum(carry.M * 1.0) + jnp.sum(carry.I * 2.0)
-            + jnp.sum(carry.cumhist * 3.0) + carry.nvalid
             + jnp.sum(vs * 4.0) + jnp.sum(vc * 5.0))
 
 
 @pytest.mark.parametrize("K", [1, 2, 4])
 def test_forward_is_bit_identical(setup, K):
     a = setup["agent"]
-    off = _loop(a, K, setup["d_tok"], setup["d_eqn"], setup["d_cnt"],
+    off = _loop(a, K, setup["d_tok"], setup["d_cnt"],
                 setup["owner"], setup["part"], remat=False)
-    on = _loop(a, K, setup["d_tok"], setup["d_eqn"], setup["d_cnt"],
+    on = _loop(a, K, setup["d_tok"], setup["d_cnt"],
                setup["owner"], setup["part"], remat=True)
     leaves_off = jax.tree_util.tree_leaves(off)
     leaves_on = jax.tree_util.tree_leaves(on)

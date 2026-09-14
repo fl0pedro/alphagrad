@@ -127,9 +127,8 @@ def _decision_inputs(agent):
     from alphagrad.approx.heads import NUM_OPS, precompute_factor_tables
 
     toks = jrand.randint(jrand.PRNGKey(1), (48,), 1, 60)
-    eqns = jnp.repeat(jnp.arange(8), 6)
     enc, vs, vc = _cs.init_carry(
-        agent, toks, eqns, 48, window=48, total_v=TOTAL_V, embd_dim=EMBD)
+        agent, toks, 48, window=48, total_v=TOTAL_V, embd_dim=EMBD)
     pre = agent.heads_from_memory(vs, vc)
     avail = jnp.zeros((TOTAL_V,), jnp.float32).at[2].set(1.0)  # force v=3
     ax_state = jnp.zeros(
@@ -152,17 +151,16 @@ def _chunk_fns(n, with_einfo):
         ct = (f % 3) + 1
         ar = jnp.arange(W, dtype=jnp.int32)
         tok = jnp.where(ar < ct, (f + ar) % 50 + 1, 0).astype(jnp.int32)
-        eqn = jnp.where(ar < ct, f.astype(jnp.int32), -1).astype(jnp.int32)
         ends = jnp.stack([(f % 3) + 1, (f % 2) + 1]).astype(jnp.int32)
         if not with_einfo:
-            return tok, eqn, jnp.asarray(ct, jnp.int32), ends
+            return tok, jnp.asarray(ct, jnp.int32), ends
         ei = jnp.stack([
             f % 3,
             jnp.where(f % 2 == 1, -1, (f + 1) % 4),
             f,
             f % 2,
         ]).astype(jnp.int32)
-        return tok, eqn, jnp.asarray(ct, jnp.int32), ends, ei
+        return tok, jnp.asarray(ct, jnp.int32), ends, ei
 
     def face_count_fn(vertex_idx):
         return jnp.asarray(n, jnp.int32)
@@ -183,15 +181,15 @@ def _run_face_path(agent, n, key, edge_rows=None, endpoint_rows=None,
         precomputed=pre, enc_carry=enc,
         face_chunk_fn=chunk_fn, face_count_fn=count_fn,
         endpoint_rows=endpoint_rows, edge_rows=edge_rows)
-    (fa, face_logp, face_ent, f_pair, f_comp, f_valid, f_cnt, f_dt, f_de,
-     f_ends) = face_out[:10]
+    (fa, face_logp, face_ent, f_pair, f_comp, f_valid, f_cnt, f_dt,
+     f_ends) = face_out[:9]
     out = dict(
         v=int(vertex_idx), fa=fa, logp=np.asarray(face_logp),
         ent=np.asarray(face_ent), f_pair=f_pair, f_comp=f_comp,
-        f_valid=f_valid, f_cnt=f_cnt, f_dt=f_dt, f_de=f_de, f_ends=f_ends,
+        f_valid=f_valid, f_cnt=f_cnt, f_dt=f_dt, f_ends=f_ends,
         enc=enc, ax_state=ax_state, ax_mask=ax_mask, ft=ft, ovr=ovr)
     if len(face_out) > 10:
-        out["f_eslots"], out["f_ewr"] = face_out[10], face_out[11]
+        out["f_eslots"], out["f_ewr"] = face_out[9], face_out[10]
     return out
 
 
@@ -222,10 +220,10 @@ def test_flag_off_is_bitwise_blind_to_edge_rows(agent_off):
                                       a["ax_mask"][a["v"]])
     lp0, e0, ar0, lat0 = agent_off._face_replay(
         feats, a["ft"], a["fa"], a["f_pair"], a["f_comp"], a["f_valid"],
-        a["enc"], (a["f_cnt"], a["f_dt"], a["f_de"]), a["ovr"])
+        a["enc"], (a["f_cnt"], a["f_dt"]), a["ovr"])
     lp1, e1, ar1, lat1 = agent_off._face_replay(
         feats, a["ft"], a["fa"], a["f_pair"], a["f_comp"], a["f_valid"],
-        a["enc"], (a["f_cnt"], a["f_dt"], a["f_de"]), a["ovr"],
+        a["enc"], (a["f_cnt"], a["f_dt"]), a["ovr"],
         edge_rows=_edge_rows(1, 100.0),
         face_eslots=jnp.zeros((MAXF, 2), jnp.int32))
     assert np.array_equal(np.asarray(lp0), np.asarray(lp1))
@@ -348,7 +346,6 @@ def test_write_then_read_binding(agent_on):
     nd = 6
     dt = jnp.zeros((W,), jnp.int32).at[:nd].set(
         jnp.asarray([7, 8, 9, 10, 11, 12]))
-    de = (-jnp.ones((W,), jnp.int32)).at[:nd].set(0)
     cnt = jnp.zeros((MAXF,), jnp.int32).at[0].set(3).at[1].set(2)
     head = jnp.zeros((MAXF,), jnp.int32).at[1].set(1)
     # NOTE: parenthesised -- unary minus binds LOOSER than .at, so
@@ -358,11 +355,11 @@ def test_write_then_read_binding(agent_on):
     es0, ec0 = _cs.zero_edge_memory(KE, EMBD)
     part = jnp.zeros((TOTAL_V + 1,), jnp.float32).at[0].set(1.0)
     _c2, _s2, _n2, es1, ec1 = _cs.advance(
-        agent, enc, vs, vc, dt, de, jnp.asarray(nd), jnp.asarray(0),
+        agent, enc, vs, vc, dt, jnp.asarray(nd), jnp.asarray(0),
         window=W, participants=part, edge_mem=(es0, ec0), edge_ids=ids)
     # Reference: the SAME encode, rows pooled by hand over the true spans.
-    _c2r, rows, valid, _e = agent.encode_extend(
-        enc, dt, de, jnp.asarray(nd), window=W, start=0, chunk=0)
+    _c2r, rows, valid = agent.encode_extend(
+        enc, dt, jnp.asarray(nd), window=W, start=0, chunk=0)
     rows = np.asarray(rows)
     want5 = rows[0:4].mean(0)
     want9 = rows[4:6].mean(0)
@@ -384,7 +381,7 @@ def test_write_then_read_binding(agent_on):
     eslots = (-jnp.ones((MAXF, 2), jnp.int32)).at[0, 0].set(5)
     _lp, _e2, _ar, lat = agent._face_replay(
         feats, r["ft"], r["fa"], r["f_pair"], r["f_comp"], r["f_valid"],
-        r["enc"], (r["f_cnt"], r["f_dt"], r["f_de"]), r["ovr"],
+        r["enc"], (r["f_cnt"], r["f_dt"]), r["ovr"],
         edge_rows=jnp.asarray(emem), face_eslots=eslots)
     lat = np.asarray(lat)
     assert lat.shape == (MAXF, 3 * EMBD)
@@ -407,7 +404,7 @@ def test_flag_on_rollout_equals_replay(agent_on, n):
                                       r["ax_mask"][r["v"]])
     lp, ent, ar, lat = agent_on._face_replay(
         feats, r["ft"], r["fa"], r["f_pair"], r["f_comp"], r["f_valid"],
-        r["enc"], (r["f_cnt"], r["f_dt"], r["f_de"]), r["ovr"],
+        r["enc"], (r["f_cnt"], r["f_dt"]), r["ovr"],
         edge_rows=rows, face_eslots=r["f_eslots"])
     np.testing.assert_allclose(np.asarray(lp), r["logp"], rtol=1e-5,
                                atol=1e-6)
@@ -418,7 +415,7 @@ def test_flag_on_rollout_equals_replay(agent_on, n):
     # stand-ins).
     lp2, _, _, _ = agent_on._face_replay(
         feats, r["ft"], r["fa"], r["f_pair"], r["f_comp"], r["f_valid"],
-        r["enc"], (r["f_cnt"], r["f_dt"], r["f_de"]), r["ovr"],
+        r["enc"], (r["f_cnt"], r["f_dt"]), r["ovr"],
         edge_rows=_edge_rows(43, 10.0), face_eslots=r["f_eslots"])
     assert not np.allclose(np.asarray(lp2), r["logp"], rtol=1e-5, atol=1e-6)
 
@@ -436,7 +433,7 @@ def test_both_flags_rollout_equals_replay(agent_both, n):
                                       r["ax_mask"][r["v"]])
     lp, ent, _ar, lat = agent_both._face_replay(
         feats, r["ft"], r["fa"], r["f_pair"], r["f_comp"], r["f_valid"],
-        r["enc"], (r["f_cnt"], r["f_dt"], r["f_de"]), r["ovr"],
+        r["enc"], (r["f_cnt"], r["f_dt"]), r["ovr"],
         endpoint_rows=prows, face_ends=r["f_ends"],
         edge_rows=erows, face_eslots=r["f_eslots"])
     assert lat.shape == (MAXF, 5 * EMBD)
@@ -461,7 +458,7 @@ def test_flag_on_probe_receives_concat_width(agent_on):
                                       r["ax_mask"][r["v"]])
     _, _, _, lat = agent_on._face_replay(
         feats, r["ft"], r["fa"], r["f_pair"], r["f_comp"], r["f_valid"],
-        r["enc"], (r["f_cnt"], r["f_dt"], r["f_de"]), r["ovr"],
+        r["enc"], (r["f_cnt"], r["f_dt"]), r["ovr"],
         edge_rows=rows, face_eslots=r["f_eslots"])
     assert lat.shape == (MAXF, 3 * EMBD)
     # the edge halves ARE the gathered slot rows (-1 -> zero row).

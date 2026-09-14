@@ -108,9 +108,8 @@ def _decision_inputs(agent):
     from alphagrad.approx.heads import NUM_OPS, precompute_factor_tables
 
     toks = jrand.randint(jrand.PRNGKey(1), (48,), 1, 60)
-    eqns = jnp.repeat(jnp.arange(8), 6)
     enc, vs, vc = _cs.init_carry(
-        agent, toks, eqns, 48, window=48, total_v=TOTAL_V, embd_dim=EMBD)
+        agent, toks, 48, window=48, total_v=TOTAL_V, embd_dim=EMBD)
     pre = agent.heads_from_memory(vs, vc)
     avail = jnp.zeros((TOTAL_V,), jnp.float32).at[2].set(1.0)  # force v=3
     ax_state = jnp.zeros(
@@ -131,9 +130,8 @@ def _chunk_fns(n):
         ct = (f % 3) + 1
         ar = jnp.arange(W, dtype=jnp.int32)
         tok = jnp.where(ar < ct, (f + ar) % 50 + 1, 0).astype(jnp.int32)
-        eqn = jnp.where(ar < ct, f.astype(jnp.int32), -1).astype(jnp.int32)
         ends = jnp.stack([(f % 3) + 1, (f % 2) + 1]).astype(jnp.int32)
-        return tok, eqn, jnp.asarray(ct, jnp.int32), ends
+        return tok, jnp.asarray(ct, jnp.int32), ends
 
     def face_count_fn(vertex_idx):
         return jnp.asarray(n, jnp.int32)
@@ -151,12 +149,12 @@ def _run_face_path(agent, n, key, endpoint_rows=None):
         precomputed=pre, enc_carry=enc,
         face_chunk_fn=chunk_fn, face_count_fn=count_fn,
         endpoint_rows=endpoint_rows)
-    (fa, face_logp, face_ent, f_pair, f_comp, f_valid, f_cnt, f_dt, f_de,
+    (fa, face_logp, face_ent, f_pair, f_comp, f_valid, f_cnt, f_dt,
      f_ends) = face_out
     return dict(
         v=int(vertex_idx), fa=fa, logp=np.asarray(face_logp),
         ent=np.asarray(face_ent), f_pair=f_pair, f_comp=f_comp,
-        f_valid=f_valid, f_cnt=f_cnt, f_dt=f_dt, f_de=f_de, f_ends=f_ends,
+        f_valid=f_valid, f_cnt=f_cnt, f_dt=f_dt, f_ends=f_ends,
         enc=enc, ax_state=ax_state, ax_mask=ax_mask, ft=ft, ovr=ovr)
 
 
@@ -182,10 +180,10 @@ def test_flag_off_is_bitwise_blind_to_endpoint_rows(agent_off):
                                       a["ax_mask"][a["v"]])
     lp0, e0, ar0, lat0 = agent_off._face_replay(
         feats, a["ft"], a["fa"], a["f_pair"], a["f_comp"], a["f_valid"],
-        a["enc"], (a["f_cnt"], a["f_dt"], a["f_de"]), a["ovr"])
+        a["enc"], (a["f_cnt"], a["f_dt"]), a["ovr"])
     lp1, e1, ar1, lat1 = agent_off._face_replay(
         feats, a["ft"], a["fa"], a["f_pair"], a["f_comp"], a["f_valid"],
-        a["enc"], (a["f_cnt"], a["f_dt"], a["f_de"]), a["ovr"],
+        a["enc"], (a["f_cnt"], a["f_dt"]), a["ovr"],
         endpoint_rows=_rand_rows(1, 100.0), face_ends=a["f_ends"])
     assert np.array_equal(np.asarray(lp0), np.asarray(lp1))
     assert np.array_equal(np.asarray(e0), np.asarray(e1))
@@ -227,7 +225,7 @@ def test_flag_on_rollout_equals_replay(agent_on, n):
                                       r["ax_mask"][r["v"]])
     lp, ent, ar, lat = agent_on._face_replay(
         feats, r["ft"], r["fa"], r["f_pair"], r["f_comp"], r["f_valid"],
-        r["enc"], (r["f_cnt"], r["f_dt"], r["f_de"]), r["ovr"],
+        r["enc"], (r["f_cnt"], r["f_dt"]), r["ovr"],
         endpoint_rows=rows, face_ends=r["f_ends"])
     np.testing.assert_allclose(np.asarray(lp), r["logp"], rtol=1e-5,
                                atol=1e-6)
@@ -237,7 +235,7 @@ def test_flag_on_rollout_equals_replay(agent_on, n):
     # head actually reads the endpoint half (all stand-in endpoints > 0).
     lp2, _, _, _ = agent_on._face_replay(
         feats, r["ft"], r["fa"], r["f_pair"], r["f_comp"], r["f_valid"],
-        r["enc"], (r["f_cnt"], r["f_dt"], r["f_de"]), r["ovr"],
+        r["enc"], (r["f_cnt"], r["f_dt"]), r["ovr"],
         endpoint_rows=_rand_rows(43, 10.0), face_ends=r["f_ends"])
     assert not np.allclose(np.asarray(lp2), r["logp"], rtol=1e-5, atol=1e-6)
 
@@ -252,7 +250,7 @@ def test_flag_on_probe_receives_concat_width(agent_on):
                                       r["ax_mask"][r["v"]])
     _, _, _, lat = agent_on._face_replay(
         feats, r["ft"], r["fa"], r["f_pair"], r["f_comp"], r["f_valid"],
-        r["enc"], (r["f_cnt"], r["f_dt"], r["f_de"]), r["ovr"],
+        r["enc"], (r["f_cnt"], r["f_dt"]), r["ovr"],
         endpoint_rows=rows, face_ends=r["f_ends"])
     assert lat.shape == (MAXF, 3 * EMBD)
     # the endpoint halves ARE the gathered slot rows (1-based, 0 -> zero row)

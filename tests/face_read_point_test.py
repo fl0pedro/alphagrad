@@ -99,9 +99,8 @@ def _decision_inputs(agent):
     from alphagrad.approx.heads import NUM_OPS, precompute_factor_tables
 
     toks = jrand.randint(jrand.PRNGKey(1), (48,), 1, 60)
-    eqns = jnp.repeat(jnp.arange(8), 6)
     enc, vs, vc = _cs.init_carry(
-        agent, toks, eqns, 48, window=48, total_v=TOTAL_V, embd_dim=EMBD)
+        agent, toks, 48, window=48, total_v=TOTAL_V, embd_dim=EMBD)
     pre = agent.heads_from_memory(vs, vc)
     avail = jnp.zeros((TOTAL_V,), jnp.float32).at[2].set(1.0)   # force v=3
     ax_state = jnp.zeros(
@@ -129,9 +128,10 @@ def _chunk_fns(n, emit_head, empty_pool=False):
         ct = (f % 3) + 2
         ar = jnp.arange(W, dtype=jnp.int32)
         tok = jnp.where(ar < ct, (f * 7 + ar) % 50 + 1, 0).astype(jnp.int32)
-        eqn = jnp.where(ar < ct, f.astype(jnp.int32), -1).astype(jnp.int32)
         ends = jnp.stack([(f % 3) + 1, (f % 2) + 1]).astype(jnp.int32)
-        out = (tok, eqn, jnp.asarray(ct, jnp.int32), ends)
+        # The stand-in mirrors the real callback: tokens, count, endpoints.
+        # There is no equation-id buffer any more.
+        out = (tok, jnp.asarray(ct, jnp.int32), ends)
         if emit_head:
             hd = ct if empty_pool else ct - 2
             out = out + (jnp.asarray(hd, jnp.int32),)
@@ -155,13 +155,13 @@ def _run(agent, mode, n, key, empty_pool=False):
         None, avail, ax_state, ax_mask, ft, ovr, key,
         precomputed=pre, enc_carry=enc,
         face_chunk_fn=chunk_fn, face_count_fn=count_fn)
-    (fa, face_logp, face_ent, f_pair, f_comp, f_valid, f_cnt, f_dt, f_de,
-     f_ends) = face_out[:10]
+    (fa, face_logp, face_ent, f_pair, f_comp, f_valid, f_cnt, f_dt,
+     f_ends) = face_out[:9]
     heads = np.asarray(face_out[-1]) if rh else None
     return dict(
         v=int(vertex_idx), fa=fa, logp=np.asarray(face_logp),
         ent=np.asarray(face_ent), f_pair=f_pair, f_comp=f_comp,
-        f_valid=f_valid, f_cnt=f_cnt, f_dt=f_dt, f_de=f_de, f_ends=f_ends,
+        f_valid=f_valid, f_cnt=f_cnt, f_dt=f_dt, f_ends=f_ends,
         heads=heads, enc=enc, ax_state=ax_state, ax_mask=ax_mask, ft=ft,
         ovr=ovr)
 
@@ -174,7 +174,7 @@ def _replay(agent, r, face_heads="stored"):
     fh = None if fh is None else jnp.asarray(fh, jnp.int32)
     return agent._face_replay(
         feats, r["ft"], r["fa"], r["f_pair"], r["f_comp"], r["f_valid"],
-        r["enc"], (r["f_cnt"], r["f_dt"], r["f_de"]), r["ovr"],
+        r["enc"], (r["f_cnt"], r["f_dt"]), r["ovr"],
         face_heads=fh)
 
 
@@ -207,10 +207,9 @@ def test_chunk_mean_matches_the_unmasked_scatter_mean(agent):
     ct = 4
     ar = jnp.arange(W, dtype=jnp.int32)
     tok = jnp.where(ar < ct, (ar * 3) % 50 + 1, 0).astype(jnp.int32)
-    eqn = jnp.where(ar < ct, 0, -1).astype(jnp.int32)
-    c2, summ = agent._face_encode(enc, tok, eqn, jnp.asarray(ct, jnp.int32))
-    _c, rows, valid, _e = agent.encode_extend(
-        enc, tok, eqn, jnp.asarray(ct, jnp.int32), window=W, start=0)
+    c2, summ = agent._face_encode(enc, tok, jnp.asarray(ct, jnp.int32))
+    _c, rows, valid = agent.encode_extend(
+        enc, tok, jnp.asarray(ct, jnp.int32), window=W, start=0)
     want = _vmem.scatter_mean(
         rows, jnp.zeros((rows.shape[0],), jnp.int32), valid, 1)[0]
     np.testing.assert_array_equal(np.asarray(summ), np.asarray(want))
@@ -223,18 +222,17 @@ def test_readout_is_what_it_says_and_carry_is_invariant(agent):
     ct, hd = 5, 2
     ar = jnp.arange(W, dtype=jnp.int32)
     tok = jnp.where(ar < ct, (ar * 11) % 50 + 1, 0).astype(jnp.int32)
-    eqn = jnp.where(ar < ct, 0, -1).astype(jnp.int32)
     ctj, hdj = jnp.asarray(ct, jnp.int32), jnp.asarray(hd, jnp.int32)
 
     # the ground truth rows, from the recurrence itself
-    _c, rows, valid, _e = agent.encode_extend(
-        enc, tok, eqn, ctj, window=W, start=0)
+    _c, rows, valid = agent.encode_extend(
+        enc, tok, ctj, window=W, start=0)
     R = np.asarray(rows)
 
     carries, summs = {}, {}
     for m in MODES:
         P.set_face_read(m)
-        c2, summ = agent._face_encode(enc, tok, eqn, ctj, pool_from=hdj)
+        c2, summ = agent._face_encode(enc, tok, ctj, pool_from=hdj)
         carries[m] = [np.asarray(x) for x in jax.tree_util.tree_leaves(c2)]
         summs[m] = np.asarray(summ)
 
@@ -264,9 +262,8 @@ def test_empty_pool_is_the_zero_vector(agent):
     ct = 4
     ar = jnp.arange(W, dtype=jnp.int32)
     tok = jnp.where(ar < ct, (ar * 5) % 50 + 1, 0).astype(jnp.int32)
-    eqn = jnp.where(ar < ct, 0, -1).astype(jnp.int32)
     P.set_face_read("own-span-mean")
-    _c, summ = agent._face_encode(enc, tok, eqn, jnp.asarray(ct, jnp.int32),
+    _c, summ = agent._face_encode(enc, tok, jnp.asarray(ct, jnp.int32),
                                   pool_from=jnp.asarray(ct, jnp.int32))
     np.testing.assert_array_equal(np.asarray(summ), 0.0)
 
