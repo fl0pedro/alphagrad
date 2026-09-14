@@ -88,6 +88,22 @@ import sys
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+# THE GATE IS A SCRIPT, AND IT PINS THE INTERPRETER AT MODULE SCOPE. Importing
+# it writes ten ALPHAGRAD_* variables into this process. Two of them,
+# MAX_DELTA_TOKENS and MAX_FACES, are also written at module scope by
+# tests/edge_mem_test.py with different values, and a variable left at two
+# different values by two modules is a CROSS-MODULE CONFIGURATION CONFLICT --
+# the collection guard fails the whole run for it, correctly, because the last
+# module collected wins and somebody is then measuring under a configuration
+# it did not choose. See _pytest_config_guard.py.
+#
+# Those two are exactly the knobs env.py FREEZES into module constants at its
+# first import, so once env.py is imported below they can do nothing more.
+# Snapshot them here and put them back after that import: a standalone run of
+# this file still freezes env.py under the gate's pins, which is what the file
+# is meant to measure, and a shared run is left with nothing to collide.
+_SCALE_PINS = {k: os.environ.get(k) for k in
+               ("ALPHAGRAD_MAX_DELTA_TOKENS", "ALPHAGRAD_MAX_FACES")}
 import policy_regression_gate as _gate                            # noqa: E402
 
 import numpy as np                                                # noqa: E402
@@ -105,6 +121,17 @@ from alphagrad.approx.common import carry_stream as CS             # noqa: E402
 from alphagrad.approx.common.face_driver import (                 # noqa: E402
     bind_sizes_callback, bind_step_callbacks)
 from alphagrad.approx.common.token_vocab import incr_token_vocab  # noqa: E402
+# The restore has to come AFTER this import, and this import has to be here for
+# that reason alone: env.py must have frozen its constants before the two scale
+# knobs go back, or a standalone run of this file would freeze the defaults
+# instead of the gate's pins.
+from alphagrad.approx import env as _env_frozen                   # noqa: E402,F401
+
+for _k, _v in _SCALE_PINS.items():
+    if _v is None:
+        os.environ.pop(_k, None)
+    else:
+        os.environ[_k] = _v
 
 
 # --------------------------------------------------------------------------
