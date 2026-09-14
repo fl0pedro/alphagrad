@@ -457,3 +457,318 @@ def test_concurrent_futures_is_what_the_pool_hands_back():
     assert isinstance(fut, _cf.Future)
     fut.result(timeout=10)
     p._submit_exec.shutdown(wait=True)
+
+
+# ---------------------------- 5. the SYNCHRONOUS discard (job 65684, A5)
+
+def test_a_sync_repeat_leaves_one_set_of_records_stamped_with_the_repeat():
+    """THE DEFECT JOB 65684 FOUND, MODELLED.
+
+    All three arms of that job hit one window-bin overflow at episode 0 and
+    repeated it. The two pipelined arms kept 16 plan records for the episode.
+    The SYNCHRONOUS arm kept 32: the discarded attempt's sixteen beside the
+    repeat's sixteen, every one stamped `attempt: 0`.
+
+    Two things were missing on that path and both are modelled here. The
+    trainer's snapshot restore cannot reach a MEASURE ACTOR, which is a
+    separate process, so the actors' records survived the discard. And
+    `_record_plan` stamps the WRITING process's attempt counter, which in an
+    actor is always 0, so the repeat's records did not say so either.
+
+    The driver now drains the actors on every discard and drops the drain,
+    and stamps the surviving pooled records from its own counter. This is
+    that sequence, against the real `episode_stream.run_episode`, the real
+    `env` containers and the real `merge_pool_plan_records`.
+    """
+    import sys
+    import types
+
+    from alphagrad.approx import env as ENV
+    from alphagrad.approx.common import episode_stream as ES
+
+    class _Actor:
+        """One measure actor. A drain EMPTIES it, as the real one does."""
+
+        def __init__(self):
+            self.records = []
+
+        class _M:
+            def __init__(self, v):
+                self._v = v
+
+            def remote(self):
+                return self._v
+
+        def __getattr__(self, name):
+            if name == "consume_plan_records":
+                out = {"records": self.records, "dropped": 0,
+                       "terminals": len(self.records), "actor_id": 7,
+                       "enabled": True}
+                self.records = []
+                return _Actor._M(out)
+            raise AttributeError(name)
+
+    class _Pool:
+        def __init__(self, actor):
+            self._actor = actor
+
+        def live_actors(self):
+            return [self._actor]
+
+    fake_ray = types.ModuleType("ray")
+    fake_ray.get = lambda x, timeout=None: x
+    saved_ray = sys.modules.get("ray")
+    sys.modules["ray"] = fake_ray
+    outer = ENV.episode_telemetry_snapshot()
+    try:
+        from alphagrad.approx.common.measure_pool import (
+            merge_pool_plan_records)
+
+        ENV._PLAN_RECORDS.clear()
+        ENV._PLAN_LOG_TERMINALS[0] = 0
+        actor = _Actor()
+        pool = _Pool(actor)
+        policy = ES.BinPolicy(8, history=4, margin=2.0)
+        held = {"attempt": 0}
+
+        def attempt(n):
+            # What the driver does at the top of every attempt.
+            held["snapshot"] = ENV.episode_telemetry_snapshot()
+            ENV.set_plan_log_attempt(held["attempt"])
+            # THE MEASURE ACTORS write this episode's terminal plans. The
+            # actor's own stamp is 0 whatever the driver's counter says,
+            # because nobody advances a counter in that process.
+            for e in range(3):
+                actor.records.append({"env_index": -1, "bin": n,
+                                      "attempt": 0})
+            return "attempt-%d" % n, (
+                ES.StreamOverflow(env_index=1, step=4, length=300, log2=n)
+                if n == 8 else None)
+
+        def discard(_result):
+            # WHAT `_ep_discard` NOW DOES, in order: drain the actors and
+            # throw the drain away, then put this process's containers back.
+            merge_pool_plan_records(pool)
+            ENV.episode_telemetry_restore(held["snapshot"])
+            held["attempt"] += 1
+
+        assert ES.run_episode(policy, "episode 0", attempt,
+                              log=lambda _l: None,
+                              on_discard=discard) == "attempt-9"
+
+        # THE DRAIN THE EPISODE'S LOGGING TAKES. One set, not two.
+        drained = merge_pool_plan_records(pool)
+        assert len(drained["records"]) == 3, drained["records"]
+        assert [r["bin"] for r in drained["records"]] == [9, 9, 9]
+        # And the driver stamps its own counter over the actor's, which is
+        # the only place the repeat is known.
+        for _r in drained["records"]:
+            _r["attempt"] = held["attempt"]
+        assert [r["attempt"] for r in drained["records"]] == [1, 1, 1]
+    finally:
+        ENV.episode_telemetry_restore(outer)
+        ENV.set_plan_log_attempt(0)
+        if saved_ray is None:
+            del sys.modules["ray"]
+        else:
+            sys.modules["ray"] = saved_ray
+
+
+def test_without_the_actor_drain_a_sync_repeat_keeps_both_attempts():
+    """The defect itself, so the test above is known to be testing something.
+
+    Same sequence with the drain removed from the discard: the actors keep
+    both attempts and the log would hold six records where three were
+    measured twice. That is job 65684's `(0, 0): 32`.
+    """
+    import sys
+    import types
+
+    from alphagrad.approx.common import episode_stream as ES
+
+    class _Actor:
+        def __init__(self):
+            self.records = []
+
+        class _M:
+            def __init__(self, v):
+                self._v = v
+
+            def remote(self):
+                return self._v
+
+        def __getattr__(self, name):
+            if name == "consume_plan_records":
+                out = {"records": self.records, "dropped": 0,
+                       "terminals": len(self.records), "actor_id": 7,
+                       "enabled": True}
+                self.records = []
+                return _Actor._M(out)
+            raise AttributeError(name)
+
+    class _Pool:
+        def __init__(self, actor):
+            self._actor = actor
+
+        def live_actors(self):
+            return [self._actor]
+
+    fake_ray = types.ModuleType("ray")
+    fake_ray.get = lambda x, timeout=None: x
+    saved_ray = sys.modules.get("ray")
+    sys.modules["ray"] = fake_ray
+    try:
+        from alphagrad.approx.common.measure_pool import (
+            merge_pool_plan_records)
+
+        actor = _Actor()
+        pool = _Pool(actor)
+        policy = ES.BinPolicy(8, history=4, margin=2.0)
+
+        def attempt(n):
+            for _e in range(3):
+                actor.records.append({"env_index": -1, "bin": n,
+                                      "attempt": 0})
+            return "attempt-%d" % n, (
+                ES.StreamOverflow(env_index=1, step=4, length=300, log2=n)
+                if n == 8 else None)
+
+        ES.run_episode(policy, "episode 0", attempt, log=lambda _l: None,
+                       on_discard=lambda _r: None)
+        drained = merge_pool_plan_records(pool)
+        assert len(drained["records"]) == 6
+        assert [r["bin"] for r in drained["records"]] == [8, 8, 8, 9, 9, 9]
+        assert {r["attempt"] for r in drained["records"]} == {0}
+    finally:
+        if saved_ray is None:
+            del sys.modules["ray"]
+        else:
+            sys.modules["ray"] = saved_ray
+
+
+# ------------------------------- 6. every counter host_log drains is parked
+
+# THE PARTITION. `host_log` empties about a dozen host counters with calls
+# that POP. Pipelined, `host_log` for episode e runs after episode e+1's
+# rollout has already added to them, so an unparked one reports two episodes
+# under a single number and then nothing under the next (job 65684:
+# `prof/env_cb_host n=190` at ep0, a blank `live-faces` line at ep2).
+#
+# There are exactly two ways a counter can be safe, and every call in
+# `host_log` has to be one of them.
+#
+# A. Its container is named in `env._EPISODE_TELEMETRY_NAMES`. The driver
+#    parks that whole set with `episode_telemetry_snapshot` at collect time
+#    and restores it around the logging, so the call sees this episode's.
+_PARKED_BY_THE_SNAPSHOT = {
+    "consume_degenerate_plan_count",
+    "consume_fidelity_stats",
+    "consume_memory_compression_stats",
+    "consume_sparsity_stats",
+    "consume_token_length_stats",
+    "consume_tokenization_truncation_stats",
+    "consume_truncated_plan_count",
+    "consume_untraceable_plan_count",
+    "consume_zero_work_plan_count",
+}
+# B. Its call site reads `_POOL_DRAIN` first, because the snapshot has no
+#    name for it: it lives on an object or in another module's globals.
+_PARKED_BY_THE_CALL_SITE = {
+    "consume_live_chain_stats",
+    "consume_per_face_stats",
+    "consume_probe_failure_stats",
+    "consume_static_peak_fallbacks",
+    "consume_stats",          # _LIVE_FACES and _EDGE_TABLE
+    "_cpf", "_cpr",           # the aliases the drain helper imports under
+    "_merge_cs", "_merge_pf", # the measure actors' own drains
+    "_plog_consume", "_plog_merge",
+}
+
+
+def _host_log_ast():
+    import ast
+    import inspect
+
+    from alphagrad.approx import ppo
+
+    tree = ast.parse(inspect.getsource(ppo))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "host_log":
+            return node
+    raise AssertionError("host_log not found in ppo.py")
+
+
+def _draining_calls(fn_ast):
+    """Every call in `fn_ast` that EMPTIES a per-episode counter."""
+    import ast
+
+    out = {}
+    for n in ast.walk(fn_ast):
+        if not isinstance(n, ast.Call):
+            continue
+        f = n.func
+        name = (f.id if isinstance(f, ast.Name)
+                else f.attr if isinstance(f, ast.Attribute) else None)
+        if name is None:
+            continue
+        if (name.startswith("consume_") or name.startswith("_merge_")
+                or name in ("_plog_consume", "_plog_merge", "_cpf", "_cpr")):
+            out.setdefault(name, []).append(n.lineno)
+    return out
+
+
+def test_every_counter_host_log_drains_is_parked_one_way_or_the_other():
+    """A new `consume_*` in `host_log` fails here until it is parked.
+
+    Silence is what makes this class of defect expensive: an unparked
+    counter reports plausible numbers under the wrong episode, and nothing
+    says so. So the rule is stated as a partition and checked as one.
+    """
+    known = _PARKED_BY_THE_SNAPSHOT | _PARKED_BY_THE_CALL_SITE
+    found = _draining_calls(_host_log_ast())
+    unknown = {k: v for k, v in found.items() if k not in known}
+    assert not unknown, (
+        f"{sorted(unknown)} empties a per-episode counter inside host_log and "
+        f"is in neither parking list. Either its container is named in "
+        f"env._EPISODE_TELEMETRY_NAMES (add it to _PARKED_BY_THE_SNAPSHOT) or "
+        f"its call site has to read _POOL_DRAIN first (add it to "
+        f"_PARKED_BY_THE_CALL_SITE and to _drain_measure_telemetry).")
+    # And the lists are not allowed to rot: every name in them is still called.
+    stale = known - set(found)
+    assert not stale, (
+        f"{sorted(stale)} is listed as parked but host_log no longer calls it")
+
+
+def test_the_call_site_parked_counters_read_the_park_before_they_drain():
+    """Group B's half of the partition, as source.
+
+    Each of these has to appear inside an expression that mentions
+    `_POOL_DRAIN`, because that is the whole mechanism: with a park in hand
+    the call does not run at all.
+    """
+    import ast
+    import inspect
+
+    from alphagrad.approx import ppo
+
+    src = inspect.getsource(ppo)
+    fn = _host_log_ast()
+    # Every statement of host_log that mentions _POOL_DRAIN, by line span.
+    guarded_lines = set()
+    for n in ast.walk(fn):
+        if not isinstance(n, (ast.If, ast.IfExp, ast.Assign, ast.Expr)):
+            continue
+        seg = ast.get_source_segment(src, n) or ""
+        if "_POOL_DRAIN" in seg:
+            guarded_lines.update(
+                range(n.lineno, (getattr(n, "end_lineno", n.lineno) or
+                                 n.lineno) + 1))
+    found = _draining_calls(fn)
+    for name in sorted(_PARKED_BY_THE_CALL_SITE):
+        if name not in found:
+            continue
+        for line in found[name]:
+            assert line in guarded_lines, (
+                f"{name} at line {line} of ppo.py drains a counter without "
+                f"reading _POOL_DRAIN first; pipelined, it would report the "
+                f"wrong episode's number")

@@ -8782,8 +8782,23 @@ def main():
         _ep_env_mod.set_plan_log_attempt(_EP_ATTEMPT[0])
 
     def _ep_discard(result):
-        """Roll the host counters back to where this attempt found them."""
+        """Roll a discarded attempt back, in the trainer AND in the actors.
+
+        THE ACTORS ARE THE HALF THE SNAPSHOT CANNOT REACH. A measure actor is
+        a separate process; `episode_telemetry_restore` puts back this
+        process's containers and knows nothing of theirs. Job 65684 measured
+        what that costs: all three arms hit one window-bin overflow at episode
+        0 and repeated it, and the SYNCHRONOUS arm's plan log kept 32 records
+        for that episode, the discarded attempt's sixteen beside the repeat's
+        sixteen, every one stamped `attempt: 0` with no field telling them
+        apart. Drain the actors here and throw the drain away, so a discarded
+        attempt leaves nothing anywhere.
+
+        The order matters: the drain EMPTIES this process's containers too,
+        and the restore below then puts back what the attempt found.
+        """
         del result
+        _drain_measure_telemetry()
         snap = _EP_HOST_SNAP[0]
         if snap is not None:
             _ep_env_mod.episode_telemetry_restore(snap)
@@ -12831,6 +12846,12 @@ def main():
                     (_plog_local.get("paired_ref") or {}).get("records", ()))
                 _plog_pr_dropped = int(
                     (_plog_local.get("paired_ref") or {}).get("dropped", 0))
+                # THE ATTEMPT THE SURVIVING RECORDS CAME FROM. Read off the
+                # drain when the measurement was pipelined (this `host_log`
+                # runs an episode later, so the live counter is the NEXT
+                # episode's by then) and off the live counter otherwise.
+                _plog_attempt = (_POOL_DRAIN[0] or {}).get(
+                    "attempt", _EP_ATTEMPT[0])
                 try:
                     from alphagrad.approx.common.measure_pool import (
                         merge_pool_plan_records as _plog_merge)
@@ -12840,6 +12861,17 @@ def main():
                             and _POOL_DRAIN[0].get("pool_plan") is not None)
                         else _plog_merge(
                             getattr(env, "_remote_pool", None)))
+                    # WHICH ATTEMPT AT THIS EPISODE A POOLED RECORD CAME FROM.
+                    # `env._record_plan` stamps the writing process's own
+                    # `_PLAN_LOG_ATTEMPT`, and a measure actor is a separate
+                    # process whose counter nobody ever advances, so every
+                    # pooled record said `attempt: 0` -- the repeat's included.
+                    # Job 65684 is the evidence: one window-bin repeat at
+                    # episode 0 and 32 records, all attempt 0. The driver's
+                    # counter is the one that knows, so stamp it here.
+                    for _pr_r in _plog_pool["records"]:
+                        if isinstance(_pr_r, dict):
+                            _pr_r["attempt"] = int(_plog_attempt)
                     _plog_recs.extend(_plog_pool["records"])
                     _plog_dropped += int(_plog_pool["dropped"])
                     _plog_actors = int(_plog_pool["actors_polled"])
@@ -13204,7 +13236,10 @@ def main():
         # substitution happens inside the measure actors, whose one-time stdout
         # note still surfaces in the driver log.
         log_dict["measure/peak_memory_static_fallback"] = int(
-            consume_static_peak_fallbacks())
+            (_POOL_DRAIN[0] or {})["static_peak_fallbacks"]
+            if (_POOL_DRAIN[0] is not None
+                and "static_peak_fallbacks" in _POOL_DRAIN[0])
+            else consume_static_peak_fallbacks())
 
         # ---- tokenization truncation (was computed but never logged) --------
         # Oracle probe failures. Non-zero means graphax could not trace some
@@ -13213,7 +13248,10 @@ def main():
         # count means the approx arm is not really approximating.
         try:
             from alphagrad.approx.common.masks import consume_probe_failure_stats
-            _probe = consume_probe_failure_stats()
+            _probe = ((_POOL_DRAIN[0] or {})["probe_failures"]
+                      if (_POOL_DRAIN[0] is not None
+                          and "probe_failures" in _POOL_DRAIN[0])
+                      else consume_probe_failure_stats())
             log_dict["oracle/probe_failures"] = int(_probe["count"])
             log_dict["oracle/probe_failed_vertices"] = int(_probe["n_vertices"])
             if _probe["count"] and not host_state.get("_probe_fail_printed"):
@@ -13833,7 +13871,7 @@ def main():
                             f"{_fs['calls']}/{_fs['elims']}/"
                             f"{_fs['build']}"
                             f"  live_chain="
-                            f"{_envmod.consume_live_chain_stats()}")
+                            f"{(_POOL_DRAIN[0] or {})['live_chain'] if (_POOL_DRAIN[0] is not None and 'live_chain' in _POOL_DRAIN[0]) else _envmod.consume_live_chain_stats()}")
                         _ss.update(hit=0, ext=0, cold=0, nostore=0)
                         _fs.update(ext=0, cold=0, compress=0, elims=0,
                                    calls=0, build=0)
@@ -14090,6 +14128,23 @@ def main():
                 # The skeleton of an empty drain, so the logging below reports
                 # "no pool" rather than draining again a whole episode late.
                 out["pool_plan"] = _mpr(None)
+        # THE FOUR COUNTERS `episode_telemetry_snapshot` HAS NO NAME FOR. Two
+        # live on objects (`_LIVE_FACES`, `_EDGE_TABLE`) and two in other
+        # modules' globals. They are consumed here whatever the caller does
+        # with them, and that is the point on BOTH paths: parked, they give
+        # `host_log` this episode's numbers; dropped, they are the rollback a
+        # discarded attempt needs, which the snapshot restore cannot give
+        # because it does not know their names.
+        out["live_faces"] = (None if _LIVE_FACES is None
+                             else _LIVE_FACES.consume_stats())
+        out["edge_table"] = (None if _EDGE_TABLE is None
+                             else _EDGE_TABLE.consume_stats())
+        out["static_peak_fallbacks"] = int(
+            _ep_env_mod.consume_static_peak_fallbacks())
+        out["live_chain"] = _ep_env_mod.consume_live_chain_stats()
+        from alphagrad.approx.common.masks import (
+            consume_probe_failure_stats as _cpfs)
+        out["probe_failures"] = _cpfs()
         if park:
             # THE TRAINER'S OWN PER-EPISODE COUNTERS, PARKED THE SAME WAY.
             # `host_log` drains a dozen of them (`prof/*`, the token lengths,
@@ -14102,14 +14157,9 @@ def main():
             # blank `live-faces` line at ep2. Park the whole set here, where
             # it holds exactly this episode, and empty the live containers so
             # the next episode counts from zero.
+            out["attempt"] = int(_EP_ATTEMPT[0])
             out["trainer_tel"] = _ep_env_mod.episode_telemetry_snapshot()
             _ep_env_mod.episode_telemetry_restore(_telemetry_zero())
-            # The two counters that live on OBJECTS rather than on env.py's
-            # module globals, so the snapshot cannot reach them.
-            out["live_faces"] = (None if _LIVE_FACES is None
-                                 else _LIVE_FACES.consume_stats())
-            out["edge_table"] = (None if _EDGE_TABLE is None
-                                 else _EDGE_TABLE.consume_stats())
         return out
 
     def _finish_episode(_fe):
@@ -14806,17 +14856,17 @@ def main():
         def _ep_discard_rollout(result):
             """Throw one ROLLOUT attempt away, its measurement included.
 
-            A discarded attempt's terminal plans must reach no trajectory and
-            its plan records must reach no log. The submission is DRAINED
-            rather than abandoned -- the repeat's own per-step tokenization
-            queues behind it on the same actors either way -- and everything
-            the actors recorded for it is then drained and dropped, which is
-            the half of the rollback the trainer's own snapshot cannot reach
-            (the actors are separate processes).
+            A discarded attempt's terminal plans must reach no trajectory. The
+            submission is DRAINED rather than abandoned: the repeat's own
+            per-step tokenization queues behind it on the same actors either
+            way, and `ray.cancel` on an actor task needs `force=True`, which
+            kills the actor and its plan records with it.
+
+            Dropping what the actors RECORDED is `_ep_discard`'s job and is
+            done for the synchronous path too.
             """
             _roll_d, _tkt_d = result
             _ep_env_mod.drop_measurement(_tkt_d)
-            _drain_measure_telemetry()
             _ep_discard_episode(_roll_d)
 
         def _ep_attempt(_ep_n, _win_n):
