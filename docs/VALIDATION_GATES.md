@@ -226,14 +226,23 @@ than "it ran".
 
 ### Why warm-up rows print `n/a`
 
-`--popart-init-episodes` (default **3**) runs random-plan rollouts with **no
-gradient step**; the caller passes an all-NaN metrics tuple purely to keep the
-tuple shape uniform. Those rows are labelled `[health warmup]` and print `n/a`
-for every loss-derived field.
+`--popart-init-episodes` (default **0**, since the 2026-09-14 owner ruling) can
+run random-plan rollouts with **no gradient step** before episode 0. When it
+does, the caller passes an all-NaN metrics tuple. This keeps the tuple shape
+uniform. Those rows are labelled `[health warmup]`. They print `n/a` for every
+loss-derived field.
 
-This used to be a trap. Warm-up rows consumed the health budget
-(`ALPHAGRAD_HEALTH_EPISODES`, also default **3**), so the three health rows a run
-printed were *always* the three warm-up rows, reading
+At default (0), no warm-up rollout runs at all. Under `--advantage-norm
+popart`, the first real episode seeds PopArt's (mu, sigma) from its own
+returns instead. No separate rollout is needed. So a 2-episode smoke prints
+exactly two `[health ep..]` rows and no `[health warmup]` row. Pass a positive
+value to restore the old warm-up path. That runs the given number of full,
+measured, random-plan rollouts before episode 0. Those rollouts still get
+logged as `[health warmup]` and are still excluded from the gate.
+
+This used to be a trap when the default was 3. Warm-up rows consumed the health
+budget (`ALPHAGRAD_HEALTH_EPISODES`, also default 3 at the time), so the three
+health rows a run printed were *always* the three warm-up rows, reading
 `ppo=nan value=nan ent=nan ratio/max_log=nan`. The first real training episode
 never printed one. Multiple agents read those expected NaNs as either
 pre-existing breakage or as fine — and a genuine NaN would have been

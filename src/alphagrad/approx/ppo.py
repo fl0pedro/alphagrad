@@ -1441,6 +1441,39 @@ def _popart_update(m1, m2, w, returns, beta, sigma_min, sigma_max, winsor_k):
     return new_m1, new_m2, new_w
 
 
+def _popart_seed_returns(rewards, done, discount):
+    """Monte-Carlo return, gamma-discounted, from the rollout's OWN
+    reward/done/discount arrays only -- no value bootstrap.
+
+    Owner ruling 2026-09-14: with ``--popart-init-episodes 0`` (the new
+    default) there are no warm-up rollouts, so the first real episode has to
+    seed PopArt's decode from ITS OWN returns. Decoding with the value head
+    (``v_raw = value*sigma + mu``) would be circular: (mu, sigma) is exactly
+    what PopArt derives to rescale that same head, and on a cold accumulator
+    it is the (0, 1) identity, which is the fallback this seed replaces. So
+    this recomputes the ``gae_lambda=1`` GAE target directly from the reward
+    tensor, ``G_t = r_t + gamma*(1-done_t)*G_{t+1}``, mirroring the same
+    recursion the old random-plan warm-up used (see git history), just
+    against the real trajectory instead of a throwaway one.
+
+    ``rewards`` is ``(E, T, K)``, ``done``/``discount`` are ``(E, T)``.
+    Returns ``(E, T, K)``.
+    """
+    rewards_t = jnp.moveaxis(rewards, 1, 0)      # (T, E, K)
+    done_t = jnp.moveaxis(done, 1, 0)            # (T, E)
+    discount_t = jnp.moveaxis(discount, 1, 0)    # (T, E)
+
+    def _step(carry, xs):
+        r_t, d_t, g_t = xs
+        ret = r_t + (g_t * (1.0 - d_t))[:, None] * carry
+        return ret, ret
+
+    init = jnp.zeros_like(rewards_t[0])
+    _, returns_t = lax.scan(
+        _step, init, (rewards_t, done_t, discount_t), reverse=True)
+    return jnp.moveaxis(returns_t, 0, 1)         # (E, T, K)
+
+
 def _popart_rescale_heads(agent, old_mu, old_sigma, new_mu, new_sigma):
     """Output-preserving rescale of the three single-output value heads.
 
@@ -4908,17 +4941,23 @@ def make_argparser() -> argparse.ArgumentParser:
         "--set-pointer-blocks", type=int, default=2,
         help="Number of Set-Transformer blocks used by --set-pointer.")
     p.add_argument(
-        # Default 3, not 0: every launcher passed 3 explicitly, so an unflagged
-        # run was silently unseeded and defined its scale from whatever the
-        # untrained policy happened to produce. az_gumbel's flag of the same
-        # name has the same default.
-        "--popart-init-episodes", type=int, default=3,
+        # Default 0 (owner ruling 2026-09-14, reversing the earlier default
+        # of 3): three full measured rollouts before episode 0 cost about
+        # nine minutes on the canary and bought nothing --advantage-norm
+        # none (the campaign's setting) ever reads. With --advantage-norm
+        # popart and this at 0, the FIRST REAL EPISODE seeds PopArt's decode
+        # from its own returns instead (see _popart_seed_returns and its
+        # call site in _episode_update) -- no throwaway rollouts, no delay.
+        # Pass a positive value to keep the old warm-up path: N full
+        # random-plan rollouts, measured, before episode 0.
+        "--popart-init-episodes", type=int, default=0,
         help="Warm-start PopArt (mu, sigma) from this many rollouts of RANDOM "
-             "but VALID plans before training. 0 disables. The rollouts use "
-             "the real legality masks and the real measurement path, so the "
-             "seeded scale is the true measurement scale; without this the "
-             "first gradient step defines the scale from whatever the "
-             "untrained policy produced.")
+             "but VALID plans before training. 0 (default): no warm-up "
+             "rollouts; under --advantage-norm popart the first real episode "
+             "seeds PopArt from its own returns before its own update runs. "
+             "A positive value restores the old path: that many full "
+             "measured rollouts of random-but-valid plans before episode 0, "
+             "using the real legality masks and the real measurement path.")
     p.add_argument(
         "--popart-init-temperature", type=float, default=10.0,
         help="Softmax temperature applied to the VERTEX pointer during the "
@@ -11084,6 +11123,33 @@ def main():
         use_popart = args.advantage_norm == "popart"
         popart_mu, popart_sigma = _popart_derive(
             popart_m1, popart_m2, popart_w, args.popart_sigma_min, 1e12)
+        # --popart-init-episodes 0 (owner ruling 2026-09-14, the new
+        # default): no warm-up rollouts. The FIRST REAL EPISODE instead
+        # seeds the DECODE above from its own returns, computed straight off
+        # the reward tensor (see _popart_seed_returns -- no value bootstrap,
+        # so there is no circularity with popart_mu/popart_sigma). This only
+        # overrides the LOCAL decode; popart_m1/popart_m2/popart_w themselves
+        # are left exactly as passed in, so on the true first call they are
+        # still (0, 0, 0) and _popart_update below still takes its "first
+        # update adopts the batch exactly" path once estim_returns is
+        # computed through this seeded decode. `_cold` is a device-side
+        # check on the accumulator itself (not on the episode index), so a
+        # resumed run that already has real statistics is never re-seeded,
+        # and the pipeline driver's one-episode update lag does not matter:
+        # whichever episode's update is the first to actually run is the one
+        # that gets seeded.
+        if use_popart and int(getattr(args, "popart_init_episodes", 0)) == 0:
+            _cold = jnp.all(popart_w <= 1e-8)
+            _seed_ret = _popart_seed_returns(head_rewards, traj.done, traj.discount)
+            _flat_seed = _seed_ret.reshape(-1, _seed_ret.shape[-1])
+            _seed_mu = jnp.mean(_flat_seed, axis=0)
+            _seed_var = (jnp.mean(jnp.square(_flat_seed), axis=0)
+                         - jnp.square(_seed_mu))
+            _seed_sigma = jnp.clip(
+                jnp.sqrt(jnp.maximum(_seed_var, 1e-12)),
+                args.popart_sigma_min, 1e12)
+            popart_mu = jnp.where(_cold, _seed_mu, popart_mu)
+            popart_sigma = jnp.where(_cold, _seed_sigma, popart_sigma)
         # TRUE OPTIMIZED RETURN (owner 2026-08-09): preference-weighted
         # PopArt-z of the post-gate post-symlog TERMINAL head rewards --
         # the exact scalar this update maximizes, in the space the
@@ -13580,17 +13646,19 @@ def main():
             print("[edgemem ep%d] %s" % (ep, _em_stats), flush=True)
         # PopArt WARM-START episodes run NO gradient step: the caller passes an
         # all-NaN `_wmets` purely to keep the tuple shape uniform (see
-        # --popart-init-episodes) and host_log drops every loss-derived key
-        # ~100 lines below. This line ran BEFORE that drop and counted warm-up
-        # rows against the budget -- and since --popart-init-episodes and
-        # ALPHAGRAD_HEALTH_EPISODES BOTH default to 3, the three health lines a
-        # run printed were ALWAYS the three warm-up rows, reading
-        # "ppo=nan value=nan ent=nan ratio/max_log=nan". The first REAL
-        # training episode never printed one, so ratio/max_log -- the
-        # ratio-1-at-epoch-0 tripwire this line exists to show -- was never
-        # displayed at all, and the expected warm-up NaNs camouflaged that.
-        # Warm-up rows are now labelled `[health warmup]`, print `n/a` for the
-        # undefined fields, and do NOT consume the budget.
+        # --popart-init-episodes, a positive value only -- the 2026-09-14
+        # default of 0 runs no warm-up at all) and host_log drops every
+        # loss-derived key ~100 lines below. This line ran BEFORE that drop
+        # and counted warm-up rows against the budget -- and back when
+        # --popart-init-episodes and ALPHAGRAD_HEALTH_EPISODES BOTH defaulted
+        # to 3, the three health lines a run printed were ALWAYS the three
+        # warm-up rows, reading "ppo=nan value=nan ent=nan
+        # ratio/max_log=nan". The first REAL training episode never printed
+        # one, so ratio/max_log -- the ratio-1-at-epoch-0 tripwire this line
+        # exists to show -- was never displayed at all, and the expected
+        # warm-up NaNs camouflaged that. Warm-up rows are now labelled
+        # `[health warmup]`, print `n/a` for the undefined fields, and do NOT
+        # consume the budget.
         if not warmup:
             _HEALTH_N[0] += 1
         _hlabel = "warmup" if warmup else "ep%d" % (_HEALTH_N[0] - 1)
@@ -14650,7 +14718,16 @@ def main():
         # then `HEAD_REWARD_INDICES` -- because seeding in one space and
         # updating in another is exactly the raw-vs-symlog bug this warm start
         # was written to fix.
-        if ep == 0 and int(getattr(args, "popart_init_episodes", 0)) > 0:
+        # THE NORM GATE (owner ruling 2026-09-14): this warm-up used to run
+        # whenever --popart-init-episodes was positive, REGARDLESS of
+        # --advantage-norm. Under --advantage-norm none (the campaign's
+        # setting) nothing ever reads popart_m1/m2/w -- `_popart_update` is
+        # called only under `if use_popart:` in _episode_update -- so those
+        # measured rollouts bought nothing and were pure cost. The canary
+        # confirmed this: it ran --advantage-norm none and still logged
+        # three warm-up rollouts. Requiring use_popart here stops that.
+        if (ep == 0 and args.advantage_norm == "popart"
+                and int(getattr(args, "popart_init_episodes", 0)) > 0):
             _wt = jnp.asarray(
                 float(getattr(args, "popart_init_temperature", 10.0)),
                 dtype=jnp.float32)
