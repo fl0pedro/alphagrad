@@ -337,7 +337,10 @@ def test_face_chunks_and_counts_unchanged():
 
     vertex, n_faces = None, 0
     for cand in range(1, V + 1):
-        _t, _i, _c, n = lfs.chunk(order, specs, 0, cand, vspecs, rows, skips, 0)[:4]
+        # `chunk` is (tokens, count, n_faces, ends, head) since the
+        # equation-id buffer was removed.
+        _t, _c, n = lfs.chunk(order, specs, 0, cand, vspecs, rows,
+                              skips, 0)[:3]
         if int(n) > n_faces:
             vertex, n_faces = cand, int(n)
         if n_faces >= 3:
