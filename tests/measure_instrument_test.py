@@ -25,6 +25,7 @@ pair are 150x apart in cost and the shared budget left the cheap half with a
 tenth of a second of integration. The last two tests in this module pin the
 fork end to end and pin that the reference's compile key is untouched by it.
 """
+import math
 import os
 
 import numpy as np
@@ -718,3 +719,308 @@ def test_the_dedupe_is_off_without_eval_samples(_paired_log_cpu,
         env_mod._callback(env.config, env.args, env.consts,
                           jnp.asarray(order), specs, faces, skips, len(order))
     assert n_windows[0] >= 2, n_windows
+
+
+# ==========================================================================
+# THE TIMED WINDOW MUST WAIT FOR THE DEVICE, NOT FOR THE DISPATCH
+# ==========================================================================
+#
+# Canary job 65720 (the campaign arm on the merged tip e90df894) measured the
+# 18.22 ms TransformerLM candidate at 119 us -- BELOW its own 135 us rev-exact
+# reference -- so `paired_log_costs` floored the candidate at the reference
+# and the paired latency reward was EXACTLY 0 on every plan. The memory
+# channel was untouched (-3.1357 nats), which is the signature: the executable
+# was right, the clock was not.
+#
+# CAUSE. JAX dispatch is ASYNCHRONOUS and `_time_one_rep`'s ResourceMonitor
+# window closed on `jax.effects_barrier()`, which waits only for ORDERED
+# EFFECTS. A jitted Jacobian carries none, so the barrier returned at once and
+# the window timed the HOST DISPATCH. It read correctly for the whole
+# fixed-count era only because `inner` was 50: the host cannot enqueue fifty
+# executions of a 780 MB program without blocking, so the enqueue loop was an
+# accidental barrier. The budget rule gives an 18 ms program `inner` 5, five
+# executions fit in the queue, and the accident stopped happening.
+#
+# These tests pin the instrument, not the accident: the reading is the DEVICE
+# time at EVERY inner, including 1.
+
+
+class _BarrierOnlyMonitor:
+    """A faithful stand-in for ``jax_memory_monitor.ResourceMonitor``.
+
+    Same contract as the real one, whose ``__enter__`` / ``__exit__`` run
+    ``jax.effects_barrier()`` and nothing else (see its
+    ``xla_resource_monitor.py``), and whose ``stats`` is read after the
+    block. Used instead of the real class so the property holds on any
+    machine -- the package is not importable on every dev box, and where it
+    is missing `env` silently swaps in `_NoopResourceMonitor`, whose timer
+    is a constant 0.0 and which would make these tests vacuous.
+    """
+
+    def __init__(self, *_a, **_kw):
+        self.stats = {"time": 0.0, "memory": 0.0}
+
+    def __enter__(self):
+        import time
+        import jax
+        jax.effects_barrier()
+        self._t0 = time.perf_counter()
+        return self
+
+    def __exit__(self, *_a):
+        import time
+        import jax
+        jax.effects_barrier()
+        # A positive memory keeps `_time_one_rep` on its runtime_delta path;
+        # these tests are about the clock.
+        self.stats = {"time": time.perf_counter() - self._t0,
+                      "memory": 1.0}
+        return False
+
+
+def _work_that_outlasts_its_dispatch():
+    """A jitted program whose EXECUTION dwarfs its dispatch, and its truth.
+
+    Returns ``(ex, eval_args, seconds_per_execution)``, the last measured
+    with an explicit ``block_until_ready`` after a warm-up -- the reading no
+    async bug can fake.
+    """
+    import time
+    import jax
+
+    rng = np.random.default_rng(7)
+    a = jnp.asarray(rng.standard_normal((512, 512)).astype(np.float32))
+    ex = jax.jit(lambda x: (x @ x) @ x)
+    for _ in range(3):                                   # warm + compile
+        jax.block_until_ready(ex(a))
+    best = float("inf")
+    for _ in range(3):
+        _t0 = time.perf_counter()
+        jax.block_until_ready(ex(a))
+        best = min(best, time.perf_counter() - _t0)
+    return ex, (a,), best
+
+
+@pytest.fixture
+def _monitor_path(monkeypatch):
+    """Force `_time_one_rep` down its ResourceMonitor branch, on the stub."""
+    monkeypatch.setenv("ALPHAGRAD_DIRECT_MEASURE", "0")
+    monkeypatch.setenv("ALPHAGRAD_BYPASS_RESOURCE_MONITOR", "0")
+    monkeypatch.setattr(env_mod, "_get_resource_monitor",
+                        lambda devices: _BarrierOnlyMonitor())
+    return None
+
+
+def test_the_timed_window_waits_for_the_device(_monitor_path):
+    """One timed window of one execution reads that execution's DEVICE time.
+
+    THE REGRESSION TEST for job 65720. With the drain missing this reads the
+    dispatch -- two to three orders of magnitude low -- and the assertion
+    below is the one that catches it.
+    """
+    import jax
+    ex, eval_args, truth_s = _work_that_outlasts_its_dispatch()
+    devices = list(jax.local_devices())
+    lat_ns, _peak, _src, _out = env_mod._time_one_rep(
+        ex, eval_args, devices, 1)
+    read_s = float(lat_ns) / 1e9
+    assert read_s > 0.5 * truth_s, (
+        f"the window read {read_s*1e6:.0f} us for a program that takes "
+        f"{truth_s*1e6:.0f} us -- the device queue was not drained inside "
+        "the timed window")
+    assert read_s < 5.0 * truth_s, (read_s, truth_s)
+
+
+def test_the_reading_does_not_depend_on_the_inner_rep_count(_monitor_path):
+    """inner 1 and inner 8 report the SAME per-execution latency.
+
+    This is the invariant the budget rule of 2026-09-14 spends: it CHOOSES
+    the inner per plan (5 for an 18 ms program, 50 for a 121 us one), so an
+    instrument whose reading depends on the inner makes the candidate and
+    the reference incomparable -- which is precisely how 65720 put an 18 ms
+    program below its own 135 us reference.
+    """
+    import jax
+    ex, eval_args, truth_s = _work_that_outlasts_its_dispatch()
+    devices = list(jax.local_devices())
+    small, _p1, _s1, _o1 = env_mod._time_one_rep(ex, eval_args, devices, 1)
+    large, _p2, _s2, _o2 = env_mod._time_one_rep(ex, eval_args, devices, 8)
+    ratio = float(small) / float(large)
+    assert 0.4 < ratio < 2.5, (
+        f"inner 1 read {float(small)/1e6:.2f} ms/execution and inner 8 read "
+        f"{float(large)/1e6:.2f} ms/execution; the instrument must not "
+        "depend on the count")
+    # BOTH against the truth, not only against each other. A missing drain
+    # makes the reading track the DISPATCH, which is per-execution too -- so
+    # the ratio above stays near 1 while both halves are two orders of
+    # magnitude low. Measured: without the drain this pair read 11 us and
+    # 9 us for a 1233 us program, and the ratio test alone passed.
+    for _name, _r in (("inner 1", small), ("inner 8", large)):
+        assert float(_r) / 1e9 > 0.5 * truth_s, (
+            f"{_name} read {float(_r)/1e6:.3f} ms/execution for a program "
+            f"that takes {truth_s*1e3:.3f} ms")
+
+
+# ==========================================================================
+# EACH HALF OF THE PAIR LANDS ON ITS OWN SIDE OF THE RECORD
+# ==========================================================================
+
+
+def _sided_time_one_rep(monkeypatch, ref_ids, cand_ns, ref_ns, seq):
+    """Replace `_time_one_rep` with one that returns a per-EXECUTABLE time.
+
+    The real function still runs (so the memory channel, the outputs and the
+    window accounting are untouched); only the latency is substituted, by
+    which executable was handed in. `seq` collects the A/B schedule.
+    """
+    real = env_mod._time_one_rep
+
+    def _sided(ex, eval_args, devices, inner):
+        _lat, peak, src, out = real(ex, eval_args, devices, inner)
+        is_ref = id(ex) in ref_ids
+        seq.append(1 if is_ref else 0)
+        return (ref_ns if is_ref else cand_ns), peak, src, out
+
+    monkeypatch.setattr(env_mod, "_time_one_rep", _sided)
+
+
+def _spy_on_the_reference_compile(monkeypatch, ref_ids):
+    """Record the identity of whatever the `paired-ref:` cache key returns."""
+    from alphagrad.approx.common import compile_cache as _cc
+    real = _cc.cached_compile
+
+    def _spy(cache_key, compile_fn):
+        out = real(cache_key, compile_fn)
+        if bytes(cache_key).startswith(b"paired-ref:"):
+            ref_ids.add(id(out))
+        return out
+
+    monkeypatch.setattr(_cc, "cached_compile", _spy)
+
+
+def test_the_record_puts_each_half_on_its_own_side(
+        _paired_log_cpu, _fresh_dedupe, monkeypatch):
+    """Two executables 100x apart: the SLOW one is the candidate.
+
+    Job 65720 wrote a record whose `candidate_latency_ns` was BELOW its
+    `ref_latency_ns` for a candidate 135x the reference's cost. This pins
+    every step between the two timed halves and the reward: which half each
+    reading is filed under, the ratio, and its SIGN -- through the real
+    callback, under the interleaved schedule, with the warm probe running,
+    and with the dedupe armed.
+    """
+    monkeypatch.setenv("ALPHAGRAD_PLAN_LOG", "1")
+    env_mod.consume_plan_records()
+
+    ref_ids: set = set()
+    _spy_on_the_reference_compile(monkeypatch, ref_ids)
+    seq: list = []
+    cand_ns, ref_ns = 1.0e7, 1.0e5                       # 10 ms vs 100 us
+    _sided_time_one_rep(monkeypatch, ref_ids, cand_ns, ref_ns, seq)
+
+    env = _one_instrument_toy_env(
+        num_data_points=2, reps_per_point=2,
+        ref_num_data_points=2, ref_reps_per_point=2)
+    order = sorted(int(v) for v in np.asarray(env.valid_vertices))
+    samples = (jnp.asarray(
+        np.stack([np.full(16, 0.5, dtype=np.float32),
+                  np.full(16, -0.5, dtype=np.float32)])),)
+    # BOTH measurements before the drain: `consume_plan_records` ends the
+    # episode's accounting, and the dedupe cache is bounded to an episode.
+    _measure_once(env, order, samples)
+    _measure_once(env, order, samples)
+
+    assert ref_ids, "the paired reference was never compiled through the cache"
+    recs = env_mod.consume_plan_records()["records"]
+    assert len(recs) == 2, recs
+    rec, dup = recs
+
+    # 1. THE SIDES. The slow executable is the candidate's, the fast one the
+    #    reference's -- not the other way round, and not both the same.
+    assert rec["candidate_latency_ns"] == pytest.approx(cand_ns, rel=1e-6)
+    assert rec["ref_latency_ns"] == pytest.approx(ref_ns, rel=1e-6)
+    # 2. THE RATIO survives the aggregation at its full size.
+    assert (rec["candidate_latency_ns"] / rec["ref_latency_ns"]
+            == pytest.approx(100.0, rel=1e-6))
+    # 3. THE SIGN. Cost slots are stored NEGATED, so a candidate 100x more
+    #    expensive than rev-exact scores -log(100).
+    lat = rec["rewards"][env_mod.REWARD_INDEX["latency_ns"]]
+    assert lat == pytest.approx(-math.log(100.0), rel=1e-6), rec["rewards"]
+    # 4. THE SCHEDULE WAS INTERLEAVED, not two blocks -- the property the
+    #    sides have to survive.
+    assert seq.count(0) >= 2 and seq.count(1) >= 2, seq
+    assert seq != sorted(seq), seq
+
+    # 5. UNDER DEDUPE: the second plan was NOT re-timed, and it carries the
+    #    measured plan's reward vector -- so the sides it was built from have
+    #    to be right there too.
+    assert dup["measured_from"] == 0
+    assert dup["rewards"][env_mod.REWARD_INDEX["latency_ns"]] == lat
+    assert dup.get("candidate_latency_ns") is None
+
+
+def test_a_candidate_cheaper_than_rev_exact_scores_above_zero(
+        _paired_log_cpu, _fresh_dedupe, monkeypatch):
+    """The mirror image, so the sign test above cannot pass by a sign flip.
+
+    Under ``--paired-cost-floor byte``, because the campaign's default floor
+    is the REFERENCE's own cost and that floor caps a cheaper candidate at
+    exactly 0 (pinned by the test below). A sign flip has to be visible
+    somewhere, and this is where.
+    """
+    monkeypatch.setenv("ALPHAGRAD_PAIRED_COST_FLOOR", "byte")
+    monkeypatch.setenv("ALPHAGRAD_PLAN_LOG", "1")
+    env_mod.consume_plan_records()
+    ref_ids: set = set()
+    _spy_on_the_reference_compile(monkeypatch, ref_ids)
+    seq: list = []
+    _sided_time_one_rep(monkeypatch, ref_ids, 1.0e5, 1.0e7, seq)
+
+    env = _one_instrument_toy_env(
+        num_data_points=2, reps_per_point=2,
+        ref_num_data_points=2, ref_reps_per_point=2)
+    order = sorted(int(v) for v in np.asarray(env.valid_vertices))
+    samples = (jnp.asarray(
+        np.stack([np.full(16, 0.25, dtype=np.float32),
+                  np.full(16, -0.25, dtype=np.float32)])),)
+    _measure_once(env, order, samples)
+    rec = env_mod.consume_plan_records()["records"][0]
+    assert rec["candidate_latency_ns"] == pytest.approx(1.0e5, rel=1e-6)
+    assert rec["ref_latency_ns"] == pytest.approx(1.0e7, rel=1e-6)
+    lat = rec["rewards"][env_mod.REWARD_INDEX["latency_ns"]]
+    assert lat == pytest.approx(math.log(100.0), rel=1e-6), rec["rewards"]
+
+
+def test_the_reference_floor_caps_a_cheaper_candidate_at_zero(
+        _paired_log_cpu, _fresh_dedupe, monkeypatch):
+    """``--paired-cost-floor reference`` (the campaign default) is a CAP.
+
+    ``lat_floor = max(100 ns, ref)``, so ``log(max(cand, ref)) - log(ref)``
+    is 0 for every candidate at or below the reference and positive above
+    it. That is the whole point of the reference floor (it prices out the
+    skip-everything absorber), and it is why the defect of job 65720
+    presented as a reward of EXACTLY 0 rather than as a wrong number: the
+    candidate's 119 us fell below the reference's 135 us and was floored.
+    """
+    monkeypatch.setenv("ALPHAGRAD_PLAN_LOG", "1")
+    env_mod.consume_plan_records()
+    ref_ids: set = set()
+    _spy_on_the_reference_compile(monkeypatch, ref_ids)
+    seq: list = []
+    _sided_time_one_rep(monkeypatch, ref_ids, 1.0e5, 1.0e7, seq)
+
+    env = _one_instrument_toy_env(
+        num_data_points=2, reps_per_point=2,
+        ref_num_data_points=2, ref_reps_per_point=2)
+    order = sorted(int(v) for v in np.asarray(env.valid_vertices))
+    samples = (jnp.asarray(
+        np.stack([np.full(16, 0.75, dtype=np.float32),
+                  np.full(16, -0.75, dtype=np.float32)])),)
+    _measure_once(env, order, samples)
+    rec = env_mod.consume_plan_records()["records"][0]
+    # The RAW readings still land on their own sides -- only the REWARD is
+    # capped. A record that loses the sides is the 65720 defect; a record
+    # that keeps them and scores 0 is the floor doing its job.
+    assert rec["candidate_latency_ns"] == pytest.approx(1.0e5, rel=1e-6)
+    assert rec["ref_latency_ns"] == pytest.approx(1.0e7, rel=1e-6)
+    assert rec["rewards"][env_mod.REWARD_INDEX["latency_ns"]] == 0.0

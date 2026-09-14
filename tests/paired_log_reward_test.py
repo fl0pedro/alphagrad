@@ -275,7 +275,7 @@ def test_reference_is_measured_once_per_terminal_callback(monkeypatch):
     from alphagrad.approx.common import compile_cache as _cc
 
     # EVERY executable the cache ever hands back under a paired-ref key, not
-    # just the last one. `compile_cache._LOCAL_CACHE` is a FIFO capped at 32
+    # just the last one. `compile_cache._LOCAL_CACHE` is an LRU capped at 32
     # entries, so in a full-suite run the reference can be evicted and
     # recompiled BETWEEN two measurements of the same plan -- a second, equal
     # executable at a different address. Counting only the newest one then
@@ -283,8 +283,29 @@ def test_reference_is_measured_once_per_terminal_callback(monkeypatch):
     # alone as a pass and in the suite as a failure (job 65528). The strong
     # references in `ref_ex` are what makes the id set safe: an id can only be
     # reused after its object is collected.
+    #
+    # THE CANDIDATE'S EXECUTABLES ARE COLLECTED TOO, and the two sets are
+    # asserted DISJOINT before anything is counted. Counting windows by
+    # ``id(ex)`` is only sound while the two halves are different objects,
+    # and they need not be: `env._callback`'s own comment records that an
+    # identity plan and its rev-exact reference are the SAME program, and
+    # `jax.jit(...).lower(...).compile()` hands back the SAME `Compiled`
+    # object for two equal lowerings. This test ran the REVERSE order as the
+    # candidate, so the two halves aliased whenever the candidate's entry had
+    # been evicted and recompiled; the callback then charged the candidate's
+    # four windows to the reference and the count read 484 where 480 was
+    # expected. Whether that happens depends on how much OTHER work has
+    # passed through a 32-entry cache first, which is why it surfaced as
+    # "passes alone, fails in the suite" a second time (job 65733, after five
+    # tests were added to `measure_instrument_test.py`). The candidate now
+    # runs the FORWARD order -- the same remedy, and the same wording,
+    # `measure_instrument_test.test_the_reference_runs_its_own_points_and_reps`
+    # already uses -- and the disjointness assertion makes a future alias a
+    # loud failure instead of a silent miscount.
     ref_ex = []
     ref_ids = set()
+    cand_ex = []
+    cand_ids = set()
     real_cc = _cc.cached_compile
 
     def _spy_compile(key, fn):
@@ -292,6 +313,9 @@ def test_reference_is_measured_once_per_terminal_callback(monkeypatch):
         if bytes(key).startswith(b"paired-ref:"):
             ref_ex.append(out)
             ref_ids.add(id(out))
+        elif bytes(key).startswith(b"approx:"):
+            cand_ex.append(out)
+            cand_ids.add(id(out))
         return out
 
     seen = []
@@ -304,26 +328,32 @@ def test_reference_is_measured_once_per_terminal_callback(monkeypatch):
     monkeypatch.setattr(_cc, "cached_compile", _spy_compile)
     monkeypatch.setattr(envmod, "_time_one_rep", _counting)
     env = _make_env()
-    rev = _rev_order(env)
+    # FORWARD, so the candidate's executable is never the rev-exact one.
+    fwd = sorted(int(x) for x in np.asarray(env.valid_vertices))
     per_cb = int(env.config.ref_num_data_points) * int(
         env.config.ref_reps_per_point)
 
     def _ref_windows():
         assert ref_ids, "the paired reference was never compiled"
+        assert ref_ids.isdisjoint(cand_ids), (
+            "the candidate and the reference are the SAME executable object, "
+            "so counting timed windows by id(ex) charges the candidate's "
+            "windows to the reference -- run a candidate order the rev-exact "
+            "reference cannot equal")
         return sum(1 for i in seen if i in ref_ids)
 
-    _run_plan(env, rev)
+    _run_plan(env, fwd)
     assert _ref_windows() == per_cb                     # one episode, one ref
-    _run_plan(env, rev)                                 # same plan again...
+    _run_plan(env, fwd)                                 # same plan again...
     assert _ref_windows() == 2 * per_cb                 # ...measured anew
-    _run_plan(env, rev, skip_everything=True)
+    _run_plan(env, fwd, skip_everything=True)
     assert _ref_windows() == 3 * per_cb
     out = envmod.consume_plan_records()
     assert len(out["paired_ref"]["records"]) == 3
     assert out["paired_ref"]["dropped"] == 0
     # ...and the candidate was measured on every step (terminal_rewards_only
     # is off on this env), yet the reference only at the terminal one.
-    assert out["mem_parity"]["measured"] == 3 * len(rev)
+    assert out["mem_parity"]["measured"] == 3 * len(fwd)
 
 
 def test_non_terminal_steps_carry_zero_costs():
