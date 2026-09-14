@@ -502,8 +502,18 @@ def test_the_two_halves_interleave_instead_of_blocking():
 
 
 @pytest.fixture
-def _fresh_dedupe():
-    """No duplicate cache and no episode accounting carried between tests."""
+def _fresh_dedupe(monkeypatch):
+    """No duplicate cache and no episode accounting carried between tests.
+
+    THE SWITCH IS SET EXPLICITLY, because `landscape_map` writes
+    ``ALPHAGRAD_MEASURE_DEDUPE=0`` into the process AT IMPORT -- correctly,
+    it exists to measure the spread of repeated measurements of one plan --
+    and pytest imports every test module, `tests/landscape_map_sweep_test.py`
+    included, BEFORE it runs any test. Without this line these tests would
+    pass alone and fail in the suite, which is exactly the failure
+    `tests/policy_regression_gate_test.py`'s header records.
+    """
+    monkeypatch.setenv("ALPHAGRAD_MEASURE_DEDUPE", "1")
     env_mod._PLAN_DEDUPE.clear()
     env_mod._MEASURE_EPISODE.update(
         {"key": None, "label": None, "n_plans": 0, "n_measured": 0,
