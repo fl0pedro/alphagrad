@@ -1776,11 +1776,18 @@ class Trajectory(NamedTuple):
     micro_quant_scale_frac_seq: jax.Array  # (max_substeps,) float32 — scale head u
     reward: jax.Array  # (NUM_REWARDS,) — full env emission, kept for host logging
     done: jax.Array
-    value: jax.Array  # (NUM_VALUE_HEADS,) per-head value prediction
-    next_value: jax.Array  # (NUM_VALUE_HEADS,) per-head bootstrap value
+    # BF16 (owner ruling 2026-09-14): read back only as GAE-bootstrap
+    # constants in `_episode_update`, never inside the PPO ratio or a KL —
+    # decoded to float32 once, right after the scan (`traj._replace`).
+    value: jax.Array  # (NUM_VALUE_HEADS,) per-head value prediction, bfloat16
+    next_value: jax.Array  # (NUM_VALUE_HEADS,) per-head bootstrap value, bfloat16
     vertex_dist: jax.Array
-    pair_dists: jax.Array
-    factor_dists: jax.Array
+    # BF16 (owner ruling 2026-09-14): the LEGACY rule-head distributions,
+    # always the zero-filled arrays under --dynamic-substeps (the only path
+    # `loss_fn` runs). `old_pair_dists` / `old_factor_dists` are never read
+    # back out of TrainBatch, so this is a storage-only cast.
+    pair_dists: jax.Array   # bfloat16
+    factor_dists: jax.Array  # bfloat16
     # Dynamic-substeps per-component distributions — zero-filled in legacy mode.
     micro_op_dists: jax.Array  # (max_substeps, NUM_OPS) float32
     micro_i_dists: jax.Array  # (max_substeps, MAX_AXES_PER_VERTEX) float32
@@ -9541,11 +9548,25 @@ def main():
                 micro_quant_scale_frac_seq=micro_quant_scale_frac_seq,
                 reward=jnp.atleast_1d(rewards),
                 done=jnp.array(done, dtype=jnp.float32),
-                value=jnp.atleast_1d(value),
-                next_value=jnp.atleast_1d(next_value),
+                # BF16 STORE SITE (owner ruling 2026-09-14): `value` and
+                # `next_value` are read back only as GAE-bootstrap constants
+                # in `_episode_update` (never inside the PPO ratio or any
+                # KL), so they are cast down here and cast back to float32
+                # once, at the single read site right after the scan --
+                # see the `traj._replace(...)` in `_episode_update`.
+                value=jnp.atleast_1d(value).astype(jnp.bfloat16),
+                next_value=jnp.atleast_1d(next_value).astype(jnp.bfloat16),
                 vertex_dist=vertex_dist,
-                pair_dists=pair_dists,
-                factor_dists=factor_dists,
+                # `pair_dists` / `factor_dists` are the LEGACY rule-head
+                # distributions: always the zero-filled arrays above under
+                # `--dynamic-substeps` (the default, and the only path
+                # `loss_fn` actually runs -- `--no-dynamic-substeps` falls
+                # through to no return value). Nothing ever reads
+                # `old_pair_dists` / `old_factor_dists` back out of
+                # `TrainBatch`, so this is a pure storage-cost cast with no
+                # read-site precision question at all.
+                pair_dists=pair_dists.astype(jnp.bfloat16),
+                factor_dists=factor_dists.astype(jnp.bfloat16),
                 micro_op_dists=micro_op_dists,
                 micro_i_dists=micro_i_dists,
                 micro_j_dists=micro_j_dists,
@@ -10930,6 +10951,21 @@ def main():
          win_over_kind_per_env,
          win_used_per_env, face_used_per_env, subkey) = roll
 
+        # BF16 READ SITE (owner ruling 2026-09-14), the single place
+        # `traj.value` / `traj.next_value` are decoded back to float32.
+        # They ride through the scan and the stack as bfloat16 (see the
+        # `Trajectory` store site) because everything below reads them only
+        # as GAE-bootstrap constants -- never inside the PPO ratio or a KL,
+        # where a bf16 old-log-prob would bias the ratio away from exactly 1
+        # at epoch 0. Decoding once here, before the popart de-normalisation
+        # and the GAE call both use them, means every downstream `traj.value`
+        # / `traj.next_value` in this function reads float32 exactly as it
+        # did before this leaf was ever cast down.
+        traj = traj._replace(
+            value=traj.value.astype(jnp.float32),
+            next_value=traj.next_value.astype(jnp.float32),
+        )
+
         # GAE on the (E, T, NUM_VALUE_HEADS) reward tensor.
         #
         # ``multi_head`` (the default): use the three training-reward indices
@@ -11410,8 +11446,14 @@ def main():
             micro_quant_scale_sign_seq=traj.micro_quant_scale_sign_seq,
             micro_quant_scale_frac_seq=traj.micro_quant_scale_frac_seq,
             old_vertex_dist=traj.vertex_dist,
-            old_pair_dists=traj.pair_dists,
-            old_factor_dists=traj.factor_dists,
+            # BF16 READ SITE (owner ruling 2026-09-14): `traj.pair_dists` /
+            # `traj.factor_dists` are the legacy zero-filled arrays (see the
+            # Trajectory store site); decoded back to float32 here, at the
+            # seam where they cross into TrainBatch, even though nothing
+            # downstream reads `old_pair_dists` / `old_factor_dists` today --
+            # so a future legacy-path reader gets float32 exactly as before.
+            old_pair_dists=traj.pair_dists.astype(jnp.float32),
+            old_factor_dists=traj.factor_dists.astype(jnp.float32),
             old_micro_op_dists=traj.micro_op_dists,
             old_micro_i_dists=traj.micro_i_dists,
             old_micro_j_dists=traj.micro_j_dists,
