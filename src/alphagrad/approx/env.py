@@ -3477,11 +3477,13 @@ def _gradient_similarity(jac_exact, jac_approx, site: str):
 # ---------------------------------------------------------------------------
 # THE PAIRED REFERENCE (ticket dsnn-3qm.9). Under ``--cost-form paired-log``
 # every terminal measurement also measures REV-EXACT -- the reverse order,
-# every face None, the jax.grad-equivalent -- in the same callback, right
-# after the candidate, through the same executable path and the same
-# instrument (`_campaign_measure_cost` -> `_time_one_rep`, same eval args,
-# same inner-reps, same warmup, same median -- but since 2026-09-14 its OWN
-# points x reps, see `EnvConfig.ref_num_data_points`). The cost
+# every face None, the jax.grad-equivalent -- in the same callback,
+# INTERLEAVED with the candidate window by window since 2026-09-14 (it used
+# to run as a second block right after it), through the same executable path
+# and the same instrument (`_time_one_rep`, same eval args, same warmup, same
+# median). Its POINTS x REPS are its own (`EnvConfig.ref_num_data_points`)
+# and so is its INNER, which the window rule derives from its own execution
+# time (`EnvConfig.measure_budget_secs`). The cost
 # channels then carry the LOG-DIFFERENCE ``Delta_c = log cost_c(candidate)
 # - log cost_c(rev-exact)`` (stored negated like every cost slot), so
 # rev-exact scores 0 by construction and a GPU-state drift of 18-20 % between
@@ -3694,17 +3696,19 @@ def _campaign_measure_cost(ex, eval_args_list, unique_devices,
     untimed executions per point, reduced by ``_aggregate_samples``
     (the same median the plan's own channels get).
 
-    Used for the paired rev-exact reference (ticket dsnn-3qm.9; the
-    quality gate's exact floor until 2026-09-04) so the reference is,
-    literally, the number the campaign path would have printed for that
-    plan.
+    NOT ON THE MEASUREMENT PATH SINCE 2026-09-14, and say so plainly: the
+    terminal callback measures the candidate and the paired rev-exact
+    reference in ONE INTERLEAVED LOOP now, window by window, so that the
+    two halves of the ratio occupy the same seconds (owner ruling; see
+    `interleave_windows`). It carried the reference from ticket
+    dsnn-3qm.9 until then, and the quality gate's exact floor until
+    2026-09-04.
 
-    The CALLER chooses the counts. Since the owner's ruling of 2026-09-14
-    the reference is handed `EnvConfig.ref_num_data_points` /
-    `ref_reps_per_point` rather than the candidate's, because the two
-    halves of the pair are 150x apart in cost and the shared budget left
-    the cheap half under-integrated. `inner` and `warmup` remain the
-    candidate's, so the per-window protocol is still one instrument.
+    It is kept because it is the FIXED-COUNT form of the instrument
+    written down in one place: `len(eval_args_list)` points x `n_reps`
+    windows, no budget, no window rule. The tests compare the callback's
+    reading against it, which is the property that matters -- one
+    instrument, whichever loop drives it.
     """
     _lat: list[float] = []
     _peak: list[float] = []
@@ -7893,6 +7897,11 @@ def _callback_measured(
             execution reads about 7 percent below its settled value -- and
             that is immaterial here, because the reading only chooses HOW
             MANY windows and how many executions per window to run.
+
+            ``max(1, _warmup)``: with ``ALPHAGRAD_MEASURE_WARMUP=0`` the
+            budget still has to size itself from something, so that
+            configuration now pays exactly ONE untimed execution per half
+            per plan where it used to pay none. It buys the counts.
             """
             _t = 0.0
             for _w in range(max(1, _warmup)):
