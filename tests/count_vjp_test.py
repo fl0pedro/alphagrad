@@ -117,7 +117,14 @@ def setup():
     tok = jnp.asarray(rng.integers(1, 200, (B, WINDOW)).astype(np.int32))
     part = jnp.asarray(np.eye(TOTAL_V + 1, dtype=np.float32)[[2, 0, 5, 1]])
     owner = jnp.asarray(np.array([1, 3, 2, 4], np.int32))
-    return dict(agent=agent, tok=tok, part=part, owner=owner)
+    # The episode stream: one row per sample, long enough for the fold's
+    # PADDED length past the largest start (episode_stream.stream_tail is
+    # what sizes this in production).
+    stream = jnp.asarray(
+        rng.integers(1, 200, (B, 4 * WINDOW)).astype(np.int32))
+    offs = jnp.asarray(np.array([0, 13, WINDOW, 2 * WINDOW], np.int32))
+    return dict(agent=agent, tok=tok, part=part, owner=owner,
+                stream=stream, offs=offs)
 
 
 # ---------------------------------------------------------------- the fold --
@@ -376,3 +383,50 @@ def test_a_carry_with_an_integer_leaf_is_refused_rather_than_silently_wrong():
         CV.count_loop(body, (jnp.ones((2,), jnp.float32),
                              jnp.zeros((), jnp.int32)),
                       nb=4, nb_live=jnp.int32(2))
+
+
+# ------------------------------------------- the shape the loss really runs --
+
+def _stream_scalar(agent, s, budget):
+    """A CHECKPOINTED advance reading the EPISODE STREAM by (row, start).
+
+    This is `_dynamic_loss_fn`'s own call and nothing above imitates it: the
+    tokens are a `dynamic_slice` out of an (E, L) stream instead of a
+    standalone window, the whole advance sits inside `jax.checkpoint`
+    (ALPHAGRAD_CARRY_HEADS_REMAT), and it all runs under a vmap over samples.
+    The first build of this change passed every case above and still failed
+    here, three frames away, with a `broadcast_in_dim` rank complaint -- so
+    the case is now pinned rather than left to the smoke.
+    """
+    from alphagrad.approx.common import carry_stream as CS
+
+    def one(off, cnt, ow, pa, row):
+        carry = agent.carry_init()
+        vs, vc = CS.zero_memory(TOTAL_V, EMBD)
+        step = jax.checkpoint(
+            lambda c, u, w: CS.advance(
+                agent, c, u, w, s["stream"], cnt, ow,
+                start=off, row=row, window=WINDOW, participants=pa,
+                chunk=CHUNK, budget=budget))
+        carry, vs, vc = step(carry, vs, vc)
+        return (jnp.sum(carry.M * 1.0) + jnp.sum(carry.I * 2.0)
+                + jnp.sum(vs * 4.0) + jnp.sum(vc * 5.0))
+
+    cnts = jnp.asarray(np.array(COUNTS, np.int32))
+    rows = jnp.arange(len(COUNTS), dtype=jnp.int32)
+    return jnp.sum(jax.vmap(one)(s["offs"], cnts, s["owner"],
+                                 s["part"], rows))
+
+
+def test_the_streamed_checkpointed_advance_under_vmap_runs_and_is_close(setup):
+    s = setup
+    bud = jnp.asarray(max(COUNTS), jnp.int32)
+    with count_vjp(False):
+        g_old = eqx.filter_grad(
+            lambda ag: _stream_scalar(ag, s, bud))(s["agent"])
+    with count_vjp(True):
+        g_new = eqx.filter_grad(
+            lambda ag: _stream_scalar(ag, s, bud))(s["agent"])
+    _assert_real_grad(g_old)
+    _assert_close_tree(g_old, g_new, "streamed checkpointed gradient",
+                       ulps=8.0)

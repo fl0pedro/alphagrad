@@ -85,6 +85,8 @@ import os
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+from jax import dtypes as _dtypes
 from jax import lax
 
 try:                                        # jax.core is the long-lived name
@@ -103,6 +105,14 @@ def enabled() -> bool:
     does not become the default on its own.
     """
     return os.environ.get("ALPHAGRAD_COUNT_VJP", "0") != "0"
+
+
+def _zero_ct(x):
+    """The cotangent JAX expects for a primal it will never differentiate."""
+    a = jnp.asarray(x)
+    if jnp.issubdtype(a.dtype, jnp.inexact):
+        return jnp.zeros(a.shape, a.dtype)
+    return np.zeros(a.shape, _dtypes.float0)
 
 
 def _is_inexact(x) -> bool:
@@ -242,16 +252,24 @@ def count_loop(body, carry, *, nb, nb_live, y_struct=None):
         out = lax.while_loop(_cond, _body, init)
         return out[1], out[2], None
 
+    # EVERY traced value is an explicit argument, the non-differentiated ones
+    # included. A value merely CLOSED OVER by a custom_vjp becomes an implicit
+    # const of its jaxpr, and under `vmap` (and again under `jax.checkpoint`,
+    # which the loss wraps around the whole advance) the rule then has no
+    # batch dimension recorded for it. That is a rank mismatch deep inside the
+    # loop, not an error message that names the cause -- it came out as a
+    # `broadcast_in_dim` complaint three frames away. So `co` and `lv` ride in
+    # as arguments and come back out through `res`, and the backward returns
+    # `float0` for the integer ones, which is the cotangent JAX expects for an
+    # integer primal.
     @jax.custom_vjp
-    def _loop(c0, cf):
-        c_f, ys_f, _ = _sweep(c0, cf, cs_o, live, save=False)
+    def _loop(c0, cf, co, lv):
+        c_f, ys_f, _ = _sweep(c0, cf, co, lv, save=False)
         return c_f, ys_f
 
-    def _loop_fwd(c0, cf):
-        c_f, ys_f, stack = _sweep(c0, cf, cs_o, live, save=True)
-        # EVERYTHING the backward reads travels in `res`. Nothing traced is
-        # closed over -- see `hoist_closure`.
-        return (c_f, ys_f), (stack, cf, cs_o, live)
+    def _loop_fwd(c0, cf, co, lv):
+        c_f, ys_f, stack = _sweep(c0, cf, co, lv, save=True)
+        return (c_f, ys_f), (stack, cf, co, lv)
 
     def _loop_bwd(res, ct):
         stack, cf, co, lv = res
@@ -288,8 +306,8 @@ def count_loop(body, carry, *, nb, nb_live, y_struct=None):
 
         _i, g_c, g_cf = lax.while_loop(
             _cond, _body, (lv - 1, ct_c, g_cf0))
-        return g_c, g_cf
+        return g_c, g_cf, [_zero_ct(x) for x in co], _zero_ct(lv)
 
     _loop.defvjp(_loop_fwd, _loop_bwd)
-    c_f, ys_f = _loop(carry, cs_f)
+    c_f, ys_f = _loop(carry, cs_f, cs_o, live)
     return c_f, (ys_f if has_y else None)
