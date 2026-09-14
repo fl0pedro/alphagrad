@@ -35,23 +35,25 @@ other pair.
 
 THE BIN IS CHOSEN, NOT ONLY GROWN (owner clarification of 2026-09-14). The
 bins are a SMALL SET OF COMPILED PROGRAMS, one per power of two, and the
-driver picks one per episode. Before each rollout it takes the smallest bin
-that holds the RECENT HISTORY: the longest episode stream of the last
-`ALPHAGRAD_EPISODE_TOKENS_HISTORY` episodes, times
-`ALPHAGRAD_EPISODE_TOKENS_MARGIN`. So a run drifts back DOWN to a smaller
-bin when the deltas shrink, and moves up only when an episode needs it. The
-compile per bin happens once, because jit keys on the static shape and the
-persistent JAX compilation cache carries it across runs, so switching
-between bins that are already compiled is free.
+driver picks one per episode from the recent history. The rule is
+:data:`SELECTION_RULE` and it is HYSTERETIC: up is immediate, down needs the
+whole history window to agree. A bin change is a retrace and a recompile of
+the rollout, the loss and the optimiser update, so a bin that flips on one
+measurement costs minutes at transformer width; a bin that is one power of
+two too large costs only memory.
 
-OVERFLOW. The host knows every environment's exact stream length after each
-step, so the check is exact and it is one per step per environment rather
-than one per token. A step that would pass `2^n` raises
-:class:`EpisodeStreamOverflow` BEFORE the write. The driver catches it, logs
-one line, RE-RUNS THAT EPISODE at the next larger bin, and records the length
-that overflowed in the history, so the next episode's choice already knows
-about it. `ALPHAGRAD_EPISODE_TOKENS_LOG2_MAX` is a hard cap and a raise -- a
-runaway stream cannot fill the device in silence.
+OVERFLOW IS A DEVICE VALUE, NOT A RAISE (review finding 2, 2026-09-14). The
+check `cursor + count <= 2^n` is arithmetic the rollout already has on the
+device, so it is done there. A step that would pass the bin sets an
+OVERFLOW FLAG in the scan carry and clamps its own write offset to `2^n`, so
+every write and every later read still lands inside the row and nothing is
+corrupted outside the attempt. The rollout RUNS TO THE END and hands the
+flag, the offending length and the step back beside the used length. The
+DRIVER reads the flag on the host after the rollout, records the length in
+the bin history, logs ONE line, THROWS THE WHOLE ATTEMPT AWAY and repeats
+the episode one bin up. Nothing is matched against a jaxlib message and
+nothing raises inside a callback. `ALPHAGRAD_EPISODE_TOKENS_LOG2_MAX` is a
+hard cap and a raise -- a runaway stream cannot fill the device in silence.
 """
 
 from __future__ import annotations
@@ -88,33 +90,67 @@ FIRST_BIN_RULE = (
 )
 
 # THE PER-EPISODE SELECTION RULE, STATED ONCE (the flag help quotes it too).
+#
+# WHY HYSTERESIS. A bin is a SHAPE, so every move retraces and recompiles the
+# rollout, the loss and the optimiser update. Moving on one measurement is
+# what produced the observed `2^15 -> 2^10` five-doubling jump off a single
+# toy episode. Up is cheap to be wrong about (one power of two of unused
+# memory); down is expensive to be wrong about (an overflow, a discarded
+# episode and a repeat). So they are not symmetric.
 SELECTION_RULE = (
-    "the smallest power of two that holds the longest episode stream of the "
-    "last " + HISTORY_ENV + " episodes (default "
-    + str(HISTORY_DEFAULT) + ") times " + MARGIN_ENV + " (default "
-    + str(MARGIN_DEFAULT) + "); with no history yet it is the first bin"
+    "the bin moves UP at once when the longest of the last " + HISTORY_ENV
+    + " episodes (default " + str(HISTORY_DEFAULT) + ") times " + MARGIN_ENV
+    + " (default " + str(MARGIN_DEFAULT) + ") no longer fits it, and DOWN "
+    "only when that whole window is full and ALL of it fits the next "
+    "smaller bin; either way by at most one power of two per episode, "
+    "except after an overflow, which goes straight to the bin the "
+    "overflowing length needs; with no history yet it is the first bin"
 )
 
 
-class EpisodeStreamOverflow(Exception):
-    """A step's delta would have been written past the bin.
+class EpisodeStreamCapReached(Exception):
+    """The bin hit `ALPHAGRAD_EPISODE_TOKENS_LOG2_MAX` and cannot grow."""
 
-    Raised on the HOST, before the write, by :func:`check_cursors`. The
-    driver catches it, raises `n` by one and repeats the episode; nothing
-    else may catch it, because a swallowed overflow is a silently corrupt
-    trajectory (``dynamic_update_slice`` clamps, it does not raise).
+    def __init__(self, log2, cap):
+        self.log2 = int(log2)
+        self.cap = int(cap)
+        super().__init__(
+            f"episode token stream bin 2^{self.log2} overflowed and the cap "
+            f"{LOG2_MAX_ENV}={self.cap} forbids growing it. Either the "
+            f"deltas are far longer than the measurement said, or a stream "
+            f"is not being reset per episode."
+        )
+
+
+class StreamOverflow:
+    """ONE episode's overflow, as a plain record. NOT an exception.
+
+    The rollout detects the overflow on the DEVICE and reports it as two
+    int32 arrays (the offending length and the step, per environment). This
+    is what the host turns them into: the environment, the step, the length
+    and the bin, so the driver's one log line can name all four. Nothing
+    raises, so nothing has to survive a `pure_callback` boundary and nothing
+    is recognised by matching a runtime's message text.
     """
+
+    __slots__ = ("env_index", "step", "length", "log2")
 
     def __init__(self, env_index, step, length, log2):
         self.env_index = int(env_index)
         self.step = int(step)
         self.length = int(length)
         self.log2 = int(log2)
-        super().__init__(
-            f"episode token stream overflow: environment {self.env_index} "
-            f"at step {self.step} would reach length {self.length}, past the "
-            f"bin 2^{self.log2} = {1 << self.log2} slots "
-            f"({LOG2_ENV}={self.log2})"
+
+    def __repr__(self):
+        return (f"StreamOverflow(env_index={self.env_index}, "
+                f"step={self.step}, length={self.length}, "
+                f"log2={self.log2})")
+
+    def __str__(self):
+        return (
+            f"environment {self.env_index} at step {self.step} would reach "
+            f"length {self.length}, past the bin 2^{self.log2} = "
+            f"{1 << self.log2} slots ({LOG2_ENV}={self.log2})"
         )
 
 
@@ -226,6 +262,12 @@ def single_row(tokens, max_delta_tokens: int, chunk=None):
     :func:`stream_tail` for the reason that function exists: a read of the
     last chunk runs to the fold's PADDED window, and ``dynamic_slice``
     clamps rather than raising if the row is shorter.
+
+    `max_delta_tokens` is REQUIRED and it is the READER's width, not the
+    window's own. The two happen to be equal at the shipped scale; sizing
+    the row from the window instead would make them diverge silently at any
+    other scale, which is the exact failure :func:`stream_tail` exists to
+    prevent.
     """
     import jax.numpy as jnp
 
@@ -267,35 +309,6 @@ def grow(log2: int) -> int:
     return int(log2) + 1
 
 
-# THE MARKER THE RAISE IS RECOGNISED BY when its TYPE did not survive.
-# `check_cursors` runs inside a `jax.pure_callback`, so its exception comes
-# back out through XLA, and the runtime is free to wrap it (jaxlib raises
-# its own error class with the original message attached). Matching on the
-# class alone would make the growth path depend on a jaxlib detail, and a
-# missed match is a CRASHED RUN instead of a grown bin.
-OVERFLOW_MARKER = "episode token stream overflow"
-
-
-def overflow_in(exc):
-    """The overflow inside ``exc``, however the runtime wrapped it, or None.
-
-    Looks for the typed exception anywhere in the `__cause__` /
-    `__context__` chain first, and falls back to :data:`OVERFLOW_MARKER` in
-    the text. Returns the exception to report, never a bare bool, so the
-    caller logs the real message.
-    """
-    seen = set()
-    cur = exc
-    while cur is not None and id(cur) not in seen:
-        seen.add(id(cur))
-        if isinstance(cur, EpisodeStreamOverflow):
-            return cur
-        cur = cur.__cause__ or cur.__context__
-    if OVERFLOW_MARKER in str(exc):
-        return exc
-    return None
-
-
 def log2_for_length(length) -> int:
     """The smallest `n` with `2^n >= length`. `n = 0` for an empty stream."""
     n = int(max(0, int(length)))
@@ -304,14 +317,96 @@ def log2_for_length(length) -> int:
     return int(n - 1).bit_length()
 
 
+# ---------------------------------------------------------------------------
+# THE OVERFLOW CHECK, ON THE DEVICE (review finding 2).
+# ---------------------------------------------------------------------------
+
+def write_offset(cursor, count, log2):
+    """DEVICE side: `(offset, end, over)` for one step's write.
+
+    * `end = cursor + count` is where the cursor lands after this write.
+    * `over` is `end > 2^n`, the overflow: this delta does not fit the bin.
+    * `offset` is `min(cursor, 2^n)` -- CLAMPED, so the write is inside the
+      row whatever happened. The row is `2^n + TAIL` slots and TAIL is at
+      least a full window, so a write of a whole window at `2^n` still fits
+      and `dynamic_update_slice` never has to clamp it silently. The stream
+      of an overflowing attempt holds the wrong bytes, and that is fine: the
+      DRIVER throws the whole attempt away.
+
+    No host round trip and no raise. The old form asked the host for this
+    offset through a `jax.pure_callback` purely so that a Python `raise`
+    could happen before the write; the raise then had to survive XLA, which
+    it did not (it arrived as a `JaxRuntimeError` recognised by a substring
+    of a jaxlib message). The arithmetic here is the same arithmetic and it
+    is where the numbers already are.
+    """
+    import jax.numpy as jnp
+
+    bin_slots = jnp.asarray(1 << int(log2), jnp.int32)
+    cur = jnp.asarray(cursor, jnp.int32)
+    cnt = jnp.asarray(count, jnp.int32)
+    end = cur + cnt
+    return jnp.minimum(cur, bin_slots), end, end > bin_slots
+
+
+def carry_overflow(seen_length, seen_step, end, over, step):
+    """DEVICE side: keep the FIRST overflow of the episode in the carry.
+
+    `seen_length` is 0 while nothing has overflowed -- a real overflowing
+    length is above `2^n` and so above 0 for every bin, so 0 is an
+    unambiguous "no". Keeping the FIRST one is what makes the log line name
+    the step the episode actually went wrong at rather than the last step.
+    """
+    import jax.numpy as jnp
+
+    first = jnp.logical_and(over, seen_length <= 0)
+    return (jnp.where(first, end.astype(jnp.int32), seen_length),
+            jnp.where(first, jnp.asarray(step, jnp.int32), seen_step))
+
+
+def overflow_from(over_length, over_step, log2):
+    """HOST side: the per-environment flags as one :class:`StreamOverflow`.
+
+    `over_length` and `over_step` are the `(num_envs,)` int32 arrays the
+    rollout returns. Zero length means that environment did not overflow.
+    Returns the FIRST offending environment, or None when nothing
+    overflowed. Reading these blocks on the rollout, which is one
+    synchronisation per EPISODE -- the old form paid one host round trip per
+    STEP for the same information.
+    """
+    lengths = np.atleast_1d(np.asarray(over_length)).reshape(-1)
+    steps = np.atleast_1d(np.asarray(over_step)).reshape(-1)
+    if lengths.shape != steps.shape:
+        raise ValueError(
+            f"overflow_from: {lengths.shape} lengths against "
+            f"{steps.shape} steps")
+    hit = np.nonzero(lengths > 0)[0]
+    if hit.size == 0:
+        return None
+    e = int(hit[0])
+    return StreamOverflow(env_index=e, step=int(steps[e]),
+                          length=int(lengths[e]), log2=int(log2))
+
+
 class BinPolicy:
     """WHICH BIN THE NEXT EPISODE COMPILES FOR. The rule lives here only.
 
     The bins are a small set of compiled programs, one per power of two, and
     this picks one per episode by :data:`SELECTION_RULE`. It goes DOWN as
-    readily as up: an episode history that shrinks picks the smaller bin
-    again, and the program for it is already compiled, so the switch is
-    free.
+    well as up, but NOT symmetrically, because a bin change is a recompile
+    of the rollout, the loss and the optimiser update:
+
+    * UP is immediate. The first episode whose recent maximum times the
+      margin no longer fits the current bin moves it, by one power of two.
+    * An OVERFLOW moves it as far as the overflowing length needs, at once,
+      because that length is a measured hard requirement and stepping up one
+      power of two at a time would discard one episode per step.
+    * DOWN needs the WHOLE history window: `ALPHAGRAD_EPISODE_TOKENS_HISTORY`
+      episodes must all have been recorded, and all of them must fit the
+      next smaller bin with the margin. Then it moves by exactly one power
+      of two. So the bin cannot fall five doublings off one toy episode,
+      which is what a run at the default first bin used to do on its second
+      rollout.
 
     `initial_log2` is what :meth:`pick` returns while the history is empty
     (`ALPHAGRAD_EPISODE_TOKENS_LOG2` when set, else the measured first bin).
@@ -347,46 +442,103 @@ class BinPolicy:
         # The bin the LAST episode ran at, or None before the first one.
         # Only used to decide whether a bin change is worth a log line.
         self.last_used = None
+        # Did the last recorded episode OVERFLOW? Set by
+        # :meth:`record_overflow`, cleared by :meth:`pick`. It is the one
+        # exception to the one-power-of-two-per-episode limit.
+        self.overflowed = False
 
     def record(self, length) -> None:
-        """Note one episode's LONGEST stream (both streams, all environments).
+        """Note one SUCCESSFUL episode's longest stream (both streams, all
+        environments)."""
+        self.recent.append(int(max(0, int(length))))
 
-        Called on success with what the episode actually used, and on an
-        overflow with the length that overflowed, so the next choice already
-        knows about it.
+    def record_overflow(self, length) -> None:
+        """Note the length that OVERFLOWED, and that it overflowed.
+
+        The next :meth:`pick` may then move up by more than one power of two
+        -- that length is a measurement, not a trend, and stepping towards
+        it one doubling per episode would discard one episode per step.
         """
         self.recent.append(int(max(0, int(length))))
+        self.overflowed = True
+
+    def _target(self) -> int:
+        """The bin the recent history asks for, cap CHECKED not clamped."""
+        need = math.ceil(max(self.recent) * self.margin)
+        want = log2_for_length(need)
+        if want > self.cap:
+            # A silent clamp here just moves the failure to the overflow
+            # that follows, and names the wrong cause in the log.
+            raise EpisodeStreamCapReached(want, self.cap)
+        return want
 
     def pick(self) -> int:
         """The bin for the next episode. See :data:`SELECTION_RULE`."""
         if not self.recent:
             self.log2 = self.initial
+            self.overflowed = False
             return self.log2
-        need = math.ceil(max(self.recent) * self.margin)
-        self.log2 = min(log2_for_length(need), self.cap)
+        current = int(self.log2)
+        target = self._target()
+        if target > current:
+            # UP, immediately. One power of two per episode, unless the last
+            # episode actually overflowed, in which case go where the
+            # measured length says.
+            chosen = target if self.overflowed else current + 1
+        elif target < current:
+            # DOWN, but only on the WHOLE window and only one step.
+            if len(self.recent) < self.window:
+                chosen = current
+            else:
+                chosen = current - 1
+        else:
+            chosen = current
+        self.log2 = min(chosen, self.cap)
+        self.overflowed = False
         return self.log2
 
-    def bump(self, log2) -> int:
-        """One doubling for the repeat of an episode that overflowed."""
-        self.log2 = grow(log2)
+    def bump(self, log2, length=None) -> int:
+        """The bin for the REPEAT of an episode that overflowed.
+
+        At least one doubling, and at least what `length` needs, so a bin
+        that was several doublings too small costs one repeat rather than
+        one repeat per doubling.
+        """
+        n = grow(log2)
+        if length:
+            n = max(n, log2_for_length(length))
+        if n > self.cap:
+            raise EpisodeStreamCapReached(n, self.cap)
+        self.log2 = n
         return self.log2
 
 
-def run_episode(policy, what, fn, log=print):
+def run_episode(policy, what, fn, log=print, on_discard=None):
     """Run ONE episode at the bin `policy` chose; repeat it a bin up on
     overflow.
 
-    `fn(n)` runs the episode compiled for `2^n`. On
-    :class:`EpisodeStreamOverflow`: record the length that overflowed, log
-    ONE line with the old bin, the new bin and what overflowed, and run the
-    SAME episode again one bin up. A new bin is a new stream shape, so the
-    caller's jit retraces by itself; a bin it has already compiled costs
-    nothing to go back to.
+    `fn(n)` runs the episode compiled for `2^n` and returns
+    `(result, overflow)`, where `overflow` is None or the
+    :class:`StreamOverflow` the rollout reported. NOTHING is raised and
+    nothing is caught here: the rollout runs to the end whatever happened,
+    and the overflow arrives as an ordinary device value the host reads
+    afterwards. That is what makes the path independent of whether a
+    callback's Python exception survives XLA, which it does not, and of
+    asynchronous dispatch, which the exception form was never verified
+    under.
 
-    Nothing of the failed attempt survives: the caller rebinds the agent,
-    the optimiser state and the env states only on RETURN, so the repeat
-    starts from exactly the state the first attempt started from. The host
-    callbacks of the failed attempt did run, so their counters saw it.
+    On an overflow: record the length in the history, log ONE line naming
+    the old bin, the new bin, what was running, the environment and the
+    length, THROW THE WHOLE RESULT AWAY, call `on_discard(result)` so the
+    caller can roll back the host-side counters the discarded attempt
+    advanced, and run the SAME episode again one bin up. A new bin is a new
+    stream shape, so the caller's jit retraces by itself; a bin it has
+    already compiled costs nothing to go back to.
+
+    Nothing of the failed attempt survives on the device either: the caller
+    rebinds the agent, the optimiser state and the env states only on
+    RETURN, so the repeat starts from exactly the state the first attempt
+    started from.
 
     The caller records the SUCCESSFUL episode's length itself
     (`policy.record(...)`), because only the caller sees the cursors the
@@ -403,59 +555,14 @@ def run_episode(policy, what, fn, log=print):
             "margin %g)"
             % (previous, n, what, max(policy.recent), policy.margin))
     while True:
-        try:
-            return fn(n)
-        except Exception as exc:                       # noqa: BLE001
-            inner = overflow_in(exc)
-            if inner is None:
-                raise
-            length = getattr(inner, "length", None)
-            if length:
-                policy.record(length)
-            old, n = n, policy.bump(n)
-            policy.last_used = n
-            log("[episode-stream] bin 2^%d -> 2^%d, repeating %s: %s"
-                % (old, n, what, inner))
-
-
-class EpisodeStreamCapReached(Exception):
-    """The bin hit `ALPHAGRAD_EPISODE_TOKENS_LOG2_MAX` and cannot grow."""
-
-    def __init__(self, log2, cap):
-        self.log2 = int(log2)
-        self.cap = int(cap)
-        super().__init__(
-            f"episode token stream bin 2^{self.log2} overflowed and the cap "
-            f"{LOG2_MAX_ENV}={self.cap} forbids growing it. Either the "
-            f"deltas are far longer than the measurement said, or a stream "
-            f"is not being reset per episode."
-        )
-
-
-def check_cursors(cursors, counts, step, log2):
-    """HOST side: raise if any environment's next write passes the bin.
-
-    `cursors` and `counts` carry a leading environment axis when the caller
-    is inside the rollout's `vmap` (``pure_callback(vmap_method=
-    "expand_dims")`` gives the host the whole batch, rows in env order, so
-    the row index IS the environment). Returns the cursors UNCHANGED, and
-    the caller must use the RETURNED value as the write offset: that data
-    dependency is what puts the raise BEFORE the write.
-    """
-    cur = np.atleast_1d(np.asarray(cursors)).reshape(-1).astype(np.int64)
-    cnt = np.atleast_1d(np.asarray(counts)).reshape(-1).astype(np.int64)
-    if cur.shape != cnt.shape:
-        raise ValueError(
-            f"check_cursors: {cur.shape} cursors against {cnt.shape} counts")
-    bin_slots = 1 << int(log2)
-    ends = cur + cnt
-    over = np.nonzero(ends > bin_slots)[0]
-    if over.size:
-        e = int(over[0])
-        raise EpisodeStreamOverflow(
-            env_index=e,
-            step=int(np.asarray(step).reshape(-1)[0]),
-            length=int(ends[e]),
-            log2=int(log2),
-        )
-    return np.asarray(cursors)
+        result, overflow = fn(n)
+        if overflow is None:
+            return result
+        policy.record_overflow(overflow.length)
+        old, n = n, policy.bump(n, overflow.length)
+        policy.last_used = n
+        log("[episode-stream] bin 2^%d -> 2^%d, repeating %s: %s"
+            % (old, n, what, overflow))
+        if on_discard is not None:
+            on_discard(result)
+        result = None

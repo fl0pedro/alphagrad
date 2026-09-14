@@ -160,37 +160,37 @@ from alphagrad.approx.common import feature_probe as _fprobe
 from alphagrad.approx.common import var_probe as _vprobe
 from alphagrad.approx.common import gate_telemetry as _gate_telemetry
 from alphagrad.approx.common import episode_stream as _epstream
-from alphagrad.approx.common.episode_stream import EpisodeStreamOverflow
 
 # Same switch carry_stream reads, so one flag turns the whole fold on or
 # off rather than leaving half the consumers folded and half not.
 _FOLD_DELTA = os.environ.get("ALPHAGRAD_FOLD_DELTA", "1") != "0"
 
 
-def _ep_stream_offset(cursor, count, step, log2):
-    """The write offset for one step, AFTER the host has checked the bin.
+def _ep_stream_step(stream, cursor, tokens, count, step, log2,
+                    over_len, over_step):
+    """One step's episode-stream write and the overflow flag it carries.
 
-    A `pure_callback` and not a device predicate, because the contract is a
-    RAISE: the driver has to catch it, grow the bin and repeat the episode,
-    and nothing on the device can raise. `vmap_method="expand_dims"` hands
-    the host the whole environment batch in one call, rows in environment
-    order, so the row index IS the environment (the same convention
-    `env._batched_host` uses for `_ENV_SLOT`), and the cost is one host
-    round trip per STEP rather than one per environment per step.
+    NO HOST ROUND TRIP AND NO RAISE (review finding 2 / finding 4). The
+    check `cursor + count <= 2^n` is arithmetic the rollout already has on
+    the device, so `episode_stream.write_offset` does it there. It hands
+    back a CLAMPED offset, so the write lands inside the row whatever
+    happened and `dynamic_update_slice` never has to clamp it in silence,
+    and an `over` predicate that `episode_stream.carry_overflow` folds into
+    the scan carry. The rollout runs to the end; the DRIVER reads the flag
+    afterwards, discards the whole attempt and repeats the episode one bin
+    up.
 
-    THE RETURN VALUE IS THE POINT. The caller must use it as the write
-    offset: without that data dependency XLA is free to run the write
-    before the check, and `dynamic_update_slice` CLAMPS rather than
-    raising, so the overflow would land as silently shifted tokens.
+    The old form asked the HOST for this offset through a `pure_callback`
+    purely so a Python `raise` could happen before the write. That raise did
+    not survive XLA (it arrived as a `JaxRuntimeError` whose text had to be
+    substring-matched), it cost one host round trip per stream per step, and
+    it was never verified under asynchronous GPU dispatch.
     """
-    return jax.pure_callback(
-        partial(_epstream.check_cursors, log2=int(log2)),
-        jax.ShapeDtypeStruct((), jnp.int32),
-        jnp.asarray(cursor, jnp.int32),
-        jnp.asarray(count, jnp.int32),
-        jnp.asarray(step, jnp.int32),
-        vmap_method="expand_dims",
-    )
+    offset, end, over = _epstream.write_offset(cursor, count, log2)
+    stream = _ep_stream_write(stream, offset, tokens, count)
+    over_len, over_step = _epstream.carry_overflow(
+        over_len, over_step, end, over, step)
+    return stream, offset, end, over_len, over_step
 
 
 def _ep_stream_write(stream, offset, tokens, count):
@@ -4309,11 +4309,14 @@ def make_argparser() -> argparse.ArgumentParser:
              + ". THEREAFTER THE DRIVER CHOOSES A BIN PER EPISODE: "
              + _epstream.SELECTION_RULE
              + ". The bins are a small set of compiled programs, one per "
-             "power of two, so a run drifts back DOWN to a smaller bin when "
-             "the deltas shrink and the switch costs nothing. A step that "
-             "would pass 2^n raises on the host BEFORE the write; the "
-             "driver logs one line, re-runs that episode one bin up and "
-             "records the length. The hard cap is "
+             "power of two, and a bin change RETRACES the rollout, the loss "
+             "and the optimiser update, which is why the rule is "
+             "hysteretic rather than symmetric. A step that would pass 2^n "
+             "sets an overflow flag on the DEVICE and clamps its write, so "
+             "nothing lands outside the row; after the rollout the driver "
+             "reads the flag, logs one line, throws the whole attempt away "
+             "and re-runs that episode one bin up with the overflowing "
+             "length recorded. The hard cap is "
              + _epstream.LOG2_MAX_ENV + ".")
     p.add_argument("--no-jit", action="store_true")
     p.add_argument(
@@ -8467,18 +8470,55 @@ def main():
     # and the same order `env._batched_host` walks its slots in, so the row
     # the overflow message names is the row the telemetry names.
     _EP_ENV_IDX = jnp.arange(num_envs, dtype=jnp.int32)
+    # THE ONLY BOUND ON THE ROW INDEX (review finding 8). Every loss-side
+    # read of the streams is `dynamic_slice(stream, (env_index, ...))`, and
+    # `dynamic_slice` CLAMPS an out-of-range row instead of raising, so an
+    # `env_index` past the end would read a neighbouring environment's
+    # tokens in silence. It is checked HERE, where it is concrete and the
+    # check costs nothing, rather than per read where it would not be.
+    if (int(_EP_ENV_IDX.shape[0]) != int(num_envs)
+            or not bool(jnp.all(_EP_ENV_IDX
+                                == jnp.arange(num_envs, jnp.int32)))):
+        raise ValueError(
+            f"the rollout's environment index must be exactly "
+            f"0..{int(num_envs) - 1}, one row per environment; got "
+            f"{_EP_ENV_IDX}")
+
+    # DOES THE FACE STREAM EXIST AT ALL? The SAME static flag the loss's
+    # reader is gated on (`fch=... if _LIVE_FACES is not None`, under
+    # `if args.face_actions`). With face actions off the rollout used to
+    # allocate a second full row per environment, scatter a zeroed window
+    # into it every step and pay a host round trip to check it, for a
+    # stream nothing ever read (review finding 3). Now there is no leaf, no
+    # scatter and no check.
+    _EP_FACE = bool(getattr(args, "face_actions", False)) and (
+        _LIVE_FACES is not None)
+    if _KL_REF_ON and not _EP_FACE:
+        # The trust region re-scores the STORED FACE ACTIONS out of the face
+        # episode stream, so it is a reader of that stream. Without the
+        # stream it used to read a zeroed row and compare the live policy
+        # against a reference replay of nothing.
+        raise ValueError(
+            "--kl-ref-weight / --kl-ref-target re-score the stored face "
+            "actions, so they need --face-actions together with "
+            "--live-faces.")
 
     def _episode_streams(log2):
-        """Two zeroed episode streams, one row per environment.
+        """The episode stream(s), one zeroed row per environment.
 
         `2^log2 + TAIL` uint8 slots each (see `common.episode_stream`). They
         are allocated here and passed in because the bin is a SHAPE: a new
         bin is a new shape, and a new shape retraces `rollout_fn` by itself,
         which is exactly what the growth path needs.
+
+        The second element is the FACE stream, and it is None unless the
+        loss actually reads it (`_EP_FACE`). None is not a pytree leaf, so
+        it costs nothing to carry through the vmap and the scan.
         """
         L = _epstream.stream_length(int(log2), MAX_DELTA_TOKENS)
         return (jnp.zeros((num_envs, L), DELTA_TOKEN_DTYPE),
-                jnp.zeros((num_envs, L), DELTA_TOKEN_DTYPE))
+                jnp.zeros((num_envs, L), DELTA_TOKEN_DTYPE)
+                if _EP_FACE else None)
 
     # THE BIN, AND THE ONLY PLACE IT IS CHOSEN. The bins are a small set of
     # compiled programs, one per power of two, and this object picks one per
@@ -8497,6 +8537,44 @@ def main():
              _epstream.FIRST_BIN_RULE, _epstream.SELECTION_RULE,
              _epstream.LOG2_ENV,
              _epstream.LOG2_MAX_ENV, _epstream.log2_max()), flush=True)
+
+    # WHAT A DISCARDED ATTEMPT MUST NOT LEAVE BEHIND (review finding 5).
+    # An episode that overflows its bin is thrown away and repeated one bin
+    # up. Its device side vanishes by itself, because the agent, the
+    # optimiser state and the env states are rebound only on RETURN. Its
+    # HOST side does not: every step of the failed attempt already ran its
+    # env callback, so the plan log, its terminal counter, the truncation
+    # counters and every other per-episode accumulator saw it. An overflow
+    # at a late step would double-count that episode's terminal plans, which
+    # is the artifact the trustworthiness claims are built on. So the
+    # attempt takes a snapshot first and the discard puts it back.
+    # AND WHAT THE SURVIVING RECORDS MUST SAY. Verification jobs 65410 and
+    # 65413 found the discarded attempt's plan records and the repeat's
+    # side by side, both stamped `"episode": 0`, three pairs byte-identical,
+    # with no field telling them apart. The rollback removes the discarded
+    # ones; `attempt` says which try the survivors came from, so a reader
+    # never has to infer it.
+    from alphagrad.approx import env as _ep_env_mod
+    _EP_HOST_SNAP = [None]
+    _EP_ATTEMPT = [0]
+
+    def _ep_new_episode():
+        """Called ONCE per episode, before the first attempt at it."""
+        _EP_ATTEMPT[0] = 0
+
+    def _ep_begin_attempt():
+        """Called at the top of EVERY attempt, including the repeats."""
+        _EP_HOST_SNAP[0] = _ep_env_mod.episode_telemetry_snapshot()
+        _ep_env_mod.set_plan_log_attempt(_EP_ATTEMPT[0])
+
+    def _ep_discard(result):
+        """Roll the host counters back to where this attempt found them."""
+        del result
+        snap = _EP_HOST_SNAP[0]
+        if snap is not None:
+            _ep_env_mod.episode_telemetry_restore(snap)
+            _EP_HOST_SNAP[0] = None
+        _EP_ATTEMPT[0] += 1
 
     @eqx.filter_jit
     # +1 entry for vertex_temperature (broadcast, not mapped): the PopArt
@@ -8529,16 +8607,28 @@ def main():
         keys = jrand.split(key, rollout_length)
 
         # THE BIN, read off the row that arrived (see the in_axes note).
-        # Both streams share it -- one bin, two streams.
-        if ep_tokens is None or ep_face_tokens is None or env_index is None:
+        # Both streams share it -- one bin, and the face stream only when
+        # the loss reads it (`_EP_FACE`).
+        if ep_tokens is None or env_index is None:
             raise ValueError(
-                "rollout_fn: the two episode streams and the environment "
-                "index are required arguments (the streams carry the bin "
-                "as their shape); pass `_episode_streams(...)` for both "
-                "streams and `jnp.arange(num_envs)` for the index.")
+                "rollout_fn: the episode stream and the environment "
+                "index are required arguments (the stream carries the bin "
+                "as its shape); pass `_episode_streams(...)` and "
+                "`jnp.arange(num_envs)` for the index.")
+        if _EP_FACE and ep_face_tokens is None:
+            raise ValueError(
+                "rollout_fn: --face-actions with --live-faces reads the "
+                "face episode stream, so it must be passed; "
+                "`_episode_streams(...)` builds it.")
+        if not _EP_FACE and ep_face_tokens is not None:
+            raise ValueError(
+                "rollout_fn: nothing reads the face episode stream without "
+                "--face-actions and --live-faces, so it must not be "
+                "allocated (review finding 3).")
         _EP_N = _epstream.log2_of_row(
             int(ep_tokens.shape[0]), MAX_DELTA_TOKENS)
-        if int(ep_face_tokens.shape[0]) != int(ep_tokens.shape[0]):
+        if _EP_FACE and int(ep_face_tokens.shape[0]) != int(
+                ep_tokens.shape[0]):
             raise ValueError(
                 "rollout_fn: the delta stream and the face stream must "
                 f"share one bin, got {ep_tokens.shape[0]} and "
@@ -8657,9 +8747,14 @@ def main():
                  ep_state) = carry
             else:
                 state, elim_order, enc_state, prev_part, ep_state = carry
-            # The two episode streams and their two cursors, one pair per
-            # environment (this whole function is under `jax.vmap`).
-            ep_tok_c, ep_cur_c, ep_ftok_c, ep_fcur_c = ep_state
+            # The episode stream(s), their cursors and the overflow the
+            # episode has seen so far, one set per environment (this whole
+            # function is under `jax.vmap`). `ep_ovl_c` is 0 until a step
+            # would pass the bin; the face half is only here when the loss
+            # reads it (`_EP_FACE`).
+            (ep_tok_c, ep_cur_c, ep_ovl_c, ep_ovs_c) = ep_state[:4]
+            if _EP_FACE:
+                ep_ftok_c, ep_fcur_c = ep_state[4:]
             sample_key, next_net_key = jrand.split(k, 2)
             vertex_avail_mask = vertex_avail_at_step(
                 state, vertex_valid_static, total_v, num_valid,
@@ -8689,17 +8784,17 @@ def main():
             ).astype(jnp.int32)
             delta_tok = state.delta_tokens
             delta_count = state.delta_count
-            # THE EPISODE STREAM WRITE. The host is asked for the offset
-            # first -- that call raises if this step would pass the bin, and
-            # its RESULT is the offset, so the raise is strictly before the
-            # write (see `_ep_stream_offset`). The cursor then advances by
-            # the EXACT count, so the stream holds the episode's deltas
-            # concatenated in step order with nothing between them.
-            delta_offset = _ep_stream_offset(
-                ep_cur_c, delta_count, state.step_count, _EP_N)
-            ep_tok_c = _ep_stream_write(
-                ep_tok_c, delta_offset, delta_tok, delta_count)
-            ep_cur_n = ep_cur_c + jnp.asarray(delta_count, jnp.int32)
+            # THE EPISODE STREAM WRITE. The bin check is device arithmetic
+            # on the cursor this carry already holds: it clamps the offset
+            # so the write stays inside the row, and raises a FLAG in the
+            # carry when the step would pass the bin (see
+            # `_ep_stream_step`). The cursor then advances by the EXACT
+            # count, so the stream holds the episode's deltas concatenated
+            # in step order with nothing between them.
+            (ep_tok_c, delta_offset, ep_cur_n,
+             ep_ovl_c, ep_ovs_c) = _ep_stream_step(
+                ep_tok_c, ep_cur_c, delta_tok, delta_count,
+                state.step_count, _EP_N, ep_ovl_c, ep_ovs_c)
             # prof/envcb: scan glue (avail mask, key split, the delta unpack
             # above). Under the partial mark anchor this key used to absorb
             # the WHOLE env callback -- `prof/envstep` fired on EnvState's
@@ -9133,14 +9228,22 @@ def main():
             # read -- and NOT the emission window's full length: the last
             # live face's approximation tail is in the emission and in no
             # chunk, and no reader of this stream wants it.
-            _face_total = jnp.sum(
-                face_cnt_v.astype(jnp.int32)).astype(jnp.int32)
-            face_offset = _ep_stream_offset(
-                ep_fcur_c, _face_total, state.step_count, _EP_N)
-            ep_ftok_c = _ep_stream_write(
-                ep_ftok_c, face_offset, face_dt_v, _face_total)
-            ep_fcur_n = ep_fcur_c + _face_total
-            ep_state_next = (ep_tok_c, ep_cur_n, ep_ftok_c, ep_fcur_n)
+            # Nothing reads it without --face-actions and --live-faces, so
+            # without them it is not written, not checked and not allocated
+            # (review finding 3); `face_offset` stays 0 so the trajectory
+            # leaf keeps its shape.
+            if _EP_FACE:
+                _face_total = jnp.sum(
+                    face_cnt_v.astype(jnp.int32)).astype(jnp.int32)
+                (ep_ftok_c, face_offset, ep_fcur_n,
+                 ep_ovl_c, ep_ovs_c) = _ep_stream_step(
+                    ep_ftok_c, ep_fcur_c, face_dt_v, _face_total,
+                    state.step_count, _EP_N, ep_ovl_c, ep_ovs_c)
+                ep_state_next = (ep_tok_c, ep_cur_n, ep_ovl_c, ep_ovs_c,
+                                 ep_ftok_c, ep_fcur_n)
+            else:
+                face_offset = jnp.zeros((), jnp.int32)
+                ep_state_next = (ep_tok_c, ep_cur_n, ep_ovl_c, ep_ovs_c)
             transition = Trajectory(
                 preference=preference.astype(jnp.float32),
                 vertex_idx=jnp.asarray(vertex_idx, dtype=jnp.int32),
@@ -9214,11 +9317,15 @@ def main():
                 (transition, raw_rewards),
             )
 
-        # The two streams and their two cursors ride LAST in the scan carry,
-        # so a step's write is visible to the next step's cursor without any
-        # of the per-step trajectory leaves growing.
+        # The stream(s), their cursors and the overflow record ride LAST in
+        # the scan carry, so a step's write is visible to the next step's
+        # cursor without any of the per-step trajectory leaves growing.
+        # `(overflow length, overflow step)` start at 0: a real overflowing
+        # length is above `2^n`, so 0 is an unambiguous "nothing yet".
         _ep_init = (ep_tokens, jnp.zeros((), jnp.int32),
-                    ep_face_tokens, jnp.zeros((), jnp.int32))
+                    jnp.zeros((), jnp.int32), jnp.zeros((), jnp.int32))
+        if _EP_FACE:
+            _ep_init = _ep_init + (ep_face_tokens, jnp.zeros((), jnp.int32))
         _scan_init = (env_state, jnp.zeros((total_v,), dtype=jnp.int32),
                       init_enc_state, _init_part)
         if _EDGE_MEM:
@@ -9231,14 +9338,22 @@ def main():
         )
         final_state = _carry_out[0]
         _ep_final = _carry_out[-1]
-        # The two streams and, LAST, how much of the bin this environment
-        # actually used. The driver records that length and chooses the next
-        # episode's bin from it (see `episode_stream.BinPolicy`), so it has
-        # to come back out of the rollout, not be inferred from the offsets.
-        # Both streams share one bin, so it is the larger of the two cursors.
-        _ep_used = jnp.maximum(_ep_final[1], _ep_final[3])
+        # The stream(s) and then three numbers the DRIVER needs on the host:
+        # how much of the bin this environment used, the length that
+        # OVERFLOWED (0 = none) and the step it overflowed at. The driver
+        # records the used length and chooses the next episode's bin from
+        # it (see `episode_stream.BinPolicy`); it reads the overflow flag
+        # and, if it is set, throws this whole attempt away and repeats the
+        # episode one bin up. Both are per environment, so neither can be
+        # inferred from the offsets.
+        _ep_used = _ep_final[1]
+        _ep_ftok_out = None
+        if _EP_FACE:
+            _ep_used = jnp.maximum(_ep_used, _ep_final[5])
+            _ep_ftok_out = _ep_final[4]
         return (final_state, traj, all_raw_rewards[-1],
-                _ep_final[0], _ep_final[2], _ep_used)
+                _ep_final[0], _ep_ftok_out, _ep_used,
+                _ep_final[2], _ep_final[3])
 
     def loss_fn(
         agent,
@@ -9294,11 +9409,36 @@ def main():
                 "(the batch carries offsets into them, not token windows); "
                 "pass ep_streams=(ep_tokens, ep_face_tokens).")
         _ep_tok, _ep_ftok = ep_streams
-        if _ep_tok.ndim != 2 or _ep_ftok.ndim != 2:
+        if _ep_tok.ndim != 2:
             raise ValueError(
-                "_dynamic_loss_fn: the episode streams must be "
-                f"(num_envs, length), got {_ep_tok.shape} and "
-                f"{_ep_ftok.shape}")
+                "_dynamic_loss_fn: the episode stream must be "
+                f"(num_envs, length), got {_ep_tok.shape}")
+        # EVERY ROW INDEX IS AN ENVIRONMENT INDEX (review finding 8).
+        # `lax.dynamic_slice` CLAMPS an out-of-range row instead of raising,
+        # so a stream with a different number of rows than there are
+        # environments would make every out-of-range sample read a
+        # NEIGHBOURING environment's tokens in silence. `env_index` itself is
+        # `jnp.arange(num_envs)` and is checked where it is built, so this
+        # static pair is the whole bound.
+        if int(_ep_tok.shape[0]) != int(num_envs):
+            raise ValueError(
+                f"_dynamic_loss_fn: the episode stream has "
+                f"{_ep_tok.shape[0]} rows against {num_envs} environments; "
+                f"`env_index` would index a row that is not its own "
+                f"environment (dynamic_slice clamps, it does not raise).")
+        # The face stream is None unless this loss reads it (`_EP_FACE`,
+        # review finding 3). The two gates are the SAME expression, so a
+        # reader without a stream is a wiring bug, not a runtime state.
+        if _EP_FACE and (_ep_ftok is None or _ep_ftok.ndim != 2):
+            raise ValueError(
+                "_dynamic_loss_fn: --face-actions with --live-faces reads "
+                "the face episode stream, so it must be "
+                f"(num_envs, length); got {_ep_ftok}")
+        if not _EP_FACE and _ep_ftok is not None:
+            raise ValueError(
+                "_dynamic_loss_fn: nothing reads the face episode stream "
+                "without --face-actions and --live-faces, so it must not "
+                "be allocated (review finding 3).")
 
         # --grad-window 0: THE FULL-HORIZON PATH. The minibatch arrives as
         # whole TRAJECTORIES, `(envs_per_mb, T, ...)`, because a scan needs a
@@ -10389,7 +10529,8 @@ def main():
         # policy entropy.
         _ep_tok0, _ep_ftok0 = _episode_streams(ep_log2)
         (env_states, traj, total_rewards_full,
-         ep_tokens, ep_face_tokens, ep_used_per_env) = rollout_fn(
+         ep_tokens, ep_face_tokens, ep_used_per_env,
+         ep_over_len_per_env, ep_over_step_per_env) = rollout_fn(
             agent,
             env_obj,
             num_valid,
@@ -11351,11 +11492,20 @@ def main():
             vprobes,
             vprobe_opt_state,
             vp_metrics,
-            # HOW MUCH OF THE BIN THIS EPISODE USED, the longest of the two
+            # HOW MUCH OF THE BIN THIS EPISODE USED, the longest of the
             # streams over the environments. The driver records it and picks
             # the next episode's bin from the recent history of these
             # numbers (`episode_stream.BinPolicy`).
             jnp.max(ep_used_per_env),
+            # THE OVERFLOW, as ordinary device values: the length that
+            # passed the bin and the step it happened at, per environment,
+            # 0 when nothing overflowed. The driver reads these AFTER the
+            # rollout and discards the whole attempt if they are set (review
+            # finding 2). They ride out of the jit rather than being raised
+            # from a callback, so nothing depends on an exception surviving
+            # XLA or on when an asynchronous dispatch happens to fail.
+            ep_over_len_per_env,
+            ep_over_step_per_env,
         )
 
     if not args.no_jit:
@@ -13561,8 +13711,9 @@ def main():
                 _wkey, key = jrand.split(key)
                 _wstates = reset_envs(env_episode)
                 def _wroll(_n, _k=_wkey, _s=_wstates):
+                    _ep_begin_attempt()
                     _t0, _f0 = _episode_streams(_n)
-                    return rollout_fn(
+                    _out = rollout_fn(
                         agent, env_episode, num_valid, _s,
                         jrand.split(_k, num_envs), base_mem,
                         preferences_per_env, stage_override,
@@ -13570,13 +13721,19 @@ def main():
                         _wt,  # positional: vmap in_axes is a positional tuple
                         _t0, _f0, _EP_ENV_IDX,
                     )
+                    # The overflow arrives as two device arrays, read here
+                    # on the host AFTER the rollout finished (finding 2).
+                    return _out, _epstream.overflow_from(
+                        _out[6], _out[7], _n)
                 # A random warm-up plan can emit MORE than a learned one, so
                 # this is a bin site like the training episode is, and its
                 # length goes into the same history.
-                (_wend, _wtraj, _wtot, _wst, _wsf,
-                 _wused) = _epstream.run_episode(
+                _ep_new_episode()
+                (_wend, _wtraj, _wtot, _wst, _wsf, _wused,
+                 _wovl, _wovs) = _epstream.run_episode(
                     _EP_BIN, "popart warm-up rollout %d" % _wi, _wroll,
-                    log=lambda line: print(line, flush=True))
+                    log=lambda line: print(line, flush=True),
+                    on_discard=_ep_discard)
                 _EP_BIN.record(int(np.max(np.asarray(_wused))))
                 _wr = _wtraj.reward                             # (E, T, R) raw
                 # Sentinel test on the RAW vector, identical to `_is_degen` in
@@ -13749,33 +13906,47 @@ def main():
         _kl_ref_coef_arg = (jnp.asarray(_kl_ref_coef, jnp.float32)
                             if _KL_REF_ON else None)
         _xtr_on = bool(_xtr_dir) and ep in _xtr_eps
+        # ONE TRACE PER ATTEMPT, not one trace spanning a discarded attempt
+        # and the repeat that replaced it (review finding 5). The attempt
+        # counter names the directory, so a repeat is visible as its own
+        # timeline instead of being folded into the one that is kept.
+        _xtr_attempt = [0]
+
+        def _xtr_path():
+            return os.path.join(
+                _xtr_dir,
+                f"ep{ep}" if _xtr_attempt[0] == 0
+                else f"ep{ep}-repeat{_xtr_attempt[0]}")
+
         if _xtr_on:
-            jax.profiler.start_trace(os.path.join(_xtr_dir, f"ep{ep}"))
-        (
-            agent,
-            opt_state,
-            _,
-            metrics,
-            total_rewards_full,
-            actions_pack,
-            global_step,
-            diag_pack,
-            popart_m1,
-            popart_m2,
-            popart_w,
-            attn_ent,
-            true_scalar_return,
-            probes,
-            probe_opt_state,
-            probe_metrics,
-            vprobes,
-            vprobe_opt_state,
-            vp_metrics,
-            _ep_used,
-        ) = _epstream.run_episode(
-            _EP_BIN,
-            "episode %d" % ep,
-            lambda _ep_n: train_episode(
+            jax.profiler.start_trace(_xtr_path())
+
+        def _ep_discard_episode(result):
+            """Throw one attempt away: host counters back, trace closed."""
+            if _xtr_on:
+                # The trace has to see the work it timed before it stops,
+                # and the discarded attempt is exactly that work.
+                jax.block_until_ready(
+                    [x for x in jax.tree_util.tree_leaves(result)
+                     if isinstance(x, jax.Array)])
+                jax.profiler.stop_trace()
+            _ep_discard(result)
+            if _xtr_on:
+                _xtr_attempt[0] += 1
+                jax.profiler.start_trace(_xtr_path())
+
+        _ep_new_episode()
+
+        def _ep_attempt(_ep_n):
+            """ONE attempt at this episode, at the bin `2^_ep_n`.
+
+            Returns the episode's whole result and the overflow the ROLLOUT
+            reported, or None. Reading the two overflow arrays blocks on
+            the rollout, which is one synchronisation per episode and the
+            only one the bin costs.
+            """
+            _ep_begin_attempt()
+            _out = train_episode(
                 agent,
                 opt_state,
                 env_states,
@@ -13798,8 +13969,37 @@ def main():
                 vprobe_opt_state,
                 _kl_ref_coef_arg,
                 _ep_n,
-            ),
+            )
+            return _out, _epstream.overflow_from(_out[-2], _out[-1], _ep_n)
+        (
+            agent,
+            opt_state,
+            _,
+            metrics,
+            total_rewards_full,
+            actions_pack,
+            global_step,
+            diag_pack,
+            popart_m1,
+            popart_m2,
+            popart_w,
+            attn_ent,
+            true_scalar_return,
+            probes,
+            probe_opt_state,
+            probe_metrics,
+            vprobes,
+            vprobe_opt_state,
+            vp_metrics,
+            _ep_used,
+            _ep_over_len,
+            _ep_over_step,
+        ) = _epstream.run_episode(
+            _EP_BIN,
+            "episode %d" % ep,
+            _ep_attempt,
             log=lambda line: print(line, flush=True),
+            on_discard=_ep_discard_episode,
         )
         # THE MEASUREMENT THE NEXT BIN IS CHOSEN FROM. Recorded on success;
         # `run_episode` records the overflowing length itself when an
