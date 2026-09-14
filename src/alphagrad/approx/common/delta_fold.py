@@ -50,6 +50,8 @@ import jax.numpy as jnp
 from jax import lax
 
 from . import count_vjp as _cvjp
+from alphagrad.transformer.fast_palimpsa_pallas import (
+    CHUNK_C as _FAST_C, fast_read_enabled as _fast_read)
 
 
 def default_chunk() -> int:
@@ -63,6 +65,14 @@ def _use_parallel() -> bool:
 def _encode_chunk(agent, enc, tk, c_cnt, C, parallel):
     """One chunk's encode. PARALLEL inside the chunk by default.
 
+    UNDER THE FAST READ the parallel/serial choice does not apply and is
+    ignored: `_extend_fast` reads the whole chunk with `fast_palimpsa`, which
+    materialises no per-token state at all, so the block size the parallel
+    path exists to bound has nothing to bound. Routing here rather than into
+    `encode_extend` keeps the fold, the rollout extend and `base_memory` on
+    the one read, which is what makes the PPO ratio 1 at epoch 0 under either
+    setting.
+
     Chunking and parallelism are ORTHOGONAL: the chunk bounds how much is
     live at once (memory), the scan inside it decides whether the tokens are
     walked serially or with log depth (speed). `_extend_parallel` is the
@@ -75,6 +85,15 @@ def _encode_chunk(agent, enc, tk, c_cnt, C, parallel):
     the same `valid` mask `encode_extend` would have built. Falls back to
     `encode_extend` when the agent has no parallel path (test stubs).
     """
+    if _fast_read():
+        fast = getattr(agent, "_extend_fast", None)
+        if fast is None:
+            raise RuntimeError(
+                "ALPHAGRAD_PALIMPSA_READ=fast but this agent has no "
+                "_extend_fast; the fold would silently fall back to the exact "
+                "read and disagree with every other call site.")
+        valid = jnp.arange(C, dtype=jnp.int32) < jnp.asarray(c_cnt, jnp.int32)
+        return fast(enc, tk, valid, c_cnt)
     if parallel:
         par = getattr(agent, "_extend_parallel", None)
         if par is not None:
@@ -109,6 +128,17 @@ def plan_chunks(window, chunk=None):
     W = int(window)
     if W <= 0:
         return C, 0, 0
+    if _fast_read():
+        # THE FAST READ'S OWN CHUNK GRID IS MEASURED FROM TOKEN 0 OF THE
+        # DELTA. Every fold chunk therefore has to start on a multiple of 32,
+        # or the rollout (which chunks by ALPHAGRAD_EXTEND_CHUNK) and the loss
+        # (which chunks by this) would cut the same delta at different places
+        # -- and a chunk boundary is exactly where the read stops
+        # approximating, so that is a real numerical difference and the PPO
+        # ratio would leave 1 at epoch 0. Round UP: rounding down could reach
+        # 0. The clamp to W below is safe on its own, because a single chunk
+        # starts at 0 whatever its width.
+        C = -(-C // _FAST_C) * _FAST_C
     C = min(C, W)
     nb = -(-W // C)
     return C, nb, nb * C
