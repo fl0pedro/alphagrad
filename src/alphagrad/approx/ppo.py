@@ -12891,9 +12891,16 @@ def main():
                     {"records": list(_plog_local.get("records") or ())},
                     dict(_plog_pool or {}))
                 _plog_n0 = int(host_state.get("_plan_log_written", 0))
+                _plog_tkt = (_POOL_DRAIN[0] or {}).get("ticket")
                 for _plog_j, _plog_r in enumerate(_plog_recs):
                     _plog_r["episode"] = int(ep)
                     _plog_r["plan_index"] = _plog_n0 + _plog_j
+                    if _plog_tkt is not None:
+                        # THE MEASUREMENT TICKET (--measure-pipeline). One
+                        # ticket is one attempt at one episode; a pooled
+                        # record has no `env_index` to join on because the
+                        # actor is a separate process, so this is the join.
+                        _plog_r["measure_ticket"] = int(_plog_tkt)
                 _plog_nw = _plog_append(_plog_path, _plog_recs)
                 host_state["_plan_log_written"] = _plog_n0 + _plog_nw
                 log_dict["plan_log/records_this_ep"] = int(_plog_nw)
@@ -14012,12 +14019,19 @@ def main():
     # read. None = drain in `host_log`, exactly as before.
     _POOL_DRAIN = [None]
 
-    def _drain_measure_telemetry():
+    def _drain_measure_telemetry(ticket=None):
         """Drain the trainer's AND the actors' per-episode telemetry, once.
 
         Called right after a ticket is collected, so the actors hold this
         episode's terminal plans and nothing later. Returns the dict
         `host_log` reads out of `_POOL_DRAIN`.
+
+        `ticket` is stamped on every record this drain produces. It is the
+        join key the pooled rows have and `env_index` is not: a measure actor
+        is a separate process and never sees the trainer's env slot, so a
+        pooled record's `env_index` is -1 and always has been. The ticket says
+        which ATTEMPT at which episode a record came from, which is what
+        separates a repeat's records from the attempt it replaced.
         """
         from alphagrad.approx.common.measure_pool import (
             merge_pool_collapse_stats as _mcs,
@@ -14028,7 +14042,8 @@ def main():
             consume_plan_records as _cpr)
         _p = getattr(env, "_remote_pool", None)
         out = {"pool_collapse": {}, "pool_face": {}, "pool_plan": None,
-               "local_face": {}, "local_plan": None}
+               "local_face": {}, "local_plan": None,
+               "ticket": (None if ticket is None else int(ticket))}
         try:
             out["pool_collapse"] = _mcs(_p, {})
         except Exception:
@@ -14814,7 +14829,7 @@ def main():
             print(f"[measure-pipeline] ep={ep} ticket={_tkt} "
                   f"collect_wait={_t_wait:.1f}s "
                   f"update_ahead={int(_prev is not None)}", flush=True)
-            _drain = _drain_measure_telemetry()
+            _drain = _drain_measure_telemetry(_tkt)
             if bool(np.any(_meas["sentinel"])):
                 print(f"[measure-pipeline] ep{ep}: "
                       f"{int(np.sum(_meas['sentinel']))} of "
