@@ -157,8 +157,12 @@ def face_ce_term(face_replay_fn, ctx, enc_carry, axis_state, axis_valid,
 
         CE = - sum_v pi'_ve(v) sum_k w_hat_{v,k} log beta_theta(F_{v,k})
 
-    ``face_chunks`` is the PAIR ``(counts, tokens)``: the parallel
-    equation-id buffer was removed on 2026-09-13 with the ids themselves.
+    ``face_chunks`` is ``(counts, stream, offset, row)`` since the episode
+    token stream landed. THE SEARCH HAS NO EPISODE STREAM: a draw is one
+    stored emission window, not a span of a rollout's row. So each draw's
+    window is handed over as a ONE-ROW stream at offset 0, which is what
+    ``episode_stream.single_row`` is for. Same tokens, same count, same
+    cost as the window it wraps.
 
     over the search's stored draws, flattened to D slots (padding has
     ``sd_li == -1`` / ``sd_w == 0`` and contributes exactly 0). ``log beta``
@@ -174,6 +178,11 @@ def face_ce_term(face_replay_fn, ctx, enc_carry, axis_state, axis_valid,
     import jax
     import jax.numpy as jnp
 
+    # Imported HERE, not at module scope: this module is deliberately
+    # import-light and env-free (see the header), and `episode_stream` pulls
+    # `delta_fold`, which pulls jax.
+    from alphagrad.approx.common import episode_stream as _epstream
+
     nv = ctx.shape[0]
 
     def _one(vidx, fp, fc, fv, cnt, dt, fa_k, fend):
@@ -188,7 +197,10 @@ def face_ce_term(face_replay_fn, ctx, enc_carry, axis_state, axis_valid,
         # discarded here exactly as on ppo's default path (DCE'd under jit).
         lp, ent, ar, _probe_face_lat = face_replay_fn(
             features, fact_tables, fa_k, fp, fc, fv,
-            enc_carry, (cnt, dt), op_override)
+            enc_carry,
+            (cnt, _epstream.single_row(dt, dt.shape[-1]),
+             jnp.zeros((), jnp.int32), jnp.zeros((), jnp.int32)),
+            op_override)
         return lp, ent / jnp.maximum(ar, 1.0)
 
     lp, ent_n = jax.vmap(_one)(
