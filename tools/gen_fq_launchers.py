@@ -302,9 +302,10 @@ SHARED_ENV = [
     ("PATH", '"$HOME/.local/bin:$PATH"'),
     ("PYTHONPATH", '"$HOME/dsnn/graphax/src:$HOME/dsnn/alphagrad/src"'),
     ("PYTHONDONTWRITEBYTECODE", "1"),
-    ("XLA_PYTHON_CLIENT_PREALLOCATE", "false"),
-    ("XLA_FLAGS",
-     '"--xla_gpu_enable_triton_gemm=false --xla_gpu_autotune_level=0"'),
+    # NO XLA FLAGS, and no preallocation switch (owner ruling 2026-09-12 on
+    # ticket .43): the arms measure with temp memory, so a preallocation
+    # fraction buys nothing, and a Triton / autotune override changes the
+    # very cost the arm measures.
     # PULLUP, not pulldown.  Every TLM arm before R1 ran PULLDOWN=1, so
     # bf16-native compute was the thing paying for the approximation; at
     # pullup the cost axis is the approximation ITSELF.
@@ -319,7 +320,6 @@ SHARED_ENV = [
     #     and the trainer only derives it after ray.init.
     ("ALPHAGRAD_MAX_FACES", "2538"),
     ("ALPHAGRAD_MAX_DELTA_TOKENS", "32768"),
-    ("ALPHAGRAD_MAX_EQNS", "512"),
     # The face-ADD configuration (formerly ALPHAGRAD_NEW_SLOT_JOIN, then
     # ALPHAGRAD_APPROX_OLD) is an ARGUMENT now: --approx-add in SHARED_CLI
     # (ticket .56, finding 73).
