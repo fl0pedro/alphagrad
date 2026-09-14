@@ -24,7 +24,6 @@ import os
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("ALPHAGRAD_SKIP_COUNT_OPS", "1")
 os.environ.setdefault("ALPHAGRAD_SKIP_COST_ANALYSIS", "1")
-os.environ.setdefault("ALPHAGRAD_MAX_EQNS", "512")
 
 import pathlib                                                  # noqa: E402
 from types import SimpleNamespace as NS                         # noqa: E402

@@ -66,7 +66,6 @@ import os
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("ALPHAGRAD_SKIP_COUNT_OPS", "1")
 os.environ.setdefault("ALPHAGRAD_SKIP_COST_ANALYSIS", "1")
-os.environ.setdefault("ALPHAGRAD_MAX_EQNS", "4096")
 # TLM-SHAPED, not TLM-SIZED: the property is about the graph, and the small
 # shapes keep this a unit test. Set before the module-level _tlm_dims() read.
 os.environ.setdefault("ALPHAGRAD_TLM_SEQ", "8")
