@@ -191,7 +191,8 @@ def test_required_flags_are_all_defined_where_the_preflight_greps(
     assert not missing, missing
     for f in ("--approx-profile", "--cost-form", "--quality-floor",
               "--mem-channel", "--gate-winners-table", "--fixed-order",
-              "--ray-measure", "--ray-measure-timeout", "--per-face-masks",
+              "--ray-measure", "--ray-measure-timeout", "--measure-pipeline",
+              "--per-face-masks",
               "--face-none-bias", "--approx-add", "--terminal-rewards-only"):
         assert f in gen.REQUIRED_FLAGS, f
 
@@ -237,6 +238,8 @@ def test_every_campaign_arm_carries_the_required_flags(gen, campaign):
                      " --incremental-encode ",
                      f" --ray-measure {gen.CAMPAIGN_RAY_MEASURE} ",
                      f" --ray-measure-timeout {gen.CAMPAIGN_RAY_MEASURE_TIMEOUT} ",
+                     # PIPELINE THE MEASUREMENT (owner ruling 2026-09-14).
+                     f" --measure-pipeline {gen.CAMPAIGN_MEASURE_PIPELINE} ",
                      " --plan-log auto ", " --episodes 250 ",
                      " --measure-toolchain-gate abort ",
                      " --reduce-axis-space physical ",
@@ -821,6 +824,10 @@ def test_ppo_argparse_accepts_every_campaign_command_line(gen, campaign):
         # 2026-09-14, replacing the one-actor ruling of 2026-09-13).
         assert ns.ray_measure == gen.CAMPAIGN_GPUS - 1, a["name"]
         assert ns.ray_measure_timeout == 600.0, a["name"]
+        # THE MEASUREMENT IS PIPELINED on every campaign arm (owner ruling
+        # 2026-09-14): the terminal step submits and the driver waits for the
+        # rewards with the previous episode's update already on the GPU.
+        assert ns.measure_pipeline == 1, a["name"]
         assert ns.face_none_bias == float(gen.FACE_NONE_BIAS_MVP), a["name"]
         assert ns.scale_face_head == float(gen.SCALE_FACE_HEAD_MVP), a["name"]
         assert ns.face_logit_clamp == float(gen.FACE_LOGIT_CLAMP_MVP), a["name"]

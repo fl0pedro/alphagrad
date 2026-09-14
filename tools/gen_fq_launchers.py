@@ -232,6 +232,9 @@ REQUIRED_FLAGS = [
     # defined in common/gate_telemetry.py, hence the second file in
     # REQUIRED_FLAGS_FILES).
     "--approx-profile",
+    # THE MEASUREMENT PIPELINE (owner ruling 2026-09-14).  Named so an arm
+    # cannot inherit the trainer's synchronous default in silence.
+    "--measure-pipeline",
     "--cost-form",
     "--quality-floor",
     # The cost floor (.9, b2c89170): every training arm passes it explicitly,
@@ -611,6 +614,11 @@ SHARED_CLI = [
     ("--num-layers", "3"),
     ("--ray-measure", "3"),
     ("--ray-measure-timeout", "600"),
+    # PIPELINE THE MEASUREMENT (owner ruling 2026-09-14).  The terminal step
+    # submits its plans and returns; the driver dispatches the PREVIOUS
+    # episode's PPO update and waits for these rewards while it runs.  See
+    # CAMPAIGN_MEASURE_PIPELINE for what the one-episode lag costs.
+    ("--measure-pipeline", "1"),
     # LOGGED, NOT TRAINED: sparsity (weight 0) and the legacy Jacobian cosine
     # (subsampled).  Clipped relative Frobenius rides slot 8 automatically
     # because grad_cosine materialises the exact reference it needs.
@@ -1361,6 +1369,15 @@ CAMPAIGN_MEM = "800G"          # the nodes have 1.5 TB; 100 G per GPU
 CAMPAIGN_RAY_MEASURE = str(CAMPAIGN_GPUS - 1)
 CAMPAIGN_RAY_MEASURE_TIMEOUT = "600"
 
+# THE PIPELINE (owner ruling 2026-09-14).  The terminal rewards of episode e
+# are read by one thing, e's PPO update, so the rollout submits the plans and
+# the driver waits for them with the PREVIOUS episode's update already running
+# on the trainer's GPU.  The cost is one update of policy lag: e's trajectory
+# was drawn under the policy that had absorbed e-2 while its update starts
+# from the policy that has absorbed e-1, so PPO's ratio is exact but no longer
+# identically 1 at epoch 0 (the arms run --ppo-epochs 1).
+CAMPAIGN_MEASURE_PIPELINE = "1"
+
 # GATE G1 (ticket .45) on a node without a home: the sweep winners are read
 # from /Scratch.  THE TABLE IS THE SWEEP64 ONE, BY ORDER (owner ruling
 # 2026-09-13): 4029 rows at q >= 0.80 on Markowitz, 2969 on reverse.  The
@@ -1631,6 +1648,7 @@ def campaign_arm(*, phase: int, tag: str, profile: str, node: str, what: str,
         # on its own GPU, the node held by this job.
         "--ray-measure": CAMPAIGN_RAY_MEASURE,
         "--ray-measure-timeout": CAMPAIGN_RAY_MEASURE_TIMEOUT,
+        "--measure-pipeline": CAMPAIGN_MEASURE_PIPELINE,
         # THE GATE .45 INPUTS, the two the trainer cannot measure for itself.
         # G1's winners table is inherited from SHARED_CLI and resolved from
         # this arm's --fixed-order by `_merge_cli` (ONE mechanism, so a wave
