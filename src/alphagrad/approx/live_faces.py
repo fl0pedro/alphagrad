@@ -596,10 +596,10 @@ class LiveFaceStream:
         _no_edge = (-np.ones((2,), np.int32),
                     -np.ones((EDGE_CVX_WIDTH,), np.int32),
                     np.int32(0), np.int32(0))
-        # NARROW WIRE: the chunk buffers carry the SAME ids as the step delta
-        # (a chunk is a slice of the same emission), so they carry the same
-        # dtypes -- uint8 tokens, int16 equation ids. See env.py's
-        # "THE NARROW ID WIRE" note.
+        # NARROW WIRE: the chunk buffer carries the SAME tokens as the step
+        # delta (a chunk is a slice of the same emission), so it carries the
+        # same dtype -- uint8. See env.py's "THE NARROW TOKEN WIRE" note.
+        # Layout: (tokens, count, n_faces, ends) + the four edge wires.
         empty = (np.zeros((W,), _TOKEN_DTYPE),
                  np.int32(0), np.int32(0), np.zeros((2,), np.int32)
                  ) + _no_edge
@@ -626,8 +626,8 @@ class LiveFaceStream:
             return empty
         n_faces = len(keys)
         if f >= n_faces:
-            res = (empty[0], empty[1], empty[2], np.int32(n_faces),
-                   empty[4]) + _no_edge
+            res = (empty[0], empty[1], np.int32(n_faces),
+                   empty[3]) + _no_edge
             self._chunks[ck] = res
             return res
 

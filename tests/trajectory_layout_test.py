@@ -525,11 +525,15 @@ def test_a_delta_count_above_a_byte_and_above_int_sixteen_survives_the_header():
 def test_the_header_codec_round_trips_every_count_the_budget_allows():
     from alphagrad.approx import env as _env
 
-    for n in (0, 1, 255, 256, 65535, 65536, 1 << 24, (1 << 32) - 1):
+    for n in (0, 1, 255, 256, 65535, 65536, 1 << 24, (1 << 31) - 1):
         enc = _env.encode_delta_header(n)
         assert enc.dtype == np.uint8
         assert enc.shape == (_env.DELTA_HEADER_SLOTS,)
         assert int(_env.decode_delta_header(jnp.asarray(enc))) == n
+    # The header is a SIGNED int32 on the device side, so 2**31 is refused
+    # rather than returned as a negative length.
+    with pytest.raises(ValueError, match="signed int32 header"):
+        _env.encode_delta_header(1 << 31)
 
 
 def test_token_id_zero_is_a_real_token_so_padding_is_read_from_the_count():
@@ -616,7 +620,7 @@ def test_the_palimpsa_mixers_have_no_relational_gate_and_take_no_equation_ids():
 
     for cls in (PalimpsaMixer, BiPalimpsaMixer):
         assert not hasattr(cls, "_relational_gate_mod")
-        assert "rel_gate" not in cls.__dataclass_fields__
+        assert "rel_gate" not in cls.__annotations__
         assert "eqn_ids" not in inspect.signature(cls.__call__).parameters
     for cls in (PalimpsaEncoderLayer, PalimpsaEncoder):
         assert "eqn_ids" not in inspect.signature(cls.__call__).parameters
@@ -643,7 +647,7 @@ def test_no_trajectory_or_train_batch_leaf_carries_equation_ids():
     from alphagrad.approx.ppo import Trajectory, TrainBatch
 
     for cls in (Trajectory, TrainBatch):
-        names = set(cls.__dataclass_fields__)
+        names = set(cls._fields)
         assert "delta_eqns" not in names
         assert "face_delta_eqns" not in names
         assert "enc_cumhist" not in names
