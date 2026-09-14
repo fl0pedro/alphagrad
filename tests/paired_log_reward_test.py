@@ -274,13 +274,24 @@ def test_reference_is_measured_once_per_terminal_callback(monkeypatch):
     """
     from alphagrad.approx.common import compile_cache as _cc
 
+    # EVERY executable the cache ever hands back under a paired-ref key, not
+    # just the last one. `compile_cache._LOCAL_CACHE` is a FIFO capped at 32
+    # entries, so in a full-suite run the reference can be evicted and
+    # recompiled BETWEEN two measurements of the same plan -- a second, equal
+    # executable at a different address. Counting only the newest one then
+    # misses every window the older one took, which is what this test read
+    # alone as a pass and in the suite as a failure (job 65528). The strong
+    # references in `ref_ex` are what makes the id set safe: an id can only be
+    # reused after its object is collected.
     ref_ex = []
+    ref_ids = set()
     real_cc = _cc.cached_compile
 
     def _spy_compile(key, fn):
         out = real_cc(key, fn)
         if bytes(key).startswith(b"paired-ref:"):
             ref_ex.append(out)
+            ref_ids.add(id(out))
         return out
 
     seen = []
@@ -298,8 +309,8 @@ def test_reference_is_measured_once_per_terminal_callback(monkeypatch):
         env.config.ref_reps_per_point)
 
     def _ref_windows():
-        assert ref_ex, "the paired reference was never compiled"
-        return seen.count(id(ref_ex[-1]))
+        assert ref_ids, "the paired reference was never compiled"
+        return sum(1 for i in seen if i in ref_ids)
 
     _run_plan(env, rev)
     assert _ref_windows() == per_cb                     # one episode, one ref
