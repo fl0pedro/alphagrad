@@ -679,8 +679,7 @@ _PARKED_BY_THE_CALL_SITE = {
     "consume_probe_failure_stats",
     "consume_static_peak_fallbacks",
     "consume_stats",          # _LIVE_FACES and _EDGE_TABLE
-    "_cpf", "_cpr",           # the aliases the drain helper imports under
-    "_merge_cs", "_merge_pf", # the measure actors' own drains
+    "_merge_cs", "_merge_pf", # the measure actors own drains
     "_plog_consume", "_plog_merge",
 }
 
@@ -712,7 +711,7 @@ def _draining_calls(fn_ast):
         if name is None:
             continue
         if (name.startswith("consume_") or name.startswith("_merge_")
-                or name in ("_plog_consume", "_plog_merge", "_cpf", "_cpr")):
+                or name in ("_plog_consume", "_plog_merge")):
             out.setdefault(name, []).append(n.lineno)
     return out
 
