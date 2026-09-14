@@ -36,21 +36,26 @@ unfolded, scalar and vmapped. A chunk at ``i >= nb_live`` is
 not running it at all is the same map, and the live chunks run the same
 arithmetic in the same order.
 
-The GRADIENT is bit-identical on the SEQUENTIAL chunk interior
-(``ALPHAGRAD_FOLD_PARALLEL=0``) and on ``_extend_sequential``'s budget form,
-at every count. On the PARALLEL chunk interior, which is the shipped default,
-it differs by a few float32 ulp once more than one chunk is live.
+The GRADIENT is bit-identical, at every count, on ``_extend_sequential``'s
+budget form and on the fold's SEQUENTIAL chunk interior
+(``ALPHAGRAD_FOLD_PARALLEL=0``) outside vmap. On the PARALLEL chunk interior,
+which is the shipped default, and on either interior under ``vmap``, it
+differs by a few float32 ulp once more than one chunk is live. The measured
+worst case is under 2 ulp of the leaf's own magnitude; the test pins 8.
 
-That last difference is a reassociation and it is not removable from this
-side. A toy probe with no alphagrad in it (``probe_cvjp.py``, job 65517
-section C) shows that ``lax.scan`` of a body and the SAME ``lax.scan`` with a
-``lax.cond`` inside it already disagree in the gradient's last bits. The two
-loop forms are different jaxprs, JAX's transpose of each forms the same sum of
-the same terms in a different shape, and float32 addition is not associative.
-A ``while_loop`` form therefore cannot be made to reproduce the ``scan`` +
-``cond`` form bit for bit; matching the transpose (``jax.checkpoint`` on the
-chunk in the backward, ``ALPHAGRAD_COUNT_VJP_REMAT``) was tried and does not
-close it.
+THE CAUSE IS THE ``lax.cond``, NOT THE ``while_loop``. A toy probe with no
+alphagrad in it (``probe_cvjp.py``, job 65523 section B) measures five loop
+forms against the shipped one. ``count_loop``'s gradient is bitwise equal to a
+plain ``lax.scan`` of the same body at every live count. What differs is the
+``lax.cond`` the shipped body wraps around the chunk: ``scan`` and
+``scan`` + ``cond`` disagree in the gradient's last bits on their own, with no
+``while_loop`` anywhere. ``cond``'s transpose joins both branches and forms
+the same sum in a different shape, and float32 addition is not associative.
+
+Deleting that cond IS the change, so the two forms cannot agree bit for bit.
+Matching the transpose (``jax.checkpoint`` on the chunk in the backward,
+``ALPHAGRAD_COUNT_VJP_REMAT``) was tried and does not close it, which is what
+you would expect once the cause is the cond.
 
 So ``ALPHAGRAD_COUNT_VJP`` DEFAULTS TO OFF and the shipped path is unchanged.
 Turn it on for a run that is allowed to move its last bits, and expect the

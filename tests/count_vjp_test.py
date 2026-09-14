@@ -23,12 +23,12 @@ Tolerance is ZERO for the forward, everywhere.
 For the gradient it is zero on the SEQUENTIAL chunk interior and on the
 unfolded extend, and a few float32 ulp on the PARALLEL chunk interior, which
 is the shipped default. That last case is a genuine reassociation and it is
-pinned here rather than hidden: two loop forms are two jaxprs, JAX's
-transpose of each forms the same sum of the same per-chunk terms in a
-different shape, and float32 addition is not associative. The probe
-``probe_cvjp.py`` shows the same thing with no alphagrad in it -- a
-``lax.scan`` and the same ``lax.scan`` with a ``lax.cond`` inside already
-disagree in the gradient's last bits.
+pinned here rather than hidden. The probe ``probe_cvjp.py`` locates it with
+no alphagrad in it at all: ``count_loop``'s gradient matches a plain
+``lax.scan`` of the same body EXACTLY, and it is the ``lax.cond`` the
+shipped body wraps around that chunk which moves the last bits. Removing
+that cond is the entire point of the change, so the two cannot agree bit for
+bit and float32 addition is not associative.
 
 The vmapped cases are the shape the loss actually runs: the per-sample counts
 are batched, the ``budget`` is the batch-wide maximum and is UNBATCHED, and
@@ -306,8 +306,13 @@ def _vmapped_scalar(agent, s):
     return jnp.sum(jax.vmap(one)(s["tok"], cnts, s["owner"], s["part"]))
 
 
-def test_the_folded_gradient_under_vmap_on_a_sequential_chunk_is_identical(
-        setup):
+def test_the_folded_gradient_under_vmap_on_a_sequential_chunk_is_close(setup):
+    """Under vmap even the sequential interior moves, by the same few ulp.
+
+    The scalar sequential case above is bitwise equal; adding the vmap is
+    enough to expose the cond's reassociation there too. The bound is the
+    same one the parallel case takes.
+    """
     s = setup
     with env(ALPHAGRAD_FOLD_PARALLEL=0):
         with count_vjp(False):
@@ -317,7 +322,7 @@ def test_the_folded_gradient_under_vmap_on_a_sequential_chunk_is_identical(
             g_new = eqx.filter_grad(
                 lambda ag: _vmapped_scalar(ag, s))(s["agent"])
     _assert_real_grad(g_old)
-    _assert_same_tree(g_old, g_new, "vmapped folded gradient")
+    _assert_close_tree(g_old, g_new, "vmapped folded gradient", ulps=8.0)
 
 
 def test_the_folded_gradient_under_vmap_on_a_parallel_chunk_is_close(setup):
