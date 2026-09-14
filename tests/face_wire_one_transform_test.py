@@ -45,8 +45,10 @@ import numpy as np                                              # noqa: E402
 import pytest                                                   # noqa: E402
 from graphax import SKIP_FACE, IncrementalJaxpr                 # noqa: E402
 from graphax.core import (                                      # noqa: E402
-    _force, _is_two_op_slots, _stable_var_index, _unpack_face_slots)
-from graphax.sparse.micro_actions import QUANT_DTYPES           # noqa: E402
+    _approx_meta, _force, _is_two_op_slots, _stable_var_index,
+    _unpack_face_slots)
+from graphax.sparse.micro_actions import (                      # noqa: E402
+    QUANT_DTYPES, Compress, Diag, Quant)
 from graphax.sparse.ops.join import FaceJoinPolicy               # noqa: E402
 
 import alphagrad.approx.env as envmod                           # noqa: E402
@@ -162,9 +164,25 @@ def _instrument(entry, v, log):
         def g(t):
             din = None if t.val is None else str(t.val.dtype)
             out = h(t)
-            dout = None if out.val is None else str(out.val.dtype)
+            if isinstance(out, (Compress, Diag, Quant)):
+                # THE SLOT HOOK IS A CHOOSER. It returns the micro-action it
+                # picked and graphax applies it, so there is no output tensor
+                # to read a dtype off here. The dtype the action leaves is the
+                # action's own, read with graphax's OWN ``_approx_meta`` --
+                # the function that writes the block's arguments -- rather
+                # than with a second copy of the cast rule. DIAG and COMPRESS
+                # do not touch the dtype, so they leave it where it was.
+                dout = _approx_meta(out)[1].get("dtype", din)
+            elif out is None:
+                dout = din          # declined: the operand passes through
+            else:
+                dout = None if out.val is None else str(out.val.dtype)
             log.append((site, din, dout))
             return out
+
+        _co = getattr(h, "chosen_applied", None)
+        if _co is not None:
+            g.chosen_applied = _co
         return g
 
     if _is_two_op_slots(entry):
