@@ -8,8 +8,10 @@ What ratio-1 actually rests on, tested directly:
    the loss relies on when it re-derives a step's encoding from the stored
    pre-step carry + delta (the rollout consumed the same tokens through the
    same window-shaped program).
-2. The property survives a NONZERO relational gate (the causal-histogram
-   features are part of the carry, not recomputed from the whole stream).
+2. The property survives a LONGER split (the carry is the whole state; there
+   is nothing recomputed from the whole stream). The relational-gate case
+   this used to be -- a nonzero rel_gate driven by a causal equation-id
+   histogram -- is gone: the gate and the ids were removed on 2026-09-13.
 3. VERTEX-MEMORY FOLD IS ASSOCIATIVE bitwise (sums/counts, explicit ids).
 4. heads_from_memory is deterministic and shape-correct, and feeding the
    same triple through sample/evaluate's `precomputed` hook yields the
@@ -28,7 +30,6 @@ import numpy as np
 
 from alphagrad.approx.ppo import (
     EncCarry,
-    MAX_EQNS,
     NUM_VALUE_HEADS,
     _build_agent,
     make_argparser,
@@ -54,16 +55,13 @@ def _agent(key=None):
 
 
 def _stream(key, n, max_tokens=512):
-    """Append-only-style buffers: n real tokens (ids >= 1), trailing pad 0;
-    eqn ids grouped in runs with occasional -1 structural tokens."""
-    k1, k2 = jrand.split(key)
+    """Append-only-style buffer: n real tokens (ids >= 1), trailing pad 0.
+
+    ONE buffer: the parallel equation-id buffer was removed on 2026-09-13.
+    """
+    k1, _k2 = jrand.split(key)
     toks = jrand.randint(k1, (n,), 1, 60)
-    eqn = jnp.repeat(jnp.arange((n + 6) // 7), 7)[:n]
-    struct = jrand.bernoulli(k2, 0.15, (n,))
-    eqn = jnp.where(struct, -1, eqn).astype(jnp.int32)
-    toks_buf = jnp.zeros((max_tokens,), jnp.int32).at[:n].set(toks)
-    eqn_buf = jnp.full((max_tokens,), -1, jnp.int32).at[:n].set(eqn)
-    return toks_buf, eqn_buf
+    return jnp.zeros((max_tokens,), jnp.int32).at[:n].set(toks)
 
 
 def _carry_equal(a, b):
@@ -74,15 +72,15 @@ def _carry_equal(a, b):
 
 def test_chunked_extend_bitwise():
     agent = _agent()
-    toks, eqns = _stream(jrand.PRNGKey(1), 300)
+    toks = _stream(jrand.PRNGKey(1), 300)
     W = 512
 
     c0 = agent.carry_init()
-    one, rows_one, valid_one, _ = agent.encode_extend(c0, toks, eqns, 300, window=W)
+    one, rows_one, valid_one = agent.encode_extend(c0, toks, 300, window=W)
 
-    mid, rows_a, valid_a, _ = agent.encode_extend(c0, toks, eqns, 100, window=W)
+    mid, rows_a, valid_a = agent.encode_extend(c0, toks, 100, window=W)
     assert int(mid.pos) == 100
-    two, rows_b, valid_b, _ = agent.encode_extend(mid, toks, eqns, 200, window=W)
+    two, rows_b, valid_b = agent.encode_extend(mid, toks, 200, window=W)
     assert int(two.pos) == 300
 
     _carry_equal(one, two)
@@ -94,37 +92,33 @@ def test_chunked_extend_bitwise():
     assert np.all(np.asarray(rows_one)[300:] == 0.0)
 
 
-def test_prefix_property_nonzero_relgate():
-    agent = _agent()
-    # Force a NONZERO relational gate on every layer so the causal-histogram
-    # features actually influence the recurrence (zero-init would let a
-    # broken histogram pass unnoticed).
-    def _bump(m):
-        for i in range(len(m.encoder.layers)):
-            m = eqx.tree_at(
-                lambda mm, i=i: mm.encoder.layers[i].attn_layer.rel_gate.weight,
-                m, jnp.full((2, 3), 0.3, jnp.float32),
-            )
-            m = eqx.tree_at(
-                lambda mm, i=i: mm.encoder.layers[i].attn_layer.rel_gate.bias,
-                m, jnp.full((2,), 0.1, jnp.float32),
-            )
-        return m
+def test_prefix_property_survives_an_uneven_split():
+    """A DIFFERENT split of a DIFFERENT stream, for the same reason: the
+    carry IS the whole state, so where the split falls cannot matter.
 
-    agent = _bump(agent)
-    toks, eqns = _stream(jrand.PRNGKey(2), 250)
+    This case used to force a nonzero ``rel_gate`` on every layer, so that a
+    broken causal histogram could not pass as a zero-initialised no-op. Both
+    the gate and the histogram were removed on 2026-09-13 together with the
+    equation ids that fed them, so the extra state this was guarding no
+    longer exists.
+    """
+    agent = _agent()
+    toks = _stream(jrand.PRNGKey(2), 250)
     W = 512
     c0 = agent.carry_init()
-    one, rows_one, _, _ = agent.encode_extend(c0, toks, eqns, 250, window=W)
-    mid, rows_a, _, _ = agent.encode_extend(c0, toks, eqns, 130, window=W)
-    two, rows_b, _, _ = agent.encode_extend(mid, toks, eqns, 120, window=W)
+    one, rows_one, _ = agent.encode_extend(c0, toks, 250, window=W)
+    mid, rows_a, _ = agent.encode_extend(c0, toks, 130, window=W)
+    two, rows_b, _ = agent.encode_extend(mid, toks, 120, window=W)
     _carry_equal(one, two)
     ra = np.asarray(rows_one)[:250]
     rb = np.concatenate([np.asarray(rows_a)[:130], np.asarray(rows_b)[:120]])
     assert np.array_equal(ra, rb)
-    # The histogram really saw the tokens: nvalid == count of eqn_id>=0.
-    n_struct_free = int(np.sum(np.asarray(eqns)[:250] >= 0))
-    assert int(one.nvalid) == n_struct_free
+    assert int(one.pos) == 250
+
+
+def test_the_encoder_carry_is_three_leaves():
+    """``cumhist`` (a (MAX_EQNS,) histogram) and ``nvalid`` are gone."""
+    assert EncCarry._fields == ("M", "I", "pos")
 
 
 def test_vmem_fold_associative_and_heads():
