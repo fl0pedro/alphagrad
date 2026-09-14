@@ -252,21 +252,17 @@ def _tokenizer_for(case):
 
 def _check_pair(rec, tok):
     """Assert the three relations for one (seed, t) pair. Fails LOUDLY, with
-    the first differing index, the two token ids and their decode, on the
-    first mismatch."""
+    the first differing index (within whatever overlap exists), the two
+    token ids and their decode, on the first mismatch -- checked BEFORE the
+    length relation, so a length violation still reports the same
+    diagnostic (index / ids / decode) rather than a bare number."""
     f_cnt, f_dt = rec["f_cnt"], rec["f_dt"]
     next_dt, next_dc = rec["next_dt"], rec["next_dc"]
     total = int(f_cnt.sum())
     W = f_dt.shape[0]
+    overlap = min(total, next_dc, next_dt.shape[0])
 
-    if total > next_dc:
-        pytest.fail(
-            "sum(face_counts[t]) exceeds delta_count[t+1]: the stored face "
-            f"stream is LONGER than the delta it is supposed to prefix.\n"
-            f"seed={rec['seed']} step={rec['t']} "
-            f"sum(face_counts)={total} delta_count[t+1]={next_dc}")
-
-    for i in range(total):
+    for i in range(overlap):
         a, b = int(f_dt[i]), int(next_dt[i])
         if a != b:
             lo, hi = max(0, i - 4), min(W, i + 5)
@@ -279,7 +275,7 @@ def _check_pair(rec, tok):
                 "env's incremental stream and LiveFaceStream's own prefix "
                 "tokenizer) and they disagree.\n"
                 f"seed={rec['seed']} step={rec['t']} "
-                f"first differing index={i} of {total} "
+                f"first differing index={i} of overlap {overlap} "
                 f"(sum(face_counts)={total}, delta_count[t+1]={next_dc})\n"
                 f"face_delta_tokens[t][{i}]={a}   "
                 f"delta_tokens[t+1][{i}]={b}\n"
@@ -288,6 +284,34 @@ def _check_pair(rec, tok):
                 f"decode(face_delta_tokens context) ={tok.decode(ctx_face)!r}\n"
                 f"decode(delta_tokens[t+1] context)  ={tok.decode(ctx_next)!r}\n"
                 f"face_counts[t]={f_cnt.tolist()}")
+
+    if total > next_dc:
+        lo = max(0, next_dc - 4)
+        hi_face = min(W, next_dc + 8)
+        hi_next = min(next_dt.shape[0], next_dc + 8)
+        ctx_face = [int(x) for x in f_dt[lo:hi_face]]
+        ctx_next = [int(x) for x in next_dt[lo:hi_next]]
+        n_live = rec["n_live"]
+        pytest.fail(
+            "THE CLAIM IS FALSE: sum(face_counts[t]) exceeds delta_count[t+1] "
+            "-- the stored face stream (read from each face while its OWN "
+            "decision was still UNDECIDED, per _face_loop's docstring) is "
+            "LONGER than the delta the decision the head actually drew "
+            "produced (e.g. SKIP drops the raw contraction the head was "
+            "shown entirely, so the real emission is far shorter than the "
+            "chunk that was read to decide on it). The two streams agreed on "
+            f"their first {overlap} shared tokens, then the shorter one "
+            "(delta_tokens[t+1]) simply ended.\n"
+            f"seed={rec['seed']} step={rec['t']} n_live_faces={n_live} "
+            f"sum(face_counts)={total} delta_count[t+1]={next_dc}\n"
+            f"face_counts[t]={f_cnt.tolist()} "
+            f"skip[:n_live]={rec['skip'][:n_live].tolist()} "
+            f"op_type[:n_live]={rec['op_type'][:n_live].tolist()}\n"
+            f"context around index {next_dc} (the successor's end):\n"
+            f"  face_delta_tokens[{lo}:{hi_face})={ctx_face}\n"
+            f"  delta_tokens[t+1][{lo}:{hi_next})={ctx_next}\n"
+            f"  decode(face_delta_tokens context) ={tok.decode(ctx_face)!r}\n"
+            f"  decode(delta_tokens[t+1] context)  ={tok.decode(ctx_next)!r}")
 
     tail = f_dt[total:]
     bad = np.flatnonzero(tail != 0)
