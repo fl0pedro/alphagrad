@@ -182,6 +182,7 @@ def face_ce_term(face_replay_fn, ctx, enc_carry, axis_state, axis_valid,
     # import-light and env-free (see the header), and `episode_stream` pulls
     # `delta_fold`, which pulls jax.
     from alphagrad.approx.common import episode_stream as _epstream
+    from alphagrad.approx.env import MAX_DELTA_TOKENS as _MAX_DELTA_TOKENS
 
     nv = ctx.shape[0]
 
@@ -198,7 +199,13 @@ def face_ce_term(face_replay_fn, ctx, enc_carry, axis_state, axis_valid,
         lp, ent, ar, _probe_face_lat = face_replay_fn(
             features, fact_tables, fa_k, fp, fc, fv,
             enc_carry,
-            (cnt, _epstream.single_row(dt, dt.shape[-1]),
+            # THE ROW IS SIZED FROM THE READER'S WIDTH, not the draw's
+            # (review finding 8). The reader's chunk plan comes from
+            # `MAX_DELTA_TOKENS`, so a draw stored at any other width would
+            # make `dynamic_slice` clamp the last chunk and return SHIFTED
+            # tokens in silence -- the exact failure `stream_tail` exists to
+            # prevent. They are equal today; this keeps them equal.
+            (cnt, _epstream.single_row(dt, _MAX_DELTA_TOKENS),
              jnp.zeros((), jnp.int32), jnp.zeros((), jnp.int32)),
             op_override)
         return lp, ent / jnp.maximum(ar, 1.0)

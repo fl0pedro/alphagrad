@@ -205,7 +205,7 @@ def extend_fold(agent, carry, tokens, count, *, window, chunk=None,
         if b_tok is None:
             i = xs
             off = i * C
-            tk = _chunk_tokens(off)
+            tk = None            # read INSIDE `_run`; see below
         else:
             i, tk = xs
             off = i * C
@@ -215,8 +215,16 @@ def extend_fold(agent, carry, tokens, count, *, window, chunk=None,
 
         def _run(s):
             enc, acc = s
+            # THE READ IS INSIDE THE BRANCH (review finding 8). On the
+            # streaming path the chunk is a `dynamic_slice` out of the whole
+            # episode stream, which is megabytes; hoisting it above the
+            # `cond` made every SKIPPED chunk pay its gather anyway, in the
+            # forward pass and again under remat in the backward pass. The
+            # pre-batched path keeps its `tk`, which is a scan input and
+            # therefore already free.
+            tk_c = _chunk_tokens(off) if tk is None else tk
             enc2, rows_c, valid_c = _encode_chunk(
-                agent, enc, tk, c_cnt, C, par)
+                agent, enc, tk_c, c_cnt, C, par)
             return (enc2, fold_fn(acc, rows_c, valid_c, off))
 
         if budget is None:
