@@ -49,6 +49,33 @@ length. STATE THIS IN THE REPORT.
   or 25,737 tokens; bwd 2966 ms). CHECK EVERY LAUNCHER SETS CHUNK != 0.
 - palimpsa single-recurrence `e171a30`; interpret-vs-ref PASS (fwd 1.0e-7,
   grad 1.8e-7).
+- **EPISODE TOKEN STREAM** (owner rulings 2026-09-13, Q1, Q3 and Q4). The
+  rollout no longer stores a padded token window per step.
+  `Trajectory.delta_tokens` and `Trajectory.face_delta_tokens` were
+  `(MAX_DELTA_TOKENS,)` uint8 each. They are now the int32 spans
+  `delta_offset` and `face_offset`. Both index one uint8 row per environment
+  per episode. There are two rows, one for the step deltas and one for the
+  face chunks.
+  At the transformer width (MAX_DELTA_TOKENS 32768, T 95) the token storage
+  was 65 536 B per step per environment. It is now about 11.7 kB. The
+  `--grad-window` K gather materialised every window K times. It is now K
+  offsets into one contiguous span.
+  `MAX_DELTA_TOKENS` is unchanged. It is still the per-step transport width
+  and the write window, and its overflow contract is the same.
+  The row is `2^n + MAX_DELTA_TOKENS` slots. `n` comes from
+  `--episode-tokens-log2`. If that is 0, it comes from
+  `ALPHAGRAD_EPISODE_TOKENS_LOG2`. If that is unset, it is MAX_DELTA_TOKENS
+  times the episode length, rounded up to the next power of two, divided by
+  8. That is 19 at the transformer width.
+  A step that would pass `2^n` raises on the host before the write. The
+  driver logs one `[episode-stream]` line, grows `n` by one, recompiles and
+  repeats the episode. Growth is monotone and stops at
+  `ALPHAGRAD_EPISODE_TOKENS_LOG2_MAX`, which defaults to 24.
+  The first bin holds the measured episode with a factor of 1.84. A per-step
+  length that doubled therefore costs exactly one growth.
+  Design: `.scratch/trustworthy-approx-search/episode-stream-design.md`.
+  Code: `src/alphagrad/approx/common/episode_stream.py`. Tests:
+  `tests/episode_stream_test.py`.
 
 ## Key measured facts to carry
 - Vertex side: tokens-only reaches DV_FILL within-step R2 **0.933 in 7 steps**,
