@@ -1138,9 +1138,12 @@ def _plan_content_key(order, rule_specs, face_specs, face_skips,
         if part is None:
             h.update(b"none")
             continue
-        arr = np.asarray(part)
+        # int32 is the wire dtype of all four, so this is a view plus one
+        # copy into the hash rather than a widening copy of a face array
+        # that is 95 x MAX_FACES x FACE_SLOTS x 3 on the flagship.
+        arr = np.asarray(part, dtype=np.int32)
         h.update(repr(arr.shape).encode())
-        h.update(np.ascontiguousarray(arr).astype(np.int64).tobytes())
+        h.update(np.ascontiguousarray(arr).tobytes())
     return h.digest()
 
 
@@ -7979,8 +7982,14 @@ def _callback_measured(
                         jax.block_until_ready(
                             compiled_cost(*eval_args_all[_p]))
                     _warmed_cand.add(_p)
-                _lat_ns, _peak_b, _peak_src, out_approx = _time_one_rep(
+                _lat_ns, _peak_b, _peak_src, _out = _time_one_rep(
                     compiled_cost, eval_args_all[_p], unique_devices, _inner)
+                # DROPPED IMMEDIATELY. The old loop kept the last timed
+                # output alive because the per-point quality work read it;
+                # that work now runs in its own loop below, so nothing needs
+                # it here and holding a full Jacobian across the timing loop
+                # is pure OOM headroom spent for nothing.
+                del _out
                 latency_samples.append(_lat_ns)
                 peak_mem_samples.append(_peak_b)
                 _ia += 1
