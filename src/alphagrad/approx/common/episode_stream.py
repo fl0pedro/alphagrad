@@ -212,6 +212,30 @@ def grow(log2: int) -> int:
     return int(log2) + 1
 
 
+def run_with_growth(state, what, fn, log=print):
+    """THE DRIVER'S GROWTH LOOP, the owner's rule in one place (Q1).
+
+    ``state`` is a one-element mutable holding the current `n`; ``fn(n)``
+    runs the episode. On :class:`EpisodeStreamOverflow`: log ONE line with
+    the old bin, the new bin and what overflowed, raise `n` by one, and run
+    the SAME episode again. A new bin is a new stream shape, so the caller's
+    jit retraces by itself -- there is nothing to invalidate by hand.
+
+    Nothing of the failed attempt survives: the caller rebinds the agent,
+    the optimiser state and the env states only on RETURN, so the repeat
+    starts from exactly the state the first attempt started from. The host
+    callbacks of the failed attempt did run, so their counters saw it.
+    """
+    while True:
+        try:
+            return fn(state[0])
+        except EpisodeStreamOverflow as exc:
+            old = int(state[0])
+            state[0] = grow(old)
+            log("[episode-stream] bin 2^%d -> 2^%d, repeating %s: %s"
+                % (old, state[0], what, exc))
+
+
 class EpisodeStreamCapReached(Exception):
     """The bin hit `ALPHAGRAD_EPISODE_TOKENS_LOG2_MAX` and cannot grow."""
 

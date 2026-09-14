@@ -53,6 +53,20 @@ from alphagrad.approx.env import (                               # noqa: E402
     MAX_FACES as MAXF)
 
 TOTAL_V = 6
+
+
+def _face_span(r):
+    """`_face_replay`'s ``face_chunks``: one window as a ONE-ROW stream.
+
+    The replay reads the FACE EPISODE STREAM by (row, offset) now. A direct
+    unit test holds one window and no episode, so it is row 0 at offset 0.
+    """
+    from alphagrad.approx.common import episode_stream as _ES
+    from alphagrad.approx.env import MAX_DELTA_TOKENS as _W
+    return (r["f_cnt"], _ES.single_row(r["f_dt"], _W),
+            jnp.asarray(0, jnp.int32), jnp.asarray(0, jnp.int32))
+
+
 EMBD = 32
 MODES = ("chunk-mean", "own-span-mean", "last-row")
 
@@ -176,7 +190,7 @@ def _replay(agent, r, face_heads="stored"):
     fh = None if fh is None else jnp.asarray(fh, jnp.int32)
     return agent._face_replay(
         feats, r["ft"], r["fa"], r["f_pair"], r["f_comp"], r["f_valid"],
-        r["enc"], (r["f_cnt"], r["f_dt"]), r["ovr"],
+        r["enc"], _face_span(r), r["ovr"],
         face_heads=fh)
 
 

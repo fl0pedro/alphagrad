@@ -691,7 +691,7 @@ def test_no_trajectory_or_train_batch_leaf_carries_equation_ids():
         assert "face_delta_eqns" not in names
         assert "enc_cumhist" not in names
         assert "enc_nvalid" not in names
-        assert "delta_tokens" in names
+        assert "delta_offset" in names
         assert "delta_count" in names
 
 

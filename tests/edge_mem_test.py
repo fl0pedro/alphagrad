@@ -65,6 +65,20 @@ import pytest  # noqa: E402
 import equinox as eqx  # noqa: E402
 
 TOTAL_V = 6
+
+
+def _face_span(r):
+    """`_face_replay`'s ``face_chunks``: one window as a ONE-ROW stream.
+
+    The replay reads the FACE EPISODE STREAM by (row, offset) now. A direct
+    unit test holds one window and no episode, so it is row 0 at offset 0.
+    """
+    from alphagrad.approx.common import episode_stream as _ES
+    from alphagrad.approx.env import MAX_DELTA_TOKENS as _W
+    return (r["f_cnt"], _ES.single_row(r["f_dt"], _W),
+            jnp.asarray(0, jnp.int32), jnp.asarray(0, jnp.int32))
+
+
 EMBD = 32
 KE = MAXF  # edge-memory capacity = the face bound
 
@@ -226,10 +240,10 @@ def test_flag_off_is_bitwise_blind_to_edge_rows(agent_off):
                                       a["ax_mask"][a["v"]])
     lp0, e0, ar0, lat0 = agent_off._face_replay(
         feats, a["ft"], a["fa"], a["f_pair"], a["f_comp"], a["f_valid"],
-        a["enc"], (a["f_cnt"], a["f_dt"]), a["ovr"])
+        a["enc"], _face_span(a), a["ovr"])
     lp1, e1, ar1, lat1 = agent_off._face_replay(
         feats, a["ft"], a["fa"], a["f_pair"], a["f_comp"], a["f_valid"],
-        a["enc"], (a["f_cnt"], a["f_dt"]), a["ovr"],
+        a["enc"], _face_span(a), a["ovr"],
         edge_rows=_edge_rows(1, 100.0),
         face_eslots=jnp.zeros((MAXF, 2), jnp.int32))
     assert np.array_equal(np.asarray(lp0), np.asarray(lp1))
@@ -387,7 +401,7 @@ def test_write_then_read_binding(agent_on):
     eslots = (-jnp.ones((MAXF, 2), jnp.int32)).at[0, 0].set(5)
     _lp, _e2, _ar, lat = agent._face_replay(
         feats, r["ft"], r["fa"], r["f_pair"], r["f_comp"], r["f_valid"],
-        r["enc"], (r["f_cnt"], r["f_dt"]), r["ovr"],
+        r["enc"], _face_span(r), r["ovr"],
         edge_rows=jnp.asarray(emem), face_eslots=eslots)
     lat = np.asarray(lat)
     assert lat.shape == (MAXF, 3 * EMBD)
@@ -410,7 +424,7 @@ def test_flag_on_rollout_equals_replay(agent_on, n):
                                       r["ax_mask"][r["v"]])
     lp, ent, ar, lat = agent_on._face_replay(
         feats, r["ft"], r["fa"], r["f_pair"], r["f_comp"], r["f_valid"],
-        r["enc"], (r["f_cnt"], r["f_dt"]), r["ovr"],
+        r["enc"], _face_span(r), r["ovr"],
         edge_rows=rows, face_eslots=r["f_eslots"])
     np.testing.assert_allclose(np.asarray(lp), r["logp"], rtol=1e-5,
                                atol=1e-6)
@@ -421,7 +435,7 @@ def test_flag_on_rollout_equals_replay(agent_on, n):
     # stand-ins).
     lp2, _, _, _ = agent_on._face_replay(
         feats, r["ft"], r["fa"], r["f_pair"], r["f_comp"], r["f_valid"],
-        r["enc"], (r["f_cnt"], r["f_dt"]), r["ovr"],
+        r["enc"], _face_span(r), r["ovr"],
         edge_rows=_edge_rows(43, 10.0), face_eslots=r["f_eslots"])
     assert not np.allclose(np.asarray(lp2), r["logp"], rtol=1e-5, atol=1e-6)
 
@@ -439,7 +453,7 @@ def test_both_flags_rollout_equals_replay(agent_both, n):
                                       r["ax_mask"][r["v"]])
     lp, ent, _ar, lat = agent_both._face_replay(
         feats, r["ft"], r["fa"], r["f_pair"], r["f_comp"], r["f_valid"],
-        r["enc"], (r["f_cnt"], r["f_dt"]), r["ovr"],
+        r["enc"], _face_span(r), r["ovr"],
         endpoint_rows=prows, face_ends=r["f_ends"],
         edge_rows=erows, face_eslots=r["f_eslots"])
     assert lat.shape == (MAXF, 5 * EMBD)
@@ -464,7 +478,7 @@ def test_flag_on_probe_receives_concat_width(agent_on):
                                       r["ax_mask"][r["v"]])
     _, _, _, lat = agent_on._face_replay(
         feats, r["ft"], r["fa"], r["f_pair"], r["f_comp"], r["f_valid"],
-        r["enc"], (r["f_cnt"], r["f_dt"]), r["ovr"],
+        r["enc"], _face_span(r), r["ovr"],
         edge_rows=rows, face_eslots=r["f_eslots"])
     assert lat.shape == (MAXF, 3 * EMBD)
     # the edge halves ARE the gathered slot rows (-1 -> zero row).

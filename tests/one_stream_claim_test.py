@@ -505,3 +505,70 @@ def test_the_stored_face_stream_is_what_the_head_read_before_the_decision_and_di
         f"seeds_tried=0..{last_seed}\n"
         f"undecided_steps_checked={undecided_checked}\n"
         f"decided_steps_checked={decided_checked}\n")
+
+
+# --------------------------------------------------------------------------
+# THE FACE EPISODE STREAM (design item 3, 2026-09-14). The face window this
+# module measures is exactly what `Trajectory.face_delta_tokens` used to
+# hold; it is now a SPAN of one row per environment per episode. This pins
+# that the span carries the same tokens the leaf did, token for token, over
+# a real rollout through the live-faces path -- the same rollout the
+# relations above are measured on.
+# --------------------------------------------------------------------------
+
+def test_the_face_stream_span_holds_the_tokens_the_stored_window_used_to_hold():
+    """One row per episode, written at a cursor, read back by (offset,
+    count).
+
+    The rollout writes step t's chunks at the face cursor and advances it by
+    `sum(face_counts[t])` exactly. So:
+
+      * step t's span IS the window's live prefix, token for token;
+      * the row is those prefixes concatenated and nothing else;
+      * the cursor after the last step is the sum of the counts, which is
+        what the host checks against the bin.
+    """
+    from alphagrad.approx.common import episode_stream as _ES
+    from alphagrad.approx.ppo import _ep_stream_write
+
+    _case, records = _run_episode(0)
+    assert records, "the rollout produced no face rows to measure"
+
+    # The window width the face loop writes into is the transport width.
+    W = int(records[0]["f_dt"].shape[0])
+    n = _ES.default_log2(W, len(records))
+    stream = jnp.zeros((_ES.stream_length(n, W),), jnp.uint8)
+
+    cursor, spans = 0, []
+    for rec in records:
+        total = int(np.sum(rec["f_cnt"]))
+        # The host's check, exactly as the rollout asks it, BEFORE the write.
+        _ES.check_cursors(np.asarray([cursor], np.int64),
+                          np.asarray([total], np.int64), rec["t"], n)
+        window = jnp.asarray(rec["f_dt"].astype(np.uint8))
+        stream = _ep_stream_write(stream, cursor, window, total)
+        spans.append((cursor, total))
+        cursor += total
+
+    row = np.asarray(stream)
+    for rec, (off, total) in zip(records, spans):
+        want = rec["f_dt"][:total].astype(np.uint8)
+        got = row[off:off + total]
+        assert np.array_equal(got, want), (
+            f"step {rec['t']}: the face stream span [{off}, {off + total}) "
+            f"is not the {total} tokens the stored window held; first "
+            f"difference at "
+            f"{int(np.argmax(got != want)) if total else 'n/a'}")
+
+    # The row is the concatenation and nothing else: no padding survived
+    # between two steps, and nothing was written past the last cursor.
+    want_all = np.concatenate(
+        [r["f_dt"][:t].astype(np.uint8) for r, (_o, t) in zip(records, spans)]
+    ) if cursor else np.zeros((0,), np.uint8)
+    assert np.array_equal(row[:cursor], want_all)
+    assert not np.any(row[cursor:])
+    assert cursor == int(sum(t for _o, t in spans))
+    assert cursor <= (1 << n), (cursor, n)
+
+    print(f"[one-stream] face stream: {len(records)} steps, {cursor} tokens, "
+          f"bin 2^{n}", flush=True)

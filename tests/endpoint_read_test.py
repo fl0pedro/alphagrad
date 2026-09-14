@@ -57,6 +57,20 @@ import pytest  # noqa: E402
 import equinox as eqx  # noqa: E402
 
 TOTAL_V = 6
+
+
+def _face_span(r):
+    """`_face_replay`'s ``face_chunks``: one window as a ONE-ROW stream.
+
+    The replay reads the FACE EPISODE STREAM by (row, offset) now. A direct
+    unit test holds one window and no episode, so it is row 0 at offset 0.
+    """
+    from alphagrad.approx.common import episode_stream as _ES
+    from alphagrad.approx.env import MAX_DELTA_TOKENS as _W
+    return (r["f_cnt"], _ES.single_row(r["f_dt"], _W),
+            jnp.asarray(0, jnp.int32), jnp.asarray(0, jnp.int32))
+
+
 EMBD = 32
 
 
@@ -186,10 +200,10 @@ def test_flag_off_is_bitwise_blind_to_endpoint_rows(agent_off):
                                       a["ax_mask"][a["v"]])
     lp0, e0, ar0, lat0 = agent_off._face_replay(
         feats, a["ft"], a["fa"], a["f_pair"], a["f_comp"], a["f_valid"],
-        a["enc"], (a["f_cnt"], a["f_dt"]), a["ovr"])
+        a["enc"], _face_span(a), a["ovr"])
     lp1, e1, ar1, lat1 = agent_off._face_replay(
         feats, a["ft"], a["fa"], a["f_pair"], a["f_comp"], a["f_valid"],
-        a["enc"], (a["f_cnt"], a["f_dt"]), a["ovr"],
+        a["enc"], _face_span(a), a["ovr"],
         endpoint_rows=_rand_rows(1, 100.0), face_ends=a["f_ends"])
     assert np.array_equal(np.asarray(lp0), np.asarray(lp1))
     assert np.array_equal(np.asarray(e0), np.asarray(e1))
@@ -231,7 +245,7 @@ def test_flag_on_rollout_equals_replay(agent_on, n):
                                       r["ax_mask"][r["v"]])
     lp, ent, ar, lat = agent_on._face_replay(
         feats, r["ft"], r["fa"], r["f_pair"], r["f_comp"], r["f_valid"],
-        r["enc"], (r["f_cnt"], r["f_dt"]), r["ovr"],
+        r["enc"], _face_span(r), r["ovr"],
         endpoint_rows=rows, face_ends=r["f_ends"])
     np.testing.assert_allclose(np.asarray(lp), r["logp"], rtol=1e-5,
                                atol=1e-6)
@@ -241,7 +255,7 @@ def test_flag_on_rollout_equals_replay(agent_on, n):
     # head actually reads the endpoint half (all stand-in endpoints > 0).
     lp2, _, _, _ = agent_on._face_replay(
         feats, r["ft"], r["fa"], r["f_pair"], r["f_comp"], r["f_valid"],
-        r["enc"], (r["f_cnt"], r["f_dt"]), r["ovr"],
+        r["enc"], _face_span(r), r["ovr"],
         endpoint_rows=_rand_rows(43, 10.0), face_ends=r["f_ends"])
     assert not np.allclose(np.asarray(lp2), r["logp"], rtol=1e-5, atol=1e-6)
 
@@ -256,7 +270,7 @@ def test_flag_on_probe_receives_concat_width(agent_on):
                                       r["ax_mask"][r["v"]])
     _, _, _, lat = agent_on._face_replay(
         feats, r["ft"], r["fa"], r["f_pair"], r["f_comp"], r["f_valid"],
-        r["enc"], (r["f_cnt"], r["f_dt"]), r["ovr"],
+        r["enc"], _face_span(r), r["ovr"],
         endpoint_rows=rows, face_ends=r["f_ends"])
     assert lat.shape == (MAXF, 3 * EMBD)
     # the endpoint halves ARE the gathered slot rows (1-based, 0 -> zero row)

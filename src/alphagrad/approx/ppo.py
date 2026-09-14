@@ -8472,24 +8472,12 @@ def main():
              _epstream.LOG2_MAX_ENV, _epstream.log2_max()), flush=True)
 
     def _run_with_bin_growth(what, fn):
-        """Run ``fn(n)``; on an overflow grow the bin and REPEAT.
-
-        The owner's growth rule (Q1), in one place: catch the host's raise,
-        log one line with the old bin, the new bin and what overflowed,
-        recompile for `2^(n+1)` (a new bin is a new stream SHAPE, which
-        retraces `rollout_fn` by itself), and run the same episode again.
-        Nothing of the failed attempt survives -- the agent, the optimiser
-        state and the env states are only rebound on success -- so the
-        repeat starts from exactly the state the first attempt did.
-        """
-        while True:
-            try:
-                return fn(_EP_LOG2[0])
-            except EpisodeStreamOverflow as _ovf:
-                _old = _EP_LOG2[0]
-                _EP_LOG2[0] = _epstream.grow(_old)
-                print("[episode-stream] bin 2^%d -> 2^%d, repeating %s: %s"
-                      % (_old, _EP_LOG2[0], what, _ovf), flush=True)
+        """The owner's growth rule (Q1). One implementation, in
+        `common.episode_stream.run_with_growth`; this only binds the run's
+        bin holder and the log line's sink."""
+        return _epstream.run_with_growth(
+            _EP_LOG2, what, fn,
+            log=lambda line: print(line, flush=True))
 
     @eqx.filter_jit
     # +1 entry for vertex_temperature (broadcast, not mapped): the PopArt
