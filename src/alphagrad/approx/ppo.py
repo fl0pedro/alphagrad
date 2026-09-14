@@ -156,6 +156,7 @@ from alphagrad.transformer.encoder import RelationalMultiheadAttention
 from alphagrad.transformer.palimpsa_encoder import (
     palimpsa_beta as _pal_beta, palimpsa_qk_norm as _pal_qk_norm)
 from alphagrad.approx.common import delta_fold as _fold
+from alphagrad.approx.common import count_vjp as _count_vjp
 from alphagrad.approx.common import feature_probe as _fprobe
 from alphagrad.approx.common import var_probe as _vprobe
 from alphagrad.approx.common import gate_telemetry as _gate_telemetry
@@ -2823,6 +2824,35 @@ class Agent(eqx.Module):
                 # every downstream reduction sees the identical array.
                 b_toks = toks_p.reshape(nb_max, C)
                 b_valid = valid_p.reshape(nb_max, C)
+                _remat_on = os.environ.get(
+                    "ALPHAGRAD_LOSS_EXTEND_REMAT", "1") != "0"
+
+                # COUNT-PROPORTIONAL BACKWARD (owner ruling 2026-09-14). The
+                # scan below is nb_max = ceil(W/C) iterations long whatever
+                # `nb` is, because reverse-mode AD cannot transpose a
+                # `while_loop`. Inside a `custom_vjp` it never has to: the
+                # forward runs `nb` chunks with a `while_loop` and saves each
+                # chunk's boundary carry, and the hand-written backward sweeps
+                # the same `nb` chunks in reverse. Same residual (the
+                # checkpointed scan already stacks exactly those boundary
+                # carries), same numbers -- see common/count_vjp.py.
+                #
+                # Gated on remat for the same reason the fold is:
+                # ALPHAGRAD_LOSS_EXTEND_REMAT=0 asks for the stored-residual
+                # form, which a recompute-in-the-backward custom_vjp cannot
+                # give.
+                if _remat_on and _count_vjp.enabled():
+                    def _cv_chunk(i, c):
+                        return lax.scan(
+                            _step, c, (b_toks[i], b_valid[i]), unroll=unroll)
+
+                    (M2, I2), rows_b = _count_vjp.count_loop(
+                        _cv_chunk, c0, nb=nb_max, nb_live=nb,
+                        y_struct=jax.ShapeDtypeStruct(
+                            (C, self.embd_dim), jnp.float32))
+                    rows = rows_b.reshape(nb_max * C, -1)[:W]
+                    new_carry = EncCarry(M=M2, I=I2, pos=carry.pos + count)
+                    return new_carry, rows, valid
 
                 def _chunk_d(c, xs):
                     i, bt, bv = xs
@@ -2849,9 +2879,7 @@ class Agent(eqx.Module):
                 # identical forward. ALPHAGRAD_LOSS_EXTEND_REMAT=0 restores
                 # the stored-residual form.
                 _body = (jax.checkpoint(_chunk_d)
-                         if os.environ.get(
-                             "ALPHAGRAD_LOSS_EXTEND_REMAT", "1") != "0"
-                         else _chunk_d)
+                         if _remat_on else _chunk_d)
                 (M2, I2), rows_b = lax.scan(
                     _body, c0,
                     (jnp.arange(nb_max, dtype=jnp.int32), b_toks, b_valid))
