@@ -206,7 +206,16 @@ def test_a_step_that_would_pass_the_bin_raises_the_flag_and_clamps_itself():
     off, end, over = ES.write_offset(250, 10, 8)
     assert bool(over)
     assert int(end) == 260
+    # The cursor itself is still inside the bin, so the write starts where it
+    # always would; the row's tail is what makes it land in the row.
+    assert int(off) == 250
+    # A LATER step of the same doomed attempt starts past the bin, and THAT
+    # is what the clamp is for: without it the write would run off the row
+    # and `dynamic_update_slice` would shift it in silence.
+    off, end, over = ES.write_offset(400, 10, 8)
+    assert bool(over)
     assert int(off) == 256              # clamped to the bin, inside the row
+    assert int(end) == 410
     # A write that lands EXACTLY on the bin is legal: the bin is a length.
     off, end, over = ES.write_offset(246, 10, 8)
     assert not bool(over)
