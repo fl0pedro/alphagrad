@@ -14055,9 +14055,22 @@ def main():
             except Exception:
                 out["pool_face"] = {}
         if _PLAN_LOG_PATH is not None:
+            from alphagrad.approx.env import (
+                MeasureToolchainFault as _MTF)
             out["local_plan"] = _cpr()
-            # A toolchain fault MUST stop the run, here as in `host_log`.
-            out["pool_plan"] = _mpr(_p)
+            try:
+                out["pool_plan"] = _mpr(_p)
+            except _MTF:
+                # A measure actor whose apparatus is faulted stops the run,
+                # here as in `host_log`. A skip is a failure.
+                raise
+            except Exception as _exc:                          # noqa: BLE001
+                print(f"[plan-log] pool drain failed at collect time "
+                      f"({_exc!r}) -- pooled plans are MISSING",
+                      file=sys.stderr, flush=True)
+                # The skeleton of an empty drain, so the logging below reports
+                # "no pool" rather than draining again a whole episode late.
+                out["pool_plan"] = _mpr(None)
         return out
 
     def _finish_episode(_fe):
