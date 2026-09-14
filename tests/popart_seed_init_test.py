@@ -207,7 +207,15 @@ _COMMON = [
 
 
 def _run_ppo(name, *extra, timeout=1800):
-    env = dict(os.environ)
+    # Strip every inherited ALPHAGRAD_* var before setting our own -- a full
+    # `pytest tests/` run leaves some behind (e.g. tests/edge_mem_test.py
+    # writes ALPHAGRAD_MAX_DELTA_TOKENS=128 into os.environ at collection
+    # time; it is a dead write for that module's own purposes, since env.py
+    # had already frozen the real value by then, but it is a live leak into
+    # any LATER subprocess that inherits os.environ, and 128 is below this
+    # config's fold chunk). See tests/policy_regression_gate_test.py's
+    # `_run_gate` for the same guard, for the same reason.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("ALPHAGRAD_")}
     env.update({
         "JAX_PLATFORMS": "cpu",
         "ALPHAGRAD_EXTEND_CHUNK": "256",
