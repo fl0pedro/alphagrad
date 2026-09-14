@@ -26,6 +26,11 @@ from __future__ import annotations
 import os
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
+os.environ.setdefault("ALPHAGRAD_POLICY", "palimpsa")
+os.environ.setdefault("ALPHAGRAD_SKIP_COST_ANALYSIS", "1")
+os.environ.setdefault("ALPHAGRAD_SKIP_COUNT_OPS", "1")
+os.environ.setdefault("ALPHAGRAD_INCR_TOKEN_VOCAB", "256")
+os.environ.setdefault("ALPHAGRAD_INCREMENTAL_TOKENS", "1")
 
 import numpy as np
 import pytest
@@ -56,15 +61,13 @@ def agent():
     """
     ns = P.make_argparser().parse_args([])
     apply_policy_arch(
-        ns, dynamic_substeps=True, unified_head=False, no_approx_head=False,
+        ns, dynamic_substeps=True, unified_head=False, no_approx_head=True,
         face_actions=False, unified_face_head=False, live_faces=False,
         max_substeps=1, axis_group_embedding=False)
-    ns.policy = "palimpsa"
-    ns.embd_dim = 16
-    ns.num_heads = 2
+    ns.embd_dim = 32
     ns.num_layers = 2
     ns.hidden_dim = 32
-    ns.vocab_size = 64
+    ns.vocab_size = 512
     ns.preference_conditioned = False
     return build_and_init_agent(ns, 6, num_factors=4, max_rules=4, seed=SEED)
 
@@ -72,7 +75,7 @@ def agent():
 @pytest.fixture(scope="module")
 def tokens():
     r = np.random.RandomState(SEED)
-    return jnp.asarray(r.randint(1, 60, size=WINDOW).astype(np.int32))
+    return jnp.asarray(r.randint(1, 200, size=WINDOW).astype(np.int32))
 
 
 def _carry(agent):
