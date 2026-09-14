@@ -440,6 +440,65 @@ def _chunk_backward(qs, kc, vc, bc, gt_c, g_s, Ip_s, M, I, vmaskf, kvmaskf,
 
 
 # =============================================================================
+# 2b. THE FLAG.  One env var, read at every call site that reads palimpsa.
+# =============================================================================
+_READ_LOGGED = [False]
+
+
+def palimpsa_read() -> str:
+    """``"exact"`` or ``"fast"`` -- ``ALPHAGRAD_PALIMPSA_READ``, default exact.
+
+    ONE flag for every reader, and every reader must consult THIS function
+    rather than the environment directly. The rollout extend, the loss extend
+    (both ``_extend_sequential`` forms and ``extend_fold``), ``base_memory``
+    and the full ``encode`` path all read palimpsa, and the PPO ratio is only
+    1 at epoch 0 while they agree on which read they are doing. A second
+    switch, or a call site that forgot to ask, would show up as a ratio that
+    drifts from 1 with no other symptom.
+
+    Default ``exact`` until the owner re-records the policy regression gate:
+    ``fast`` is a different operator, so it produces a different (and
+    correct) golden, not a failure.
+    """
+    mode = os.environ.get("ALPHAGRAD_PALIMPSA_READ", "exact")
+    if mode not in ("exact", "fast"):
+        raise ValueError(
+            "ALPHAGRAD_PALIMPSA_READ must be 'exact' or 'fast', got "
+            f"{mode!r}. It selects the palimpsa READ, and a typo that fell "
+            "back to a default would silently train a different operator "
+            "from the one the launcher asked for.")
+    if not _READ_LOGGED[0]:
+        _READ_LOGGED[0] = True
+        print("[palimpsa] read=%s" % mode, flush=True)
+    return mode
+
+
+def fast_read_enabled() -> bool:
+    return palimpsa_read() == "fast"
+
+
+def require_chunk_alignment(chunk, what):
+    """Raise unless ``chunk`` keeps the C=32 grid aligned to the delta start.
+
+    The fast read's chunk grid is measured from token 0 of the delta, so any
+    OUTER chunking (``ALPHAGRAD_EXTEND_CHUNK``, ``ALPHAGRAD_LOSS_EXTEND_CHUNK``,
+    ``ALPHAGRAD_FOLD_CHUNK``) has to start each of its blocks on a multiple of
+    32. Otherwise the rollout and the loss, which chunk differently, would cut
+    the same delta into different chunks -- and since a chunk boundary is
+    where the read stops approximating, that is a real numerical difference,
+    not a reassociation. The PPO ratio would leave 1 at epoch 0.
+    """
+    c = int(chunk)
+    if c > 0 and c % CHUNK_C != 0:
+        raise ValueError(
+            f"{what}={c} is not a multiple of the fast-palimpsa chunk "
+            f"{CHUNK_C}. Under ALPHAGRAD_PALIMPSA_READ=fast every outer "
+            "chunk must start on a multiple of 32 tokens, or the rollout and "
+            "the loss read the same delta with different chunk boundaries.")
+    return c
+
+
+# =============================================================================
 # 3. Backend resolution (same three-way contract as palimpsa_pallas).
 # =============================================================================
 _BACKEND_LOGGED = [False]

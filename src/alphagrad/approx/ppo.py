@@ -155,6 +155,9 @@ from alphagrad.approx import vertex_memory as _vmem
 from alphagrad.transformer.encoder import RelationalMultiheadAttention
 from alphagrad.transformer.palimpsa_encoder import (
     palimpsa_beta as _pal_beta, palimpsa_qk_norm as _pal_qk_norm)
+from alphagrad.transformer.fast_palimpsa_pallas import (
+    CHUNK_C as _FAST_C, fast_palimpsa as _fast_palimpsa,
+    fast_read_enabled as _fast_read, require_chunk_alignment as _need_c32)
 from alphagrad.approx.common import delta_fold as _fold
 from alphagrad.approx.common import count_vjp as _count_vjp
 from alphagrad.approx.common import feature_probe as _fprobe
@@ -2632,7 +2635,12 @@ class Agent(eqx.Module):
         _mode = os.environ.get("ALPHAGRAD_CHUNKED_EXTEND", "0")
         if _mode == "1" or os.environ.get(
                 "ALPHAGRAD_CHUNKED_SELFTEST", "0") == "1":
-            par = self._extend_parallel(carry, toks, valid, count)
+            # `_extend_parallel` is an EXACT-read path (an associative scan of
+            # the per-token affine recurrence). Under the fast read it has no
+            # counterpart and must not be entered, or this one call site would
+            # read a different operator from every other one.
+            par = (self._extend_fast(carry, toks, valid, count) if _fast_read()
+                   else self._extend_parallel(carry, toks, valid, count))
             if os.environ.get("ALPHAGRAD_CHUNKED_SELFTEST", "0") == "1":
                 seq = self._extend_sequential(carry, toks, valid, count)
                 jax.debug.print(
@@ -2738,6 +2746,77 @@ class Agent(eqx.Module):
         new_carry = EncCarry(M=M2, I=I2, pos=carry.pos + count)
         return new_carry, rows, valid
 
+    def _fast_block(self, c, toks, valid):
+        """One block of tokens through the WHOLE layer stack with the FAST
+        palimpsa read. ``c`` is ``(M, I)`` stacked per layer; returns
+        ``((M2, I2), rows)`` -- the same pair ``lax.scan(_step, ...)`` returns,
+        so it drops into every place that scan is called.
+
+        The layer arithmetic is `_step`'s, token for token; only the palimpsa
+        read changes, and it changes by calling ONE function --
+        ``fast_palimpsa`` -- which is the same function the full ``encode``
+        path's mixer calls. That is what keeps the rollout, the loss and
+        ``base_memory`` on one operator.
+
+        INVALID STEPS ARE FROZEN THE SAME WAY. ``_step`` writes
+        ``where(ok, M_l, M[li])``; here the freezing happens at the input
+        instead -- ``v = b = 0`` contributes nothing to either state and
+        ``gt = 0`` makes the decay exactly 1, so the boundary update is the
+        identity on the carry. ``k`` is deliberately NOT zeroed: `valid` is a
+        prefix, so an invalid token's key can only ever be read by a later
+        token, which is invalid too and whose row is discarded.
+
+        A BLOCK IS READ AS ceil(T/32) CHUNKS, ALWAYS. The last one is zero
+        padded when the block does not divide by 32, and the pad tokens are a
+        no-op for the same reason the invalid ones are.
+        """
+        M, I = c
+        T = toks.shape[0]
+        layers = self.encoder.layers
+        x = jax.vmap(self.embedding)(toks)
+        okf = jnp.asarray(valid, jnp.float32)[:, None]        # (T, 1)
+        new_M, new_I = [], []
+        for li, layer in enumerate(layers):
+            mixer = layer.attn_layer
+            H, d = mixer.num_heads, mixer.head_dim
+            y = jax.vmap(layer.attn_norm)(x)
+            q = _pal_qk_norm(jax.vmap(mixer.query_proj)(y).reshape(T, H, d))
+            kk = _pal_qk_norm(jax.vmap(mixer.key_proj)(y).reshape(T, H, d))
+            v = jax.vmap(mixer.value_proj)(y).reshape(T, H, d)
+            b = _pal_beta(
+                jax.vmap(mixer.bias_proj)(y).reshape(T, H, d),
+                mixer.b_scale_raw)
+            gt = jnn.softplus(jax.vmap(mixer.gate_proj)(y))   # (T, H)
+            g = jnn.softplus(mixer.g_raw)
+            Ip = jnn.softplus(mixer.Ip_raw)
+            v = v * okf[:, :, None]
+            b = b * okf[:, :, None]
+            gt = gt * okf
+            out, M_l, I_l = _fast_palimpsa(
+                q[None], kk[None], v[None], b[None], gt[None], g, Ip,
+                scale=None, chunk_size=_FAST_C,
+                initial_M=M[li][None], initial_I=I[li][None],
+                output_final_state=True)
+            x = x + jax.vmap(mixer.output_proj)(out[0].reshape(T, H * d))
+            y2 = jax.vmap(layer.mlp_norm)(x)
+            x = x + jax.vmap(layer.mlp)(y2)
+            new_M.append(M_l[0])
+            new_I.append(I_l[0])
+        rows = jnp.where(jnp.asarray(valid)[:, None], x, 0.0)
+        return (jnp.stack(new_M), jnp.stack(new_I)), rows
+
+    def _extend_fast(self, carry, toks, valid, count):
+        """``_extend_parallel``'s exact contract, with the FAST read.
+
+        ``delta_fold._encode_chunk`` calls this instead of the parallel
+        associative-scan path when ``ALPHAGRAD_PALIMPSA_READ=fast``. There is
+        no inner blocking here: the fast read materialises no per-token
+        ``(T, H, d, d)`` state, which is the only thing the parallel path's
+        block size existed to bound.
+        """
+        (M2, I2), rows = self._fast_block((carry.M, carry.I), toks, valid)
+        return EncCarry(M=M2, I=I2, pos=carry.pos + count), rows, valid
+
     def _extend_sequential(self, carry, toks, valid, count,
                            chunk=None, budget=None):
         layers = self.encoder.layers
@@ -2786,6 +2865,18 @@ class Agent(eqx.Module):
         W = toks.shape[0]
         C = int(os.environ.get("ALPHAGRAD_EXTEND_CHUNK", "0")
                 if chunk is None else chunk)
+
+        # THE READ, chosen once for the whole call. `_walk` is what every
+        # branch below calls instead of spelling out its own scan, so the
+        # flat form, the while_loop form, the scan+cond form and the
+        # count_vjp form cannot drift apart -- and switching the read is one
+        # line, not four.
+        _fast = _fast_read()
+
+        def _walk(c, toks_blk, valid_blk):
+            if _fast:
+                return self._fast_block(c, toks_blk, valid_blk)
+            return lax.scan(_step, c, (toks_blk, valid_blk), unroll=unroll)
         if budget is not None:
             # The differentiated form pays nb_max = ceil(W/C) OUTER scan
             # iterations whatever the budget is -- the trip count is a
@@ -2797,10 +2888,12 @@ class Agent(eqx.Module):
             # knob each; unset falls back to ALPHAGRAD_EXTEND_CHUNK, so the
             # old behaviour is one env var away.
             C = int(os.environ.get("ALPHAGRAD_LOSS_EXTEND_CHUNK", C))
+        if _fast:
+            _need_c32(C, "ALPHAGRAD_LOSS_EXTEND_CHUNK"
+                      if budget is not None else "ALPHAGRAD_EXTEND_CHUNK")
 
         if C <= 0 or C >= W:
-            (M2, I2), rows = lax.scan(
-                _step, c0, (toks, valid), unroll=unroll)
+            (M2, I2), rows = _walk(c0, toks, valid)
         else:
             # DYNAMIC TRIP COUNT. The scan above is `window` long no matter
             # what `count` is -- on the TLM flagship a median 78-token delta
@@ -2883,8 +2976,7 @@ class Agent(eqx.Module):
                 # give.
                 if _remat_on and _count_vjp.enabled():
                     def _cv_chunk(i, c):
-                        return lax.scan(
-                            _step, c, (b_toks[i], b_valid[i]), unroll=unroll)
+                        return _walk(c, b_toks[i], b_valid[i])
 
                     (M2, I2), rows_b = _count_vjp.count_loop(
                         _cv_chunk, c0, nb=nb_max, nb_live=nb,
@@ -2898,7 +2990,7 @@ class Agent(eqx.Module):
                     i, bt, bv = xs
 
                     def _run(c):
-                        return lax.scan(_step, c, (bt, bv), unroll=unroll)
+                        return _walk(c, bt, bv)
 
                     def _skip(c):
                         return c, jnp.zeros((C, self.embd_dim), jnp.float32)
@@ -2934,9 +3026,7 @@ class Agent(eqx.Module):
                 def _sl(a):
                     return lax.dynamic_slice(a, (off,), (C,))
 
-                (M2, I2), r = lax.scan(
-                    _step, (M, I), (_sl(toks_p), _sl(valid_p)),
-                    unroll=unroll)
+                (M2, I2), r = _walk((M, I), _sl(toks_p), _sl(valid_p))
                 return (i + 1, M2, I2,
                         lax.dynamic_update_slice(rows, r, (off, 0)))
 

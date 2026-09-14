@@ -16,6 +16,8 @@ import equinox as eqx
 
 from alphagrad.approx.common.relations import NUM_RELATIONS
 from alphagrad.transformer.palimpsa_pallas import palimpsa
+from alphagrad.transformer.fast_palimpsa_pallas import (
+    CHUNK_C as FAST_CHUNK_C, fast_palimpsa, fast_read_enabled)
 from alphagrad.transformer.encoder import SwiGLU
 
 Array = jax.Array
@@ -42,6 +44,23 @@ PRNGKey = jax.Array
 # b_scale_raw parameter is ALWAYS constructed so the parameter tree does not
 # depend on the flag.
 # --------------------------------------------------------------------------
+def palimpsa_mix(q, k, v, b, gt, g, Ip, chunk_size):
+    """The token mixer, behind the ONE read flag.
+
+    ``exact`` is ``palimpsa_pallas``'s token-exact kernel at the mixer's own
+    ``chunk_size`` (which there only decides how often a boundary state is
+    checkpointed and has no effect on the numbers). ``fast`` is
+    ``fast_palimpsa_pallas``'s chunked isotropic read, whose chunk size IS the
+    operator and is therefore always ``FAST_CHUNK_C`` -- the mixer's
+    ``chunk_size`` is deliberately not forwarded to it.
+    """
+    if fast_read_enabled():
+        return fast_palimpsa(q, k, v, b, gt, g, Ip,
+                             scale=None, chunk_size=FAST_CHUNK_C)
+    return palimpsa(q, k, v, b, gt, g, Ip,
+                    scale=None, chunk_size=chunk_size)
+
+
 PALIMPSA_QK_NORM = int(os.environ.get("ALPHAGRAD_PALIMPSA_QK_NORM", "1"))
 PALIMPSA_BETA_BOUNDED = int(os.environ.get("ALPHAGRAD_PALIMPSA_BETA_BOUNDED", "1"))
 _QK_EPS2 = 1e-12
@@ -248,9 +267,9 @@ class PalimpsaMixer(eqx.Module):
         Ip = jnn.softplus(self.Ip_raw)                       # (H,)
 
         # Add leading batch axis B=1 for the kernel, then drop it.
-        out = palimpsa(
+        out = palimpsa_mix(
             q[None], k[None], v[None], b[None], gt[None], g, Ip,
-            scale=None, chunk_size=self.chunk_size,
+            self.chunk_size,
         )                                                    # (1, S, H, d)
         out = out[0].reshape(S, H * d)
         return jax.vmap(self.output_proj)(out)
@@ -400,9 +419,9 @@ class BiPalimpsaMixer(eqx.Module):
         Ip_r = jnn.softplus(self.Ip_raw_rev)
 
         # Forward pass (causal left->right).
-        out_fwd = palimpsa(
+        out_fwd = palimpsa_mix(
             q[None], k[None], v[None], b[None], gt[None], g_f, Ip_f,
-            scale=None, chunk_size=self.chunk_size,
+            self.chunk_size,
         )[0]                                                   # (S, H, d)
 
         # Reverse pass: flip the sequence (S) axis on every per-token input,
@@ -410,9 +429,9 @@ class BiPalimpsaMixer(eqx.Module):
         qr = jnp.flip(q, axis=0); kr = jnp.flip(k, axis=0)
         vr = jnp.flip(v, axis=0); br = jnp.flip(b, axis=0)
         gtr = jnp.flip(gt, axis=0)
-        out_rev = palimpsa(
+        out_rev = palimpsa_mix(
             qr[None], kr[None], vr[None], br[None], gtr[None], g_r, Ip_r,
-            scale=None, chunk_size=self.chunk_size,
+            self.chunk_size,
         )[0]
         out_rev = jnp.flip(out_rev, axis=0)                    # back to original order
 
