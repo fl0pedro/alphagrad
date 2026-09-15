@@ -235,6 +235,16 @@ REQUIRED_FLAGS = [
     # THE MEASUREMENT PIPELINE (owner ruling 2026-09-14).  Named so an arm
     # cannot inherit the trainer's synchronous default in silence.
     "--measure-pipeline",
+    # WHERE THE PER-STEP TOKENIZATION RUNS (owner ruling 2026-09-15).  Named
+    # for the same reason: it decides whether the measure actors are free
+    # during a rollout, and therefore whether the pipeline overlaps a
+    # measurement with the NEXT rollout or only with the previous update.
+    "--tokenize-where",
+    # HOW MANY FACE COLUMNS THE HOST CALLBACKS CARRY.  Named because a tree
+    # without the flag would ship the whole 1920-column prefix history on
+    # every callback -- 59.4 GB device to host per episode, measured -- while
+    # the preflight said yes.
+    "--face-wire-faces",
     "--cost-form",
     "--quality-floor",
     # The cost floor (.9, b2c89170): every training arm passes it explicitly,
@@ -703,6 +713,25 @@ SHARED_CLI = [
     # episode's PPO update and waits for these rewards while it runs.  See
     # CAMPAIGN_MEASURE_PIPELINE for what the one-episode lag costs.
     ("--measure-pipeline", "1"),
+    # THE PER-STEP TOKENIZATION STAYS IN THE TRAINER (ruling 2026-09-15).  It
+    # measures nothing, so it needs no measure actor; routing it to the pool
+    # cost a Ray round trip per step AND held the actors, which is what made
+    # the measurement of e overlap only the update of e-1.  With the actors
+    # free for the whole of the next rollout, e's measurement now overlaps
+    # the ROLLOUT of e+1.  See CAMPAIGN_TOKENIZE_WHERE.
+    ("--tokenize-where", "local"),
+    # THE FACE WIRE CARRIES THE COLUMNS THAT ARE USED (ruling 2026-09-15).
+    # The four per-step face callbacks and the env step callback each take
+    # the whole elimination-prefix face history as an operand, sized by the
+    # provable bound MAX_FACES = 1920 on this graph.  Measured under an XLA
+    # trace on pgi15-gpu17, one episode at 16 environments: 59.4 GB copied
+    # device to host, the GPU idle for three quarters of the rollout behind
+    # it, against a MEASURED occupancy of a median of one face per vertex and
+    # a maximum of thirteen.  At 64 columns the same episode copies 2.4 GB
+    # and its traced span falls from 48.0 s to 14.7 s.  NOT a lowered bound:
+    # the state keeps every column and a vertex with more faces than this
+    # stops the run by name.  See CAMPAIGN_FACE_WIRE_FACES.
+    ("--face-wire-faces", "64"),
     # LOGGED, NOT TRAINED: sparsity (weight 0) and the legacy Jacobian cosine
     # (subsampled).  Clipped relative Frobenius rides slot 8 automatically
     # because grad_cosine materialises the exact reference it needs.
@@ -1463,6 +1492,26 @@ CAMPAIGN_RAY_MEASURE_TIMEOUT = "600"
 # identically 1 at epoch 0 (the arms run --ppo-epochs 1).
 CAMPAIGN_MEASURE_PIPELINE = "1"
 
+# WHERE THE PER-STEP TOKENIZATION RUNS (owner ruling 2026-09-15).  A
+# non-terminal callback row measures nothing under terminal rewards: it
+# tokenizes the prefix, decides face legality and returns the delta
+# observation.  It was riding the measure actors, which cost a Ray round trip
+# on every step and, worse, kept the actors busy -- so the pipelined terminal
+# measurement could only be hidden behind the previous UPDATE.  Kept in the
+# trainer process the actors are idle for the whole of the next rollout, and
+# the measurement of episode e is hidden behind the ROLLOUT of e+1.
+CAMPAIGN_TOKENIZE_WHERE = "local"
+
+# HOW MANY FACE COLUMNS THE HOST CALLBACKS CARRY (owner ruling 2026-09-15).
+# 64 against a measured maximum of 13 faces on any vertex of this graph
+# (profile-rollout.md section 4: n=1520 vertices, median 1, p95 3, p99 11,
+# max 13, occupancy 0.069 percent of the 1920 cap), so just under five times
+# the largest thing ever seen.  The elimination order is FIXED on these arms,
+# so the face count of each vertex is a property of the order rather than of
+# the policy.  If a vertex ever exceeds this the run stops and the message
+# names the flag; it does not truncate.
+CAMPAIGN_FACE_WIRE_FACES = "64"
+
 # GATE G1 (ticket .45) on a node without a home: the sweep winners are read
 # from /Scratch.  THE TABLE IS THE SWEEP64 ONE, BY ORDER (owner ruling
 # 2026-09-13): 4029 rows at q >= 0.80 on Markowitz, 2969 on reverse.  The
@@ -1740,6 +1789,8 @@ def campaign_arm(*, phase: int, tag: str, profile: str, node: str, what: str,
         "--ray-measure": CAMPAIGN_RAY_MEASURE,
         "--ray-measure-timeout": CAMPAIGN_RAY_MEASURE_TIMEOUT,
         "--measure-pipeline": CAMPAIGN_MEASURE_PIPELINE,
+        "--tokenize-where": CAMPAIGN_TOKENIZE_WHERE,
+        "--face-wire-faces": CAMPAIGN_FACE_WIRE_FACES,
         # THE GATE .45 INPUTS, the two the trainer cannot measure for itself.
         # G1's winners table is inherited from SHARED_CLI and resolved from
         # this arm's --fixed-order by `_merge_cli` (ONE mechanism, so a wave

@@ -279,13 +279,17 @@ class CpuApproxPool:
         blocks on the result.
 
         ONE BATCH IN FLIGHT AT A TIME, and that is a fact about this pool, not
-        a cautious default. The same actors also serve the PER-STEP
-        TOKENIZATION of every rollout (``env._remote_callback_batched`` sends
-        every row to the pool unless ``ALPHAGRAD_POOL_TERMINAL_LOCAL=1``), and
-        Ray runs one task per actor at a time. A measurement left in flight
-        therefore occupies every actor it holds, and a rollout that started
-        underneath it would block behind it step for step. A second submit is
-        a programming error here, so it raises.
+        a cautious default. Under ``--tokenize-where pool`` the same actors
+        also serve the PER-STEP TOKENIZATION of every rollout
+        (``env._remote_callback_batched``) and Ray runs one task per actor, so
+        a measurement left in flight would starve the next rollout step for
+        step. With the tokenization off the pool the reason changes but the
+        limit does not: a second batch would write its plan records into the
+        actors while the driver was still draining the first batch's out of
+        them. ``env.start_measurement`` is what keeps the deep pipeline inside
+        this limit -- the terminal step packages its batch and the driver
+        starts it after the previous episode has been collected and drained.
+        A second submit is a programming error here, so it raises.
         """
         import concurrent.futures as _cf
 
@@ -297,9 +301,10 @@ class CpuApproxPool:
             if f is not None and not f.done():
                 raise RuntimeError(
                     "the measure pool already has a batch in flight; collect "
-                    "it before submitting another. The actors also serve the "
-                    "per-step tokenization of the next rollout, so two "
-                    "batches in flight starve it.")
+                    "it before submitting another. Two batches in flight "
+                    "would interleave their plan records in the actors, and "
+                    "under --tokenize-where pool the second would also starve "
+                    "the next rollout's per-step tokenization.")
             if self._submit_exec is None:
                 self._submit_exec = _cf.ThreadPoolExecutor(
                     max_workers=1, thread_name_prefix="measure-submit")
