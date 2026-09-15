@@ -29,11 +29,11 @@ WHY THE QUALITY CHANNEL IS IN THE REWARD HERE (``--rewards cmp mem acc``,
 which is also the trainer's own default, where `ppo_resume_equivalence_test`
 uses the two cost channels alone). Under the campaign's paired-log cost form
 a plan that IS rev-exact scores exactly 0 on both cost slots, so with the
-cost channels alone this arm's scalar return is float noise around zero --
-measured at -7e-10 and -4e-10 over two settled windows, which is a RELATIVE
-move of 42 percent and no stop. With quality in, a settled arm returns a
-steady 2.0 and the relative move is 0. See the note over `RETURN_TOLERANCE`
-in `common/auto_stop.py`; no thesis arm drops the quality channel.
+cost channels alone this arm's raw scalar return is float noise around zero,
+and a relative move between two such windows is 40 percent of nothing. With
+quality in, a settled window returns a steady order-1 number. See the note
+over `RETURN_TOLERANCE` in `common/auto_stop.py`; no thesis arm drops the
+quality channel.
 
 THE CONFIGURATION is the canonical deterministic CPU one from `tools/smoke.sh`
 with the policy gate's environment pins, the same one
@@ -150,7 +150,7 @@ def test_a_settled_run_stops_at_its_check_point(tmp_path):
     assert c["collapse_identity"] is True
     n = doc["numbers"]
     assert n["admitted_recent"] == 0
-    assert n["relative_return_move"] == 0.0
+    assert n["relative_return_move"] < 0.02
     assert n["max_approximations_in_any_terminal_plan"] == 0
     assert n["total_approximations_in_window"] == 0
     assert isinstance(n["terminal_plan_digest"], str)

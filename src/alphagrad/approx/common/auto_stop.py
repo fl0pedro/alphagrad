@@ -49,10 +49,11 @@ already has in `host_log`, and nothing here measures anything of its own.
   discarded it; the auto-stop call site keeps it. It is the number of points
   that were non-dominated ON ARRIVAL, which is exactly "the archive admitted a
   new point".
-* ``scalar_return`` is ``true_scalar_return``, the episode's mean scalar
-  return over the environments, before PopArt normalisation. The normalised
-  one moves when the normaliser moves and would call a shifting scale a
-  change in the result.
+* ``scalar_return`` is the episode's RAW weighted scalar return, averaged over
+  the live environments -- the same sum wandb logs as ``mean_return``. The
+  PopArt-z form (``scalarized_return``) is recorded beside it and never
+  decided on; see the note over ``RETURN_TOLERANCE`` for the measurement that
+  settles which of the two the rule may read.
 * ``qualities`` are the quality channel of the terminal reward vectors of the
   LIVE environments (the same exact-sentinel test the reward panels use). A
   sentinelled environment has no quality, not a quality of -1e10.
@@ -98,17 +99,29 @@ CHECK_POINTS = (250, 500)
 #: The mean scalar return must move by LESS than this against the previous
 #: window. Strictly less: a move of exactly 2 percent does not stop.
 #
-# A RUN WHOSE MEAN RETURN SITS AT FLOAT NOISE AROUND ZERO NEVER MEETS THIS
-# CONDITION, and that is deliberate. A RELATIVE move against a mean of 1e-10
-# is 40 percent when the mean shifts by 4e-11, which is nothing. Measured on
-# an arm with the quality channel out of the reward (`--rewards cmp mem`) and
-# the campaign's paired-log cost form, where a plan that IS rev-exact scores
-# exactly 0 on both cost slots: the mean return was -7e-10 and -4e-10 over two
-# settled windows, so condition 2 read 42 percent and the run correctly-by-the
-# -letter did not stop. No thesis arm is in that state -- all of A, B and C
-# carry the quality channel, so a settled arm's return is order 1 -- and the
-# rule is the owner's, so no absolute floor is invented here. It is named so
-# that a future arm that drops the quality channel knows why it never stops.
+# WHICH RETURN. The RAW weighted scalar return over the live environments, in
+# reward units -- the sum wandb logs as `mean_return`. NOT `scalarized_return`
+# (`true_scalar_return` in ppo.py), which is the PopArt-z of the same
+# quantity. PopArt subtracts a running mean of the returns themselves, so a
+# SETTLED arm drives its own normaliser onto its own returns and the z-score
+# walks towards zero; a relative test between two windows of a walk towards
+# zero says the opposite of what it means. MEASURED, job 65941, on an arm
+# whose terminal plan was the same plan in every one of eight episodes:
+# `scalarized_return` read -5.97e-07 over episodes 2..3 and -4.59e-10 over
+# 4..5, a "move" of 99.9 percent on a run that had not changed at all, while
+# the raw return held steady. The z-scored value is RECORDED beside the raw
+# one in every reason, so the two can be compared on a real arm.
+#
+# A RUN WHOSE RAW MEAN RETURN IS ITSELF AT FLOAT NOISE AROUND ZERO still never
+# meets this condition, and that is left alone. A relative move against a mean
+# of 1e-10 is 40 percent when the mean shifts by 4e-11, which is nothing. That
+# state is reachable with the quality channel OUT of the reward
+# (`--rewards cmp mem`) under the campaign's paired-log cost form, where a
+# plan that IS rev-exact scores exactly 0 on both cost slots. No thesis arm is
+# in it -- A, B and C all carry the quality channel, so a settled arm's return
+# is order 1 -- and the rule is the owner's, so no absolute floor is invented
+# here. It is named so that an arm that drops the quality channel knows why it
+# never stops.
 RETURN_TOLERANCE = 0.02
 
 #: Arm A's collapse: the median terminal quality over the window is below
@@ -256,6 +269,15 @@ def _digest(hashes) -> str:
     return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:16]
 
 
+def _mean_or_none(values):
+    """The mean of the values that are present, or None when none is."""
+    vals = [float(v) for v in values
+            if v is not None and math.isfinite(float(v))]
+    if not vals:
+        return None
+    return float(np.mean(np.asarray(vals, dtype=np.float64)))
+
+
 def _median(values):
     vals = [float(v) for v in values if v is not None and math.isfinite(v)]
     if not vals:
@@ -290,9 +312,16 @@ class AutoStopMonitor:
 
     # -- recording ------------------------------------------------------
 
-    def record(self, *, episode: int, admitted: int, scalar_return: float,
-               qualities, plan_hashes, n_approx, n_skip=None) -> dict:
+    def record(self, *, episode: int, admitted: int, scalar_return,
+               qualities, plan_hashes, n_approx, n_skip=None,
+               scalar_return_z=None) -> dict:
         """Take one episode's observation. Returns the row it stored.
+
+        `scalar_return` is the RAW weighted scalar return over the live
+        environments, in reward units, or None when no environment produced a
+        measurement at all. `scalar_return_z` is the PopArt-z of the same
+        quantity (`scalarized_return`); it is RECORDED and never decided on,
+        for the reason the note over `RETURN_TOLERANCE` gives.
 
         `qualities` are the quality channel of the LIVE environments only.
         `plan_hashes`, `n_approx` and `n_skip` cover EVERY environment: a plan
@@ -304,7 +333,7 @@ class AutoStopMonitor:
         skips = [int(s) for s in (n_skip or ())]
         quals = [float(q) for q in np.asarray(qualities, dtype=np.float64).ravel()
                  if math.isfinite(float(q))]
-        if not math.isfinite(float(scalar_return)):
+        if scalar_return is not None and not math.isfinite(float(scalar_return)):
             raise AutoStopError(
                 f"episode {episode} offered a non-finite scalar return "
                 f"({scalar_return!r}). The auto-stop decision reads it, and a "
@@ -312,7 +341,9 @@ class AutoStopMonitor:
         row = {
             "episode": episode,
             "admitted": int(admitted),
-            "ret": float(scalar_return),
+            "ret": (None if scalar_return is None else float(scalar_return)),
+            "ret_z": (None if scalar_return_z is None
+                      else float(scalar_return_z)),
             "n_plans": len(hashes),
             "n_quality": len(quals),
             "q_median": _median(quals),
@@ -399,14 +430,23 @@ class AutoStopMonitor:
         admitted = int(sum(r["admitted"] for r in recent))
         archive_quiet = admitted == 0
 
-        # (2) the mean scalar return moved by less than the tolerance.
-        m_recent = float(np.mean([r["ret"] for r in recent]))
-        m_previous = float(np.mean([r["ret"] for r in previous]))
-        if m_previous == 0.0:
+        # (2) the mean scalar return moved by less than the tolerance. An
+        # episode in which NO environment produced a measurement has no
+        # return; it is left out of the mean. A window with no measured
+        # episode at all cannot establish the condition, so it does not.
+        r_recent = [r["ret"] for r in recent if r["ret"] is not None]
+        r_previous = [r["ret"] for r in previous if r["ret"] is not None]
+        m_recent = float(np.mean(r_recent)) if r_recent else None
+        m_previous = float(np.mean(r_previous)) if r_previous else None
+        if m_recent is None or m_previous is None:
+            rel = None
+            return_flat = False
+        elif m_previous == 0.0:
             rel = 0.0 if m_recent == 0.0 else float("inf")
+            return_flat = rel < self.return_tolerance
         else:
             rel = abs(m_recent - m_previous) / abs(m_previous)
-        return_flat = rel < self.return_tolerance
+            return_flat = rel < self.return_tolerance
 
         # (3a) arm A's collapse: the median terminal quality is under 0.05.
         ep_medians = [r["q_median"] for r in recent if r["q_median"] is not None]
@@ -448,6 +488,13 @@ class AutoStopMonitor:
                 "mean_return_recent": m_recent,
                 "mean_return_previous": m_previous,
                 "relative_return_move": rel,
+                "episodes_with_a_measured_return": len(r_recent),
+                # RECORDED, NOT DECIDED ON. The PopArt-z of the same return
+                # (`scalarized_return`), so a reader can see both numbers.
+                "mean_scalarized_return_recent": _mean_or_none(
+                    [r.get("ret_z") for r in recent]),
+                "mean_scalarized_return_previous": _mean_or_none(
+                    [r.get("ret_z") for r in previous]),
                 "quality_median_of_episode_medians": q_window_median,
                 "quality_plans_in_window": n_quality,
                 "quality_plans_below_threshold": n_below,
@@ -546,14 +593,21 @@ def _message(reason: dict) -> str:
         f"episodes {lo}..{hi}"
         + (" (condition 1 HOLDS)" if c["archive_admitted_nothing"]
            else " (condition 1 does not hold)"))
-    held.append(
-        f"the mean scalar return moved {100.0 * n['relative_return_move']:.3f} "
-        f"percent, from {n['mean_return_previous']:.6g} over episodes "
-        f"{plo}..{phi} to {n['mean_return_recent']:.6g}"
-        + (f" (condition 2 HOLDS, the tolerance is "
-           f"{100.0 * reason['return_tolerance']:.1f} percent)"
-           if c["return_moved_less_than_tolerance"]
-           else " (condition 2 does not hold)"))
+    if n["relative_return_move"] is None:
+        held.append(
+            f"no episode of the two windows produced a measured scalar "
+            f"return, so the return condition cannot be established "
+            f"(condition 2 does not hold)")
+    else:
+        held.append(
+            f"the mean scalar return moved "
+            f"{100.0 * n['relative_return_move']:.3f} percent, from "
+            f"{n['mean_return_previous']:.6g} over episodes {plo}..{phi} to "
+            f"{n['mean_return_recent']:.6g}"
+            + (f" (condition 2 HOLDS, the tolerance is "
+               f"{100.0 * reason['return_tolerance']:.1f} percent)"
+               if c["return_moved_less_than_tolerance"]
+               else " (condition 2 does not hold)"))
     third = []
     if c["collapse_quality"]:
         third.append(

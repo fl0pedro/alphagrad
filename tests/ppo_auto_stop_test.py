@@ -526,3 +526,61 @@ def test_the_gate_arm_command_line_parses_to_auto_stop_off():
     ns = _parser().parse_args(["--episodes", "2", "--checkpoint-every", "0"])
     assert ns.auto_stop is False
     autostop.check_auto_stop_args(ns)
+
+
+# ---------------------------------------------------------------------------
+# 10. The return the rule reads, and the one it only records.
+# ---------------------------------------------------------------------------
+
+def test_the_popart_z_return_is_recorded_and_never_decided_on():
+    """`scalarized_return` is the PopArt-z of the raw return. A settled arm
+    drives its own normaliser onto its own returns, so the z-score walks
+    towards zero and a relative test on it says the opposite of what it means
+    (measured on job 65941: a 99.9 percent "move" on a run whose terminal plan
+    was the same plan in every episode). It rides in the reason so the two can
+    be compared on a real arm, and nothing branches on it."""
+    mon = _monitor()
+    for ep in range(0, _W):
+        mon.record(episode=ep, admitted=0, scalar_return=100.0,
+                   qualities=[0.9], plan_hashes=[autostop.plan_hash(["P"])],
+                   n_approx=[3], scalar_return_z=-5.97e-07)
+    for ep in range(_W, 2 * _W):
+        mon.record(episode=ep, admitted=0, scalar_return=100.0,
+                   qualities=[0.9], plan_hashes=[autostop.plan_hash(["P"])],
+                   n_approx=[3], scalar_return_z=-4.59e-10)
+    d = mon.decide(_CHECK)
+    # The z-scored pair "moved" by 99.9 percent and the run stops anyway,
+    # because the raw return did not move.
+    assert d["stop"] is True
+    n = d["reason"]["numbers"]
+    assert n["relative_return_move"] == 0.0
+    assert n["mean_scalarized_return_recent"] == pytest.approx(-4.59e-10)
+    assert n["mean_scalarized_return_previous"] == pytest.approx(-5.97e-07)
+
+
+def test_an_episode_with_no_measured_return_is_left_out_of_the_mean():
+    mon = _monitor()
+    _fill(mon, 0, _W - 1, ret=100.0)
+    _fill(mon, _W, 2 * _W - 2, ret=100.0)
+    mon.record(episode=2 * _W - 1, admitted=0, scalar_return=None,
+               qualities=[], plan_hashes=[autostop.plan_hash(["P"])],
+               n_approx=[3])
+    d = mon.decide(_CHECK)
+    assert d["reason"]["numbers"]["episodes_with_a_measured_return"] == _W - 1
+    assert d["reason"]["numbers"]["mean_return_recent"] == 100.0
+    assert d["stop"] is True
+
+
+def test_a_window_with_no_measured_return_at_all_does_not_stop():
+    """The condition cannot be established, so it does not hold."""
+    mon = _monitor()
+    _fill(mon, 0, _W - 1, ret=100.0)
+    for ep in range(_W, 2 * _W):
+        mon.record(episode=ep, admitted=0, scalar_return=None,
+                   qualities=[], plan_hashes=[autostop.plan_hash(["P"])],
+                   n_approx=[3])
+    d = mon.decide(_CHECK)
+    assert d["reason"]["numbers"]["relative_return_move"] is None
+    assert d["reason"]["conditions"]["return_moved_less_than_tolerance"] is False
+    assert d["stop"] is False
+    assert "cannot be established" in d["message"]

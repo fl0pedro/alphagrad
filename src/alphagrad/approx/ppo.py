@@ -13972,10 +13972,27 @@ def main():
                     f"reward vector (the measure is {_QUALITY_METRIC!r}) to "
                     f"run its collapse detector, and this episode's reward "
                     f"vectors have shape {all_rets.shape}.")
-            if true_return is None:
-                raise RuntimeError(
-                    "--auto-stop needs the episode's true scalar return and "
-                    "host_log was called without one.")
+            # THE RETURN IS THE RAW WEIGHTED ONE, NOT `scalarized_return`.
+            # `weighted_sums` is this episode's per-environment scalar return
+            # in REWARD UNITS -- the same sum `mean_return` is logged from --
+            # and the mean is taken over the LIVE environments, because a
+            # sentinelled one carries -1e10 on every cost slot.
+            #
+            # `true_return` (`scalarized_return`) is the PopArt-z of the same
+            # quantity: the exact scalar the update maximises. It is the wrong
+            # input for a "has the result stopped moving" test, because a
+            # settled arm drives its own normaliser onto its own returns and
+            # the z-score then walks towards zero. MEASURED on job 65941, on
+            # an arm whose terminal plan was the same plan in every episode:
+            # `scalarized_return` read -5.97e-07 over one window and -4.59e-10
+            # over the next, a relative move of 99.9 percent on a run that had
+            # not changed at all, while the raw return was a steady 2.0. It is
+            # recorded beside the raw one so a reader of auto_stop.json can
+            # see both.
+            _as_ret = None
+            if _any_live:
+                _as_ret = float(np.mean(
+                    np.asarray(weighted_sums, dtype=np.float64)[_live_env]))
             _as_q = np.asarray(
                 all_rets[_live_env, int(_as_qi)], dtype=np.float64)
             _as_hashes, _as_napprox, _as_nskip = [], [], []
@@ -13994,9 +14011,11 @@ def main():
                     else int(np.sum(np.asarray(face_skips_arr[_as_i]) == 1)))
             _as_row = _AUTO_STOP.record(
                 episode=ep, admitted=int(_AS_ADMITTED),
-                scalar_return=float(true_return), qualities=_as_q,
+                scalar_return=_as_ret, qualities=_as_q,
                 plan_hashes=_as_hashes, n_approx=_as_napprox,
-                n_skip=_as_nskip)
+                n_skip=_as_nskip,
+                scalar_return_z=(None if true_return is None
+                                 else float(true_return)))
             log_dict["auto_stop/admitted"] = int(_as_row["admitted"])
             log_dict["auto_stop/distinct_terminal_plans"] = int(
                 _as_row["n_distinct"])
