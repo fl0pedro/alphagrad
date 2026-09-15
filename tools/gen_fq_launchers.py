@@ -385,8 +385,12 @@ SHARED_ENV = [
     # 12ed4936) printed ppo.py's own warning ("ALPHAGRAD_EXTEND_CHUNK is 0,
     # so every encode_extend scans all 32768 window steps ... 256 measured
     # well") and an episode took 275 s at 0.  ppo.py has no --extend-chunk
-    # flag (2026-09-14 audit).
-    ("ALPHAGRAD_EXTEND_CHUNK", "256"),
+    # flag (2026-09-14 audit).  32, not 256, since the rollout profile of
+    # 2026-09-15 (scratchpad profile-rollout.md, gpu15, fast read): the
+    # per-step cost outside the env callback was 363 ms at 256 and 226 ms
+    # at 32, 14.5 s per episode, no code change; 32 is the fast read's
+    # chunk, and the fold refuses a chunk that is not a multiple of it.
+    ("ALPHAGRAD_EXTEND_CHUNK", "32"),
     ("ALPHAGRAD_EXTEND_UNROLL", "32"),
     ("ALPHAGRAD_MULS_SENTINEL_CAP", "5e12"),
     # Project memory: ALWAYS skip the count pass (77% of host time) and use the
@@ -1539,8 +1543,10 @@ NO_FLAG_ENV = [
      "(/Scratch/assmuth/mrg/runs/smoke_merged.sbatch) sets this and drains "
      "clean; the reward channels these arms train (cmp mem acc) do not "
      "need the count pass.  env.py has no --skip-count-ops flag."),
-    ("ALPHAGRAD_EXTEND_CHUNK", "256",
-     "chunk the encode_extend scan instead of walking the whole window.  "
+    ("ALPHAGRAD_EXTEND_CHUNK", "32",
+     "chunk the encode_extend scan instead of walking the whole window; "
+     "32 since the rollout profile of 2026-09-15 measured 14.5 s per "
+     "episode less than 256 at the fast read (the kernel's own chunk).  "
      "The same canary job (65443) printed ppo.py's own warning "
      "('ALPHAGRAD_EXTEND_CHUNK is 0, so every encode_extend scans all "
      "32768 window steps ... 256 measured well') and an episode took "
