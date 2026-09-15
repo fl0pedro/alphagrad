@@ -53,8 +53,8 @@
       2
      ]
     ],
-    "entropy": "3f2b8bfe",
-    "logp": "beffab6a",
+    "entropy": "3f2c31c4",
+    "logp": "bf026064",
     "n_live": 1,
     "pair_valid": [
      [
@@ -285,8 +285,8 @@
       7
      ]
     ],
-    "entropy": "40dcc20d",
-    "logp": "c0e61c58",
+    "entropy": "40dcec27",
+    "logp": "c0e47c34",
     "n_live": 1,
     "pair_valid": [
      [
@@ -509,8 +509,8 @@
       4
      ]
     ],
-    "entropy": "3fab4bb1",
-    "logp": "bf7dcb1e",
+    "entropy": "3fab3440",
+    "logp": "bf7d2120",
     "n_live": 2,
     "pair_valid": [
      [
@@ -852,8 +852,8 @@
       7
      ]
     ],
-    "entropy": "4117663d",
-    "logp": "c1154ba0",
+    "entropy": "41172aef",
+    "logp": "c113b319",
     "n_live": 2,
     "pair_valid": [
      [
