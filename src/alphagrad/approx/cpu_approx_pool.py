@@ -265,7 +265,7 @@ class CpuApproxPool:
         # flight on it. See `submit_batch` for why the limit is a fact of the
         # apparatus rather than a conservative default.
         self._submit_exec = None
-        self._submit_inflight: list = []
+        self._submit_inflight = None
 
     def submit_batch(self, *args, **kwargs):
         """Start :meth:`evaluate_batch` on a worker thread; return its future.
@@ -297,9 +297,8 @@ class CpuApproxPool:
             if self._closed:
                 raise RuntimeError(
                     "submit_batch on a closed measure pool")
-            self._submit_inflight = [f for f in self._submit_inflight
-                                     if not f.done()]
-            if self._submit_inflight:
+            f = self._submit_inflight
+            if f is not None and not f.done():
                 raise RuntimeError(
                     "the measure pool already has a batch in flight; collect "
                     "it before submitting another. Two batches in flight "
@@ -311,13 +310,14 @@ class CpuApproxPool:
                     max_workers=1, thread_name_prefix="measure-submit")
             fut = self._submit_exec.submit(
                 self.evaluate_batch, *args, **kwargs)
-            self._submit_inflight.append(fut)
+            self._submit_inflight = fut
         return fut
 
     def has_batch_in_flight(self) -> bool:
         """True while a :meth:`submit_batch` future is still running."""
         with self._lock:
-            return any(not f.done() for f in self._submit_inflight)
+            f = self._submit_inflight
+        return f is not None and not f.done()
 
     def _timeout_for(self, actor: Any) -> float:
         """Cold vs warm timeout for ``actor``. Returns 0 when the

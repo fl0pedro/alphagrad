@@ -136,10 +136,15 @@ def _clear_caches():
 
 
 def _order_and_specs(n_envs, n_vertices, order):
+    """The wire the callback decodes: one `MAX_RULES_PER_VERTEX x 3` block
+    per vertex. All zeros is the legacy no-op, so no rule is applied and the
+    step is pure tokenization -- which is the work `--tokenize-where` moves.
+    """
+    from alphagrad.approx.env import MAX_RULES_PER_VERTEX
     o = np.zeros((n_envs, n_vertices), np.int32)
     for i in range(n_envs):
         o[i] = np.asarray(order, np.int32)
-    s = np.zeros((n_envs, n_vertices, 4), np.int32)
+    s = np.zeros((n_envs, n_vertices, MAX_RULES_PER_VERTEX, 3), np.int32)
     return o, s
 
 
@@ -454,7 +459,7 @@ def test_the_pool_still_refuses_a_second_batch_in_flight():
     pool._lock = threading.RLock()
     pool._closed = False
     pool._submit_exec = None
-    pool._submit_inflight = []
+    pool._submit_inflight = None
     gate = threading.Event()
 
     def _block():
