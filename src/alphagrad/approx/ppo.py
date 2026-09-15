@@ -5010,6 +5010,30 @@ def make_argparser() -> argparse.ArgumentParser:
              "are the behaviour policy's) but it is no longer identically 1 "
              "at epoch 0. Needs --ray-measure > 0.")
     p.add_argument(
+        "--tokenize-where", type=str, default="local",
+        choices=("pool", "local", "cpu-actors"),
+        help="WHERE THE PER-STEP TOKENIZATION RUNS (owner ruling "
+             "2026-09-15). A non-terminal callback row measures nothing "
+             "under terminal rewards: it tokenizes the elimination prefix, "
+             "decides face legality and returns the delta observation. "
+             "'pool' is the historical route, which sent every row to the "
+             "measure actors -- a Ray round trip per step, and the actors "
+             "were then busy, so a terminal measurement left in flight "
+             "blocked the next rollout step for step. 'local' (default) "
+             "keeps that work in the trainer process, which is what the "
+             "non-pooled path has always done. 'cpu-actors' hands it to a "
+             "SECOND pool of CPU-only actors (--tokenize-actors N). The "
+             "tokens are a pure function of the prefix, so all three "
+             "produce the same bytes; only locality and IPC differ. With "
+             "the measure pool free during a rollout, --measure-pipeline 1 "
+             "overlaps episode e's measurement with the ROLLOUT of e+1 "
+             "instead of only with the update of e-1.")
+    p.add_argument(
+        "--tokenize-actors", type=int, default=0, metavar="N",
+        help="How many CPU-only actors --tokenize-where cpu-actors spawns. "
+             "0 (default) means as many as --ray-measure. They hold no GPU "
+             "and measure nothing.")
+    p.add_argument(
         "--pareto-dump-every", type=int, default=50, metavar="N",
         help="Write the Pareto FRONT (objectives + the sequences that "
              "achieved them) to the wandb run dir every N episodes, plus once "
@@ -7397,6 +7421,28 @@ def main():
                 "the terminal rows are measured in the TRAINER process "
                 "there, so there is no pool submission to defer. Choose one.")
 
+    # ---- --tokenize-where: who runs the per-step tokenization ----
+    # Read here, before the pool is built, for the same reason: a refusal
+    # belongs at startup and not in the first callback.
+    _TWHERE = str(getattr(args, "tokenize_where", "local") or "local")
+    from alphagrad.approx import env as _tok_env_mod
+    if _TWHERE not in _tok_env_mod.TOKENIZE_WHERE_CHOICES:
+        raise ValueError(
+            f"--tokenize-where {_TWHERE!r} is not one of "
+            f"{list(_tok_env_mod.TOKENIZE_WHERE_CHOICES)}")
+    if _TWHERE == "cpu-actors" and int(getattr(args, "ray_measure", 0) or 0) <= 0:
+        raise ValueError(
+            "--tokenize-where cpu-actors without --ray-measure: with no "
+            "measure pool the callback already runs entirely in the trainer "
+            "process, and a second pool would only add a Ray round trip to "
+            "work that is already local. Use --tokenize-where local.")
+    # THE DEEP PIPELINE. Episode e's measurement can only overlap the ROLLOUT
+    # of e+1 while the actors are free during that rollout, which is exactly
+    # what taking the tokenization off them buys. Under `--tokenize-where
+    # pool` the actors still serve every step, so the pipeline keeps the
+    # shallower overlap it had: e's measurement against e-1's UPDATE.
+    _PIPE_DEEP = bool(_MPIPE) and _TWHERE != "pool"
+
     # ---- --ray-measure: fan the measurement callback out over Ray actors ----
     if int(getattr(args, "ray_measure", 0) or 0) > 0:
         _n_actors = int(args.ray_measure)
@@ -7622,6 +7668,68 @@ def main():
               f"timeout={args.ray_measure_timeout}s, "
               f"measure-pipeline={int(_MPIPE)}",
               flush=True)
+
+        # ---- --tokenize-where: the per-step route, installed on the env ----
+        _tok_pool = None
+        if _TWHERE == "cpu-actors":
+            # A SECOND pool, CPU ONLY. No GPU is pinned and nothing here is
+            # ever timed, so these actors may share cores freely with each
+            # other; what they must not do is share the measure actors'
+            # devices or their queue. CUDA_VISIBLE_DEVICES is emptied
+            # explicitly rather than left to Ray, for the same reason the
+            # measure actors pin theirs explicitly.
+            _n_tok = int(getattr(args, "tokenize_actors", 0) or 0) or _n_actors
+            _tok_args = dict(_args_dict)
+            _tok_args["num_cpu_workers"] = _n_tok
+            _tok_next = [0]
+
+            def _spawn_tok(slot: int | None = None):
+                _tok_next[0] += 1
+                _rt = {"py_executable": _sys.executable,
+                       "env_vars": {
+                           "CUDA_VISIBLE_DEVICES": "",
+                           "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+                           "JAX_PLATFORMS": "cpu",
+                           "ALPHAGRAD_MEASURE_ACTOR": "1",
+                       }}
+                return CpuApproximationActor.options(
+                    runtime_env=_rt, num_gpus=0).remote(
+                        _tok_args, variant=None,
+                        actor_id=1000 + _tok_next[0])
+
+            _tok_actors = [_spawn_tok(i) for i in range(_n_tok)]
+            _tok_pool = CpuApproxPool(
+                _tok_actors,
+                timeout_s=float(args.ray_measure_timeout),
+                initial_timeout_s=float(args.ray_measure_timeout) * 4.0,
+                warm_after=3,
+                respawn_factory=_spawn_tok,
+                max_tokens=int(env.obs_width),
+                token_dtype=env.wire_token_dtype,
+                emit_eqn_ids=not env.config.delta_obs,
+                num_rewards=int(NUM_REWARDS),
+                cosine_sim_idx=int(REWARD_INDEX["cosine_sim"]),
+                frob_residual_idx=int(REWARD_INDEX["frob_residual"]),
+                fidelity_idx=int(REWARD_INDEX["fidelity"]),
+                sparsity_idx=int(REWARD_INDEX["sparsity"]),
+            )
+            print(f"[tokenize-where] cpu-actors: {_n_tok} CPU-only actors "
+                  f"serve the per-step tokenization; the {_n_actors} measure "
+                  f"actors serve terminals only", flush=True)
+        _tok_env_mod.set_tokenize_where(_TWHERE, pool=_tok_pool)
+        # THE DEFERRED SUBMISSION. Under the deep pipeline the terminal step
+        # packages its batch and the driver starts it after the previous
+        # episode has been collected and drained, so exactly one batch is ever
+        # in the actors and every plan record in them belongs to one episode.
+        _tok_env_mod.set_measure_defer(_PIPE_DEEP)
+        print(f"[tokenize-where] {_TWHERE} "
+              f"(measurement overlaps "
+              f"{'the ROLLOUT of the next episode' if _PIPE_DEEP else ('the previous update' if _MPIPE else 'nothing')})",
+              flush=True)
+    elif _TWHERE == "local":
+        # No pool at all: the callback has always run here. Say so anyway, so
+        # `tokenize_where()` reports the truth to anything that reads it.
+        _tok_env_mod.set_tokenize_where("local")
 
     # DIAG per-face masking. The dynamic policy's DIAG head must be masked by the
     # LIVE per-vertex pair / compress validity — the nominal tag-bit mask admits
@@ -9010,7 +9118,7 @@ def main():
         _EP_HOST_SNAP[0] = _ep_env_mod.episode_telemetry_snapshot()
         _ep_env_mod.set_plan_log_attempt(_EP_ATTEMPT[0])
 
-    def _ep_discard(result):
+    def _ep_discard(result, pool_drain: bool = True):
         """Roll a discarded attempt back, in the trainer AND in the actors.
 
         THE ACTORS ARE THE HALF THE SNAPSHOT CANNOT REACH. A measure actor is
@@ -9025,9 +9133,16 @@ def main():
 
         The order matters: the drain EMPTIES this process's containers too,
         and the restore below then puts back what the attempt found.
+
+        `pool_drain=False` says the discarded attempt left NOTHING in the
+        actors, so draining them would take another episode's records instead
+        of this attempt's. That is the deep pipeline's case: the terminal step
+        packaged its batch and the driver never started it, while the actors
+        are still measuring the PREVIOUS episode, whose records the driver has
+        not collected yet.
         """
         del result
-        _drain_measure_telemetry()
+        _drain_measure_telemetry(pool=bool(pool_drain))
         snap = _EP_HOST_SNAP[0]
         if snap is not None:
             _ep_env_mod.episode_telemetry_restore(snap)
@@ -14357,12 +14472,22 @@ def main():
     # read. None = drain in `host_log`, exactly as before.
     _POOL_DRAIN = [None]
 
-    def _drain_measure_telemetry(ticket=None, park=False):
+    def _drain_measure_telemetry(ticket=None, park=False, pool=True,
+                                 trainer=True):
         """Drain the trainer's AND the actors' per-episode telemetry, once.
 
         Called right after a ticket is collected, so the actors hold this
         episode's terminal plans and nothing later. Returns the dict
         `host_log` reads out of `_POOL_DRAIN`.
+
+        THE TWO HALVES COME APART UNDER THE DEEP PIPELINE, which overlaps
+        episode e's measurement with the ROLLOUT of e+1. The TRAINER half then
+        has to be taken right after rollout e (`pool=False`), because the next
+        rollout is what fills those counters next; the POOL half has to be
+        taken at the collect of e (`trainer=False`), which is one rollout
+        later, because that is when the actors hold e's plans. Under
+        `--tokenize-where pool` the two moments coincide and one call takes
+        both, exactly as before.
 
         `ticket` is stamped on every record this drain produces. It is the
         join key the pooled rows have and `env_index` is not: a measure actor
@@ -14382,20 +14507,23 @@ def main():
         out = {"pool_collapse": {}, "pool_face": {}, "pool_plan": None,
                "local_face": {}, "local_plan": None,
                "ticket": (None if ticket is None else int(ticket))}
-        try:
-            out["pool_collapse"] = _mcs(_p, {})
-        except Exception:
-            pass
-        if args.per_face or args.face_actions:
+        if pool:
+            try:
+                out["pool_collapse"] = _mcs(_p, {})
+            except Exception:
+                pass
+        if (args.per_face or args.face_actions) and trainer:
             out["local_face"] = _cpf()
+        if (args.per_face or args.face_actions) and pool:
             try:
                 out["pool_face"] = _mpf(_p, {})
             except Exception:
                 out["pool_face"] = {}
-        if _PLAN_LOG_PATH is not None:
+        if _PLAN_LOG_PATH is not None and trainer:
+            out["local_plan"] = _cpr()
+        if _PLAN_LOG_PATH is not None and pool:
             from alphagrad.approx.env import (
                 MeasureToolchainFault as _MTF)
-            out["local_plan"] = _cpr()
             try:
                 out["pool_plan"] = _mpr(_p)
             except _MTF:
@@ -14409,6 +14537,11 @@ def main():
                 # The skeleton of an empty drain, so the logging below reports
                 # "no pool" rather than draining again a whole episode late.
                 out["pool_plan"] = _mpr(None)
+        if not trainer:
+            # The pool half alone. Everything below this line is the trainer's
+            # own, and a second consume of it here would empty the containers
+            # the rollout that has meanwhile run is filling.
+            return out
         # THE FOUR COUNTERS `episode_telemetry_snapshot` HAS NO NAME FOR. Two
         # live on objects (`_LIVE_FACES`, `_EDGE_TABLE`) and two in other
         # modules' globals. They are consumed here whatever the caller does
@@ -15087,7 +15220,7 @@ def main():
         if _xtr_on:
             jax.profiler.start_trace(_xtr_path())
 
-        def _ep_discard_episode(result):
+        def _ep_discard_episode(result, pool_drain: bool = True):
             """Throw one attempt away: host counters back, trace closed."""
             if _xtr_on:
                 # The trace has to see the work it timed before it stops,
@@ -15096,7 +15229,7 @@ def main():
                     [x for x in jax.tree_util.tree_leaves(result)
                      if isinstance(x, jax.Array)])
                 jax.profiler.stop_trace()
-            _ep_discard(result)
+            _ep_discard(result, pool_drain=pool_drain)
             if _xtr_on:
                 _xtr_attempt[0] += 1
                 jax.profiler.start_trace(_xtr_path())
@@ -15157,11 +15290,15 @@ def main():
             kills the actor and its plan records with it.
 
             Dropping what the actors RECORDED is `_ep_discard`'s job and is
-            done for the synchronous path too.
+            done for the synchronous path too. UNDER THE DEEP PIPELINE IT MUST
+            NOT BE: this attempt's batch was packaged and never started, so it
+            left nothing in the actors, and the actors are meanwhile measuring
+            the PREVIOUS episode, whose records the driver has not collected
+            yet. Draining here would throw that episode's plans away.
             """
             _roll_d, _tkt_d = result
             _ep_env_mod.drop_measurement(_tkt_d)
-            _ep_discard_episode(_roll_d)
+            _ep_discard_episode(_roll_d, pool_drain=not _PIPE_DEEP)
 
         def _ep_attempt(_ep_n, _win_n):
             """ONE attempt at this episode, at the PAIR `(2^_ep_n, 2^_win_n)`.
@@ -15209,6 +15346,96 @@ def main():
                 return _out, _wov
             return _out, _epstream.overflow_from(_out[-7], _out[-6], _ep_n)
 
+        if _PIPE_DEEP:
+            # ---- THE DEEP PIPELINE (owner ruling 2026-09-15) -------------
+            # Episode e's measurement overlaps the ROLLOUT of e+1, not just
+            # the update of e-1. It can, because the per-step tokenization is
+            # off the measure actors (`--tokenize-where`), so the actors are
+            # idle for the whole of the next rollout.
+            #
+            # ONE ITERATION, IN ORDER:
+            #   1. roll out episode e. Its terminal step PACKAGES its plans.
+            #   2. park e's own trainer-side telemetry, here, before the next
+            #      rollout can add to it.
+            #   3. collect episode e-1's rewards. They were measured while
+            #      this rollout ran, so the wait is usually zero.
+            #   4. drain the actors: they hold e-1's plans and nothing else,
+            #      because e's batch has not been started yet.
+            #   5. START e's measurement. It runs during the NEXT rollout.
+            #   6. update and finish e-1.
+            #
+            # The policy lag is the same one `--measure-pipeline 1` already
+            # had: rollout k runs under parameters that have absorbed the
+            # update of k-2.
+            _roll, _tkt = _epstream.run_episode(
+                _EP_BIN,
+                "episode %d" % ep,
+                _ep_rollout_attempt,
+                log=lambda line: print(line, flush=True),
+                on_discard=_ep_discard_rollout,
+                window_policy=_WIN_BIN,
+            )
+            _EP_BIN.record(int(np.max(np.asarray(_roll[5]))))
+            _win_max = int(np.max(np.asarray(_roll[11])))
+            _face_max = int(np.max(np.asarray(_roll[12])))
+            _WIN_BIN.record(max(_win_max, _face_max))
+            if _xtr_on:
+                jax.block_until_ready(
+                    [x for x in jax.tree_util.tree_leaves(_roll)
+                     if isinstance(x, jax.Array)])
+                jax.profiler.stop_trace()
+                _xtr_on = False
+            # 2. THIS rollout's own counters, parked before anything else can
+            #    touch them. The pool half of the same episode arrives one
+            #    iteration from now and is merged into this dict then.
+            _park = _drain_measure_telemetry(_tkt, park=True, pool=False)
+            _EP_CTX.update(win_max=_win_max, face_max=_face_max,
+                           xtr_on=False, ticket=_tkt)
+            _prev = _PIPE_PENDING[0]
+            if _prev is not None:
+                # 3. THE WAIT, which the rollout above was there to hide.
+                _t_wait0 = _prof_time.perf_counter()
+                _meas = _ep_env_mod.collect_measurement(_prev["ticket"])
+                _t_wait = _prof_time.perf_counter() - _t_wait0
+                print(f"[measure-pipeline] ep={int(_prev['ctx']['ep'])} "
+                      f"ticket={_prev['ticket']} "
+                      f"collect_wait={_t_wait:.1f}s "
+                      f"overlapped=rollout{ep}", flush=True)
+                # 4. The actors hold exactly this episode's plans.
+                _pd = _drain_measure_telemetry(
+                    _prev["ticket"], park=False, trainer=False)
+                _prev["park"]["pool_collapse"] = _pd["pool_collapse"]
+                _prev["park"]["pool_face"] = _pd["pool_face"]
+                _prev["park"]["pool_plan"] = _pd["pool_plan"]
+                if bool(np.any(_meas["sentinel"])):
+                    print(f"[measure-pipeline] "
+                          f"ep{int(_prev['ctx']['ep'])}: "
+                          f"{int(np.sum(_meas['sentinel']))} of "
+                          f"{_meas['rewards'].shape[0]} terminal plans came "
+                          f"back sentinelled", flush=True)
+                _prev["roll"] = _pipe_fill_rewards(
+                    _prev["roll"], _meas["rewards"])
+                _prev["ctx"].update(
+                    pool_drain=_prev["park"], collect_wait=_t_wait,
+                    sentinelled=int(np.sum(_meas["sentinel"])))
+            # 5. START this episode's measurement. Nothing of the previous
+            #    episode is left in the actors, so its records cannot mix with
+            #    this one's.
+            _ep_env_mod.start_measurement(_tkt)
+            # 6. Now the previous episode's update, and its epilogue.
+            if _prev is not None:
+                _pipe_finish(_prev, _pipe_update_dispatch(_prev))
+            _PIPE_PENDING[0] = {
+                "roll": _roll,
+                "ctx": _EP_CTX,
+                "ticket": _tkt,
+                "park": _park,
+                "args": (default_freeze_mask, stage_override,
+                         stage_vertex_mult, stage_pin_rules,
+                         stage_micro_mult, _kl_ref_coef_arg,
+                         _EP_BIN.last_used, int(_WIN_BIN.last_used)),
+            }
+            continue
         if _MPIPE:
             # ---- THE PIPELINE. Rollout now, update one episode late. ----
             _roll, _tkt = _epstream.run_episode(
@@ -15340,6 +15567,32 @@ def main():
     if _MPIPE and _PIPE_PENDING[0] is not None:
         _prev = _PIPE_PENDING[0]
         _PIPE_PENDING[0] = None
+        if _PIPE_DEEP:
+            # DEEP: the last episode's measurement was started at the end of
+            # its own iteration and has no next rollout to hide behind. Wait
+            # for it, drain the actors that hold its plans, and put the
+            # rewards in the trajectory this update is about to read.
+            _t_wait0 = _prof_time.perf_counter()
+            _meas = _ep_env_mod.collect_measurement(_prev["ticket"])
+            _t_wait = _prof_time.perf_counter() - _t_wait0
+            print(f"[measure-pipeline] ep={int(_prev['ctx']['ep'])} "
+                  f"ticket={_prev['ticket']} collect_wait={_t_wait:.1f}s "
+                  f"overlapped=nothing (last episode)", flush=True)
+            _pd = _drain_measure_telemetry(
+                _prev["ticket"], park=False, trainer=False)
+            _prev["park"]["pool_collapse"] = _pd["pool_collapse"]
+            _prev["park"]["pool_face"] = _pd["pool_face"]
+            _prev["park"]["pool_plan"] = _pd["pool_plan"]
+            if bool(np.any(_meas["sentinel"])):
+                print(f"[measure-pipeline] ep{int(_prev['ctx']['ep'])}: "
+                      f"{int(np.sum(_meas['sentinel']))} of "
+                      f"{_meas['rewards'].shape[0]} terminal plans came back "
+                      f"sentinelled", flush=True)
+            _prev["roll"] = _pipe_fill_rewards(
+                _prev["roll"], _meas["rewards"])
+            _prev["ctx"].update(
+                pool_drain=_prev["park"], collect_wait=_t_wait,
+                sentinelled=int(np.sum(_meas["sentinel"])))
         _pipe_finish(_prev, _pipe_update_dispatch(_prev))
 
     pbar.close()
