@@ -183,6 +183,12 @@ _PREFIX_EXTEND = os.environ.get("ALPHAGRAD_FACE_PREFIX_EXTEND", "1") == "1"
 # because it costs exactly what the chain saves.
 _FACE_KEY_VERIFY = os.environ.get("ALPHAGRAD_FACE_KEY_VERIFY", "0") == "1"
 
+# ALPHAGRAD_FACE_KEY_CHAIN=0 restores the DENSE prefix key (the whole
+# `frh[:n].tobytes()`), which is what every cache here used before the chain.
+# An A/B switch, not a fallback: the two answer identically and differ only in
+# what they cost.
+_FACE_KEY_CHAIN = os.environ.get("ALPHAGRAD_FACE_KEY_CHAIN", "1") == "1"
+
 
 def _face_row_key(row, skiprow):
     """One vertex's face wire, as a few dozen bytes instead of 69 kilobytes.
@@ -406,7 +412,7 @@ class LiveFaceStream:
         arrays on every call and raises on any disagreement. It is off by
         default because it costs exactly what the chain saves.
         """
-        if frh is None or fsh is None:
+        if frh is None or fsh is None or not _FACE_KEY_CHAIN:
             return None
         n = int(n)
         cur = self._histkeys.get(int(env))
