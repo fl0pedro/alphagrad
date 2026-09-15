@@ -49,6 +49,17 @@ x64-OFF catalog, which is the catalog every archived log was written under
 (no launcher or campaign ever set jax_enable_x64; job 63579 confirms
 x64=False on the cluster).
 
+THE PALIMPSA OPERATOR PAIR TRAVELS WITH THE RECORD (owner ruling
+2026-09-15). The trainer stamps ``palimpsa_read_rollout`` and
+``palimpsa_read_loss`` on every record it writes, beside ``episode`` and
+``plan_index``. They are ``"exact"`` or ``"fast"``. When the two differ, the
+rollout sampled under one operator and the loss scored under another, so the
+PPO ratio at epoch 0 was not 1 and the policy that produced this plan was
+trained with a systematic off-policy bias. A plan log outlives the run it came
+from and is read on its own, so nothing else in the file would say so. They
+are written by the TRAINER, not by :func:`encode_wires`, which is why they do
+not move ``SCHEMA`` -- readers already tolerate added fields.
+
 NON-FINITE FLOATS. The coverage census legitimately contains ``nan`` (an
 uncounted leaf) and can contain ``inf``. ``json.dumps`` would emit bare
 ``NaN``/``Infinity`` literals, which are not JSON and which several readers

@@ -144,7 +144,8 @@ def _decision_inputs(agent):
 
     toks = jrand.randint(jrand.PRNGKey(1), (48,), 1, 60)
     enc, vs, vc = _cs.init_carry(
-        agent, toks, 48, window=48, total_v=TOTAL_V, embd_dim=EMBD)
+        agent, toks, 48, window=48, total_v=TOTAL_V, embd_dim=EMBD,
+        path="rollout")
     pre = agent.heads_from_memory(vs, vc)
     avail = jnp.zeros((TOTAL_V,), jnp.float32).at[2].set(1.0)  # force v=3
     ax_state = jnp.zeros(
@@ -376,7 +377,8 @@ def test_write_then_read_binding(agent_on):
     part = jnp.zeros((TOTAL_V + 1,), jnp.float32).at[0].set(1.0)
     _c2, _s2, _n2, es1, ec1 = _cs.advance(
         agent, enc, vs, vc, dt, jnp.asarray(nd), jnp.asarray(0),
-        window=W, participants=part, edge_mem=(es0, ec0), edge_ids=ids)
+        window=W, participants=part, edge_mem=(es0, ec0), edge_ids=ids,
+        path="rollout")
     # Reference: the SAME encode, rows pooled by hand over the true spans.
     _c2r, rows, valid = agent.encode_extend(
         enc, dt, jnp.asarray(nd), window=W, start=0, chunk=0)

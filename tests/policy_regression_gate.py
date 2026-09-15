@@ -320,7 +320,8 @@ def run_trace(case=None, steps=None):
     # to recompute the base half inside the gradient).
     enc_carry, base_s, base_c = CS.init_carry(
         agent, base_tok[:base_w], base_n,
-        window=base_w, total_v=total_v, embd_dim=EMBD, base_owners=base_own)
+        window=base_w, total_v=total_v, embd_dim=EMBD,
+        base_owners=base_own, path="rollout")
     base_mem = (base_s, base_c)
     vmem_s, vmem_c = CS.zero_memory(total_v, EMBD)
 
@@ -338,7 +339,8 @@ def run_trace(case=None, steps=None):
         enc_carry, vmem_s, vmem_c = CS.advance(
             agent, enc_carry, vmem_s, vmem_c,
             state.delta_tokens, state.delta_count,
-            delta_owner, window=case["window"], participants=part)
+            delta_owner, window=case["window"], participants=part,
+            path="rollout")
         precomputed = CS.heads(agent, vmem_s, vmem_c,
                                base_mem=base_mem, preference=None)
         avail = vertex_avail_at_step(

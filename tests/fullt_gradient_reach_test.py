@@ -70,7 +70,7 @@ def _extend_chunk():
     after each one.
 
     The size moved from 8 to 32 at the same time. Under
-    ``ALPHAGRAD_PALIMPSA_READ=fast`` every outer block has to start on a
+    ``ALPHAGRAD_PALIMPSA_READ_ROLLOUT/_LOSS=fast`` every outer block has to start on a
     multiple of 32, and 8 does not. 32 forces the chunked path just as 8 did,
     which is all this module ever wanted from it.
     """
@@ -114,7 +114,7 @@ def _step(agent, carry, vs, vc, dt, dc, ow, pa):
     return CS.advance(
         agent, carry, vs, vc, dt, dc, ow,
         window=DELTA_W, participants=pa,
-        chunk=None, budget=jnp.asarray(DELTA_W, jnp.int32),
+        chunk=None, budget=jnp.asarray(DELTA_W, jnp.int32), path="rollout",
     )
 
 

@@ -57,7 +57,7 @@ import pytest  # noqa: E402
 @pytest.fixture(autouse=True)
 def _exact_read():
     """THIS MODULE PINS A PROPERTY OF THE EXACT OPERATOR, so it forces
-    ``ALPHAGRAD_PALIMPSA_READ=exact`` even though the shipped default is now
+    ``ALPHAGRAD_PALIMPSA_READ_ROLLOUT/_LOSS=exact`` even though the shipped default is now
     ``fast``.
 
     The claim is BIT-IDENTITY between `count_loop` and the scan-plus-cond form
@@ -70,7 +70,8 @@ def _exact_read():
     ``tests/fast_read_extend_parity_test.py``.
     """
     with pytest.MonkeyPatch.context() as mp:
-        mp.setenv("ALPHAGRAD_PALIMPSA_READ", "exact")
+        mp.setenv("ALPHAGRAD_PALIMPSA_READ_ROLLOUT", "exact")
+        mp.setenv("ALPHAGRAD_PALIMPSA_READ_LOSS", "exact")
         yield
 
 
@@ -158,7 +159,7 @@ def _advance(agent, tok, count, owner, part, budget):
     return CS.advance(
         agent, carry, vs, vc, tok, count, owner,
         window=WINDOW, participants=part,
-        chunk=CHUNK, budget=budget,
+        chunk=CHUNK, budget=budget, path="rollout",
     )
 
 
@@ -429,7 +430,7 @@ def _stream_scalar(agent, s, budget):
             lambda c, u, w: CS.advance(
                 agent, c, u, w, s["stream"], cnt, ow,
                 start=off, row=row, window=WINDOW, participants=pa,
-                chunk=CHUNK, budget=budget))
+                chunk=CHUNK, budget=budget, path="rollout"))
         carry, vs, vc = step(carry, vs, vc)
         return (jnp.sum(carry.M * 1.0) + jnp.sum(carry.I * 2.0)
                 + jnp.sum(vs * 4.0) + jnp.sum(vc * 5.0))

@@ -83,6 +83,7 @@ from alphagrad.approx.common import (
 )
 from alphagrad.approx.common.gae import reward_normalization_fn
 from alphagrad.utils import symlog
+from alphagrad.transformer.fast_palimpsa_pallas import read_path as _read_path
 from alphagrad.approx.env import (
     AXIS_FEATURE_DIM,
     MAX_AXES_PER_VERTEX,
@@ -1716,9 +1717,14 @@ class PPORayWorker:
 
             def per_env(state_i, avail_i, pv_i, cv_i, k_i):
                 k_enc, k_v, k_micro = jrand.split(k_i, 3)
-                enc_x, token_mask = agent.encode_tokens(
-                    state_i.tokens, key=k_enc, eqn_ids=state_i.eqn_ids,
-                )
+                # THE ROLLOUT'S PATH, named for `palimpsa_mix` -- the one
+                # reader with no path argument (owner ruling 2026-09-15: the
+                # rollout and the loss may read palimpsa with different
+                # operators). This is `act_step`, so it is the rollout.
+                with _read_path("rollout"):
+                    enc_x, token_mask = agent.encode_tokens(
+                        state_i.tokens, key=k_enc, eqn_ids=state_i.eqn_ids,
+                    )
                 vertex_logits, vertex_contexts, value = (
                     agent.policy_value_from_encoding(enc_x, token_mask)
                 )
@@ -1888,9 +1894,12 @@ class PPORayWorker:
             def per_sample(tok, eqn, av, v_act, op, i_s, j_s, exp_s, f_s,
                            kind_s, q_s, ax_st, ax_va, pv_s, cv_s,
                            olp, ret, adv, k):
-                enc_x, token_mask = agent.encode_tokens(
-                    tok, key=k, eqn_ids=eqn,
-                )
+                # THE LOSS'S PATH -- see `act_step`'s note. This is
+                # `loss_fn`, so it is the loss.
+                with _read_path("loss"):
+                    enc_x, token_mask = agent.encode_tokens(
+                        tok, key=k, eqn_ids=eqn,
+                    )
                 vertex_logits, vertex_contexts, value = (
                     agent.policy_value_from_encoding(enc_x, token_mask)
                 )

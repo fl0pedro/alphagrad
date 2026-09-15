@@ -64,7 +64,7 @@ def test_base_tokens_never_land_in_a_vertex_slot():
     toks, count = _base_block()
     _, sums, counts = cs.init_carry(
         _StubAgent(), toks, count,
-        window=WINDOW, total_v=TOTAL_V, embd_dim=EMBD)
+        window=WINDOW, total_v=TOTAL_V, embd_dim=EMBD, path="rollout")
     counts = np.asarray(counts)
     assert counts[:TOTAL_V].sum() == 0.0, (
         f"base rows leaked into vertex slots: {counts[:TOTAL_V]}")
@@ -84,7 +84,7 @@ def test_attribution_needs_base_owners_and_nothing_else():
     _, _, counts = cs.init_carry(
         _StubAgent(), toks, count,
         window=WINDOW, total_v=TOTAL_V, embd_dim=EMBD,
-        base_owners=jnp.asarray(own))
+        base_owners=jnp.asarray(own), path="rollout")
     counts = np.asarray(counts)
     assert counts[1] == 9.0, (
         f"the owner's slot (vertex 2 -> index 1) did not get its rows: "
@@ -105,13 +105,13 @@ def test_advance_still_credits_the_owning_vertex():
     toks, count = _base_block()
     carry, sums, counts = cs.init_carry(
         _StubAgent(), toks, count,
-        window=WINDOW, total_v=TOTAL_V, embd_dim=EMBD)
+        window=WINDOW, total_v=TOTAL_V, embd_dim=EMBD, path="rollout")
 
     owner = 2
     _, sums2, counts2 = cs.advance(
         _StubAgent(), carry, sums, counts,
         jnp.ones((WINDOW,), jnp.int32),
-        jnp.asarray(4, jnp.int32), owner, window=WINDOW)
+        jnp.asarray(4, jnp.int32), owner, window=WINDOW, path="rollout")
 
     delta = np.asarray(counts2) - np.asarray(counts)
     assert delta[owner] == 4.0, f"owner slot did not receive the delta: {delta}"
@@ -132,6 +132,6 @@ def test_summary_is_unchanged_by_the_attribution():
     toks, count = _base_block()
     _, sums, counts = cs.init_carry(
         _StubAgent(), toks, count,
-        window=WINDOW, total_v=TOTAL_V, embd_dim=EMBD)
+        window=WINDOW, total_v=TOTAL_V, embd_dim=EMBD, path="rollout")
     got = np.asarray(_vmem.summary(sums, counts))
     np.testing.assert_allclose(got, np.ones(EMBD), rtol=0, atol=1e-6)

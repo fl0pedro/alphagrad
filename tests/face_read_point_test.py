@@ -117,7 +117,8 @@ def _decision_inputs(agent):
 
     toks = jrand.randint(jrand.PRNGKey(1), (48,), 1, 60)
     enc, vs, vc = _cs.init_carry(
-        agent, toks, 48, window=48, total_v=TOTAL_V, embd_dim=EMBD)
+        agent, toks, 48, window=48, total_v=TOTAL_V, embd_dim=EMBD,
+        path="rollout")
     pre = agent.heads_from_memory(vs, vc)
     avail = jnp.zeros((TOTAL_V,), jnp.float32).at[2].set(1.0)   # force v=3
     ax_state = jnp.zeros(
@@ -228,7 +229,7 @@ def test_chunk_mean_matches_the_unmasked_scatter_mean(agent):
     c2, summ = agent._face_encode(enc, tok, jnp.asarray(ct, jnp.int32))
     # THE REFERENCE ROWS HAVE TO COME FROM THE SAME READ. The face pipeline
     # forces the exact recurrence under both settings of
-    # ALPHAGRAD_PALIMPSA_READ (see the block comment above
+    # ALPHAGRAD_PALIMPSA_READ_ROLLOUT/_LOSS (see the block comment above
     # `Agent._face_encode`: the rollout extends once per face and the loss
     # reads all the faces as one span, and only the exact recurrence has no
     # chunk grid to disagree about). Reading the reference with the shipped

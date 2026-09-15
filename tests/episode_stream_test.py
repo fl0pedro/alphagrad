@@ -66,10 +66,15 @@ _FOLD = _LazyModule("alphagrad.approx.common.delta_fold")
 
 
 def extend_fold(*a, **k):
+    # `path` names which side of PPO a read is on (rollout or loss); this
+    # module's claims are about WHERE the tokens come from and hold on either,
+    # so the wrapper picks one and every case inherits it.
+    k.setdefault("path", "loss")
     return _FOLD.extend_fold(*a, **k)
 
 
 def plan_chunks(*a, **k):
+    k.setdefault("path", "loss")
     return _FOLD.plan_chunks(*a, **k)
 
 
@@ -173,7 +178,7 @@ def test_the_tail_also_covers_the_folds_padded_window_not_only_the_write():
     # THE CHUNKS ARE MULTIPLES OF 32, including the awkward one. 3008 is
     # 32 x 94 and still does not divide the window, which is the case this
     # test is about -- a chunk that pads. Under the shipped
-    # ALPHAGRAD_PALIMPSA_READ=fast a multi-block fold refuses anything else
+    # ALPHAGRAD_PALIMPSA_READ_LOSS=fast a multi-block fold refuses anything else
     # (see `delta_fold.plan_chunks`), which the next test pins.
     for chunk in (1024, 3008, 32, W):
         _C, _nb, padded = plan_chunks(W, chunk)
@@ -186,7 +191,7 @@ def test_the_tail_refuses_a_chunk_that_would_misalign_the_fast_grid(
     """The sizes above are multiples of 32 because of this. A stream row is
     sized from `plan_chunks`, so a misaligned fold chunk has to be caught
     before a row is ever built on it."""
-    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ", "fast")
+    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ_LOSS", "fast")
     with pytest.raises(ValueError, match="not a multiple of the fast-palimpsa"):
         plan_chunks(32768, 3000)
 
@@ -850,7 +855,7 @@ def test_the_snapshot_names_only_containers_this_module_still_defines():
 # -------------------------------------------------------------- 5. the read
 
 # THE CHUNKS ARE MULTIPLES OF 32. Under the shipped
-# ALPHAGRAD_PALIMPSA_READ=fast a multi-block fold has to start every block on
+# ALPHAGRAD_PALIMPSA_READ_LOSS=fast a multi-block fold has to start every block on
 # a multiple of 32 (see `delta_fold.plan_chunks`), and 48 is allowed because
 # the window clamps it to a single block. The claim under test is about WHERE
 # the reader takes its tokens from, not about the chunk width, and the counts

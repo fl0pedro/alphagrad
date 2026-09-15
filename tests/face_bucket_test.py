@@ -108,7 +108,8 @@ def _decision_inputs(agent):
     EMBD = 32
     toks = jrand.randint(jrand.PRNGKey(1), (48,), 1, 60)
     enc, vs, vc = _cs.init_carry(
-        agent, toks, 48, window=48, total_v=TOTAL_V, embd_dim=EMBD)
+        agent, toks, 48, window=48, total_v=TOTAL_V, embd_dim=EMBD,
+        path="rollout")
     pre = agent.heads_from_memory(vs, vc)
     avail = jnp.zeros((TOTAL_V,), jnp.float32).at[2].set(1.0)  # force v=3
     ax_state = jnp.zeros(

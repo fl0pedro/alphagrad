@@ -156,9 +156,11 @@ from alphagrad.transformer.encoder import RelationalMultiheadAttention
 from alphagrad.transformer.palimpsa_encoder import (
     palimpsa_beta as _pal_beta, palimpsa_qk_norm as _pal_qk_norm)
 from alphagrad.transformer.fast_palimpsa_pallas import (
-    CHUNK_C as _FAST_C, fast_palimpsa as _fast_palimpsa,
+    CHUNK_C as _FAST_C, current_read_path as _cur_read_path,
+    fast_palimpsa as _fast_palimpsa,
     fast_read_enabled as _fast_read, read_override as _read_override,
-    require_chunk_alignment as _need_c32)
+    read_path as _read_path, require_chunk_alignment as _need_c32,
+    require_read_agreement as _need_read_agreement, read_pair as _read_pair)
 from alphagrad.approx.common import delta_fold as _fold
 from alphagrad.approx.common import count_vjp as _count_vjp
 from alphagrad.approx.common import feature_probe as _fprobe
@@ -2318,7 +2320,15 @@ _ATTN_ENTROPY_ON = os.environ.get("ALPHAGRAD_ATTN_ENTROPY", "1") == "1"
 @eqx.filter_jit
 def attention_entropy_diagnostic(agent, tokens,
                                  axis_state=None, axis_valid=None):
-    """Mean encoder attention-row entropy, or NaN when nothing applies."""
+    """Mean encoder attention-row entropy, or NaN when nothing applies.
+
+    THE PATH IS THE LOSS. This runs the FULL ``agent.encoder``, which reaches
+    ``palimpsa_mix``, the one reader with no path argument of its own. Since
+    owner ruling 2026-09-15 the rollout and the loss may read palimpsa with
+    different operators, so the diagnostic has to say which one its curve
+    describes. It is computed inside ``_episode_update``, beside the loss, so
+    it names the loss. With the two reads equal the block changes nothing.
+    """
     from alphagrad.approx.set_pointer import SetPointerVertexPolicy
     parts = []
     pol = getattr(agent, "vertex_policy", None)
@@ -2328,7 +2338,8 @@ def attention_entropy_diagnostic(agent, tokens,
         if agent.pos_enc is not None:
             x = agent.pos_enc(x)
         enc_mask = None if agent.pos_enc is not None else token_mask
-        enc_x = agent.encoder(x, mask=enc_mask, key=jrand.PRNGKey(0))
+        with _read_path("loss"):
+            enc_x = agent.encoder(x, mask=enc_mask, key=jrand.PRNGKey(0))
         # Same segment pooling SetPointerVertexPolicy.__call__ does, so the
         # slots this scores are the slots the pointer actually sees.
         n_slots = pol.num_vertices + 1
@@ -2587,7 +2598,7 @@ class Agent(eqx.Module):
         return EncCarry(M=M0, I=I0, pos=jnp.zeros((), jnp.int32))
 
     def encode_extend(self, carry, tokens_buf, count, *, window,
-                      start=None, chunk=None, budget=None):
+                      start=None, chunk=None, budget=None, path=None):
         """Extend the palimpsa carry by ``count`` tokens read from
         ``tokens_buf`` at ``carry.pos`` (fixed static ``window``; pad steps
         freeze the carry, so the valid prefix is bitwise-independent of the
@@ -2611,12 +2622,19 @@ class Agent(eqx.Module):
         ``jnp.max(batch.delta_count)`` computed OUTSIDE the vmap -- a budget
         below some sample's ``count`` silently drops that sample's tail.
 
+        ``path`` is ``"rollout"`` or ``"loss"`` and says which read this
+        extend is on. ``None`` means "the enclosing ``read_path`` block",
+        which is what ``delta_fold._encode_chunk`` uses -- it may be calling
+        a test stub whose ``encode_extend`` takes no ``path`` keyword at
+        all, so it names the path with a block instead of an argument.
+
         Byte-identical math to the PalimpsaMixer/EncoderLayer stack. The one
         deliberate exception this docstring used to carry -- the causal
         relational forget-gate features, which the full path computed
         acausally -- is gone: there is no relational modulation on either
         side any more, so the two paths now agree with nothing to except.
         """
+        path = _cur_read_path() if path is None else path
         if self.pos_enc is not None:
             raise RuntimeError(
                 "encode_extend requires the palimpsa backbone "
@@ -2640,7 +2658,8 @@ class Agent(eqx.Module):
             # the per-token affine recurrence). Under the fast read it has no
             # counterpart and must not be entered, or this one call site would
             # read a different operator from every other one.
-            par = (self._extend_fast(carry, toks, valid, count) if _fast_read()
+            par = (self._extend_fast(carry, toks, valid, count)
+                   if _fast_read(path)
                    else self._extend_parallel(carry, toks, valid, count))
             if os.environ.get("ALPHAGRAD_CHUNKED_SELFTEST", "0") == "1":
                 seq = self._extend_sequential(carry, toks, valid, count)
@@ -2654,7 +2673,8 @@ class Agent(eqx.Module):
                     return seq
             return par
         return self._extend_sequential(carry, toks, valid, count,
-                                       chunk=chunk, budget=budget)
+                                       chunk=chunk, budget=budget,
+                                       path=path)
 
     def _extend_parallel(self, carry, toks, valid, count):
         """Blocked parallel extend: scan across fixed-size blocks, one
@@ -2810,7 +2830,7 @@ class Agent(eqx.Module):
         """``_extend_parallel``'s exact contract, with the FAST read.
 
         ``delta_fold._encode_chunk`` calls this instead of the parallel
-        associative-scan path when ``ALPHAGRAD_PALIMPSA_READ=fast``. There is
+        associative-scan path when that path's read is ``fast``. There is
         no inner blocking here: the fast read materialises no per-token
         ``(T, H, d, d)`` state, which is the only thing the parallel path's
         block size existed to bound.
@@ -2819,7 +2839,13 @@ class Agent(eqx.Module):
         return EncCarry(M=M2, I=I2, pos=carry.pos + count), rows, valid
 
     def _extend_sequential(self, carry, toks, valid, count,
-                           chunk=None, budget=None):
+                           chunk=None, budget=None, path=None):
+        # THE PATH. `budget is not None` is the LOSS's form (it is the only
+        # one reverse mode can transpose) and `budget is None` the rollout's,
+        # but that correspondence is not load-bearing here and is not used as
+        # the answer: `init_carry` passes no budget on either side. The caller
+        # names the path, or an enclosing `read_path` block does.
+        path = _cur_read_path() if path is None else path
         layers = self.encoder.layers
 
         def _step(c, tv):
@@ -2872,7 +2898,7 @@ class Agent(eqx.Module):
         # flat form, the while_loop form, the scan+cond form and the
         # count_vjp form cannot drift apart -- and switching the read is one
         # line, not four.
-        _fast = _fast_read()
+        _fast = _fast_read(path)
 
         def _walk(c, toks_blk, valid_blk):
             if _fast:
@@ -3509,8 +3535,8 @@ class Agent(eqx.Module):
     # identical or the ratio is not 1 at epoch 0.
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
-    # THE FACE PIPELINE READS EXACT, UNDER BOTH SETTINGS OF
-    # ALPHAGRAD_PALIMPSA_READ. This is not a preference, it is forced by the
+    # THE FACE PIPELINE READS EXACT, ON BOTH PATHS AND UNDER EVERY SETTING
+    # OF EITHER READ FLAG. This is not a preference, it is forced by the
     # two sides reading the same tokens through different call shapes.
     #
     #   * the ROLLOUT extends the side carry ONCE PER FACE: `_face_loop` calls
@@ -3569,8 +3595,12 @@ class Agent(eqx.Module):
         _W_ENC = int(window or MAX_DELTA_TOKENS)
 
         def _run(c):
+            # path="rollout" names where this call site is; the override
+            # below decides the operator, and it decides it the same on both
+            # paths, which is the whole point of the face pipeline being
+            # exact.
             c2, rows, valid = self.encode_extend(
-                c, tokens, count, window=_W_ENC, start=0)
+                c, tokens, count, window=_W_ENC, start=0, path="rollout")
             # THE SAME SCATTER, KEYED BY FACE. One chunk is one segment, so
             # this is `_vmem.scatter` with a single key -- the identical
             # primitive the vertex slots are built from, and it has no
@@ -4027,7 +4057,7 @@ class Agent(eqx.Module):
             # after the first to face 0 -- a plausible wrong answer, not a
             # crash, which is why delta_fold pins this in a dedicated test.
             _ends = jnp.cumsum(f_cnt.astype(jnp.int32))
-            _C, _nb, _pad_len = _fold.plan_chunks(_W_RPL)
+            _C, _nb, _pad_len = _fold.plan_chunks(_W_RPL, path="loss")
 
             def _face_fold(acc, rows_c, valid_c, off):
                 s_acc, c_acc = acc
@@ -4052,7 +4082,7 @@ class Agent(eqx.Module):
                     init_acc=(jnp.zeros((F, self.embd_dim), jnp.float32),
                               jnp.zeros((F,), jnp.float32)),
                     fold_fn=_face_fold, budget=face_win_budget,
-                    start=f_off, row=f_row)
+                    start=f_off, row=f_row, path="loss")
             face_latents = _fs / jnp.maximum(_fc, 1.0)[:, None]
         else:
             # LEGACY, UNFOLDED BRANCH: `encode_extend` reads a standalone
@@ -4066,7 +4096,7 @@ class Agent(eqx.Module):
                     enc_carry, _f_toks, total,
                     window=_W_RPL, start=0,
                     chunk=(None if face_win_budget is not None else 0),
-                    budget=face_win_budget)
+                    budget=face_win_budget, path="loss")
         # ONE SCATTER, KEYED BY FACE. The chunks concatenate in face order,
         # so token t belongs to the face whose exclusive-prefix interval
         # contains t -- a `searchsorted` against the counts' cumsum. That key
@@ -7049,6 +7079,19 @@ def main():
                       "ceiling and NOTHING refuses it; read the "
                       "hackability warning]"), flush=True)
 
+    # THE PALIMPSA READ PAIR, AND THE GUARD ON IT (owner ruling 2026-09-15).
+    # The rollout and the loss each have their own read flag, because the
+    # fast read costs the rollout about 10 s per episode and saves the loss
+    # about 13.7 s on the campaign shape. Naming them separately is allowed;
+    # running them differently is not, unless the launcher says so in
+    # writing. `require_read_agreement` prints the pair, and on a mismatch
+    # prints what the mismatch does to the PPO ratio and refuses to start
+    # unless ALPHAGRAD_ALLOW_READ_MISMATCH=1. It runs HERE, before ray.init,
+    # so the measure actors inherit an environment that has already been
+    # checked and so the refusal is a startup error rather than something
+    # the first update discovers.
+    _PAL_READ_ROLLOUT, _PAL_READ_LOSS = _need_read_agreement()
+
     # A6 PLAN LOG -- before ray.init so the measure actors inherit
     # ALPHAGRAD_PLAN_LOG. Independent of the three configure_* calls above:
     # it appends no value head and moves no reward slot, so it neither reads
@@ -9127,8 +9170,8 @@ def main():
           "--delta-window-log2)"
           % (_WIN_BIN.initial, _WIN0, _WIN_FLOOR, 1 << _WIN_FLOOR,
              _WIN_CAP, 1 << _WIN_CAP,
-             _fold.plan_chunks(_WIN0)[1],
-             _fold.plan_chunks(MAX_DELTA_TOKENS)[1],
+             _fold.plan_chunks(_WIN0, path=_fold.PATH_ANY)[1],
+             _fold.plan_chunks(MAX_DELTA_TOKENS, path=_fold.PATH_ANY)[1],
              _epstream.WIN_FIRST_BIN_RULE, _epstream.WIN_SELECTION_RULE,
              _epstream.WIN_LOG2_ENV), flush=True)
 
@@ -9320,7 +9363,7 @@ def main():
         _enc_base = _carry_stream.init_carry(
             agent, _BASE_TOK, _BASE_N,
             window=_BASE_W, total_v=total_v, embd_dim=args.embd_dim,
-            base_owners=_BASE_OWN,
+            base_owners=_BASE_OWN, path="rollout",
         )[0]
         _init_pre = (_enc_base,) + _carry_stream.zero_memory(
             total_v, args.embd_dim)
@@ -9345,7 +9388,7 @@ def main():
                       jnp.zeros((), jnp.int32),
                       jnp.array(-1, jnp.int32)).astype(jnp.int32),
             window=_W_BIN,
-            participants=_init_part,
+            participants=_init_part, path="rollout",
         )
         init_enc_state = _init_pre + _init_post
         if _EDGE_MEM:
@@ -9785,13 +9828,14 @@ def main():
                     next_state.delta_count, vertex_idx.astype(jnp.int32),
                     window=_W_BIN, participants=step_part,
                     edge_mem=(emem_s2, emem_c2), edge_ids=_wr_ids,
+                    path="rollout",
                 )
             else:
                 nxt_carry, nv_s_raw, nv_c_raw = _carry_stream.advance(
                     agent, enc_carry2, vmem_s2, vmem_c2,
                     next_state.delta_tokens,
                     next_state.delta_count, vertex_idx.astype(jnp.int32),
-                    window=_W_BIN, participants=step_part,
+                    window=_W_BIN, participants=step_part, path="rollout",
                 )
             # The UNMARKED triple is what gets threaded (see next_enc_state):
             # `_pp_mark` adds a host-produced 0.0 to every numeric leaf, so
@@ -10076,10 +10120,13 @@ def main():
         # path was taken. (The dynamic path doesn't use pin_rules_to_exact;
         # the JAX-traced arg is ignored there.)
         if args.dynamic_substeps:
-            return _dynamic_loss_fn(
-                agent, batch, key, op_legality_override, kl_ref_coef,
-                ep_streams, delta_window,
-            )
+            # NAME THE PATH FOR THE WHOLE LOSS TRACE -- the counterpart of
+            # the block around `rollout_fn`, and for the same one reader.
+            with _read_path("loss"):
+                return _dynamic_loss_fn(
+                    agent, batch, key, op_legality_override, kl_ref_coef,
+                    ep_streams, delta_window,
+                )
     def _dynamic_loss_fn(
         agent, batch: TrainBatch, key, op_legality_override,
         kl_ref_coef=None, ep_streams=None, delta_window=None,
@@ -10318,7 +10365,7 @@ def main():
         _init0 = _carry_stream.init_carry(
             agent, _BASE_TOK, _BASE_N,
             window=_BASE_W, total_v=total_v, embd_dim=args.embd_dim,
-            base_owners=_BASE_OWN,
+            base_owners=_BASE_OWN, path="loss",
         )
         _base_carry = _init0[0]
         _base_mem = _init0[1:]
@@ -10341,7 +10388,7 @@ def main():
                 # the batch-wide `budget` instead and gets the scan/cond
                 # form, which has a transpose rule and skips exactly the
                 # same pad steps.
-                chunk=None, budget=_delta_budget,
+                chunk=None, budget=_delta_budget, path="loss",
             )
 
         # REMAT THE K-LOOP BODY. `advance` is a whole `encode_extend` over
@@ -10381,7 +10428,7 @@ def main():
                 _ep_tok, dcnt_k, own_k,
                 start=doff_k, row=eidx,
                 window=_W_LOSS, participants=part_k,
-                chunk=None, budget=_delta_budget,
+                chunk=None, budget=_delta_budget, path="loss",
                 edge_mem=(es, ec), edge_ids=eids,
             )
 
@@ -11264,28 +11311,36 @@ def main():
         # See attention_entropy_diagnostic: representation diagnostic, not a
         # policy entropy.
         _ep_tok0, _ep_ftok0 = _episode_streams(ep_log2, win_log2)
-        (env_states, traj, total_rewards_full,
-         ep_tokens, ep_face_tokens, ep_used_per_env,
-         ep_over_len_per_env, ep_over_step_per_env,
-         win_over_len_per_env, win_over_step_per_env,
-         win_over_kind_per_env,
-         win_used_per_env, face_used_per_env) = rollout_fn(
-            agent,
-            env_obj,
-            num_valid,
-            env_states,
-            rollout_keys,
-            base_mem,
-            preferences_per_env,
-            op_legality_override_arg,
-            pin_rules_to_exact_arg,
-            # vertex_temperature: None in training (the vmap in_axes tuple is
-            # positional, so this must be passed explicitly).
-            None,
-            _ep_tok0,
-            _ep_ftok0,
-            _EP_ENV_IDX,
-        )
+        # NAME THE PATH FOR THE WHOLE ROLLOUT TRACE. Every reader inside
+        # `rollout_fn` names its own path as an argument; this block is for
+        # the one that cannot, `palimpsa_mix` inside the mixer module, which
+        # `agent.encode()` reaches on both paths. It is insurance: the
+        # trainer always hands `precomputed` down, so the full encode is not
+        # traced here, and with the two reads equal the block changes
+        # nothing at all.
+        with _read_path("rollout"):
+            (env_states, traj, total_rewards_full,
+             ep_tokens, ep_face_tokens, ep_used_per_env,
+             ep_over_len_per_env, ep_over_step_per_env,
+             win_over_len_per_env, win_over_step_per_env,
+             win_over_kind_per_env,
+             win_used_per_env, face_used_per_env) = rollout_fn(
+                agent,
+                env_obj,
+                num_valid,
+                env_states,
+                rollout_keys,
+                base_mem,
+                preferences_per_env,
+                op_legality_override_arg,
+                pin_rules_to_exact_arg,
+                # vertex_temperature: None in training (the vmap in_axes
+                # tuple is positional, so this must be passed explicitly).
+                None,
+                _ep_tok0,
+                _ep_ftok0,
+                _EP_ENV_IDX,
+            )
         # THE ROLLOUT'S WHOLE OUTPUT, as one tuple. `subkey` rides along
         # because the update's epoch keys are split from it and the split
         # order has to stay exactly what it was: `subkey` first, the rollout
@@ -12462,6 +12517,13 @@ def main():
     # the policy heads, not the reward.
     _wandb_config["quality_metric_resolved"] = _QUALITY_METRIC
     _wandb_config["mem_channel"] = str(args.mem_channel)
+    # THE OPERATOR PAIR, ON THE RUN ITSELF. A result read without it cannot
+    # be interpreted: with the two reads equal the PPO ratio is 1 at epoch 0
+    # and the run is on-policy, and with them different it is not.
+    _pal_r, _pal_l = _read_pair()
+    _wandb_config["palimpsa_read_rollout"] = _pal_r
+    _wandb_config["palimpsa_read_loss"] = _pal_l
+    _wandb_config["palimpsa_read_mismatch"] = bool(_pal_r != _pal_l)
     # TOOLCHAIN FINGERPRINT (ticket .45): jax / jaxlib versions, XLA_FLAGS,
     # the sparse flag, beside the repo SHAs _repo_commits put here.
     _wandb_config.update(_gate_telemetry.toolchain_fingerprint(
@@ -13385,9 +13447,18 @@ def main():
                     dict(_plog_pool or {}))
                 _plog_n0 = int(host_state.get("_plan_log_written", 0))
                 _plog_tkt = (_POOL_DRAIN[0] or {}).get("ticket")
+                # THE OPERATOR PAIR, ON EVERY RECORD. The run config has it
+                # too, but a plan log outlives the run it came from and is
+                # read on its own, so the pair travels with the record. A
+                # plan produced under a mismatched pair was produced by a
+                # policy trained with a systematic off-policy bias, and
+                # nothing else in the record says so.
+                _plog_rd_r, _plog_rd_l = _read_pair()
                 for _plog_j, _plog_r in enumerate(_plog_recs):
                     _plog_r["episode"] = int(ep)
                     _plog_r["plan_index"] = _plog_n0 + _plog_j
+                    _plog_r["palimpsa_read_rollout"] = _plog_rd_r
+                    _plog_r["palimpsa_read_loss"] = _plog_rd_l
                     if _plog_tkt is not None:
                         # THE MEASUREMENT TICKET (--measure-pipeline). One
                         # ticket is one attempt at one episode; a pooled
@@ -14996,7 +15067,7 @@ def main():
         base_mem = _carry_stream.base_memory(
             agent, _BASE_TOK, _BASE_N,
             window=_BASE_W, total_v=total_v, embd_dim=args.embd_dim,
-            base_owners=_BASE_OWN,
+            base_owners=_BASE_OWN, path="rollout",
         )
 
         env_states = reset_envs(env_episode)
@@ -15056,14 +15127,15 @@ def main():
                     _env_w = env_episode.with_delta_window(1 << int(_w))
                     _s = reset_envs(_env_w)
                     _t0, _f0 = _episode_streams(_n, _w)
-                    _out = rollout_fn(
-                        agent, _env_w, num_valid, _s,
-                        jrand.split(_k, num_envs), base_mem,
-                        preferences_per_env, stage_override,
-                        stage_pin_rules,
-                        _wt,  # positional: vmap in_axes is a positional tuple
-                        _t0, _f0, _EP_ENV_IDX,
-                    )
+                    with _read_path("rollout"):
+                        _out = rollout_fn(
+                            agent, _env_w, num_valid, _s,
+                            jrand.split(_k, num_envs), base_mem,
+                            preferences_per_env, stage_override,
+                            stage_pin_rules,
+                            _wt,  # positional: vmap in_axes is positional
+                            _t0, _f0, _EP_ENV_IDX,
+                        )
                     # The overflows arrive as device arrays, read here on
                     # the host AFTER the rollout finished (finding 2). THE
                     # WINDOW IS CHECKED FIRST: a step whose delta does not

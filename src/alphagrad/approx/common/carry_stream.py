@@ -56,6 +56,7 @@ from jax import lax
 
 from alphagrad.approx import vertex_memory as _vmem
 from alphagrad.approx.common import delta_fold as _fold
+from alphagrad.transformer.fast_palimpsa_pallas import read_path as _read_path
 
 __all__ = ["init_carry", "base_memory", "zero_memory", "zero_edge_memory",
            "advance", "heads"]
@@ -89,7 +90,7 @@ def zero_memory(total_v, embd_dim):
 
 
 def init_carry(agent, base_tokens, base_count, *, window,
-               total_v, embd_dim, base_owners=None):
+               total_v, embd_dim, base_owners=None, path):
     """``(enc_carry, base_sums, base_counts)`` -- the BASE MEMORY.
 
     The returned memory is NOT an accumulator to advance into: it is the base
@@ -111,6 +112,12 @@ def init_carry(agent, base_tokens, base_count, *, window,
     ``window`` is the base stream's OWN length (it is a constant of the
     jaxpr, not of the elimination order), so the base encode scan is exactly
     as long as the base is.
+
+    ``path`` is ``"rollout"`` or ``"loss"`` and is REQUIRED. BOTH sides call
+    this function on the same base stream -- the rollout once per episode,
+    the loss again inside ``filter_grad`` -- and since owner ruling
+    2026-09-15 the two may read palimpsa with different operators. Nothing
+    else in the call distinguishes them, so the caller has to say.
     """
     enc0 = agent.carry_init()
     # chunk=0: the base window IS the base length (count == window), so a
@@ -128,10 +135,17 @@ def init_carry(agent, base_tokens, base_count, *, window,
         return _init_carry_folded(
             agent, enc0, base_tokens, base_count,
             window=window, total_v=total_v, embd_dim=embd_dim,
-            base_owners=base_owners)
-    enc1, rows0, valid0 = agent.encode_extend(
-        enc0, base_tokens, base_count, window=window, start=0, chunk=0,
-    )
+            base_owners=base_owners, path=path)
+    # THE PATH IS NAMED BY A BLOCK, not by an argument, on the two UNFOLDED
+    # branches of this module. The agent here may be a test STUB whose
+    # `encode_extend` takes no `path` keyword at all -- it carries its own
+    # recurrence and has no palimpsa read to choose -- so passing one would
+    # be a TypeError. A real agent's `encode_extend` defaults its `path` to
+    # the enclosing block, so it sees exactly the same answer.
+    with _read_path(path):
+        enc1, rows0, valid0 = agent.encode_extend(
+            enc0, base_tokens, base_count, window=window, start=0, chunk=0,
+        )
     # BASE ATTRIBUTION. The owners come from the tokenizer:
     # `IncrementalPathTokenizer.last_owner_ids()` gives the 1-based vertex
     # that produced each base token (0 = no owner: headers, the input list),
@@ -166,14 +180,14 @@ def _base_ids(base_owners, n):
 
 
 def _init_carry_folded(agent, enc0, base_tokens, base_count, *,
-                       window, total_v, embd_dim, base_owners=None):
+                       window, total_v, embd_dim, base_owners=None, path):
     """`init_carry` with the (window, E) rows folded away chunk by chunk."""
     # Pad the ids to the fold's PADDED length, not the window: the fold pads
     # its token buffers to nb * C and slices side arrays at the same offsets,
     # so a window-length ids array overruns the final chunk. -1 sends the pad
     # to the global slot, and those lanes are invalid anyway so they carry
     # zero weight.
-    C, _nb, padded = _fold.plan_chunks(window)
+    C, _nb, padded = _fold.plan_chunks(window, path=path)
     base_ids = _base_ids(base_owners, padded)
     vs0, vc0 = zero_memory(total_v, embd_dim)
 
@@ -186,12 +200,12 @@ def _init_carry_folded(agent, enc0, base_tokens, base_count, *,
 
     enc1, (vs1, vc1) = _fold.extend_fold(
         agent, enc0, base_tokens, base_count,
-        window=window, init_acc=(vs0, vc0), fold_fn=fold)
+        window=window, init_acc=(vs0, vc0), fold_fn=fold, path=path)
     return enc1, vs1, vc1
 
 
 def base_memory(agent, base_tokens, base_count, *, window,
-                total_v, embd_dim, base_owners=None):
+                total_v, embd_dim, base_owners=None, path):
     """:func:`init_carry` without the carry -- ``(base_sums, base_counts)``.
 
     THIS IS THE CALL THE LOSS MAKES, inside the differentiated region, once
@@ -199,10 +213,14 @@ def base_memory(agent, base_tokens, base_count, *, window,
     constant of the graph, so the result is the same for every sample in the
     minibatch and a closed-over unbatched tracer is what vmap wants). It is
     the entire reason palimpsa's base encode now has a cotangent.
+
+    The ROLLOUT calls it too, for its own base scatter, and passes
+    ``path="rollout"``. Behaviour policy and target policy agree at epoch 0
+    only while the two paths read the same operator.
     """
     return init_carry(agent, base_tokens, base_count,
                       window=window, total_v=total_v, embd_dim=embd_dim,
-                      base_owners=base_owners)[1:]
+                      base_owners=base_owners, path=path)[1:]
 
 
 _FOLD = os.environ.get("ALPHAGRAD_FOLD_DELTA", "1") != "0"
@@ -232,7 +250,7 @@ def _stream_window(stream, start, row, window):
 def advance(agent, enc_carry, vmem_sums, vmem_counts,
             delta_tokens, delta_count, owner, *, window,
             chunk=None, budget=None, participants=None,
-            edge_mem=None, edge_ids=None, start=None, row=None):
+            edge_mem=None, edge_ids=None, start=None, row=None, path):
     """Extend the carry by one step's delta; returns the new
     ``(enc_carry, vmem_sums, vmem_counts)``.
 
@@ -298,6 +316,10 @@ def advance(agent, enc_carry, vmem_sums, vmem_counts,
     the unfolded legacy branch cuts the ``window`` out first, because
     ``encode_extend`` takes a standalone buffer. See
     ``common.episode_stream``.
+
+    ``path`` is ``"rollout"`` or ``"loss"`` and is REQUIRED, for the reason
+    :func:`init_carry` gives: both sides advance the same carry over the same
+    delta and only the caller knows which side it is.
     """
     if edge_mem is not None and edge_ids is None:
         raise ValueError("advance: edge_mem given without edge_ids")
@@ -312,7 +334,8 @@ def advance(agent, enc_carry, vmem_sums, vmem_counts,
             agent, enc_carry, vmem_sums, vmem_counts, delta_tokens,
             delta_count, window=window, chunk=chunk,
             budget=budget, participants=participants,
-            edge_mem=edge_mem, edge_ids=edge_ids, start=start, row=row)
+            edge_mem=edge_mem, edge_ids=edge_ids, start=start, row=row,
+            path=path)
     if start is not None:
         # LEGACY, UNFOLDED BRANCH. `encode_extend` reads a standalone
         # buffer, so the delta's window is cut out of the stream first --
@@ -320,10 +343,12 @@ def advance(agent, enc_carry, vmem_sums, vmem_counts,
         # it is the branch production does not run (`_FOLD` is on by
         # default and the trainer always passes `participants`).
         delta_tokens = _stream_window(delta_tokens, start, row, window)
-    carry2, rows, valid = agent.encode_extend(
-        enc_carry, delta_tokens, delta_count,
-        window=window, start=0, chunk=chunk, budget=budget,
-    )
+    # A block, not an argument -- see `init_carry`.
+    with _read_path(path):
+        carry2, rows, valid = agent.encode_extend(
+            enc_carry, delta_tokens, delta_count,
+            window=window, start=0, chunk=chunk, budget=budget,
+        )
     _edge_out = ()
     if edge_mem is not None:
         # The SAME rows, scattered a third way: by the host-assigned edge
@@ -365,7 +390,8 @@ def advance(agent, enc_carry, vmem_sums, vmem_counts,
 def _advance_folded(agent, enc_carry, vmem_sums, vmem_counts, delta_tokens,
                     delta_count, *, window, chunk=None,
                     budget=None, participants=None,
-                    edge_mem=None, edge_ids=None, start=None, row=None):
+                    edge_mem=None, edge_ids=None, start=None, row=None,
+                    path):
     """`advance`'s participation branch with the rows folded away.
 
     Everything the branch does with `rows` is LINEAR in two running
@@ -388,7 +414,7 @@ def _advance_folded(agent, enc_carry, vmem_sums, vmem_counts, delta_tokens,
     init = (jnp.zeros((E,), jnp.float32), jnp.zeros((), jnp.float32))
     if edge_mem is not None:
         K = edge_mem[0].shape[0]
-        C, _nb, padded = _fold.plan_chunks(window, chunk)
+        C, _nb, padded = _fold.plan_chunks(window, chunk, path=path)
         # Pad the ids to the fold's PADDED length (see plan_chunks): -1
         # sends the pad lanes to the trash segment, and they are invalid
         # anyway so they carry zero weight.
@@ -412,7 +438,7 @@ def _advance_folded(agent, enc_carry, vmem_sums, vmem_counts, delta_tokens,
     carry2, _acc = _fold.extend_fold(
         agent, enc_carry, delta_tokens, delta_count,
         window=window, chunk=chunk, budget=budget,
-        init_acc=init, fold_fn=fold, start=start, row=row)
+        init_acc=init, fold_fn=fold, start=start, row=row, path=path)
     tot_rows, n_rows = _acc[:2]
 
     part = jnp.asarray(participants, jnp.float32)

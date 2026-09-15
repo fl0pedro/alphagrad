@@ -288,13 +288,13 @@ def test_plan_chunks_returns_the_same_chunk_size_at_every_window_bin_at_or_above
     """
     floor = 1024
     for w in (1024, 2048, 4096, 8192, 16384, 32768):
-        C, nb, padded = FOLD.plan_chunks(w, floor)
+        C, nb, padded = FOLD.plan_chunks(w, floor, path="loss")
         assert C == floor, (w, C)
         assert nb == w // floor
         assert padded == w
     # One doubling under the floor and the chunk moves. That is the change
     # the floor exists to forbid.
-    assert FOLD.plan_chunks(512, floor)[0] == 512
+    assert FOLD.plan_chunks(512, floor, path="loss")[0] == 512
 
 
 # ----------------------------------------- 3. the overflow and the two bins
@@ -460,7 +460,7 @@ def _fold_rows(window, count, chunk=1024):
         jnp.asarray(count, jnp.int32),
         window=window, chunk=chunk,
         init_acc=(jnp.zeros((E,), jnp.float32), jnp.zeros((), jnp.float32)),
-        fold_fn=fold)
+        fold_fn=fold, path="loss")
     return np.asarray(carry), np.asarray(acc[0]), np.asarray(acc[1])
 
 
@@ -497,7 +497,7 @@ def test_advance_at_a_smaller_window_bin_gives_bit_identical_vertex_memory():
             StubAgent(), jnp.zeros(()), vs, vc,
             jnp.asarray(t), jnp.asarray(count, jnp.int32),
             jnp.asarray(2, jnp.int32),
-            window=window, participants=jnp.asarray(part))
+            window=window, participants=jnp.asarray(part), path="rollout")
 
     a = [np.asarray(x) for x in run(32768)]
     b = [np.asarray(x) for x in run(4096)]
@@ -686,7 +686,7 @@ def test_the_window_bin_at_four_thousand_and_ninety_six_pays_a_quarter_of_the_it
     chunk, embd = 1024, 128
     table = {}
     for w in (32768, 8192, 4096):
-        C, nb, padded = FOLD.plan_chunks(w, chunk)
+        C, nb, padded = FOLD.plan_chunks(w, chunk, path="loss")
         table[w] = (nb, w * embd * 4)
         assert C == chunk and padded == w
     assert table[32768] == (32, 16777216)
