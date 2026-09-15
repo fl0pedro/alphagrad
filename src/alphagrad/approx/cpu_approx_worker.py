@@ -737,12 +737,17 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *, seed: int = 0)
     key, args_key, eval_key = jrand.split(key, 3)
 
     dataset_arg = None if args.dataset == "none" else args.dataset
+    from alphagrad.approx.common.snn_shd import SHD_TARGETS
     use_dataset = (
-        dataset_arg is not None and args.example.endswith("NeuralNetwork")
+        dataset_arg is not None
+        and (args.example.endswith("NeuralNetwork")
+             or args.example in SHD_TARGETS)
     )
     dataset_for_call = dataset_arg if use_dataset else None
     target_fn = get_fn(args.example)
-    xs = get_args(args.example, args_key, dataset=dataset_for_call)
+    xs = get_args(args.example, args_key, dataset=dataset_for_call,
+                  grad_window=getattr(args, "target_grad_window", None),
+                  dataset_size=args.dataset_size)
     gen = data_gen(
         args.example, dataset=dataset_for_call, dataset_size=args.dataset_size
     )

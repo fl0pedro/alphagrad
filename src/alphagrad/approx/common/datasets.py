@@ -110,6 +110,10 @@ def dataset_dims(name: str) -> tuple[int, int]:
     """Return (input_dim, output_dim) for a built-in dataset name."""
     if name == "mnist":
         return 784, 10
+    if name == "shd":
+        # ONE TIME BIN's input width and the class count. The time axis is not
+        # a "dim" here: the SNN targets consume it one step at a time.
+        return SHD_CHANNELS, SHD_CLASSES
     raise ValueError(f"Unknown dataset '{name}'")
 
 
@@ -157,10 +161,15 @@ def load_dataset(name: str, dataset_size: int | None, subset: str = "train"):
             x_np = x_np[:dataset_size]
             y_np = y_np[:dataset_size]
         result = (jnp.asarray(x_np), jnp.asarray(y_np))
+    elif name == "shd":
+        # The binned Spiking Heidelberg Digits. Its x carries a TIME axis
+        # (N, 100, 700) where MNIST's carries none, so it has its own loader;
+        # this branch is the one door every caller can knock on.
+        result = load_shd(dataset_size, subset=subset)
     else:
         if subset != "train":
             raise ValueError(
-                f"subset={subset!r} is only supported for MNIST"
+                f"subset={subset!r} is only supported for MNIST and SHD"
             )
         raise ValueError(f"Unknown dataset '{name}'")
 
@@ -206,3 +215,139 @@ def load_wikitext2(vocab_size: int, subset: str = "train") -> np.ndarray:
     ids = np.asarray([idx.get(w, unk) for w in words], dtype=np.int32)
     _DATASET_CACHE[ck] = ids
     return ids
+
+
+# ---------------------------------------------------------------------------
+# Spiking Heidelberg Digits (SHD) for the temporal SNN targets.
+#
+# THE RAW FILES, NOT A PACKAGE. ``shd_train.h5`` / ``shd_test.h5`` are read
+# with h5py (already in the stack) and binned here. ``tonic`` is deliberately
+# NOT a dependency: it pulls torch and a download stack onto the trainer's hot
+# path for what is fifty lines of binning.
+#
+# THE LAYOUT of either file, as the Zenke lab publishes it:
+#   spikes/times   (N,) variable-length float64, spike times in SECONDS
+#   spikes/units   (N,) variable-length int,     input channel 0..699
+#   labels         (N,)  int, the spoken digit 0..19 (0-9 English, 10-19 German)
+#
+# THE BINNING is the one LIF_SNN_SHD's shape already declares: 700 channels x
+# 100 time bins of 10 ms over the FIRST SECOND of each recording. A spike later
+# than 1.0 s is dropped (the recordings are about 0.7-1.4 s; the window is the
+# stated shape, not a property of the data). A bin holds the COUNT of spikes of
+# that channel in those 10 ms, which is 0 or 1 almost everywhere: a sample
+# carries about 8k spikes over 70k (bin, channel) cells.
+_SHD_MIRROR = "https://zenkelab.org/datasets"
+_SHD_FILES = {"train": "shd_train.h5", "test": "shd_test.h5"}
+
+#: The binned shape. n_in = 700 input channels, T = 100 bins, 10 ms each,
+#: n_out = 20 classes. LIF_SNN_SHD / ADALIF_SNN_SHD are built to it.
+SHD_CHANNELS = 700
+SHD_TIME_BINS = 100
+SHD_BIN_SECONDS = 0.01
+SHD_CLASSES = 20
+
+
+def _shd_cache_dir() -> Path:
+    """Where the raw ``.h5`` files and the binned ``.npz`` cache live.
+
+    ``DSNN_SHD_DIR`` overrides, exactly as ``DSNN_MNIST_DIR`` does, and the
+    campaign points all three at one directory on ``/Scratch`` because the GPU
+    nodes mount no home (finding 57). The default sits beside the MNIST cache.
+    """
+    override = os.environ.get("DSNN_SHD_DIR")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".cache" / "dsnn_shd"
+
+
+def _download_shd(cache: Path, subset: str) -> Path:
+    """The raw ``shd_<subset>.h5``, downloading and un-gzipping it once."""
+    cache.mkdir(parents=True, exist_ok=True)
+    fname = _SHD_FILES[subset]
+    target = cache / fname
+    if target.exists():
+        return target
+    url = f"{_SHD_MIRROR}/{fname}.gz"
+    gz = cache / f"{fname}.gz"
+    if not gz.exists():
+        print(f"  fetching {url} -> {gz}", flush=True)
+        urllib.request.urlretrieve(url, gz)
+    print(f"  unpacking {gz} -> {target}", flush=True)
+    tmp = cache / f"{fname}.part"
+    with gzip.open(gz, "rb") as src, open(tmp, "wb") as dst:
+        while True:
+            chunk = src.read(1 << 22)
+            if not chunk:
+                break
+            dst.write(chunk)
+    tmp.replace(target)
+    return target
+
+
+def _bin_shd(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Bin one raw SHD file to ``(x [N, T, 700] float32, y [N] uint8)``."""
+    import h5py
+
+    with h5py.File(path, "r") as fh:
+        times = fh["spikes"]["times"]
+        units = fh["spikes"]["units"]
+        labels = np.asarray(fh["labels"][:], dtype=np.uint8)
+        n = int(labels.shape[0])
+        x = np.zeros((n, SHD_TIME_BINS, SHD_CHANNELS), dtype=np.float32)
+        for i in range(n):
+            t = np.asarray(times[i], dtype=np.float64)
+            u = np.asarray(units[i], dtype=np.int64)
+            keep = (t >= 0.0) & (t < SHD_TIME_BINS * SHD_BIN_SECONDS)
+            b = (t[keep] / SHD_BIN_SECONDS).astype(np.int64)
+            c = u[keep]
+            if c.size and (c.min() < 0 or c.max() >= SHD_CHANNELS):
+                raise ValueError(
+                    f"{path.name} sample {i}: channel index out of range "
+                    f"[0, {SHD_CHANNELS}): min {c.min()}, max {c.max()}")
+            np.add.at(x[i], (b, c), 1.0)
+    if labels.size and int(labels.max()) >= SHD_CLASSES:
+        raise ValueError(
+            f"{path.name}: label {int(labels.max())} is outside "
+            f"[0, {SHD_CLASSES})")
+    return x, labels
+
+
+def _shd_binned(subset: str) -> tuple[np.ndarray, np.ndarray]:
+    """The binned split, from the ``.npz`` cache or built and cached once."""
+    if subset not in _SHD_FILES:
+        raise ValueError(
+            f"SHD subset must be one of {sorted(_SHD_FILES)}, got {subset!r}")
+    cache = _shd_cache_dir()
+    npz = cache / (f"shd_{subset}_binned_"
+                   f"{SHD_TIME_BINS}x{SHD_CHANNELS}.npz")
+    if npz.exists():
+        with np.load(npz) as z:
+            return z["x"], z["y"]
+    raw = _download_shd(cache, subset)
+    x, y = _bin_shd(raw)
+    tmp = npz.with_suffix(".npz.part")
+    np.savez(tmp, x=x, y=y)
+    tmp.replace(npz)
+    return x, y
+
+
+def load_shd(dataset_size: int | None = -1, subset: str = "train"):
+    """SHD as ``(x [N, 100, 700] float32, y [N, 20] float32 one-hot)``.
+
+    ``dataset_size > 0`` keeps the FIRST ``dataset_size`` samples -- the same
+    fixed-prefix subset rule :func:`load_dataset` applies to MNIST, so two
+    processes that were given the same number see the same samples in the same
+    slots and the trainer and its measure actors cannot disagree about which
+    recording a gradient was taken on.
+    """
+    ck = ("shd", int(dataset_size) if dataset_size is not None else None, subset)
+    if ck in _DATASET_CACHE:
+        return _DATASET_CACHE[ck]
+    x_np, y_np = _shd_binned(subset)
+    y_np = np.eye(SHD_CLASSES, dtype=np.float32)[y_np]
+    if dataset_size is not None and dataset_size > 0:
+        x_np = x_np[:dataset_size]
+        y_np = y_np[:dataset_size]
+    result = (jnp.asarray(x_np), jnp.asarray(y_np))
+    _DATASET_CACHE[ck] = result
+    return result

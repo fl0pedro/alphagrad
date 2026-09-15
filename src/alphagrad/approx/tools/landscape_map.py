@@ -131,6 +131,11 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument("--dataset", default="wikitext2",
                    help="'none' disables the dataset (Helmholtz smoke).")
     p.add_argument("--dataset-size", type=int, default=-1)
+    # The TARGET's gradient window, spelled and defaulted exactly as in ppo.py,
+    # so a replay of a recurrent arm rebuilds the SAME number of per-step
+    # blocks. Without it this tool would silently map a one-step graph against
+    # a run that trained on a hundred.
+    p.add_argument("--target-grad-window", type=int, default=None, metavar="N")
     p.add_argument("--hidden-dim", type=int, default=256)
     p.add_argument("--vocab-size", type=int, default=512)
     p.add_argument("--embd-dim", type=int, default=128)
@@ -483,14 +488,18 @@ def build_env(args):
     key = jrand.PRNGKey(args.seed)
     key, args_key = jrand.split(key)
 
+    from alphagrad.approx.common.snn_shd import SHD_TARGETS
     dataset_arg = None if args.dataset == "none" else args.dataset
     use_dataset = dataset_arg is not None and (
         args.example.endswith("NeuralNetwork")
-        or args.example.startswith("TransformerLM"))
+        or args.example.startswith("TransformerLM")
+        or args.example in SHD_TARGETS)
     dataset_for_call = dataset_arg if use_dataset else None
 
     target_fn = get_fn(args.example)
-    xs = get_args(args.example, args_key, dataset=dataset_for_call)
+    xs = get_args(args.example, args_key, dataset=dataset_for_call,
+                  grad_window=getattr(args, "target_grad_window", None),
+                  dataset_size=args.dataset_size)
     gen = data_gen(args.example, dataset=dataset_for_call,
                    dataset_size=args.dataset_size)
     target_fn, xs, argnums = grad_target_setup(args, target_fn, xs, args.example)

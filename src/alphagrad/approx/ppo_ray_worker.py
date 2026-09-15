@@ -517,15 +517,19 @@ class PPORayWorker:
         # references locally — we need both `args` (for tokenizer/eval)
         # and `valid_vertices` for the action mask.
         dataset_arg = None if self.args.dataset == "none" else self.args.dataset
+        from alphagrad.approx.common.snn_shd import SHD_TARGETS
         use_dataset = (
             dataset_arg is not None
-            and self.args.example.endswith("NeuralNetwork")
+            and (self.args.example.endswith("NeuralNetwork")
+                 or self.args.example in SHD_TARGETS)
         )
         dataset_for_call = dataset_arg if use_dataset else None
         from alphagrad.approx.common.examples import (
             has_scalar_loss as _has_scalar_loss)
         target_fn = get_fn(self.args.example)
-        xs = get_args(self.args.example, args_key, dataset=dataset_for_call)
+        xs = get_args(self.args.example, args_key, dataset=dataset_for_call,
+                      grad_window=getattr(self.args, "target_grad_window", None),
+                      dataset_size=self.args.dataset_size)
         gen = data_gen(
             self.args.example,
             dataset=dataset_for_call,

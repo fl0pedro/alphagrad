@@ -22,6 +22,21 @@ from alphagrad.approx.common.datasets import (
     load_dataset,
     loss_mode,
 )
+from alphagrad.approx.common.snn_shd import (
+    SHD_TARGETS,
+    TEMPORAL_TARGETS,
+    refuse_legacy_snn_env,
+    resolve_grad_window,
+    shd_args,
+)
+
+# ALPHAGRAD_SNN_STEPS and ALPHAGRAD_SNN_TRUNC were the two environment
+# variables that sized the temporal targets. They are ARGUMENTS now
+# (--target-grad-window), and a process that still exports either one dies
+# HERE, at import, naming the flag -- rather than silently running a different
+# window from the one its launcher claims. Same discipline as
+# ALPHAGRAD_FORCE_REV_ORDER in common/masks.py.
+refuse_legacy_snn_env()
 
 
 def example_width(default: int | None = None):
@@ -258,21 +273,20 @@ def _adalif_snn_args():
     return tuple(jax.random.normal(kk, s) for kk, s in zip(keys, shapes))
 
 
-def _adalif_seq_args():
-    """ADALIF_SNN_SEQ args. ``ALPHAGRAD_SNN_STEPS`` (default 1) sets N.
+def _adalif_seq_args(grad_window: int = 1):
+    """ADALIF_SNN_SEQ args. ``--target-grad-window`` sets N.
 
     N=1 is the single-step ("one loop") case and N=T the fully-unrolled
     ("multi loop / state") case. Both use the SAME function, so the only thing
-    that differs between those two runs is the number of unrolled steps --
-    which is the point: ADALIF_SNN is single-timestep and ignores
-    ALPHAGRAD_SNN_TRUNC entirely, so configuring a one-loop vs multi-loop pair
-    through that variable would have produced two identical runs.
+    that differs between those two runs is the number of unrolled steps.
+    ADALIF_SNN_SEQ has NO detached warm-up, so its whole sequence IS the
+    gradient window: window and step count are the same number here, which is
+    why one flag sets both.
     """
-    import os as _o
     n_in = n_out = h = example_width(16)
-    steps = int(_o.environ.get("ALPHAGRAD_SNN_STEPS", "1"))
+    steps = int(grad_window)
     if steps < 1:
-        raise ValueError(f"ALPHAGRAD_SNN_STEPS must be >= 1, got {steps}")
+        raise ValueError(f"--target-grad-window must be >= 1, got {steps}")
     shapes = [
         (steps, n_in), (n_out,),        # S_in_seq, S_target
         (h,), (h,), (n_out,),           # U1, U2, U3
@@ -284,48 +298,16 @@ def _adalif_seq_args():
     return tuple(jax.random.normal(kk, sh) for kk, sh in zip(keys, shapes))
 
 
-def _lif_shd_args():
-    """SHD-shaped temporal LIF args with REVERSE-mode truncation baked into the
-    graph. n_in=700, hidden=128, n_out=20, T=100 Poisson spike train. The full
-    T-step forward runs here (detached) to produce the recurrent carry entering
-    the truncation window; only the last N steps (N from ALPHAGRAD_SNN_TRUNC:
-    unset=T full BPTT, k>0=window k, 0=online=1) are returned as the differentiable
-    window, so the elimination graph = constant base + N*per-step. Weights 8,9,10."""
-    import os as _os
-    from graphax.examples.neuromorphic import lif_cb as _lif
-    n_in, h, n_out, T = 700, 128, 20, 100
-    k = jax.random.split(jax.random.PRNGKey(1), 8)
-    full_seq = jax.random.bernoulli(k[0], 0.1, (T, n_in)).astype(jnp.float32)
-    S_target = jax.nn.one_hot(jax.random.randint(k[1], (), 0, n_out), n_out).astype(jnp.float32)
-    U1 = jnp.zeros((h,)); U2 = jnp.zeros((h,)); U3 = jnp.zeros((n_out,))
-    I1 = jnp.zeros((h,)); I2 = jnp.zeros((h,)); I3 = jnp.zeros((n_out,))
-    W1 = jax.random.normal(k[2], (h, n_in)) * (6.0 / (n_in ** 0.5))
-    W2 = jax.random.normal(k[3], (h, h)) * (6.0 / (h ** 0.5))
-    W3 = jax.random.normal(k[4], (n_out, h)) * (6.0 / (h ** 0.5))
-    alpha = jnp.array(0.9); beta = jnp.array(0.8); thresh = jnp.array(0.3)
-    v = _os.environ.get("ALPHAGRAD_SNN_TRUNC", None)
-    if v is None or v == "":
-        N = T
-    elif int(v) <= 0:
-        N = 1               # online
-    else:
-        N = min(int(v), T)
-    for t in range(T - N):  # FULL detached pre-window forward (activations only)
-        i1 = W1 @ full_seq[t]; U1, I1, s1 = _lif(U1, I1, i1, alpha, beta, thresh)
-        i2 = W2 @ s1;          U2, I2, s2 = _lif(U2, I2, i2, alpha, beta, thresh)
-        i3 = W3 @ s2;          U3, I3, s3 = _lif(U3, I3, i3, alpha, beta, thresh)
-    sg = jax.lax.stop_gradient
-    U1, U2, U3 = sg(U1), sg(U2), sg(U3)
-    I1, I2, I3 = sg(I1), sg(I2), sg(I3)
-    window = full_seq[T - N:]
-    return (window, S_target, U1, U2, U3, I1, I2, I3, W1, W2, W3, alpha, beta, thresh)
+# THE SHD PAIR IS BUILT ON DEMAND, NOT AT IMPORT. Its args builder runs a
+# T-step detached forward and, under --dataset shd, reads a 131 MB HDF5 file;
+# both used to happen on `import examples` because the tuple sat in the dict
+# below. It now lives in common/snn_shd.py and `get_args` calls it with the
+# window and the dataset the run actually asked for.
 
 
 _BASIC_ARGS = {
     "LIF_SNN": _lif_snn_args(),
     "ADALIF_SNN": _adalif_snn_args(),
-    "ADALIF_SNN_SEQ": _adalif_seq_args(),
-    "LIF_SNN_SHD": _lif_shd_args(),
     "Simple": (5.0, 7.0),
     "Lighthouse": (0.02,) * 4,
     "Helmholtz": (jnp.array([0.05, 0.15, 0.25, 0.35]),),
@@ -343,8 +325,24 @@ _BASIC_ARGS = {
 }
 
 
-def get_args(fn_str: str, key, dataset: str | None = None):
-    """Build the initial argument tuple for the example function `fn_str`."""
+def get_args(fn_str: str, key, dataset: str | None = None,
+             grad_window: int | None = None, dataset_size: int | None = -1):
+    """Build the initial argument tuple for the example function `fn_str`.
+
+    ``grad_window`` is the TARGET's gradient window (``--target-grad-window``,
+    CONTEXT.md): the number of time steps the gradient sees, which decides how
+    many per-step blocks the elimination graph has. It is accepted only on a
+    target that HAS time steps and raises on anything else, so a launcher can
+    never claim a window it did not run. ``None`` is "not asked for" and means
+    one step on a temporal target.
+    """
+    if fn_str in TEMPORAL_TARGETS:
+        n = resolve_grad_window(fn_str, grad_window)
+        if fn_str in SHD_TARGETS:
+            return shd_args(fn_str, n, key=key, dataset=dataset,
+                            dataset_size=dataset_size)
+        return _adalif_seq_args(n)
+    resolve_grad_window(fn_str, grad_window)    # refuses the flag off a temporal target
     if fn_str.endswith("NeuralNetwork"):
         if dataset is not None:
             in_dim, out_dim = dataset_dims(dataset)
@@ -587,7 +585,7 @@ def get_fn(fn_str: str):
 
     # ALREADY THE LOSS. ``LIF_SNN_SHD`` / ``ADALIF_SNN_SEQ`` reduce inside the
     # model and return 0-d. Nothing is added: the model IS the target.
-    if base in ("LIF_SNN_SHD", "ADALIF_SNN_SEQ"):
+    if base in ("LIF_SNN_SHD", "ADALIF_SNN_SHD", "ADALIF_SNN_SEQ"):
         return raw
 
     # NO TRAINING LOSS -- exempt, deliberately. See the block comment.
@@ -863,7 +861,8 @@ def infer_argnums(fn_str: str) -> tuple[int, ...]:
     # a1..a3, which does not move the weight slots). Without the ADALIF names
     # here they fell through to (0,), i.e. differentiating w.r.t. the INPUT
     # SPIKES rather than the weights -- a silently different problem.
-    if fn_str in ("LIF_SNN", "LIF_SNN_SHD", "ADALIF_SNN", "ADALIF_SNN_SEQ"):
+    if fn_str in ("LIF_SNN", "LIF_SNN_SHD", "ADALIF_SNN", "ADALIF_SNN_SHD",
+                  "ADALIF_SNN_SEQ"):
         return (8, 9, 10)
     if "Encoder" in fn_str or "Decoder" in fn_str:
         # (x, y, *weights) -> every weight arg, matching the vision models.

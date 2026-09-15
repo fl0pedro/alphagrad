@@ -979,9 +979,16 @@ echo "===================== P3: post-744fc3d re-baseline =================="
 for EX in LIF_SNN ADALIF_SNN ADALIF_SNN_SEQ LIF_SNN_SHD \
           Simple Lighthouse RobotArm_6DOF RoeFlux_1d BlackScholes_Jacobian; do
   echo "--- P3 example=$EX ---"
+  # THE TARGET'S GRADIENT WINDOW, named because it used to be a default.
+  # LIF_SNN_SHD read ALPHAGRAD_SNN_TRUNC and, unset, unrolled the whole T=100
+  # sequence; the flag that replaced it (--target-grad-window) defaults to ONE
+  # step, so the window this arm re-baselined is written out.  The flag RAISES
+  # on a target with no time steps, which is why the other eight do not get it.
+  WIN=""
+  [ "$EX" = "LIF_SNN_SHD" ] && WIN="--target-grad-window 100"
   CUDA_VISIBLE_DEVICES=0 $PY \
     src/alphagrad/approx/tools/landscape_map.py \
-    --example $EX --dataset none --seed 250197 \
+    --example $EX --dataset none --seed 250197 $WIN \
     --exec-on-gpu --cmp-type latency --mem-type peak_memory \
     --num-data-points 5 --reps-per-point 4 --latency-inner-reps 50 \
     --ladder 1,5 --ops quant,diag,compress --reps 3 \
