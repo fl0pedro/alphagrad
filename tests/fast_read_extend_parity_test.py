@@ -563,10 +563,18 @@ def _step_state(agent, toks, count, read):
     try:
         total_v = 6
         base = toks[: 2 * CHUNK_C]
+        # BASE OWNERS ARE WHAT MAKE THE SLOTS DIFFER. `advance` credits ONE
+        # row sum to every participating slot, so a delta alone gives all six
+        # vertices identical content and the pointer head returns six
+        # identical logits whatever its weights are -- measured: a log-prob
+        # spread of exactly 0.0. The base stream's per-token owner is what
+        # gives each vertex rows of its own, which is the whole point of
+        # `base_owners` in `init_carry`.
+        owners = 1 + (jnp.arange(base.shape[0], dtype=jnp.int32) % total_v)
         enc0, bs, bc = _cs.init_carry(
             agent, base, jnp.asarray(base.shape[0], jnp.int32),
             window=int(base.shape[0]), total_v=total_v,
-            embd_dim=agent.embd_dim, path="rollout")
+            embd_dim=agent.embd_dim, base_owners=owners, path="rollout")
         vs0, vc0 = _cs.zero_memory(total_v, agent.embd_dim)
         part = jnp.ones((total_v + 1,), jnp.float32)
         _c, vs, vc = _cs.advance(
