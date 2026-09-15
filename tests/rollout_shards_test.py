@@ -357,8 +357,23 @@ def test_a_sharded_env_without_a_rendezvous_refuses_to_trace():
     e = _tiny_env().with_rollout_shard(1, 4)
     envmod.set_shard_gather(None)
     with pytest.raises(RuntimeError) as exc:
-        e.tokenize(batched=True)
+        e._shard_wrap(lambda *a: a)
     assert "rendezvous" in str(exc.value)
+
+
+def test_a_sharded_env_refuses_the_per_environment_callback():
+    """Without the BATCHED callback there is nothing to gather, and every
+    shard would make its own pool call -- which sentinels the rows it cannot
+    place an actor for. `tokenize` refuses rather than returning it."""
+    from alphagrad.approx import env as envmod
+    if envmod._BATCHED_CALLBACK:
+        pytest.skip("ALPHAGRAD_BATCHED_CALLBACK is on in this process")
+    e = _tiny_env().with_rollout_shard(1, 4)
+    with pytest.raises(RuntimeError) as exc:
+        e.tokenize(batched=True)
+    assert "BATCHED_CALLBACK" in str(exc.value)
+    # And the unbatched reset callback is untouched: it makes no measurement.
+    e.tokenize(init=True)
 
 
 def test_an_unsharded_env_wraps_nothing_at_all():

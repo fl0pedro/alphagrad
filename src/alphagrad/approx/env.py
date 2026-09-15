@@ -9159,6 +9159,20 @@ class VertexEliminationEnv:
         path (single-process, no Ray) for backward compatibility
         with ``ppo.py`` / non-Ray callers.
         """
+        if batched and int(self.rollout_shards) > 1 and not _BATCHED_CALLBACK:
+            # THE RENDEZVOUS ONLY EXISTS FOR THE BATCHED CALLBACK. Without
+            # ALPHAGRAD_BATCHED_CALLBACK the step callback runs once per
+            # environment, there is nothing to gather, and every shard would
+            # make its own measurement call -- which the pool answers by
+            # sentinelling the rows it could not place an actor for. Refuse
+            # here rather than in the driver alone, so a second caller that
+            # shards a rollout cannot reach that state at all.
+            raise RuntimeError(
+                f"this env is rollout shard {self.rollout_shard} of "
+                f"{self.rollout_shards} and ALPHAGRAD_BATCHED_CALLBACK is "
+                f"off, so its step callback runs one environment at a time "
+                f"and the shards have nothing to gather into one measurement "
+                f"call.")
         if self._remote_pool is None:
             # THE JOIN CHANNEL IS KEYWORD-ONLY ON `_callback`, ON PURPOSE.
             # `io_callback` / `pure_callback` pass their operands POSITIONALLY,

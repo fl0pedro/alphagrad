@@ -229,10 +229,16 @@ class ShardGather:
             rnd = self._round
             self._arrivals[shard] = args
             if len(self._arrivals) == self.n:
-                ordered = [self._arrivals[i] for i in range(self.n)]
-                merged = jax.tree_util.tree_map(self._merge, *ordered)
                 out = err = None
+                # THE MERGE IS INSIDE THE TRY. It can fail -- two shards that
+                # disagree on a broadcast operand's shape fail it by design --
+                # and a failure that escaped here would leave the round open
+                # and every other shard waiting on it until the timeout. The
+                # rule is that this block always publishes a result, whether
+                # that result is an answer or the exception that replaced it.
                 try:
+                    ordered = [self._arrivals[i] for i in range(self.n)]
+                    merged = jax.tree_util.tree_map(self._merge, *ordered)
                     with HOST_LOCK:
                         out = fn(*merged)
                 except BaseException as exc:      # noqa: BLE001
