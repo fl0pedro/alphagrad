@@ -1,18 +1,23 @@
 # -*- coding: utf-8 -*-
 """A chunk loop whose BACKWARD pass costs the real chunk count.
 
+THIS IS THE ONLY DIFFERENTIATED CHUNK LOOP. Owner ruling 2026-09-15. There is
+no switch and no second body in the source; the old form lives on in exactly
+one place, ``tests/count_vjp_oracle.py``, where it is the gradient oracle this
+loop is measured against.
+
 THE PROBLEM
 -----------
 The rollout walks a step's delta with ``lax.while_loop`` and stops after
-``ceil(count / C)`` chunks. The LOSS cannot: reverse-mode AD has no transpose
-rule for ``lax.while_loop``, so the differentiated form is a ``lax.scan`` of
-``nb = ceil(window / C)`` iterations with a ``lax.cond`` inside that skips the
-chunks past the batch-wide ``budget``. The skipped chunks are numerically free
--- ``_step`` freezes the whole carry and emits a zero row, so their value and
-their cotangent are exactly zero -- but the SCAN STILL RUNS. At the 32768 cap
-and a fold chunk of 1024 that is 32 outer iterations to do the work of 4, in
-the forward pass and again in the backward pass, per ``advance``, per sample,
-per K step.
+``ceil(count / C)`` chunks. The LOSS could not: reverse-mode AD has no
+transpose rule for ``lax.while_loop``, so the differentiated form USED TO BE a
+``lax.scan`` of ``nb = ceil(window / C)`` iterations with a ``lax.cond`` inside
+that skipped the chunks past the batch-wide ``budget``. The skipped chunks are
+numerically free -- ``_step`` freezes the whole carry and emits a zero row, so
+their value and their cotangent are exactly zero -- but the SCAN STILL RAN. At
+the 32768 cap and a fold chunk of 1024 that is 32 outer iterations to do the
+work of 4, in the forward pass and again in the backward pass, per
+``advance``, per sample, per K step.
 
 THE FIX
 -------
@@ -31,10 +36,10 @@ incoming cotangent, and accumulates the loop-invariant cotangents.
 WHAT IS THE SAME NUMBER, AND WHAT IS NOT
 ----------------------------------------
 The FORWARD is bit-identical, measured, at every count -- folded and
-unfolded, scalar and vmapped. A chunk at ``i >= nb_live`` is
-``lax.cond(False, run, identity)`` today, which is the identity on the carry;
-not running it at all is the same map, and the live chunks run the same
-arithmetic in the same order.
+unfolded, scalar and vmapped. A chunk at ``i >= nb_live`` was
+``lax.cond(False, run, identity)``, which is the identity on the carry; not
+running it at all is the same map, and the live chunks run the same arithmetic
+in the same order.
 
 The GRADIENT is bit-identical, at every count, on ``_extend_sequential``'s
 budget form and on the fold's SEQUENTIAL chunk interior
@@ -57,9 +62,8 @@ Matching the transpose (``jax.checkpoint`` on the chunk in the backward,
 ``ALPHAGRAD_COUNT_VJP_REMAT``) was tried and does not close it, which is what
 you would expect once the cause is the cond.
 
-So ``ALPHAGRAD_COUNT_VJP`` DEFAULTS TO OFF and the shipped path is unchanged.
-Turn it on for a run that is allowed to move its last bits, and expect the
-loss time to stop tracking the window bin.
+The owner accepted that last bit on 2026-09-15 and made this the only path.
+The loss time no longer tracks the window bin.
 
 MEMORY
 ------
@@ -94,17 +98,6 @@ try:                                        # jax.core is the long-lived name
 except AttributeError:                      # pragma: no cover - version drift
     from jax._src import core as _jcore
     _eval_jaxpr = _jcore.eval_jaxpr
-
-
-def enabled() -> bool:
-    """``ALPHAGRAD_COUNT_VJP`` -- the count-proportional backward pass.
-
-    OFF by default. On the shipped parallel chunk interior the gradient it
-    produces differs from the ``lax.scan`` + ``lax.cond`` form by a few
-    float32 ulp (see the module docstring), and a path that moves the numbers
-    does not become the default on its own.
-    """
-    return os.environ.get("ALPHAGRAD_COUNT_VJP", "0") != "0"
 
 
 def _zero_ct(x):

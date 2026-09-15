@@ -2970,80 +2970,42 @@ class Agent(eqx.Module):
 
             if budget is not None:
                 # DIFFERENTIABLE dynamic trip count. `nb` here is a batch-wide
-                # bound, so the predicate `i < nb` is UNBATCHED under the
-                # loss's vmap -- vmap then keeps a real `cond` instead of
-                # lowering it to `select_n` over both branches, which is the
-                # whole point (a per-sample predicate would compute the
-                # skipped chunk anyway and save nothing).
+                # bound, so it is UNBATCHED under the loss's vmap. That is the
+                # contract `count_loop` needs: a batched loop bound makes
+                # `lax.while_loop` run to the batch-wide maximum with a select
+                # on every lane, which would compute the skipped chunks anyway
+                # and save nothing.
                 #
-                # Bit-identical for the same reason the while_loop is: `_step`
-                # freezes the entire carry and emits a zero row on an invalid
-                # step, so a skipped chunk is the identity map -- and its
-                # gradient is exactly zero, because every param path out of a
-                # padded step goes through `jnp.where(ok, ., <carry>)` /
-                # `jnp.where(ok, x, 0)` whose cotangent on the frozen side is
-                # zero. The zero rows are still materialised at full width, so
-                # every downstream reduction sees the identical array.
+                # COUNT-PROPORTIONAL BACKWARD, AND THE ONLY LOOP HERE (owner
+                # ruling 2026-09-15). A `lax.scan` would be nb_max = ceil(W/C)
+                # iterations long whatever `nb` is, because reverse-mode AD
+                # cannot transpose a `while_loop`. Inside a `custom_vjp` it
+                # never has to: the forward runs `nb` chunks with a
+                # `while_loop` and saves each chunk's boundary carry, and the
+                # hand-written backward sweeps the same `nb` chunks in
+                # reverse. Same residual (the checkpointed scan stacked
+                # exactly those boundary carries), and the forward is
+                # bit-identical -- see common/count_vjp.py. The old
+                # scan-and-cond body survives in exactly one place,
+                # tests/count_vjp_oracle.py, as the gradient oracle.
+                #
+                # `ALPHAGRAD_LOSS_EXTEND_REMAT` is gone with that scan. It
+                # chose between the scan's stored-residual and recomputed
+                # forms, and `count_loop`'s backward always recomputes the
+                # chunk, so there is no form left to choose.
                 b_toks = toks_p.reshape(nb_max, C)
                 b_valid = valid_p.reshape(nb_max, C)
-                _remat_on = os.environ.get(
-                    "ALPHAGRAD_LOSS_EXTEND_REMAT", "1") != "0"
 
-                # COUNT-PROPORTIONAL BACKWARD (owner ruling 2026-09-14). The
-                # scan below is nb_max = ceil(W/C) iterations long whatever
-                # `nb` is, because reverse-mode AD cannot transpose a
-                # `while_loop`. Inside a `custom_vjp` it never has to: the
-                # forward runs `nb` chunks with a `while_loop` and saves each
-                # chunk's boundary carry, and the hand-written backward sweeps
-                # the same `nb` chunks in reverse. Same residual (the
-                # checkpointed scan already stacks exactly those boundary
-                # carries), same numbers -- see common/count_vjp.py.
-                #
-                # Gated on remat for the same reason the fold is:
-                # ALPHAGRAD_LOSS_EXTEND_REMAT=0 asks for the stored-residual
-                # form, which a recompute-in-the-backward custom_vjp cannot
-                # give.
-                if _remat_on and _count_vjp.enabled():
-                    def _cv_chunk(i, c):
-                        return _walk(c, b_toks[i], b_valid[i])
+                def _cv_chunk(i, c):
+                    return _walk(c, b_toks[i], b_valid[i])
 
-                    (M2, I2), rows_b = _count_vjp.count_loop(
-                        _cv_chunk, c0, nb=nb_max, nb_live=nb,
-                        y_struct=jax.ShapeDtypeStruct(
-                            (C, self.embd_dim), jnp.float32))
-                    rows = rows_b.reshape(nb_max * C, -1)[:W]
-                    new_carry = EncCarry(M=M2, I=I2, pos=carry.pos + count)
-                    return new_carry, rows, valid
-
-                def _chunk_d(c, xs):
-                    i, bt, bv = xs
-
-                    def _run(c):
-                        return _walk(c, bt, bv)
-
-                    def _skip(c):
-                        return c, jnp.zeros((C, self.embd_dim), jnp.float32)
-
-                    return lax.cond(i < nb, _run, _skip, c)
-
-                # REMAT the chunk body. Without it the scan stores every
-                # step's per-layer activations for the backward -- and the
-                # SKIPPED chunks store a zero block of exactly the same
-                # shape, because `cond`'s partial-eval joins both branches'
-                # residuals. That residual traffic is O(window) no matter how
-                # few chunks actually run, which is why shrinking the chunk
-                # count alone left a floor. With remat each chunk stores only
-                # its boundary carry and recomputes its forward, so a skipped
-                # chunk costs a predicate.
-                # ON by default: measured 4.8s -> 2.1s of prof/update on the
-                # TLM flagship and 4.1s -> 3.2s on CPU, with a bitwise
-                # identical forward. ALPHAGRAD_LOSS_EXTEND_REMAT=0 restores
-                # the stored-residual form.
-                _body = (jax.checkpoint(_chunk_d)
-                         if _remat_on else _chunk_d)
-                (M2, I2), rows_b = lax.scan(
-                    _body, c0,
-                    (jnp.arange(nb_max, dtype=jnp.int32), b_toks, b_valid))
+                (M2, I2), rows_b = _count_vjp.count_loop(
+                    _cv_chunk, c0, nb=nb_max, nb_live=nb,
+                    y_struct=jax.ShapeDtypeStruct(
+                        (C, self.embd_dim), jnp.float32))
+                # The untaken slots stay zero, which is what the cond form's
+                # skip branch wrote there, so every downstream reduction sees
+                # the identical array.
                 rows = rows_b.reshape(nb_max * C, -1)[:W]
                 new_carry = EncCarry(M=M2, I=I2, pos=carry.pos + count)
                 return new_carry, rows, valid
@@ -10532,9 +10494,9 @@ def main():
         # 21785 at 16). With remat each of the K steps stores only its
         # boundary `(carry, vmem_sums, vmem_counts)` and recomputes its own
         # forward when the cotangent arrives -- the same trade `_block` and
-        # `_chunk_d` already make one level down, and the reason nesting is
-        # correct rather than doubly wasteful: the inner remat bounds what a
-        # single recomputed step costs.
+        # `count_vjp.count_loop` already make one level down, and the reason
+        # nesting is correct rather than doubly wasteful: the inner remat
+        # bounds what a single recomputed step costs.
         #
         # NOTHING COMPUTED CHANGES, only where the activations live: the
         # recomputation replays the identical jaxpr on the identical inputs,

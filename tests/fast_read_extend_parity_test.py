@@ -336,8 +336,11 @@ def test_a_window_shorter_than_one_chunk_still_reads_under_the_fast_grid():
 @pytest.mark.parametrize("read", READS)
 def test_the_count_proportional_backward_agrees_with_the_scan_form(
         read, agent, tokens, monkeypatch):
-    """``ALPHAGRAD_COUNT_VJP=1`` replaces the fold's ``scan`` + ``cond`` with a
-    hand-written ``while_loop`` in both directions (``common/count_vjp.py``).
+    """The fold's budget path is ``count_vjp.count_loop``, a hand-written
+    ``while_loop`` in both directions, and it is the only loop there (owner
+    ruling 2026-09-15). The form it replaced -- a ``lax.scan`` with a
+    ``lax.cond`` inside -- lives in ``count_vjp_oracle.py`` and is installed
+    here by replacing the module attribute both call sites read.
 
     It is ORTHOGONAL to the read: it decides HOW MANY chunks run, the read
     decides what happens inside one. Under the fast read a chunk body is a
@@ -346,6 +349,9 @@ def test_the_count_proportional_backward_agrees_with_the_scan_form(
     ``custom_vjp`` is for. This pins that the two forms still land on the same
     value and the same gradient with the fast read in force.
     """
+    from alphagrad.approx.common import count_vjp as _CV
+    from count_vjp_oracle import scan_cond_loop as _scan_cond
+
     _set_read(monkeypatch, read)
     c0 = _carry(agent)
     dyn, static = eqx.partition(agent, eqx.is_inexact_array)
@@ -355,10 +361,13 @@ def test_the_count_proportional_backward_agrees_with_the_scan_form(
         _c, (s, _n) = _folded(a, c0, tokens, COUNT, 2 * CHUNK_C)
         return jnp.sum(s ** 2)
 
-    monkeypatch.setenv("ALPHAGRAD_COUNT_VJP", "0")
-    v_scan = float(loss(dyn))
-    g_scan = jax.grad(loss)(dyn)
-    monkeypatch.setenv("ALPHAGRAD_COUNT_VJP", "1")
+    _shipped = _CV.count_loop
+    _CV.count_loop = _scan_cond
+    try:
+        v_scan = float(loss(dyn))
+        g_scan = jax.grad(loss)(dyn)
+    finally:
+        _CV.count_loop = _shipped
     v_loop = float(loss(dyn))
     g_loop = jax.grad(loss)(dyn)
 
