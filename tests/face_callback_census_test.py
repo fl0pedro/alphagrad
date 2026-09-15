@@ -116,7 +116,6 @@ def _run(case, steps=STEPS):
     """
     from alphagrad.approx.common import carry_stream as CS
     from alphagrad.approx.common.masks import vertex_avail_at_step
-    from alphagrad.approx.common.order import fixed_order_for_env
 
     env, agent = case["env"], case["agent"]
     total_v, num_valid = case["total_v"], case["num_valid"]
@@ -135,9 +134,8 @@ def _run(case, steps=STEPS):
     base_mem = (base_s, base_c)
     vmem_s, vmem_c = CS.zero_memory(total_v, _gate.EMBD)
 
-    fixed_order = fixed_order_for_env("markowitz", env)
-    n_steps = min(int(steps), max(1, num_valid - 1))
-    keys = jrand.split(jrand.PRNGKey(_gate.SEED), max(1, num_valid - 1))
+    n_steps = max(1, min(int(steps), num_valid - 1))
+    keys = jrand.split(jrand.PRNGKey(_gate.SEED), n_steps)
     part = jnp.zeros((total_v + 1,), jnp.float32)
 
     consume_callback_census()
@@ -155,8 +153,7 @@ def _run(case, steps=STEPS):
         precomputed = CS.heads(agent, vmem_s, vmem_c,
                                base_mem=base_mem, preference=None)
         avail = vertex_avail_at_step(
-            state, case["vertex_valid_static"], total_v, num_valid,
-            fixed_order=fixed_order)
+            state, case["vertex_valid_static"], total_v, num_valid)
 
         chunk_fn, count_fn = bind_step_callbacks(
             case["chunk_cb"], case["count_cb"],
@@ -199,6 +196,12 @@ def _run(case, steps=STEPS):
             op_type=np.asarray(fa.op_type, np.int64).copy(),
         ))
 
+        # The participation mask of the delta the NEXT step consumes, exactly
+        # as `run_trace` computes it: drop it and the carry diverges from the
+        # gate's after one step, and with it every draw.
+        part = agent.participation_mask(
+            total_v, jnp.asarray(vertex_idx, jnp.int32),
+            face_out[8], face_out[5])
         env_action = agent.to_env_action_dynamic(
             vertex_idx, micro, state.axis_state, face_action=fa)
         state = env.step(state, env_action).state
