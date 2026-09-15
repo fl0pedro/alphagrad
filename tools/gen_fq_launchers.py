@@ -386,22 +386,12 @@ SHARED_ENV = [
     ("ALPHAGRAD_DEBUG_MEASURE", "1"),
     ("ALPHAGRAD_DEBUG_DEGEN", "1"),
     ("ALPHAGRAD_PROFILE", "1"),
-    # 32, not the unset 0 and not 256.  Not 0 because canary job 65443
-    # (fq_p1a on gpu19, stack at 12ed4936) printed ppo.py's own warning
-    # ("ALPHAGRAD_EXTEND_CHUNK is 0, so every encode_extend scans all 32768
-    # window steps ... 256 measured well") and an episode took 275 s at 0.
-    # 32 rather than 256 because the rollout profile of 2026-09-15
-    # (scratchpad/profile-rollout.md section 6 (b)) MEASURED it: the step
-    # minus the env callback is 225.8 ms at 32 against 363.1 ms at 256, and
-    # 1024 is the same as 256.  That is 14.5 s per episode for one variable
-    # and no code change.  The mechanism is in `_extend_sequential`: the
-    # rollout form is a while_loop over ceil(count / C) chunks, so a smaller
-    # C pads less past the real delta, and the comment there already says
-    # the rollout "wants C small".  32 is a multiple of 32, which is what
-    # the fast read's chunk grid requires.  The loss reads
-    # ALPHAGRAD_LOSS_EXTEND_CHUNK and is untouched.  ppo.py has no
-    # --extend-chunk flag (2026-09-14 audit).
-    ("ALPHAGRAD_EXTEND_CHUNK", "32"),
+    # 256, not the unset 0: canary job 65443 (fq_p1a on gpu19, stack at
+    # 12ed4936) printed ppo.py's own warning ("ALPHAGRAD_EXTEND_CHUNK is 0,
+    # so every encode_extend scans all 32768 window steps ... 256 measured
+    # well") and an episode took 275 s at 0.  ppo.py has no --extend-chunk
+    # flag (2026-09-14 audit).
+    ("ALPHAGRAD_EXTEND_CHUNK", "256"),
     ("ALPHAGRAD_EXTEND_UNROLL", "32"),
     ("ALPHAGRAD_MULS_SENTINEL_CAP", "5e12"),
     # Project memory: ALWAYS skip the count pass (77% of host time) and use the
@@ -1571,16 +1561,13 @@ NO_FLAG_ENV = [
      "(/Scratch/assmuth/mrg/runs/smoke_merged.sbatch) sets this and drains "
      "clean; the reward channels these arms train (cmp mem acc) do not "
      "need the count pass.  env.py has no --skip-count-ops flag."),
-    ("ALPHAGRAD_EXTEND_CHUNK", "32",
+    ("ALPHAGRAD_EXTEND_CHUNK", "256",
      "chunk the encode_extend scan instead of walking the whole window.  "
      "The same canary job (65443) printed ppo.py's own warning "
      "('ALPHAGRAD_EXTEND_CHUNK is 0, so every encode_extend scans all "
      "32768 window steps ... 256 measured well') and an episode took "
      "275 s with it unset; the rendered fq_p1a launcher exports neither "
-     "this nor ALPHAGRAD_SKIP_COUNT_OPS today.  32 rather than 256 is the "
-     "rollout profile of 2026-09-15 (scratchpad/profile-rollout.md sec 6 "
-     "(b)): the step minus the env callback is 225.8 ms at 32 against "
-     "363.1 ms at 256, which is 14.5 s per episode.  ppo.py has no "
+     "this nor ALPHAGRAD_SKIP_COUNT_OPS today.  ppo.py has no "
      "--extend-chunk flag."),
 ]
 
