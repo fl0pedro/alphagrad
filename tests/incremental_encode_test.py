@@ -27,6 +27,7 @@ import jax
 import jax.numpy as jnp
 import jax.random as jrand
 import numpy as np
+import pytest
 
 from alphagrad.approx.ppo import (
     EncCarry,
@@ -35,6 +36,26 @@ from alphagrad.approx.ppo import (
     make_argparser,
 )
 from alphagrad.approx import vertex_memory as vmem
+
+
+@pytest.fixture(autouse=True)
+def _exact_read():
+    """THIS MODULE PINS A PROPERTY OF THE EXACT OPERATOR, so it forces
+    ``ALPHAGRAD_PALIMPSA_READ=exact`` even though the shipped default is now
+    ``fast``.
+
+    The claim is that a chunked extend split at an ARBITRARY token (100 of 300,
+    130 of 250) is bitwise the same as one call. Under the fast read a split
+    that is not on a multiple of 32 starts a fresh chunk, so the two sides read
+    different chunks on purpose. That is the operator, not a defect.
+
+    The fast read is pinned separately, on the properties it does have, in
+    ``tests/fast_read_extend_parity_test.py``.
+    """
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("ALPHAGRAD_PALIMPSA_READ", "exact")
+        yield
+
 
 TOTAL_V = 5
 EMBD = 16

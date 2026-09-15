@@ -170,10 +170,25 @@ def test_the_tail_also_covers_the_folds_padded_window_not_only_the_write():
     chunk short would return SHIFTED tokens in silence. The tail is the
     larger of the write window and the fold's padded window."""
     W = 32768
-    for chunk in (1024, 3000, 7, W):
+    # THE CHUNKS ARE MULTIPLES OF 32, including the awkward one. 3008 is
+    # 32 x 94 and still does not divide the window, which is the case this
+    # test is about -- a chunk that pads. Under the shipped
+    # ALPHAGRAD_PALIMPSA_READ=fast a multi-block fold refuses anything else
+    # (see `delta_fold.plan_chunks`), which the next test pins.
+    for chunk in (1024, 3008, 32, W):
         _C, _nb, padded = plan_chunks(W, chunk)
         assert ES.stream_tail(W, chunk) >= padded
         assert ES.stream_tail(W, chunk) >= W
+
+
+def test_the_tail_refuses_a_chunk_that_would_misalign_the_fast_grid(
+        monkeypatch):
+    """The sizes above are multiples of 32 because of this. A stream row is
+    sized from `plan_chunks`, so a misaligned fold chunk has to be caught
+    before a row is ever built on it."""
+    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ", "fast")
+    with pytest.raises(ValueError, match="not a multiple of the fast-palimpsa"):
+        plan_chunks(32768, 3000)
 
 
 def test_a_row_that_is_not_a_power_of_two_plus_the_tail_is_refused():
@@ -834,9 +849,15 @@ def test_the_snapshot_names_only_containers_this_module_still_defines():
 
 # -------------------------------------------------------------- 5. the read
 
+# THE CHUNKS ARE MULTIPLES OF 32. Under the shipped
+# ALPHAGRAD_PALIMPSA_READ=fast a multi-block fold has to start every block on
+# a multiple of 32 (see `delta_fold.plan_chunks`), and 48 is allowed because
+# the window clamps it to a single block. The claim under test is about WHERE
+# the reader takes its tokens from, not about the chunk width, and the counts
+# still sweep 0, 1, 17, 37, 63 and the full window.
 @pytest.mark.parametrize("window,count,chunk", [
-    (64, 64, 16), (64, 0, 16), (64, 1, 16), (64, 63, 16), (64, 17, 16),
-    (64, 64, 64), (64, 64, 7), (48, 37, 32),
+    (64, 64, 32), (64, 0, 32), (64, 1, 32), (64, 63, 32), (64, 17, 32),
+    (64, 64, 64), (64, 64, 128), (48, 37, 48),
 ])
 def test_the_chunked_read_from_the_stream_equals_the_read_from_the_window(
         window, count, chunk):
@@ -877,7 +898,7 @@ def test_the_chunked_read_from_the_stream_equals_the_read_from_the_window(
 
 def test_a_one_dimensional_stream_reads_the_same_span_as_a_row_of_a_batch():
     agent = StubAgent()
-    window, chunk, count, off = 64, 16, 40, 77
+    window, chunk, count, off = 64, 32, 40, 77
     rng = np.random.RandomState(5)
     win = rng.randint(1, 9, size=window).astype(np.uint8)
     L = ES.stream_length(10, window, chunk)
@@ -903,10 +924,10 @@ def test_the_reader_refuses_a_stream_whose_rank_does_not_match_the_row():
     win = jnp.zeros((64,), jnp.uint8)
     with pytest.raises(ValueError):
         extend_fold(agent, 0.0, win, jnp.asarray(8, jnp.int32), window=64,
-                    chunk=16, init_acc=init, fold_fn=fold, start=0, row=0)
+                    chunk=32, init_acc=init, fold_fn=fold, start=0, row=0)
     with pytest.raises(ValueError):
         extend_fold(agent, 0.0, win[None, :], jnp.asarray(8, jnp.int32),
-                    window=64, chunk=16, init_acc=init, fold_fn=fold, start=0)
+                    window=64, chunk=32, init_acc=init, fold_fn=fold, start=0)
 
 
 def test_the_k_window_is_one_contiguous_span_of_the_stream():

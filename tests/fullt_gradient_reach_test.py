@@ -45,7 +45,6 @@ os.environ.setdefault("ALPHAGRAD_SKIP_COST_ANALYSIS", "1")
 os.environ.setdefault("ALPHAGRAD_SKIP_COUNT_OPS", "1")
 os.environ.setdefault("ALPHAGRAD_INCR_TOKEN_VOCAB", "256")
 os.environ.setdefault("ALPHAGRAD_INCREMENTAL_TOKENS", "1")
-os.environ.setdefault("ALPHAGRAD_EXTEND_CHUNK", "8")
 
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
@@ -57,6 +56,27 @@ from alphagrad.approx.common import carry_stream as CS  # noqa: E402
 TOTAL_V = 6
 EMBD = 32
 DELTA_W = 32
+
+
+@pytest.fixture(autouse=True)
+def _extend_chunk():
+    """Force the CHUNKED extend, in a FIXTURE, not at import.
+
+    This used to be ``os.environ.setdefault("ALPHAGRAD_EXTEND_CHUNK", "8")`` at
+    module scope. Pytest imports every test module before it runs the first
+    test, so that write was in force for the WHOLE session and reached three
+    other modules -- which is the exact hazard ``_pytest_config_guard`` was
+    written for. A fixture is scoped to this module's tests and restored
+    after each one.
+
+    The size moved from 8 to 32 at the same time. Under
+    ``ALPHAGRAD_PALIMPSA_READ=fast`` every outer block has to start on a
+    multiple of 32, and 8 does not. 32 forces the chunked path just as 8 did,
+    which is all this module ever wanted from it.
+    """
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("ALPHAGRAD_EXTEND_CHUNK", "32")
+        yield
 T = 8
 
 

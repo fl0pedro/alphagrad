@@ -53,6 +53,28 @@ import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 
+
+@pytest.fixture(autouse=True)
+def _exact_read():
+    """THIS MODULE PINS A PROPERTY OF THE EXACT OPERATOR, so it forces
+    ``ALPHAGRAD_PALIMPSA_READ=exact`` even though the shipped default is now
+    ``fast``.
+
+    The claim is BIT-IDENTITY between `count_loop` and the scan-plus-cond form
+    at an arbitrary chunk size (16) and arbitrary counts (0, 16, 37, 64). Under
+    the fast read a chunk of 16 misaligns the 32-token grid and is refused, and
+    the property being compared is a property of the recurrence the loop walks,
+    not of the loop.
+
+    The fast read is pinned separately, on the properties it does have, in
+    ``tests/fast_read_extend_parity_test.py``.
+    """
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("ALPHAGRAD_PALIMPSA_READ", "exact")
+        yield
+
+
+
 TOTAL_V = 6
 EMBD = 32
 WINDOW = 64

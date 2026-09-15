@@ -244,16 +244,27 @@ def test_an_unknown_read_is_rejected_rather_than_defaulted(monkeypatch):
         palimpsa_read()
 
 
-def test_the_fold_rounds_its_chunk_up_to_the_fast_grid(monkeypatch):
+def test_the_fold_refuses_a_chunk_that_would_misalign_the_fast_grid(
+        monkeypatch):
     """`plan_chunks` is what every folded caller sizes its side arrays from,
-    so the rounding has to happen there and be visible in what it returns."""
+    so this is where a misaligned request has to be caught.
+
+    It RAISES rather than rounding 100 up to 128. Rounding is silent, and a
+    launcher that asked for 100 and got 128 has no way to find out. The exact
+    read has no chunk grid, so the same request is fine there."""
     monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ", "fast")
-    C, nb, padded = _fold.plan_chunks(4096, 100)
-    assert C == 128 and C % CHUNK_C == 0
-    assert nb * C == padded and padded >= 4096
+    with pytest.raises(ValueError, match="not a multiple of the fast-palimpsa"):
+        _fold.plan_chunks(4096, 100)
     monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ", "exact")
     C2, _nb2, _p2 = _fold.plan_chunks(4096, 100)
     assert C2 == 100
+
+
+def test_an_aligned_fold_chunk_is_returned_unchanged(monkeypatch):
+    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ", "fast")
+    C, nb, padded = _fold.plan_chunks(4096, 128)
+    assert C == 128 and C % CHUNK_C == 0
+    assert nb == 32 and padded == 4096
 
 
 def test_a_window_shorter_than_one_chunk_still_reads_under_the_fast_grid():
@@ -308,3 +319,56 @@ def test_the_count_proportional_backward_agrees_with_the_scan_form(
     pairs = list(zip(jax.tree.leaves(g_loop), jax.tree.leaves(g_scan)))
     worst = max(_rel(a, b) for a, b in pairs if np.max(np.abs(b)) > 0)
     assert worst < 1e-4, f"count_loop gradient gap {worst:.3e}"
+
+
+# --------------------------------------------------------------------------
+# the per-face escape hatch
+# --------------------------------------------------------------------------
+def test_the_read_override_actually_changes_what_the_readers_see(monkeypatch):
+    """The face pipeline rests on this, so it is pinned on its own.
+
+    It shipped once as a context manager that set a variable nothing read.
+    Every caller went on using the shipped read, the face rollout and the
+    face replay went on disagreeing, and the only symptom was a log-prob
+    8.4e-3 out at three faces. A context manager that does nothing looks
+    exactly like one that works.
+    """
+    from alphagrad.transformer.fast_palimpsa_pallas import (
+        palimpsa_read, read_override)
+    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ", "fast")
+    assert palimpsa_read() == "fast"
+    assert _fold._fast_read() is True
+    with read_override("exact"):
+        assert palimpsa_read() == "exact"
+        assert _fold._fast_read() is False
+    assert palimpsa_read() == "fast"
+
+
+def test_the_read_override_is_restored_when_the_body_raises(monkeypatch):
+    from alphagrad.transformer.fast_palimpsa_pallas import (
+        palimpsa_read, read_override)
+    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ", "fast")
+    with pytest.raises(RuntimeError):
+        with read_override("exact"):
+            raise RuntimeError("boom")
+    assert palimpsa_read() == "fast"
+
+
+def test_the_read_override_refuses_a_mode_it_does_not_know():
+    from alphagrad.transformer.fast_palimpsa_pallas import read_override
+    with pytest.raises(ValueError, match="takes 'exact' or 'fast'"):
+        with read_override("approximate"):
+            pass
+
+
+def test_the_override_reaches_the_fold_through_plan_chunks(monkeypatch):
+    """`plan_chunks` refuses a misaligned chunk under the fast read. The face
+    replay folds a window whose chunk it does not choose, so the override has
+    to lift that refusal too, or the face path would raise instead of reading
+    exact."""
+    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ", "fast")
+    from alphagrad.transformer.fast_palimpsa_pallas import read_override
+    with pytest.raises(ValueError, match="not a multiple of the fast-palimpsa"):
+        _fold.plan_chunks(4096, 100)
+    with read_override("exact"):
+        assert _fold.plan_chunks(4096, 100)[0] == 100

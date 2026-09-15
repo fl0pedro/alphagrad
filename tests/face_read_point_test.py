@@ -51,6 +51,8 @@ import pytest                                                   # noqa: E402
 from alphagrad.approx.env import (                               # noqa: E402
     DELTA_TOKEN_DTYPE as _TOKEN_DTYPE, MAX_DELTA_TOKENS as W,
     MAX_FACES as MAXF)
+from alphagrad.transformer.fast_palimpsa_pallas import (         # noqa: E402
+    read_override)
 
 TOTAL_V = 6
 
@@ -224,8 +226,16 @@ def test_chunk_mean_matches_the_unmasked_scatter_mean(agent):
     ar = jnp.arange(W, dtype=jnp.int32)
     tok = jnp.where(ar < ct, (ar * 3) % 50 + 1, 0).astype(jnp.int32)
     c2, summ = agent._face_encode(enc, tok, jnp.asarray(ct, jnp.int32))
-    _c, rows, valid = agent.encode_extend(
-        enc, tok, jnp.asarray(ct, jnp.int32), window=W, start=0)
+    # THE REFERENCE ROWS HAVE TO COME FROM THE SAME READ. The face pipeline
+    # forces the exact recurrence under both settings of
+    # ALPHAGRAD_PALIMPSA_READ (see the block comment above
+    # `Agent._face_encode`: the rollout extends once per face and the loss
+    # reads all the faces as one span, and only the exact recurrence has no
+    # chunk grid to disagree about). Reading the reference with the shipped
+    # fast read would compare two different operators.
+    with read_override("exact"):
+        _c, rows, valid = agent.encode_extend(
+            enc, tok, jnp.asarray(ct, jnp.int32), window=W, start=0)
     want = _vmem.scatter_mean(
         rows, jnp.zeros((rows.shape[0],), jnp.int32), valid, 1)[0]
     np.testing.assert_array_equal(np.asarray(summ), np.asarray(want))
@@ -240,9 +250,12 @@ def test_readout_is_what_it_says_and_carry_is_invariant(agent):
     tok = jnp.where(ar < ct, (ar * 11) % 50 + 1, 0).astype(jnp.int32)
     ctj, hdj = jnp.asarray(ct, jnp.int32), jnp.asarray(hd, jnp.int32)
 
-    # the ground truth rows, from the recurrence itself
-    _c, rows, valid = agent.encode_extend(
-        enc, tok, ctj, window=W, start=0)
+    # the ground truth rows, from the recurrence itself -- under the EXACT
+    # read, which is what the face pipeline itself uses (see the block
+    # comment above `Agent._face_encode`).
+    with read_override("exact"):
+        _c, rows, valid = agent.encode_extend(
+            enc, tok, ctj, window=W, start=0)
     R = np.asarray(rows)
 
     carries, summs = {}, {}

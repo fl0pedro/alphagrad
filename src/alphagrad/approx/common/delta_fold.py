@@ -62,7 +62,7 @@ def _use_parallel() -> bool:
     return os.environ.get("ALPHAGRAD_FOLD_PARALLEL", "1") != "0"
 
 
-def _encode_chunk(agent, enc, tk, c_cnt, C, parallel):
+def _encode_chunk(agent, enc, tk, c_cnt, C, parallel, fast):
     """One chunk's encode. PARALLEL inside the chunk by default.
 
     UNDER THE FAST READ the parallel/serial choice does not apply and is
@@ -85,16 +85,29 @@ def _encode_chunk(agent, enc, tk, c_cnt, C, parallel):
     the same `valid` mask `encode_extend` would have built. Falls back to
     `encode_extend` when the agent has no parallel path (test stubs).
     """
-    if _fast_read():
-        fast = getattr(agent, "_extend_fast", None)
-        if fast is None:
+    if fast:
+        run_fast = getattr(agent, "_extend_fast", None)
+        if run_fast is not None:
+            valid = jnp.arange(C, dtype=jnp.int32) < jnp.asarray(
+                c_cnt, jnp.int32)
+            return run_fast(enc, tk, valid, c_cnt)
+        if getattr(agent, "_extend_parallel", None) is not None:
+            # A palimpsa agent with the associative-scan path but no fast one.
+            # Falling through would read the EXACT recurrence here and the fast
+            # one everywhere else, which is the one thing that must not happen
+            # silently, so it raises.
             raise RuntimeError(
-                "ALPHAGRAD_PALIMPSA_READ=fast but this agent has no "
-                "_extend_fast; the fold would silently fall back to the exact "
-                "read and disagree with every other call site.")
-        valid = jnp.arange(C, dtype=jnp.int32) < jnp.asarray(c_cnt, jnp.int32)
-        return fast(enc, tk, valid, c_cnt)
-    if parallel:
+                "ALPHAGRAD_PALIMPSA_READ=fast but this agent has "
+                "_extend_parallel and no _extend_fast; the fold would read the "
+                "exact recurrence here and the fast read at every other call "
+                "site.")
+        # NO PALIMPSA AT ALL. A stub whose only method is `encode_extend` (the
+        # fold's own tests, the episode-stream tests, the window-bin tests)
+        # carries its own recurrence and has no read to choose. There is
+        # nothing to fall back FROM, so it takes the ordinary path below. A
+        # real agent reaches `encode_extend` too, and that honours the flag
+        # through `_extend_sequential`'s `_walk`, so this is not a back door.
+    if parallel and not fast:
         par = getattr(agent, "_extend_parallel", None)
         if par is not None:
             valid = jnp.arange(C, dtype=jnp.int32) < jnp.asarray(c_cnt,
@@ -128,19 +141,27 @@ def plan_chunks(window, chunk=None):
     W = int(window)
     if W <= 0:
         return C, 0, 0
-    if _fast_read():
-        # THE FAST READ'S OWN CHUNK GRID IS MEASURED FROM TOKEN 0 OF THE
-        # DELTA. Every fold chunk therefore has to start on a multiple of 32,
-        # or the rollout (which chunks by ALPHAGRAD_EXTEND_CHUNK) and the loss
-        # (which chunks by this) would cut the same delta at different places
-        # -- and a chunk boundary is exactly where the read stops
-        # approximating, so that is a real numerical difference and the PPO
-        # ratio would leave 1 at epoch 0. Round UP: rounding down could reach
-        # 0. The clamp to W below is safe on its own, because a single chunk
-        # starts at 0 whatever its width.
-        C = -(-C // _FAST_C) * _FAST_C
     C = min(C, W)
     nb = -(-W // C)
+    if _fast_read() and nb > 1 and C % _FAST_C:
+        # THE FAST READ'S CHUNK GRID STARTS AT TOKEN 0 OF THE DELTA. With more
+        # than one block the blocks begin at 0, C, 2C, ..., so C has to be a
+        # multiple of 32. Otherwise the rollout (which blocks by
+        # ALPHAGRAD_EXTEND_CHUNK) and the loss (which blocks by this) cut the
+        # same delta at different places. A chunk boundary is exactly where the
+        # read stops approximating, so that is a real numerical difference and
+        # the PPO ratio leaves 1 at epoch 0.
+        #
+        # It RAISES rather than rounding. Rounding is silent, and a launcher
+        # that asked for 100 and got 128 has no way to find out. ONE block is
+        # exempt because it starts at 0 whatever its width, which is what makes
+        # the `min(C, W)` clamp above safe for a window under the chunk.
+        raise ValueError(
+            f"ALPHAGRAD_FOLD_CHUNK={C} is not a multiple of the "
+            f"fast-palimpsa chunk {_FAST_C} and the window {W} needs {nb} "
+            "blocks. Under ALPHAGRAD_PALIMPSA_READ=fast every block must "
+            "start on a multiple of 32 tokens, or the rollout and the loss "
+            "read the same delta with different chunk boundaries.")
     return C, nb, nb * C
 
 
@@ -225,6 +246,11 @@ def extend_fold(agent, carry, tokens, count, *, window, chunk=None,
     # instead of lowering it to `select_n` over both branches, which would
     # compute the skipped chunk anyway and save nothing.
     par = _use_parallel() if parallel is None else bool(parallel)
+    # ASKED ONCE, HERE. `count_vjp`'s backward re-runs `_make_run` when it
+    # rebuilds a chunk's VJP, and that happens LATER than this trace -- after
+    # a `read_override` block has already closed. Capturing the answer now
+    # means the backward cannot read a different operator from the forward.
+    _fast = _fast_read()
 
     if budget is None:
         nb_live = nb
@@ -250,7 +276,7 @@ def extend_fold(agent, carry, tokens, count, *, window, chunk=None,
             # therefore already free.
             tk_c = _chunk_tokens(off) if tk is None else tk
             enc2, rows_c, valid_c = _encode_chunk(
-                agent, enc, tk_c, c_cnt, C, par)
+                agent, enc, tk_c, c_cnt, C, par, _fast)
             return (enc2, fold_fn(acc, rows_c, valid_c, off))
 
         return _run

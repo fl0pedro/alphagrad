@@ -157,7 +157,8 @@ from alphagrad.transformer.palimpsa_encoder import (
     palimpsa_beta as _pal_beta, palimpsa_qk_norm as _pal_qk_norm)
 from alphagrad.transformer.fast_palimpsa_pallas import (
     CHUNK_C as _FAST_C, fast_palimpsa as _fast_palimpsa,
-    fast_read_enabled as _fast_read, require_chunk_alignment as _need_c32)
+    fast_read_enabled as _fast_read, read_override as _read_override,
+    require_chunk_alignment as _need_c32)
 from alphagrad.approx.common import delta_fold as _fold
 from alphagrad.approx.common import count_vjp as _count_vjp
 from alphagrad.approx.common import feature_probe as _fprobe
@@ -3507,6 +3508,36 @@ class Agent(eqx.Module):
     # stored decisions off the STORED chunks. They must stay gate for gate
     # identical or the ratio is not 1 at epoch 0.
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # THE FACE PIPELINE READS EXACT, UNDER BOTH SETTINGS OF
+    # ALPHAGRAD_PALIMPSA_READ. This is not a preference, it is forced by the
+    # two sides reading the same tokens through different call shapes.
+    #
+    #   * the ROLLOUT extends the side carry ONCE PER FACE: `_face_loop` calls
+    #     `_face_encode(carry, tokens_f, count_f)` with face f's own buffer,
+    #     read from its token 0;
+    #   * the LOSS reads every face of the step as ONE contiguous span of the
+    #     face stream, `_face_replay`'s `extend_fold(..., start=f_off)` over
+    #     `total = sum(f_cnt)` tokens.
+    #
+    # For the exact recurrence those are the same computation, which is why
+    # they have always agreed bitwise. The fast read has a CHUNK GRID, and the
+    # grid starts at token 0 of each call: the rollout therefore starts a
+    # fresh 32-token chunk at every face, and the loss does not. A face
+    # boundary at token 5 of the span lands mid-chunk on the loss side and at
+    # a chunk start on the rollout side, and a chunk boundary is exactly where
+    # the fast read stops approximating. MEASURED before this override: the
+    # face log-prob moved by 8.4e-3 on a -19.27 total at three faces and at
+    # five, and not at all at one face, which is the signature of the
+    # boundaries and nothing else.
+    #
+    # Making the two agree would mean either replaying face by face (a
+    # MAX_FACES-long loop where there is now one fold) or 32-aligning each
+    # face's slot in the stream (a change to the layout, the cursor, the bin
+    # and every reader of both). Both are larger than this ticket. The delta
+    # path, which is where the tokens are -- about 3000 per step against tens
+    # per face -- keeps the fast read.
+    # ------------------------------------------------------------------
     def _face_encode(self, carry, tokens, count, pool_from=None,
                      window=None):
         """Extend the side carry by one face's chunk; ``(carry, summary)``.
@@ -3569,7 +3600,9 @@ class Agent(eqx.Module):
         def _skip(c):
             return c, jnp.zeros((self.embd_dim,), jnp.float32)
 
-        return lax.cond(count > 0, _run, _skip, carry)
+        # EXACT, always. See the block comment above this method.
+        with _read_override("exact"):
+            return lax.cond(count > 0, _run, _skip, carry)
 
     def _face_row_specs(self, row, axis_state_v, nout_f=None):
         """One face's per-slot wire row -> the env's ``[bi1, bi2, factor]``
@@ -4008,13 +4041,18 @@ class Agent(eqx.Module):
                 s_c, c_c = _vmem.scatter(rows_c, fid, live, F)
                 return (s_acc + s_c, c_acc + c_c)
 
-            _, (_fs, _fc) = _fold.extend_fold(
-                self, enc_carry, f_stream, total,
-                window=_W_RPL,
-                init_acc=(jnp.zeros((F, self.embd_dim), jnp.float32),
-                          jnp.zeros((F,), jnp.float32)),
-                fold_fn=_face_fold, budget=face_win_budget,
-                start=f_off, row=f_row)
+            # EXACT, always, and for the same reason `_face_encode` is:
+            # this fold reads every face of the step as ONE span, and the
+            # rollout reads them one face at a time. See the block comment
+            # above `_face_encode`.
+            with _read_override("exact"):
+                _, (_fs, _fc) = _fold.extend_fold(
+                    self, enc_carry, f_stream, total,
+                    window=_W_RPL,
+                    init_acc=(jnp.zeros((F, self.embd_dim), jnp.float32),
+                              jnp.zeros((F,), jnp.float32)),
+                    fold_fn=_face_fold, budget=face_win_budget,
+                    start=f_off, row=f_row)
             face_latents = _fs / jnp.maximum(_fc, 1.0)[:, None]
         else:
             # LEGACY, UNFOLDED BRANCH: `encode_extend` reads a standalone
@@ -4022,11 +4060,13 @@ class Agent(eqx.Module):
             # window out -- exactly the window that used to be stored.
             _f_toks = _carry_stream._stream_window(
                 f_stream, f_off, f_row, _W_RPL)
-            _, rows, _valid = self.encode_extend(
-                enc_carry, _f_toks, total,
-                window=_W_RPL, start=0,
-                chunk=(None if face_win_budget is not None else 0),
-                budget=face_win_budget)
+            # EXACT, always -- see the block comment above `_face_encode`.
+            with _read_override("exact"):
+                _, rows, _valid = self.encode_extend(
+                    enc_carry, _f_toks, total,
+                    window=_W_RPL, start=0,
+                    chunk=(None if face_win_budget is not None else 0),
+                    budget=face_win_budget)
         # ONE SCATTER, KEYED BY FACE. The chunks concatenate in face order,
         # so token t belongs to the face whose exclusive-prefix interval
         # contains t -- a `searchsorted` against the counts' cumsum. That key
