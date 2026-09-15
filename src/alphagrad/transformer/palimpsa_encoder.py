@@ -17,7 +17,8 @@ import equinox as eqx
 from alphagrad.approx.common.relations import NUM_RELATIONS
 from alphagrad.transformer.palimpsa_pallas import palimpsa
 from alphagrad.transformer.fast_palimpsa_pallas import (
-    CHUNK_C as FAST_CHUNK_C, fast_palimpsa, fast_read_enabled)
+    CHUNK_C as FAST_CHUNK_C, current_read_path, fast_palimpsa,
+    fast_read_enabled)
 from alphagrad.transformer.encoder import SwiGLU
 
 Array = jax.Array
@@ -45,7 +46,7 @@ PRNGKey = jax.Array
 # depend on the flag.
 # --------------------------------------------------------------------------
 def palimpsa_mix(q, k, v, b, gt, g, Ip, chunk_size):
-    """The token mixer, behind the ONE read flag.
+    """The token mixer, behind the per-path read flags.
 
     ``exact`` is ``palimpsa_pallas``'s token-exact kernel at the mixer's own
     ``chunk_size`` (which there only decides how often a boundary state is
@@ -53,8 +54,16 @@ def palimpsa_mix(q, k, v, b, gt, g, Ip, chunk_size):
     ``fast_palimpsa_pallas``'s chunked isotropic read, whose chunk size IS the
     operator and is therefore always ``FAST_CHUNK_C`` -- the mixer's
     ``chunk_size`` is deliberately not forwarded to it.
+
+    THE ONE READER THAT CANNOT NAME ITS PATH. This function sits inside an
+    equinox module and is reached from ``agent.encode()``, which both the
+    rollout and the loss call, so nothing here says which path is being
+    traced. It asks ``current_read_path()`` instead: the enclosing
+    ``read_path`` block when there is one, and otherwise the single answer
+    both flags give while they agree. With a mismatched pair and no block
+    open it RAISES rather than guessing.
     """
-    if fast_read_enabled():
+    if fast_read_enabled(current_read_path()):
         return fast_palimpsa(q, k, v, b, gt, g, Ip,
                              scale=None, chunk_size=FAST_CHUNK_C)
     return palimpsa(q, k, v, b, gt, g, Ip,

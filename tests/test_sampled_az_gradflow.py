@@ -82,7 +82,7 @@ def setup():
     base_own = jnp.asarray(((np.arange(W0) % TOTAL_V) + 1).astype(np.int32))
     enc, vs, vc = _cs.init_carry(
         agent, base_tok, W0, window=W0, total_v=TOTAL_V,
-        embd_dim=ns.embd_dim, base_owners=base_own)
+        embd_dim=ns.embd_dim, base_owners=base_own, path="rollout")
 
     F = agent.face_path_policy.max_faces
     S = FACE_SLOTS

@@ -90,14 +90,14 @@ def _base(a, s):
     return CS.base_memory(a, s["base_tok"],
                           jnp.asarray(BASE_W, jnp.int32), window=BASE_W,
                           total_v=TOTAL_V, embd_dim=EMBD,
-                          base_owners=s["base_own"])
+                          base_owners=s["base_own"], path="loss")
 
 
 def _enc0(a, s):
     return CS.init_carry(a, s["base_tok"],
                          jnp.asarray(BASE_W, jnp.int32), window=BASE_W,
                          total_v=TOTAL_V, embd_dim=EMBD,
-                         base_owners=s["base_own"])[0]
+                         base_owners=s["base_own"], path="loss")[0]
 
 
 def _scalar(triple):

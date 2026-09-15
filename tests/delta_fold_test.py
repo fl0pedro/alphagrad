@@ -68,7 +68,7 @@ def _flat_sums(agent, toks, count, window):
 
 
 # THE CHUNKS ARE MULTIPLES OF 32, and 48 is allowed because the window clamps
-# it to a single block. Under ALPHAGRAD_PALIMPSA_READ=fast, which is the
+# it to a single block. Under ALPHAGRAD_PALIMPSA_READ_LOSS=fast, which is the
 # shipped default, a multi-block fold has to start every block on a multiple
 # of 32 (see `plan_chunks`). The COUNTS still sweep the interesting
 # remainders -- 0, 1, 17, 37, 63, and the full window -- which is what this
@@ -84,7 +84,8 @@ def test_fold_matches_full_width_reduction(window, count, chunk):
     c_ref, ref = _flat_sums(agent, toks, cnt, window)
     init, fold = sum_reducer(E)
     c_fold, acc = extend_fold(agent, 0.0, toks, cnt, window=window,
-                              chunk=chunk, init_acc=init, fold_fn=fold)
+                              chunk=chunk, init_acc=init, fold_fn=fold,
+                              path="loss")
     assert float(jnp.abs(c_fold - c_ref)) < 1e-5, "carry diverged"
     for a, b in zip(acc, ref):
         assert bool(jnp.allclose(a, b, atol=1e-5)), "%s vs %s" % (a, b)
@@ -104,7 +105,7 @@ def test_gradient_matches_too():
         init, fold = sum_reducer(E)
         _, (te, _ne) = extend_fold(
             agent, c0, toks, cnt, window=window, chunk=chunk,
-            init_acc=init, fold_fn=fold)
+            init_acc=init, fold_fn=fold, path="loss")
         return jnp.sum(te)
 
     def g_flat(c0):
@@ -117,7 +118,7 @@ def test_gradient_matches_too():
         init, fold = sum_reducer(E)
         _, (te, _ne) = extend_fold(
             agent, c0, toks, cnt, window=window, chunk=chunk,
-            init_acc=init, fold_fn=fold)
+            init_acc=init, fold_fn=fold, path="loss")
         return jnp.sum(te)
 
     assert bool(jnp.allclose(g_flat(0.5), g_fold(0.5), atol=1e-5))
@@ -162,7 +163,7 @@ def test_segment_fold_matches_full_width_scatter():
     init, fold = segment_reducer(E, F, face_key_fn(ends))
     _cf, (sums, counts) = extend_fold(
         agent, 0.0, toks, cnt, window=window, chunk=chunk,
-        init_acc=init, fold_fn=fold)
+        init_acc=init, fold_fn=fold, path="loss")
     assert bool(jnp.allclose(sums, ref_sums, atol=1e-5))
     assert bool(jnp.allclose(counts, ref_counts, atol=1e-5))
 
@@ -175,7 +176,8 @@ def test_chunk_size_does_not_change_the_answer():
     for chunk in (32, 64, 96, 128):
         init, fold = sum_reducer(E)
         _c, acc = extend_fold(agent, 0.0, toks, cnt, window=window,
-                              chunk=chunk, init_acc=init, fold_fn=fold)
+                              chunk=chunk, init_acc=init, fold_fn=fold,
+                              path="loss")
         outs.append(acc[0])
     for o in outs[1:]:
         assert bool(jnp.allclose(o, outs[0], atol=1e-5))
@@ -194,7 +196,7 @@ def test_chunk_zero_is_the_encode_extend_sentinel_not_an_error():
     ref = _flat_sums(agent, toks, cnt, 64)[1]
     init, fold = sum_reducer(E)
     _c, acc = extend_fold(agent, 0.0, toks, cnt, window=64, chunk=0,
-                          init_acc=init, fold_fn=fold)
+                          init_acc=init, fold_fn=fold, path="loss")
     for a, b in zip(acc, ref):
         assert bool(jnp.allclose(a, b, atol=1e-5))
 
@@ -203,7 +205,7 @@ def test_rejects_a_negative_chunk():
     with pytest.raises(ValueError, match="chunk must be positive"):
         init, fold = sum_reducer(E)
         extend_fold(StubAgent(), 0.0, *_mk(16, 8), window=16, chunk=-4,
-                    init_acc=init, fold_fn=fold)
+                    init_acc=init, fold_fn=fold, path="loss")
 
 
 def test_a_misaligned_chunk_is_refused_under_the_fast_read(monkeypatch):
@@ -216,32 +218,35 @@ def test_a_misaligned_chunk_is_refused_under_the_fast_read(monkeypatch):
     genuinely different numbers. Rounding the request up would be silent, so
     `plan_chunks` raises.
     """
-    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ", "fast")
+    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ_ROLLOUT", "fast")
+    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ_LOSS", "fast")
     init, fold = sum_reducer(E)
     with pytest.raises(ValueError, match="not a multiple of the fast-palimpsa"):
         extend_fold(StubAgent(), 0.0, *_mk(64, 40), window=64, chunk=7,
-                    init_acc=init, fold_fn=fold)
+                    init_acc=init, fold_fn=fold, path="loss")
 
 
 def test_one_block_is_exempt_from_the_alignment_rule(monkeypatch):
     """A window under the chunk leaves ONE block, and one block starts at
     token 0 whatever its width. That is what makes `plan_chunks`'s clamp to
     the window safe, and a window bin of 11 is a real case."""
-    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ", "fast")
-    C, nb, padded = plan_chunks(11, 1024)
+    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ_ROLLOUT", "fast")
+    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ_LOSS", "fast")
+    C, nb, padded = plan_chunks(11, 1024, path="loss")
     assert (C, nb, padded) == (11, 1, 11)
 
 
 def test_a_misaligned_chunk_is_still_fine_under_the_exact_read(monkeypatch):
     """The alignment rule belongs to the fast read alone. The exact recurrence
     has no chunk grid, so no size is wrong for it."""
-    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ", "exact")
+    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ_ROLLOUT", "exact")
+    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ_LOSS", "exact")
     agent = StubAgent()
     toks, cnt = _mk(64, 40, seed=31)
     ref = _flat_sums(agent, toks, cnt, 64)[1]
     init, fold = sum_reducer(E)
     _c, acc = extend_fold(agent, 0.0, toks, cnt, window=64, chunk=7,
-                          init_acc=init, fold_fn=fold)
+                          init_acc=init, fold_fn=fold, path="loss")
     for a, b in zip(acc, ref):
         assert bool(jnp.allclose(a, b, atol=1e-5))
 
@@ -263,11 +268,12 @@ def test_budget_skipping_is_exact(window, count, chunk, budget):
     toks, cnt = _mk(window, count, seed=11)
     init, fold = sum_reducer(E)
     c_no, acc_no = extend_fold(agent, 0.0, toks, cnt, window=window,
-                               chunk=chunk, init_acc=init, fold_fn=fold)
+                               chunk=chunk, init_acc=init, fold_fn=fold,
+                               path="loss")
     init2, fold2 = sum_reducer(E)
     c_bd, acc_bd = extend_fold(agent, 0.0, toks, cnt, window=window,
                                chunk=chunk, init_acc=init2, fold_fn=fold2,
-                               budget=budget)
+                               budget=budget, path="loss")
     assert float(jnp.abs(c_bd - c_no)) < 1e-5, "carry diverged under budget"
     for a, b in zip(acc_bd, acc_no):
         assert bool(jnp.allclose(a, b, atol=1e-5)), "%s vs %s" % (a, b)
@@ -282,7 +288,7 @@ def test_budget_gradient_survives_the_cond():
         init, fold = sum_reducer(E)
         _, (te, _ne) = extend_fold(
             agent, c0, toks, cnt, window=128, chunk=32,
-            init_acc=init, fold_fn=fold, budget=30)
+            init_acc=init, fold_fn=fold, budget=30, path="loss")
         return jnp.sum(te)
 
     d = jax.grad(g)(0.5)

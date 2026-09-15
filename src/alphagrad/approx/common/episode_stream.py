@@ -547,7 +547,12 @@ def stream_tail(max_delta_tokens: int, chunk=None) -> int:
     """
     from alphagrad.approx.common import delta_fold as _fold
 
-    _C, _nb, padded = _fold.plan_chunks(int(max_delta_tokens), chunk)
+    # path="any": this row is WRITTEN by the rollout and READ by the loss, so
+    # its plan has to be legal on whichever side folds. The two may now read
+    # with different operators, and the shape does not depend on which -- only
+    # the alignment refusal does, and "any" takes the stricter of the two.
+    _C, _nb, padded = _fold.plan_chunks(int(max_delta_tokens), chunk,
+                                        path=_fold.PATH_ANY)
     return max(int(max_delta_tokens), int(padded))
 
 

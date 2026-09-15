@@ -3,7 +3,8 @@
 
 WHY THIS FILE EXISTS
 --------------------
-``ALPHAGRAD_PALIMPSA_READ=fast`` swaps the palimpsa read for a chunked
+``ALPHAGRAD_PALIMPSA_READ_ROLLOUT`` and ``ALPHAGRAD_PALIMPSA_READ_LOSS`` each
+pick ``exact`` or ``fast``. ``fast`` swaps the palimpsa read for a chunked
 approximation whose chunk boundary is where it stops approximating. That makes
 the CHUNK GRID part of the operator. The rollout walks a delta in blocks of
 ``ALPHAGRAD_EXTEND_CHUNK``; the loss walks the same delta in blocks of
@@ -20,6 +21,15 @@ same rows, the same carry and the same gradient.
 
 The exact read is checked in the same shape, so a regression that broke only
 one of the two settings cannot hide.
+
+THE MISMATCHED PAIR. Owner ruling 2026-09-15 allows the rollout and the loss
+to read with DIFFERENT operators, because the fast read costs the rollout
+about 10 s per episode and saves the loss about 13.7 s. The price is that the
+PPO ratio at epoch 0 is no longer 1. Every case above runs with the two reads
+EQUAL and keeps its bit-identical claims. Two cases at the end run them
+different: one checks that the trainer refuses without
+``ALPHAGRAD_ALLOW_READ_MISMATCH=1``, and one sets the allow flag, MEASURES the
+epoch-0 ratio drift and prints it instead of asserting 1.
 """
 from __future__ import annotations
 
@@ -50,6 +60,18 @@ WINDOW = 4 * CHUNK_C          # 128 tokens of delta window
 COUNT = 2 * CHUNK_C + 19      # a delta that ends mid-chunk, on purpose
 SEED = 11
 READS = ["exact", "fast"]
+
+ROLLOUT_ENV = "ALPHAGRAD_PALIMPSA_READ_ROLLOUT"
+LOSS_ENV = "ALPHAGRAD_PALIMPSA_READ_LOSS"
+
+
+def _set_read(monkeypatch, rollout, loss=None):
+    """Set the PAIR. ``loss=None`` means "the same on both", which is what
+    every bit-identical case in this file wants: with one operator on both
+    sides the rollout and the loss compute the same function and the old
+    claims stand unchanged."""
+    monkeypatch.setenv(ROLLOUT_ENV, rollout)
+    monkeypatch.setenv(LOSS_ENV, rollout if loss is None else loss)
 
 
 @pytest.fixture(scope="module")
@@ -85,7 +107,8 @@ def _carry(agent):
 def _rollout(agent, carry, toks, count, chunk):
     """What the rollout runs: ``encode_extend`` with its own block size."""
     return agent.encode_extend(carry, toks, jnp.asarray(count, jnp.int32),
-                               window=WINDOW, start=0, chunk=chunk)
+                               window=WINDOW, start=0, chunk=chunk,
+                               path="rollout")
 
 
 def _rollout_diff(agent, carry, toks, count, chunk):
@@ -98,7 +121,8 @@ def _rollout_diff(agent, carry, toks, count, chunk):
     """
     return agent.encode_extend(carry, toks, jnp.asarray(count, jnp.int32),
                                window=WINDOW, start=0, chunk=chunk,
-                               budget=jnp.asarray(count, jnp.int32))
+                               budget=jnp.asarray(count, jnp.int32),
+                               path="loss")
 
 
 def _folded(agent, carry, toks, count, chunk):
@@ -107,7 +131,7 @@ def _folded(agent, carry, toks, count, chunk):
     return _fold.extend_fold(
         agent, carry, toks, jnp.asarray(count, jnp.int32), window=WINDOW,
         chunk=chunk, init_acc=init, fold_fn=fold,
-        budget=jnp.asarray(count, jnp.int32))
+        budget=jnp.asarray(count, jnp.int32), path="loss")
 
 
 def _reduce(rows, valid):
@@ -126,7 +150,7 @@ def _rel(a, b):
 def test_the_rollout_extend_and_the_loss_fold_agree_on_the_same_delta(
         read, agent, tokens, monkeypatch):
     """Rows and carry, both paths, at the block sizes production uses."""
-    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ", read)
+    _set_read(monkeypatch, read)
     c0 = _carry(agent)
     c_r, rows, valid = _rollout(agent, c0, tokens, COUNT, 2 * CHUNK_C)
     ref_sum, ref_n = _reduce(rows, valid)
@@ -146,7 +170,7 @@ def test_the_outer_block_size_does_not_change_what_a_delta_reads(
     aligned multiples of 32. All four must agree, because the fast grid is
     measured from token 0 of the delta and every one of these starts its
     blocks on a multiple of 32."""
-    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ", read)
+    _set_read(monkeypatch, read)
     c0 = _carry(agent)
     c_a, rows_a, valid_a = _rollout(agent, c0, tokens, COUNT, 0)
     c_b, rows_b, _valid = _rollout(agent, c0, tokens, COUNT, chunk)
@@ -160,16 +184,16 @@ def test_a_delta_split_across_two_calls_equals_one_call(
         read, agent, tokens, monkeypatch):
     """A step's delta is consumed once, but the SAME carry is then extended by
     the next step's delta. Splitting on a chunk multiple has to be free."""
-    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ", read)
+    _set_read(monkeypatch, read)
     c0 = _carry(agent)
     whole, rows_w, _v = _rollout(agent, c0, tokens, WINDOW, 0)
     half = 2 * CHUNK_C
     c1, rows_1, _v1 = agent.encode_extend(
         c0, tokens[:half], jnp.asarray(half, jnp.int32), window=half,
-        start=0, chunk=0)
+        start=0, chunk=0, path="rollout")
     c2, rows_2, _v2 = agent.encode_extend(
         c1, tokens[half:], jnp.asarray(WINDOW - half, jnp.int32),
-        window=WINDOW - half, start=0, chunk=0)
+        window=WINDOW - half, start=0, chunk=0, path="rollout")
     joined = jnp.concatenate([rows_1, rows_2], axis=0)
     assert _rel(joined, rows_w) < 1e-5
     assert _rel(c2.M, whole.M) < 1e-5
@@ -182,7 +206,7 @@ def test_the_gradient_agrees_between_the_two_paths(
     """Values agreeing is not enough. The loss differentiates the fold, the
     rollout's numbers are what the ratio's denominator was recorded from, and
     an epoch-0 ratio of 1 needs both."""
-    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ", read)
+    _set_read(monkeypatch, read)
     c0 = _carry(agent)
     dyn, static = eqx.partition(agent, eqx.is_inexact_array)
 
@@ -211,9 +235,9 @@ def test_the_flag_actually_changes_the_read(agent, tokens, monkeypatch):
     """A flag that did nothing would pass every test above. This one fails if
     `fast` silently fell back to the exact path anywhere."""
     c0 = _carry(agent)
-    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ", "exact")
+    _set_read(monkeypatch, "exact")
     _c, rows_e, _v = _rollout(agent, c0, tokens, COUNT, 0)
-    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ", "fast")
+    _set_read(monkeypatch, "fast")
     _c2, rows_f, _v2 = _rollout(agent, c0, tokens, COUNT, 0)
     assert not np.allclose(np.asarray(rows_e), np.asarray(rows_f),
                            rtol=1e-4, atol=1e-6)
@@ -223,7 +247,7 @@ def test_a_misaligned_outer_chunk_is_refused_under_the_fast_read(
         agent, tokens, monkeypatch):
     """Silently reading a misaligned grid is the one failure mode that would
     show up only as a drifting ratio, so it raises instead."""
-    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ", "fast")
+    _set_read(monkeypatch, "fast")
     with pytest.raises(ValueError, match="not a multiple of the fast-palimpsa"):
         _rollout(agent, _carry(agent), tokens, COUNT, 24)
 
@@ -232,16 +256,39 @@ def test_a_misaligned_outer_chunk_is_still_allowed_under_the_exact_read(
         agent, tokens, monkeypatch):
     """The alignment rule belongs to the fast read alone; the exact read has
     no chunk grid to align, and its callers must not start failing."""
-    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ", "exact")
+    _set_read(monkeypatch, "exact")
     _c, rows, _v = _rollout(agent, _carry(agent), tokens, COUNT, 24)
     assert np.all(np.isfinite(np.asarray(rows)))
 
 
-def test_an_unknown_read_is_rejected_rather_than_defaulted(monkeypatch):
+@pytest.mark.parametrize("env", [ROLLOUT_ENV, LOSS_ENV])
+def test_an_unknown_read_is_rejected_rather_than_defaulted(env, monkeypatch):
     from alphagrad.transformer.fast_palimpsa_pallas import palimpsa_read
-    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ", "approximate")
+    _set_read(monkeypatch, "fast")
+    monkeypatch.setenv(env, "approximate")
+    path = "rollout" if env == ROLLOUT_ENV else "loss"
     with pytest.raises(ValueError, match="must be 'exact' or 'fast'"):
-        palimpsa_read()
+        palimpsa_read(path)
+
+
+def test_the_retired_single_flag_is_refused_by_name(monkeypatch):
+    """`ALPHAGRAD_PALIMPSA_READ` used to select ONE read for both paths. A
+    launcher that still exports it would otherwise get the default pair in
+    silence, which is the one thing a read flag must never do."""
+    from alphagrad.transformer.fast_palimpsa_pallas import palimpsa_read
+    _set_read(monkeypatch, "fast")
+    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ", "exact")
+    with pytest.raises(ValueError, match="is retired"):
+        palimpsa_read("loss")
+
+
+def test_a_reader_that_does_not_name_a_path_is_refused(monkeypatch):
+    """The path is not optional. A reader that forgot it would read one
+    operator while the other side read the other, and nothing would say so."""
+    from alphagrad.transformer.fast_palimpsa_pallas import palimpsa_read
+    _set_read(monkeypatch, "fast")
+    with pytest.raises(ValueError, match="path must be one of"):
+        palimpsa_read("both")
 
 
 def test_the_fold_refuses_a_chunk_that_would_misalign_the_fast_grid(
@@ -252,17 +299,17 @@ def test_the_fold_refuses_a_chunk_that_would_misalign_the_fast_grid(
     It RAISES rather than rounding 100 up to 128. Rounding is silent, and a
     launcher that asked for 100 and got 128 has no way to find out. The exact
     read has no chunk grid, so the same request is fine there."""
-    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ", "fast")
+    _set_read(monkeypatch, "fast")
     with pytest.raises(ValueError, match="not a multiple of the fast-palimpsa"):
-        _fold.plan_chunks(4096, 100)
-    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ", "exact")
-    C2, _nb2, _p2 = _fold.plan_chunks(4096, 100)
+        _fold.plan_chunks(4096, 100, path="loss")
+    _set_read(monkeypatch, "exact")
+    C2, _nb2, _p2 = _fold.plan_chunks(4096, 100, path="loss")
     assert C2 == 100
 
 
 def test_an_aligned_fold_chunk_is_returned_unchanged(monkeypatch):
-    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ", "fast")
-    C, nb, padded = _fold.plan_chunks(4096, 128)
+    _set_read(monkeypatch, "fast")
+    C, nb, padded = _fold.plan_chunks(4096, 128, path="loss")
     assert C == 128 and C % CHUNK_C == 0
     assert nb == 32 and padded == 4096
 
@@ -271,16 +318,16 @@ def test_a_window_shorter_than_one_chunk_still_reads_under_the_fast_grid():
     """`plan_chunks` clamps the chunk to the window. A single block starts at
     token 0 whatever its width, so the clamp cannot misalign anything."""
     import os as _os
-    prev = _os.environ.get("ALPHAGRAD_PALIMPSA_READ")
-    _os.environ["ALPHAGRAD_PALIMPSA_READ"] = "fast"
+    prev = _os.environ.get(LOSS_ENV)
+    _os.environ[LOSS_ENV] = "fast"
     try:
-        C, nb, padded = _fold.plan_chunks(11, 1024)
+        C, nb, padded = _fold.plan_chunks(11, 1024, path="loss")
         assert C == 11 and nb == 1 and padded == 11
     finally:
         if prev is None:
-            _os.environ.pop("ALPHAGRAD_PALIMPSA_READ", None)
+            _os.environ.pop(LOSS_ENV, None)
         else:
-            _os.environ["ALPHAGRAD_PALIMPSA_READ"] = prev
+            _os.environ[LOSS_ENV] = prev
 
 
 # --------------------------------------------------------------------------
@@ -299,7 +346,7 @@ def test_the_count_proportional_backward_agrees_with_the_scan_form(
     ``custom_vjp`` is for. This pins that the two forms still land on the same
     value and the same gradient with the fast read in force.
     """
-    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ", read)
+    _set_read(monkeypatch, read)
     c0 = _carry(agent)
     dyn, static = eqx.partition(agent, eqx.is_inexact_array)
 
@@ -335,23 +382,23 @@ def test_the_read_override_actually_changes_what_the_readers_see(monkeypatch):
     """
     from alphagrad.transformer.fast_palimpsa_pallas import (
         palimpsa_read, read_override)
-    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ", "fast")
-    assert palimpsa_read() == "fast"
-    assert _fold._fast_read() is True
+    _set_read(monkeypatch, "fast")
+    assert palimpsa_read("loss") == "fast"
+    assert _fold._fast_read("loss") is True
     with read_override("exact"):
-        assert palimpsa_read() == "exact"
-        assert _fold._fast_read() is False
-    assert palimpsa_read() == "fast"
+        assert palimpsa_read("loss") == "exact"
+        assert _fold._fast_read("loss") is False
+    assert palimpsa_read("loss") == "fast"
 
 
 def test_the_read_override_is_restored_when_the_body_raises(monkeypatch):
     from alphagrad.transformer.fast_palimpsa_pallas import (
         palimpsa_read, read_override)
-    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ", "fast")
+    _set_read(monkeypatch, "fast")
     with pytest.raises(RuntimeError):
         with read_override("exact"):
             raise RuntimeError("boom")
-    assert palimpsa_read() == "fast"
+    assert palimpsa_read("loss") == "fast"
 
 
 def test_the_read_override_refuses_a_mode_it_does_not_know():
@@ -366,9 +413,204 @@ def test_the_override_reaches_the_fold_through_plan_chunks(monkeypatch):
     replay folds a window whose chunk it does not choose, so the override has
     to lift that refusal too, or the face path would raise instead of reading
     exact."""
-    monkeypatch.setenv("ALPHAGRAD_PALIMPSA_READ", "fast")
+    _set_read(monkeypatch, "fast")
     from alphagrad.transformer.fast_palimpsa_pallas import read_override
     with pytest.raises(ValueError, match="not a multiple of the fast-palimpsa"):
-        _fold.plan_chunks(4096, 100)
+        _fold.plan_chunks(4096, 100, path="loss")
     with read_override("exact"):
-        assert _fold.plan_chunks(4096, 100)[0] == 100
+        assert _fold.plan_chunks(4096, 100, path="loss")[0] == 100
+
+
+# --------------------------------------------------------------------------
+# THE MISMATCHED PAIR (owner ruling 2026-09-15)
+# --------------------------------------------------------------------------
+# Everything above runs the two paths on ONE operator, where the rollout and
+# the loss compute the same function and every claim is bit-identical. These
+# cases run them on DIFFERENT operators, which is what the ruling allows and
+# what the guard exists for.
+def test_a_mismatched_pair_is_refused_without_the_allow_flag(monkeypatch):
+    """The guard the trainer runs at startup. A mismatched pair is a
+    deliberate choice with a price, so it has to be asked for in writing."""
+    from alphagrad.transformer.fast_palimpsa_pallas import (
+        require_read_agreement)
+    monkeypatch.delenv("ALPHAGRAD_ALLOW_READ_MISMATCH", raising=False)
+    _set_read(monkeypatch, "exact", "fast")
+    with pytest.raises(RuntimeError) as exc:
+        require_read_agreement()
+    msg = str(exc.value)
+    # The refusal NAMES both flags and says what the mismatch does, because a
+    # refusal that only says "no" sends the reader back to the source.
+    assert ROLLOUT_ENV in msg and LOSS_ENV in msg
+    assert "ALPHAGRAD_ALLOW_READ_MISMATCH" in msg
+    assert "ratio" in msg
+
+
+def test_a_matched_pair_needs_no_allow_flag(monkeypatch):
+    from alphagrad.transformer.fast_palimpsa_pallas import (
+        require_read_agreement)
+    monkeypatch.delenv("ALPHAGRAD_ALLOW_READ_MISMATCH", raising=False)
+    for mode in READS:
+        _set_read(monkeypatch, mode)
+        assert require_read_agreement(echo=False) == (mode, mode)
+
+
+def test_the_allow_flag_lets_a_mismatched_pair_run(monkeypatch):
+    from alphagrad.transformer.fast_palimpsa_pallas import (
+        require_read_agreement)
+    monkeypatch.setenv("ALPHAGRAD_ALLOW_READ_MISMATCH", "1")
+    _set_read(monkeypatch, "exact", "fast")
+    assert require_read_agreement(echo=False) == ("exact", "fast")
+
+
+def test_the_two_flags_really_are_two(monkeypatch):
+    """A second flag that did nothing would pass every case above. This one
+    fails if one path's flag silently answered for the other."""
+    from alphagrad.transformer.fast_palimpsa_pallas import palimpsa_read
+    monkeypatch.setenv("ALPHAGRAD_ALLOW_READ_MISMATCH", "1")
+    _set_read(monkeypatch, "exact", "fast")
+    assert palimpsa_read("rollout") == "exact"
+    assert palimpsa_read("loss") == "fast"
+    _set_read(monkeypatch, "fast", "exact")
+    assert palimpsa_read("rollout") == "fast"
+    assert palimpsa_read("loss") == "exact"
+
+
+def test_the_mixer_refuses_to_guess_a_path_under_a_mismatched_pair(
+        monkeypatch):
+    """`palimpsa_mix` is the one reader with no path argument (it lives
+    inside the mixer module and `agent.encode()` reaches it from both sides).
+    With the two reads equal there is one honest answer and it gives it; with
+    them different there is none, so it raises rather than picking."""
+    from alphagrad.transformer.fast_palimpsa_pallas import (
+        current_read_path, read_path)
+    monkeypatch.setenv("ALPHAGRAD_ALLOW_READ_MISMATCH", "1")
+    _set_read(monkeypatch, "fast")
+    assert current_read_path() in ("rollout", "loss")
+    _set_read(monkeypatch, "exact", "fast")
+    with pytest.raises(RuntimeError, match="outside any `read_path` block"):
+        current_read_path()
+    with read_path("loss"):
+        assert current_read_path() == "loss"
+    with read_path("rollout"):
+        assert current_read_path() == "rollout"
+
+
+# --------------------------------------------------------------------------
+# THE DRIFT BOUND, AND ITS ARITHMETIC
+# --------------------------------------------------------------------------
+# The PPO ratio is exp(new_logp - old_logp). With one operator on both sides
+# it is exactly 1 at epoch 0 (measured on the GPU: ratio/max_log of order
+# 1e-12, which is float noise). With two operators it is not, and this is how
+# far it can go.
+#
+#   1. THE KERNEL'S OWN ERROR. tests/fast_palimpsa_kernel_test.py pins the
+#      fast read against its oracle at a RELATIVE 5e-3, forward and in every
+#      one of the nine gradients. That is upstream's own tolerance for its
+#      tensor-core dots, so 5e-3 is the per-chunk figure, not a guess.
+#
+#   2. HOW MANY CHUNKS ONE STEP IS. The fast grid is CHUNK_C = 32 tokens
+#      measured from token 0 of the delta, so a step of N tokens is
+#      ceil(N / 32) chunks. Each chunk hands its boundary state to the next,
+#      so the state's relative error compounds ONCE PER CHUNK, not once per
+#      token:
+#
+#          rel_state(N)  <=  (1 + 5e-3) ** ceil(N / 32)  -  1
+#
+#      This is the "over the token count of one step" term. At COUNT = 83
+#      tokens that is 3 chunks and rel_state <= 1.508e-2.
+#
+#   3. FROM THE STATE TO THE LOG-PROB. The vertex logits are a linear map of
+#      the pooled rows, and log-softmax is 2-Lipschitz in the sup norm of its
+#      input (|d log softmax_i| <= 2 |dx|_inf). A relative error rel_state on
+#      logits of magnitude |logp| therefore moves one action's log-prob by at
+#      most 2 * |logp| * rel_state. |logp| is floored at 1 so the bound does
+#      not collapse on a near-uniform head.
+#
+#          max_log_bound  =  2 * max(|logp|, 1) * rel_state(N)
+#
+#      At COUNT = 83 and this six-vertex head that is about 6e-2.
+#
+# The number MEASURED here is much smaller than the bound, and it is PRINTED
+# rather than asserted equal to anything: the point of the case is to publish
+# the drift, and the assertion is only a ceiling that a real regression would
+# break.
+KERNEL_REL = 5e-3
+
+
+def _drift_bound(count, logp):
+    import math
+    n_chunks = -(-int(count) // CHUNK_C)
+    rel_state = (1.0 + KERNEL_REL) ** n_chunks - 1.0
+    return 2.0 * max(abs(float(logp)), 1.0) * rel_state, n_chunks, rel_state
+
+
+def _step_logp(agent, toks, count, read, action):
+    """One step's vertex log-prob, read end to end on ONE path's operator.
+
+    This is the quantity the PPO ratio is built from: the base encode, the
+    step's delta advance, the vertex head, log-softmax, one action. Running
+    it twice under two operators and subtracting IS `ratio/max_log` at
+    epoch 0.
+    """
+    import os as _os
+    from alphagrad.approx.common import carry_stream as _cs
+    prev = _os.environ.get(ROLLOUT_ENV), _os.environ.get(LOSS_ENV)
+    _os.environ[ROLLOUT_ENV] = read
+    _os.environ[LOSS_ENV] = read
+    try:
+        total_v = 6
+        base = toks[: 2 * CHUNK_C]
+        enc0, bs, bc = _cs.init_carry(
+            agent, base, jnp.asarray(base.shape[0], jnp.int32),
+            window=int(base.shape[0]), total_v=total_v,
+            embd_dim=agent.embd_dim, path="rollout")
+        vs0, vc0 = _cs.zero_memory(total_v, agent.embd_dim)
+        part = jnp.zeros((total_v + 1,), jnp.float32).at[0].set(1.0)
+        _c, vs, vc = _cs.advance(
+            agent, enc0, vs0, vc0, toks, jnp.asarray(count, jnp.int32),
+            jnp.asarray(0, jnp.int32), window=WINDOW, participants=part,
+            path="rollout")
+        vlog, _ctx, _val = _cs.heads(agent, vs, vc, base_mem=(bs, bc),
+                                     preference=None)
+        return float(jax.nn.log_softmax(vlog)[action])
+    finally:
+        for env, val in zip((ROLLOUT_ENV, LOSS_ENV), prev):
+            if val is None:
+                _os.environ.pop(env, None)
+            else:
+                _os.environ[env] = val
+
+
+def test_a_matched_pair_leaves_the_epoch_zero_ratio_at_one(agent, tokens):
+    """The control for the case below. One operator on both sides and the
+    two log-probs are the SAME number, so the ratio is exactly 1."""
+    a = _step_logp(agent, tokens, COUNT, "fast", 0)
+    b = _step_logp(agent, tokens, COUNT, "fast", 0)
+    assert a == b
+
+
+@pytest.mark.parametrize("rollout,loss", [("exact", "fast"),
+                                          ("fast", "exact")])
+def test_a_mismatched_pair_reports_its_epoch_zero_ratio_drift(
+        rollout, loss, agent, tokens, capsys):
+    """MEASURE AND REPORT, do not assert 1.
+
+    With the rollout sampling under one operator and the loss scoring under
+    another the epoch-0 ratio is 1 plus the operator difference. The number is
+    printed so a reader of the test output sees it; the assertion is the
+    ceiling derived in the block comment above.
+    """
+    lp_rollout = _step_logp(agent, tokens, COUNT, rollout, 0)
+    lp_loss = _step_logp(agent, tokens, COUNT, loss, 0)
+    max_log = abs(lp_loss - lp_rollout)
+    bound, n_chunks, rel_state = _drift_bound(COUNT, lp_rollout)
+    with capsys.disabled():
+        print(f"\n[ratio drift] rollout={rollout} loss={loss}  "
+              f"logp_rollout={lp_rollout:.6f} logp_loss={lp_loss:.6f}  "
+              f"ratio/max_log={max_log:.3e}  ratio={np.exp(max_log):.6f}  "
+              f"bound={bound:.3e} "
+              f"(N={COUNT} tokens = {n_chunks} chunks of {CHUNK_C}, "
+              f"rel_state={rel_state:.3e}, kernel rel={KERNEL_REL:g})")
+    assert max_log < bound, (
+        f"epoch-0 ratio drift {max_log:.3e} exceeds the derived bound "
+        f"{bound:.3e}")

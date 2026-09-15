@@ -23,7 +23,7 @@ TOKENS = np.array([7, 11, 23, 5, 42, 13, 99, 31, 60, 8, 17, 25], dtype=np.int32)
 @pytest.fixture(autouse=True)
 def _exact_read():
     """THIS MODULE PINS A PROPERTY OF THE EXACT OPERATOR, so it forces
-    ``ALPHAGRAD_PALIMPSA_READ=exact`` even though the shipped default is now
+    ``ALPHAGRAD_PALIMPSA_READ_ROLLOUT/_LOSS=exact`` even though the shipped default is now
     ``fast``.
 
     The claim is that the incremental encode equals the full encode at every
@@ -35,7 +35,8 @@ def _exact_read():
     ``tests/fast_read_extend_parity_test.py``.
     """
     with pytest.MonkeyPatch.context() as mp:
-        mp.setenv("ALPHAGRAD_PALIMPSA_READ", "exact")
+        mp.setenv("ALPHAGRAD_PALIMPSA_READ_ROLLOUT", "exact")
+        mp.setenv("ALPHAGRAD_PALIMPSA_READ_LOSS", "exact")
         yield
 
 

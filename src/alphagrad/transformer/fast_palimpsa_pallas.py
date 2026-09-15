@@ -441,15 +441,122 @@ def _chunk_backward(qs, kc, vc, bc, gt_c, g_s, Ip_s, M, I, vmaskf, kvmaskf,
 
 
 # =============================================================================
-# 2b. THE FLAG.  One env var, read at every call site that reads palimpsa.
+# 2b. THE TWO FLAGS.  ONE READ PER PATH, named at every call site.
 # =============================================================================
+#: The two PATHS that read palimpsa. They are separate flags because the
+#: rollout and the loss pay the fast read differently: measured on the
+#: campaign shape, the fast read COSTS the rollout about 10 s per episode and
+#: SAVES the loss about 13.7 s. Owner ruling 2026-09-15 therefore allows a
+#: per-path read. See `require_read_agreement` for the price of using it.
+READ_PATHS = ("rollout", "loss")
+
+READ_ENV = {
+    "rollout": "ALPHAGRAD_PALIMPSA_READ_ROLLOUT",
+    "loss": "ALPHAGRAD_PALIMPSA_READ_LOSS",
+}
+
+#: The env var that lets a MISMATCHED pair run at all.
+ALLOW_MISMATCH_ENV = "ALPHAGRAD_ALLOW_READ_MISMATCH"
+
+#: The single flag this pair replaced. Reading it silently would train one
+#: operator while the launcher asked for another, so it is refused by name.
+_RETIRED_ENV = "ALPHAGRAD_PALIMPSA_READ"
+
 _READ_LOGGED = [False]
 
 #: Set by :func:`read_override` while a caller that owns its own chunk grid is
-#: being TRACED. Not a second flag: it cannot be reached from the environment
+#: being TRACED. Not a third flag: it cannot be reached from the environment
 #: and it is always paired with a comment at the call site saying why that
 #: caller cannot use the shipped read.
 _READ_OVERRIDE = [None]
+
+#: Set by :func:`read_path` around a region whose path is known but whose
+#: readers cannot name it. Exactly ONE reader uses it -- `palimpsa_mix`, the
+#: mixer's own token mix, which sits inside an equinox module and is reached
+#: from `agent.encode()` on both paths. Every other reader takes `path` as an
+#: argument.
+_READ_PATH = [None]
+
+
+def _check_path(path):
+    if path not in READ_PATHS:
+        raise ValueError(
+            f"palimpsa read path must be one of {READ_PATHS}, got {path!r}. "
+            "Every reader of palimpsa names the path it is on, because the "
+            "rollout and the loss may now read with different operators.")
+    return path
+
+
+def read_for(path) -> str:
+    """The configured read for ONE path, straight from the environment.
+
+    No override and no ambient path: this is what the flag says, and it is
+    what the guard, the run config and the plan log record.
+    """
+    _check_path(path)
+    if _RETIRED_ENV in os.environ:
+        raise ValueError(
+            f"{_RETIRED_ENV} is retired. It selected ONE read for both the "
+            f"rollout and the loss; the pair is now "
+            f"{READ_ENV['rollout']} and {READ_ENV['loss']}, each "
+            "'exact' or 'fast'. Set both (they default to 'fast', which is "
+            "what the single flag defaulted to).")
+    env = READ_ENV[path]
+    mode = os.environ.get(env, "fast")
+    if mode not in ("exact", "fast"):
+        raise ValueError(
+            f"{env} must be 'exact' or 'fast', got {mode!r}. It selects the "
+            f"palimpsa READ on the {path} path, and a typo that fell back to "
+            "a default would silently train a different operator from the "
+            "one the launcher asked for.")
+    return mode
+
+
+def read_pair():
+    """``(rollout_read, loss_read)`` -- the operator pair this process runs."""
+    return read_for("rollout"), read_for("loss")
+
+
+def reads_differ() -> bool:
+    r, l = read_pair()
+    return r != l
+
+
+def mismatch_allowed() -> bool:
+    return os.environ.get(ALLOW_MISMATCH_ENV, "0") == "1"
+
+
+MISMATCH_MEANING = (
+    "The PPO ratio is exp(new_logp - old_logp). The rollout SAMPLES under "
+    "one palimpsa operator and the loss SCORES under another, so the ratio "
+    "at epoch 0 is not 1 but 1 plus the operator difference. That is a "
+    "systematic off-policy bias in every update, not noise, and nothing "
+    "else in the run reports it.")
+
+
+def require_read_agreement(*, echo=True):
+    """The startup guard. Returns ``(rollout_read, loss_read)``.
+
+    Prints the pair once. If the two differ it prints what the mismatch
+    MEANS and refuses to run unless ``ALPHAGRAD_ALLOW_READ_MISMATCH=1``.
+    """
+    r, l = read_pair()
+    if echo:
+        print(f"[palimpsa] read rollout={r} loss={l}", flush=True)
+    if r == l:
+        return r, l
+    line = (f"[palimpsa] READ MISMATCH: {READ_ENV['rollout']}={r} but "
+            f"{READ_ENV['loss']}={l}. {MISMATCH_MEANING}")
+    print(line, flush=True)
+    if not mismatch_allowed():
+        raise RuntimeError(
+            line + f" Set {ALLOW_MISMATCH_ENV}=1 to run anyway, or set "
+            f"{READ_ENV['rollout']} and {READ_ENV['loss']} to the same "
+            "value.")
+    print(f"[palimpsa] {ALLOW_MISMATCH_ENV}=1: running the mismatched pair "
+          "on purpose. Read ratio/max_log at epoch 0 before believing any "
+          "number from this run.", flush=True)
+    return r, l
 
 
 @contextlib.contextmanager
@@ -460,6 +567,9 @@ def read_override(mode: str):
     side extends the carry once per face and whose loss side reads all the
     faces as one contiguous span. Those two give the same chunk grid only for
     the exact recurrence, which has no grid at all (see ``_face_encode``).
+    It therefore overrides the PATH as well: the face pipeline reads the same
+    operator on both paths whatever the two flags say, which is the only
+    reason the face ratio is 1 at epoch 0.
 
     It affects TRACING, not execution, so a caller must capture the answer
     once inside the block rather than asking again from a backward pass that
@@ -476,44 +586,87 @@ def read_override(mode: str):
         _READ_OVERRIDE[0] = prev
 
 
-def palimpsa_read() -> str:
-    """``"exact"`` or ``"fast"`` -- ``ALPHAGRAD_PALIMPSA_READ``, default fast.
+@contextlib.contextmanager
+def read_path(path: str):
+    """Name the path of everything TRACED inside the block.
 
-    ONE flag for every reader, and every reader must consult THIS function
-    rather than the environment directly. The rollout extend, the loss extend
-    (both ``_extend_sequential`` forms and ``extend_fold``), ``base_memory``
-    and the full ``encode`` path all read palimpsa, and the PPO ratio is only
-    1 at epoch 0 while they agree on which read they are doing. A second
-    switch, or a call site that forgot to ask, would show up as a ratio that
-    drifts from 1 with no other symptom.
+    For the one reader that cannot name its own path: ``palimpsa_mix``, the
+    mixer's token mix, which lives in an equinox module and is reached from
+    ``agent.encode()`` on both the rollout and the loss. Every other reader
+    takes ``path`` as an ordinary argument, so this block is not a way to
+    set the read for a call site that could have said which path it is on.
+    """
+    _check_path(path)
+    prev = _READ_PATH[0]
+    _READ_PATH[0] = path
+    try:
+        yield
+    finally:
+        _READ_PATH[0] = prev
 
-    Default ``fast`` (owner ruling 2026-09-14: "just adopt the fast read").
-    The policy regression gate's live golden was recorded under ``fast``;
-    the exact operator's golden is archived as
-    ``tests/golden/policy_gate_golden_pre_fastread.json``. ``fast`` is a
-    different operator, so the two goldens differ by design.
+
+def current_read_path() -> str:
+    """The ambient path, for ``palimpsa_mix`` and nothing else.
+
+    With no block open the answer is only well defined while the two flags
+    AGREE -- then both names give the same operator and 'rollout' is as good
+    as 'loss'. With a mismatched pair and no block open there is no honest
+    answer, so it raises rather than picking one.
+    """
+    p = _READ_PATH[0]
+    if p is not None:
+        return p
+    if reads_differ():
+        raise RuntimeError(
+            "palimpsa is being read outside any `read_path` block while "
+            f"{READ_ENV['rollout']} and {READ_ENV['loss']} differ, so there "
+            "is no way to tell which operator this reader should use. "
+            "Wrap the traced region in `read_path('rollout')` or "
+            "`read_path('loss')`, or set the two flags to the same value.")
+    return "rollout"
+
+
+def palimpsa_read(path) -> str:
+    """``"exact"`` or ``"fast"`` for the given PATH (``rollout``/``loss``).
+
+    TWO flags, one per path, and every reader must consult THIS function
+    rather than the environment directly. The rollout extend and the
+    rollout's ``base_memory`` are the rollout; ``_extend_sequential``'s
+    budget forms, the loss's ``extend_fold`` and the reference face log-prob
+    are the loss.
+
+    THE CAVEAT THE TWO FLAGS BUY. The PPO ratio is 1 at epoch 0 only while
+    the rollout and the loss read the SAME operator. Give them different
+    ones and the ratio at epoch 0 becomes 1 plus the operator difference --
+    a systematic off-policy bias with no other symptom. That is why the
+    trainer refuses a mismatched pair unless
+    ``ALPHAGRAD_ALLOW_READ_MISMATCH=1`` is set, and why a mismatch is
+    written into the run config and into every plan-log record.
+
+    Both flags default ``fast`` (owner ruling 2026-09-14: "just adopt the
+    fast read"). The policy regression gate's live golden was recorded under
+    fast/fast; the exact operator's golden is archived as
+    ``tests/golden/policy_gate_golden_pre_fastread.json``.
     """
     if _READ_OVERRIDE[0] is not None:
         # A caller inside a `read_override` block, which is the per-face
         # pipeline and nothing else. It does not log and it does not consult
         # the environment: the block exists precisely because that caller
-        # cannot use whatever the environment says.
+        # cannot use whatever the environment says. The path is still
+        # validated, so a call site inside the block cannot get away with
+        # not naming one.
+        _check_path(path)
         return _READ_OVERRIDE[0]
-    mode = os.environ.get("ALPHAGRAD_PALIMPSA_READ", "fast")
-    if mode not in ("exact", "fast"):
-        raise ValueError(
-            "ALPHAGRAD_PALIMPSA_READ must be 'exact' or 'fast', got "
-            f"{mode!r}. It selects the palimpsa READ, and a typo that fell "
-            "back to a default would silently train a different operator "
-            "from the one the launcher asked for.")
+    mode = read_for(path)
     if not _READ_LOGGED[0]:
         _READ_LOGGED[0] = True
-        print("[palimpsa] read=%s" % mode, flush=True)
+        r, l = read_pair()
+        print("[palimpsa] read rollout=%s loss=%s" % (r, l), flush=True)
     return mode
 
 
-def fast_read_enabled() -> bool:
-    return palimpsa_read() == "fast"
+def fast_read_enabled(path) -> bool:
+    return palimpsa_read(path) == "fast"
 
 
 def require_chunk_alignment(chunk, what):
@@ -522,18 +675,18 @@ def require_chunk_alignment(chunk, what):
     The fast read's chunk grid is measured from token 0 of the delta, so any
     OUTER chunking (``ALPHAGRAD_EXTEND_CHUNK``, ``ALPHAGRAD_LOSS_EXTEND_CHUNK``,
     ``ALPHAGRAD_FOLD_CHUNK``) has to start each of its blocks on a multiple of
-    32. Otherwise the rollout and the loss, which chunk differently, would cut
-    the same delta into different chunks -- and since a chunk boundary is
-    where the read stops approximating, that is a real numerical difference,
-    not a reassociation. The PPO ratio would leave 1 at epoch 0.
+    32. Otherwise one path's blocks and the other's cut the same delta into
+    different chunks -- and since a chunk boundary is where the read stops
+    approximating, that is a real numerical difference, not a reassociation.
+    The PPO ratio would leave 1 at epoch 0.
     """
     c = int(chunk)
     if c > 0 and c % CHUNK_C != 0:
         raise ValueError(
             f"{what}={c} is not a multiple of the fast-palimpsa chunk "
-            f"{CHUNK_C}. Under ALPHAGRAD_PALIMPSA_READ=fast every outer "
-            "chunk must start on a multiple of 32 tokens, or the rollout and "
-            "the loss read the same delta with different chunk boundaries.")
+            f"{CHUNK_C}. Under a fast read every outer chunk must start on a "
+            "multiple of 32 tokens, or the rollout and the loss read the "
+            "same delta with different chunk boundaries.")
     return c
 
 

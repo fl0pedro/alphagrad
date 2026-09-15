@@ -51,7 +51,8 @@ from jax import lax
 
 from . import count_vjp as _cvjp
 from alphagrad.transformer.fast_palimpsa_pallas import (
-    CHUNK_C as _FAST_C, fast_read_enabled as _fast_read)
+    CHUNK_C as _FAST_C, READ_ENV as _READ_ENV,
+    fast_read_enabled as _fast_read, read_path as _read_path)
 
 
 def default_chunk() -> int:
@@ -62,7 +63,7 @@ def _use_parallel() -> bool:
     return os.environ.get("ALPHAGRAD_FOLD_PARALLEL", "1") != "0"
 
 
-def _encode_chunk(agent, enc, tk, c_cnt, C, parallel, fast):
+def _encode_chunk(agent, enc, tk, c_cnt, C, parallel, fast, path):
     """One chunk's encode. PARALLEL inside the chunk by default.
 
     UNDER THE FAST READ the parallel/serial choice does not apply and is
@@ -97,10 +98,10 @@ def _encode_chunk(agent, enc, tk, c_cnt, C, parallel, fast):
             # one everywhere else, which is the one thing that must not happen
             # silently, so it raises.
             raise RuntimeError(
-                "ALPHAGRAD_PALIMPSA_READ=fast but this agent has "
+                f"{_READ_ENV[path]}=fast but this agent has "
                 "_extend_parallel and no _extend_fast; the fold would read the "
                 "exact recurrence here and the fast read at every other call "
-                "site.")
+                f"site on the {path} path.")
         # NO PALIMPSA AT ALL. A stub whose only method is `encode_extend` (the
         # fold's own tests, the episode-stream tests, the window-bin tests)
         # carries its own recurrence and has no read to choose. There is
@@ -113,11 +114,33 @@ def _encode_chunk(agent, enc, tk, c_cnt, C, parallel, fast):
             valid = jnp.arange(C, dtype=jnp.int32) < jnp.asarray(c_cnt,
                                                                  jnp.int32)
             return par(enc, tk, valid, c_cnt)
-    return agent.encode_extend(enc, tk, c_cnt, window=C, start=0, chunk=0)
+    # THE PATH IS NAMED BY A BLOCK, NOT BY AN ARGUMENT, and only here. The
+    # agent on this line may be a STUB whose `encode_extend` takes no `path`
+    # keyword at all (it carries its own recurrence and has no read to
+    # choose), so the path cannot be passed as one. A real agent that lands
+    # here -- ALPHAGRAD_FOLD_PARALLEL=0 with the exact read -- reaches
+    # `_extend_sequential`, whose `path` defaults to this block.
+    with _read_path(path):
+        return agent.encode_extend(enc, tk, c_cnt, window=C, start=0, chunk=0)
 
 
-def plan_chunks(window, chunk=None):
+#: `plan_chunks` only -- a caller that wants the SHAPE and serves BOTH paths.
+#: `stream_tail` sizes one row that the rollout writes and the loss reads, so
+#: its plan has to be legal on whichever side actually folds. "any" therefore
+#: takes the STRICTER rule: misaligned is refused when EITHER read is fast.
+#: It is not a path and `palimpsa_read` does not accept it.
+PATH_ANY = "any"
+
+
+def plan_chunks(window, chunk=None, *, path):
     """``(C, nb, padded_len)`` for a window.
+
+    ``path`` is ``"rollout"``, ``"loss"`` or ``"any"`` and is REQUIRED. The
+    alignment rule below applies only under a FAST read, and since owner
+    ruling 2026-09-15 the two paths may read with different operators, so a
+    plan that did not say which side it is for could not tell whether the
+    rule applies. ``"any"`` is for a caller that only wants the shape and
+    serves both sides; it takes the stricter of the two.
 
     EVERY caller with a per-token SIDE array (base_owners ids, face keys)
     must pad it to ``padded_len``, not to ``window``: the fold pads its token
@@ -143,7 +166,13 @@ def plan_chunks(window, chunk=None):
         return C, 0, 0
     C = min(C, W)
     nb = -(-W // C)
-    if _fast_read() and nb > 1 and C % _FAST_C:
+    if path == PATH_ANY:
+        _fast_here = _fast_read("rollout") or _fast_read("loss")
+        _which = "%s / %s" % (_READ_ENV["rollout"], _READ_ENV["loss"])
+    else:
+        _fast_here = _fast_read(path)
+        _which = _READ_ENV[path]
+    if _fast_here and nb > 1 and C % _FAST_C:
         # THE FAST READ'S CHUNK GRID STARTS AT TOKEN 0 OF THE DELTA. With more
         # than one block the blocks begin at 0, C, 2C, ..., so C has to be a
         # multiple of 32. Otherwise the rollout (which blocks by
@@ -159,7 +188,7 @@ def plan_chunks(window, chunk=None):
         raise ValueError(
             f"ALPHAGRAD_FOLD_CHUNK={C} is not a multiple of the "
             f"fast-palimpsa chunk {_FAST_C} and the window {W} needs {nb} "
-            "blocks. Under ALPHAGRAD_PALIMPSA_READ=fast every block must "
+            f"blocks. Under {_which}=fast every block must "
             "start on a multiple of 32 tokens, or the rollout and the loss "
             "read the same delta with different chunk boundaries.")
     return C, nb, nb * C
@@ -167,8 +196,15 @@ def plan_chunks(window, chunk=None):
 
 def extend_fold(agent, carry, tokens, count, *, window, chunk=None,
                 init_acc, fold_fn, budget=None, remat=None, parallel=None,
-                start=None, row=None):
+                start=None, row=None, path):
     """Extend ``carry`` over ``window`` tokens, folding rows into an acc.
+
+    ``path`` is ``"rollout"`` or ``"loss"`` and is REQUIRED. The rollout and
+    the loss may read palimpsa with different operators (owner ruling
+    2026-09-15), so a fold that did not say which side it is on could not
+    pick one. The rollout's `advance` and the rollout's `base_memory` are
+    the rollout; the loss's `_advance_k`, the loss's own `base_memory` and
+    the face replay are the loss.
 
     ``fold_fn(acc, rows_c, valid_c, offset) -> acc`` sees one chunk at a time
     (the ``eqns_c`` argument went with the equation-id stream). ``offset`` is
@@ -200,7 +236,7 @@ def extend_fold(agent, carry, tokens, count, *, window, chunk=None,
     short row returns shifted tokens in silence. ``episode_stream.
     stream_tail`` sizes it; this is the reason that function exists.
     """
-    C, nb, padded = plan_chunks(window, chunk)
+    C, nb, padded = plan_chunks(window, chunk, path=path)
     W = int(window)
     if start is None and row is None:
         pad = padded - W
@@ -250,7 +286,7 @@ def extend_fold(agent, carry, tokens, count, *, window, chunk=None,
     # rebuilds a chunk's VJP, and that happens LATER than this trace -- after
     # a `read_override` block has already closed. Capturing the answer now
     # means the backward cannot read a different operator from the forward.
-    _fast = _fast_read()
+    _fast = _fast_read(path)
 
     if budget is None:
         nb_live = nb
@@ -276,7 +312,7 @@ def extend_fold(agent, carry, tokens, count, *, window, chunk=None,
             # therefore already free.
             tk_c = _chunk_tokens(off) if tk is None else tk
             enc2, rows_c, valid_c = _encode_chunk(
-                agent, enc, tk_c, c_cnt, C, par, _fast)
+                agent, enc, tk_c, c_cnt, C, par, _fast, path)
             return (enc2, fold_fn(acc, rows_c, valid_c, off))
 
         return _run

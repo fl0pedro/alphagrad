@@ -41,7 +41,7 @@ from alphagrad.approx import vertex_memory as vmem
 @pytest.fixture(autouse=True)
 def _exact_read():
     """THIS MODULE PINS A PROPERTY OF THE EXACT OPERATOR, so it forces
-    ``ALPHAGRAD_PALIMPSA_READ=exact`` even though the shipped default is now
+    ``ALPHAGRAD_PALIMPSA_READ_ROLLOUT/_LOSS=exact`` even though the shipped default is now
     ``fast``.
 
     The claim is that a chunked extend split at an ARBITRARY token (100 of 300,
@@ -53,7 +53,8 @@ def _exact_read():
     ``tests/fast_read_extend_parity_test.py``.
     """
     with pytest.MonkeyPatch.context() as mp:
-        mp.setenv("ALPHAGRAD_PALIMPSA_READ", "exact")
+        mp.setenv("ALPHAGRAD_PALIMPSA_READ_ROLLOUT", "exact")
+        mp.setenv("ALPHAGRAD_PALIMPSA_READ_LOSS", "exact")
         yield
 
 

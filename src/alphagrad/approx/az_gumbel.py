@@ -655,7 +655,7 @@ def _base_init(agent):
     """``(enc_carry, base_sums, base_counts)`` -- carry + base scatter."""
     return _cs.init_carry(agent, BASE_TOK, BASE_N,
                           window=BASE_W, total_v=TOTAL_V, embd_dim=EMBD,
-                          base_owners=BASE_OWN)
+                          base_owners=BASE_OWN, path="rollout")
 
 
 BASE_MEM = None   # rebound to (base_sums, base_counts) once `agent` exists
@@ -668,7 +668,7 @@ def _zero_mem():
 @eqx.filter_jit
 def _carry_advance(agent, enc, vs, vc, dtok, dcount, owner):
     return _cs.advance(agent, enc, vs, vc, dtok, dcount, owner,
-                       window=MAX_DELTA_TOKENS)
+                       window=MAX_DELTA_TOKENS, path="rollout")
 
 
 @eqx.filter_jit
@@ -1702,7 +1702,7 @@ def loss_fn(agent, enc_M, enc_I, enc_pos, vmem_s, vmem_c,
     # of exactly zero. Computed ONCE per loss call, outside the vmap below.
     _base_mem = _cs.base_memory(agent, BASE_TOK, BASE_N,
                                 window=BASE_W, total_v=TOTAL_V, embd_dim=EMBD,
-                                base_owners=BASE_OWN)
+                                base_owners=BASE_OWN, path="loss")
 
     def per(M, I, pos, vs, vc, dt, dc, ow, vsl,
             la, lam, pi, vt, vm, s_li, s_vidx, s_w, s_fp, s_fc, s_fv,
@@ -1711,7 +1711,8 @@ def loss_fn(agent, enc_M, enc_I, enc_pos, vmem_s, vmem_c,
         # chunk=0: AZ's loss is reverse-differentiated through this extend
         # too, and the dynamic trip count is a lax.while_loop.
         c2, vs2, vc2 = _cs.advance(agent, carry, vs, vc, dt, dc, ow,
-                                   window=MAX_DELTA_TOKENS, chunk=0)
+                                   window=MAX_DELTA_TOKENS, chunk=0,
+                                   path="loss")
         vlog, ctx, v3 = _cs.heads(agent, vs2, vc2, base_mem=_base_mem,
                                   preference=None)
         lg = vlog[la]
