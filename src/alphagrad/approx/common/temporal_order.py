@@ -48,6 +48,13 @@ real-time recurrent learning respectively do. This is the right number only
 while the untagged block is downstream of the steps, which is a property of
 every target in ``snn_shd.TEMPORAL_TARGETS``; a future target with a
 once-computed input block would need its own tag, not this default.
+
+MEASURED on the SHD pair: that base group is EMPTY. The only untagged equation
+is the final ``loss / N``, which is the graph's OUTPUT and therefore not an
+eliminable vertex, so the base group has size 0 and never appears in a plan.
+An empty group is never the active one and never blocks the group after it, so
+the rule above costs nothing here and stays correct for a target that does put
+eliminable work outside the loop.
 """
 
 from __future__ import annotations
@@ -234,5 +241,6 @@ def describe(constraint: "OrderConstraint | None", table, spatial: str,
     return (f"order: spatial {spatial}, temporal {temporal}; "
             f"{constraint.n_groups} groups "
             f"({constraint.n_groups - 1} step copies of "
-            f"{int(sizes[0])} vertices + a base of {int(sizes[-1])}), "
+            f"{int(sizes[0])} eliminable vertices + a base of "
+            f"{int(sizes[-1])}), {int(sizes.sum())} vertices in all; "
             f"partial order filled in by the policy")

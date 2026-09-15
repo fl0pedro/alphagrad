@@ -150,25 +150,42 @@ def test_the_target_consumes_the_real_recording(shd_cache):
 # 2. the gradient window
 # ---------------------------------------------------------------------------
 
-def test_the_window_sizes_the_graph():
-    """base + N * per-step, measured on the traced equation count."""
+def _traced_tag_counts(window):
     from alphagrad.approx.common.examples import get_args, get_fn
     from alphagrad.approx.common.temporal_order import BASE_STEP, step_tags
     from graphax import inline_call_primitives
 
-    counts = {}
-    for n in (1, 2, 5):
-        xs = get_args("ADALIF_SNN_SHD", jax.random.PRNGKey(0), dataset=None,
-                      grad_window=n)
-        cj = jax.make_jaxpr(get_fn("ADALIF_SNN_SHD"))(*xs)
-        jx, _ = inline_call_primitives(cj.jaxpr, cj.literals)
-        tags = step_tags(jx)
-        counts[n] = (int((tags == BASE_STEP).sum()), len(tags))
-    base = counts[1][0]
-    per_step = counts[1][1] - base
+    xs = get_args("ADALIF_SNN_SHD", jax.random.PRNGKey(0), dataset=None,
+                  grad_window=window)
+    cj = jax.make_jaxpr(get_fn("ADALIF_SNN_SHD"))(*xs)
+    jx, _ = inline_call_primitives(cj.jaxpr, cj.literals)
+    tags = step_tags(jx)
+    return int((tags == BASE_STEP).sum()), len(tags)
+
+
+def test_the_window_sizes_the_graph():
+    """base + N * per-step, measured on the traced equation count.
+
+    MEASURED on ADALIF_SNN_SHD: base 1, per-step 47, so N = 2 is 95 equations,
+    N = 3 is 142 and N = 5 is 236. The base is the final ``loss / N``.
+    """
+    counts = {n: _traced_tag_counts(n) for n in (2, 3, 5)}
+    base = counts[2][0]
+    per_step = (counts[2][1] - base) // 2
+    assert (base, per_step) == (1, 47), counts
     for n, (b, total) in counts.items():
         assert b == base, counts
         assert total == base + n * per_step, counts
+
+
+def test_window_one_is_one_equation_smaller_than_the_block_predicts():
+    """RECORDED, not a defect. At N = 1 the window array is ``(1, 700)`` and
+    ``S_in_seq[0]`` is the WHOLE leading axis, so JAX emits the squeeze without
+    the slice in front of it: 46 equations in that step instead of 47. Every
+    other window traces the uniform block. Pinned so that a change to the
+    indexing shows up here rather than as an off-by-one in a step tag."""
+    assert _traced_tag_counts(1) == (1, 47)
+    assert _traced_tag_counts(2) == (1, 95)
 
 
 def test_the_window_shortens_the_differentiated_window_only():

@@ -117,6 +117,23 @@ def test_the_graph_is_base_plus_window_times_per_step(adalif_shd):
     assert len(tags) == base + WINDOW * per_step
 
 
+def test_the_base_block_holds_no_eliminable_vertex_on_this_target(adalif_shd):
+    """MEASURED, and the reason the two direction tests below look the way
+    they do. The detached pre-window forward is not in the traced graph at all
+    -- it runs in the args builder -- so the only untagged equation of an SHD
+    target is the final ``loss / N``, which is the OUTPUT vertex and therefore
+    not eliminable. The base group is real and correctly placed (one past the
+    last step), and on this target it is EMPTY. The mask handles an empty group
+    by never making it active, so it neither appears in a plan nor blocks one.
+    """
+    env, closed = adalif_shd
+    _, oc = build_order_constraint("free", "reverse", env, "ADALIF_SNN_SHD")
+    sizes = np.asarray(oc.group_size)
+    assert sizes.shape == (WINDOW + 1,)
+    assert int(sizes[-1]) == 0, "the base group is no longer empty"
+    assert len(set(int(s) for s in sizes[:-1])) == 1, sizes
+
+
 # ---------------------------------------------------------------------------
 # 2. every combination is a legal complete plan, and its gradient is jax.grad
 # ---------------------------------------------------------------------------
@@ -167,11 +184,16 @@ def test_temporal_reverse_eliminates_step_copies_latest_first(adalif_shd,
     env, closed = adalif_shd
     order, oc = _walk(env, closed, spatial, "reverse")
     groups = [int(np.asarray(oc.group_of)[v - 1]) for v in order]
-    # The base group is numbered one past the last step, so reverse takes it
-    # first; after it the copies run WINDOW-1, ..., 0.
+    # Later copies first: the group index never rises along the plan, the LAST
+    # copy opens it and the FIRST copy closes it. (The base group is numbered
+    # one past the last step and would come before them, but it holds no
+    # eliminable vertex on this target -- see the test above.)
     assert groups == sorted(groups, reverse=True), groups
-    assert groups[0] == WINDOW, "the base block is not eliminated first"
+    assert groups[0] == WINDOW - 1, "the last step copy is not eliminated first"
     assert groups[-1] == 0, "the earliest step copy is not eliminated last"
+    # Every copy is finished before the next one starts.
+    starts = [groups.index(g) for g in range(WINDOW)]
+    assert starts == sorted(starts, reverse=True), starts
 
 
 @pytest.mark.parametrize("spatial", FIXED_ORDER_CHOICES)
@@ -182,7 +204,9 @@ def test_temporal_forward_eliminates_step_copies_earliest_first(adalif_shd,
     groups = [int(np.asarray(oc.group_of)[v - 1]) for v in order]
     assert groups == sorted(groups), groups
     assert groups[0] == 0, "the earliest step copy is not eliminated first"
-    assert groups[-1] == WINDOW, "the base block is not eliminated last"
+    assert groups[-1] == WINDOW - 1, "the last step copy is not eliminated last"
+    starts = [groups.index(g) for g in range(WINDOW)]
+    assert starts == sorted(starts), starts
 
 
 def test_free_temporal_interleaves_the_copies_under_a_spatial_pin(adalif_shd):
@@ -200,8 +224,9 @@ def test_free_temporal_interleaves_the_copies_under_a_spatial_pin(adalif_shd):
             step_count=jnp.asarray(0, jnp.int32))
     a = np.asarray(M.vertex_avail_at_step(st, static, total_v, len(valid),
                                           order_constraint=oc))
-    # One head per group: WINDOW step copies plus the base.
-    assert int(a.sum()) == WINDOW + 1, int(a.sum())
+    # One head per NON-EMPTY group: the WINDOW step copies. (The base group is
+    # empty on this target, so it offers no head.)
+    assert int(a.sum()) == WINDOW, int(a.sum())
 
 
 def test_both_pinned_is_a_total_order(adalif_shd):

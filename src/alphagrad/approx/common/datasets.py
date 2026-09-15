@@ -325,8 +325,13 @@ def _shd_binned(subset: str) -> tuple[np.ndarray, np.ndarray]:
             return z["x"], z["y"]
     raw = _download_shd(cache, subset)
     x, y = _bin_shd(raw)
-    tmp = npz.with_suffix(".npz.part")
-    np.savez(tmp, x=x, y=y)
+    # Written through an OPEN HANDLE, then renamed: np.savez appends ".npz" to
+    # a path that does not already end in it, so passing a ".part" NAME wrote
+    # "<...>.npz.part.npz" and the rename then failed on a file that was never
+    # created. The rename is what makes a half-written cache impossible.
+    tmp = cache / (npz.name + ".part")
+    with open(tmp, "wb") as fh:
+        np.savez(fh, x=x, y=y)
     tmp.replace(npz)
     return x, y
 
