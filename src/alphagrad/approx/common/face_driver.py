@@ -116,6 +116,23 @@ class EdgeSlotTable:
         return out
 
 
+def _hk_kw(live_faces, env, frh, fsh, n):
+    """``{"hist_key": ...}`` for this environment's prefix, or ``{}``.
+
+    EMPTY IS ALWAYS CORRECT. The stream then builds the dense key itself and
+    gets the same answer, slowly -- which is what a stand-in stream in a test,
+    a stream from a module that predates the chain, and
+    `ALPHAGRAD_FACE_KEY_CHAIN=0` all want. So the fast key is passed only when
+    there is something to pass and somebody to pass it to, and no caller has
+    to know it exists.
+    """
+    fn = getattr(live_faces, "hist_key", None)
+    if fn is None:
+        return {}
+    k = fn(env, frh, fsh, n)
+    return {} if k is None else {"hist_key": k}
+
+
 def _default_window():
     from alphagrad.approx.env import MAX_DELTA_TOKENS
     return int(MAX_DELTA_TOKENS)
@@ -274,9 +291,9 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None,
                 # `LiveFaceStream.hist_key`: the dense key it replaces is
                 # 6.5 megabytes of mostly padding, and it was materialised
                 # and hashed about five times per environment per step.
-                _hk1 = live_faces.hist_key(
-                    0, np.asarray(face_hist), np.asarray(skip_hist),
-                    int(np.asarray(step_count)))
+                _hk1 = _hk_kw(
+                    live_faces, 0, np.asarray(face_hist),
+                    np.asarray(skip_hist), int(np.asarray(step_count)))
                 if edge_table is not None:
                     _sc1 = int(np.asarray(step_count))
                     (tok, cnt, _nf, ends, ekey, cvx, head,
@@ -284,7 +301,7 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None,
                         order, spec_hist, _sc1,
                         int(np.asarray(vertex_idx)) + 1, vertex_specs,
                         face_rows, face_skips, int(np.asarray(f)),
-                        face_hist, skip_hist, hist_key=_hk1,
+                        face_hist, skip_hist, **_hk1,
                     )
                     _dist("face_chunk_len", cnt)
                     tok, cnt = _fit(tok, cnt)
@@ -298,7 +315,7 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None,
                     order, spec_hist, int(np.asarray(step_count)),
                     int(np.asarray(vertex_idx)) + 1, vertex_specs,
                     face_rows, face_skips, int(np.asarray(f)),
-                    face_hist, skip_hist, hist_key=_hk1,
+                    face_hist, skip_hist, **_hk1,
                 )
                 _dist("face_chunk_len", cnt)
                 tok, cnt = _fit(tok, cnt)
@@ -328,13 +345,13 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None,
             _fh, _kh = np.asarray(face_hist), np.asarray(skip_hist)
             _ff = np.asarray(f)
             for i in range(B):
-                _hk = live_faces.hist_key(i, _fh[i], _kh[i], int(_sc[i]))
+                _hk = _hk_kw(live_faces, i, _fh[i], _kh[i], int(_sc[i]))
                 if edge_table is not None:
                     (tok, cnt, _nf, end, ekey, cvx, head,
                      wrok) = live_faces.chunk_ex(
                         _order[i], _sh[i], int(_sc[i]), int(_vi[i]) + 1,
                         _vs[i], _fr[i], _fs[i], int(_ff[i]),
-                        _fh[i], _kh[i], hist_key=_hk,
+                        _fh[i], _kh[i], **_hk,
                     )
                     einf[i] = _einfo_host(i, int(_sc[i]), ekey, cvx,
                                           head, wrok)
@@ -342,7 +359,7 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None,
                     tok, cnt, _nf, end, head = live_faces.chunk(
                         _order[i], _sh[i], int(_sc[i]), int(_vi[i]) + 1,
                         _vs[i], _fr[i], _fs[i], int(_ff[i]),
-                        _fh[i], _kh[i], hist_key=_hk,
+                        _fh[i], _kh[i], **_hk,
                     )
                 _tk_i, _ct_i = _fit(tok, cnt)
                 toks[i], cnts[i] = _tk_i, np.int32(_ct_i)
@@ -391,13 +408,13 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None,
         try:
             _order = np.asarray(order)
             if _order.ndim == 1:
-                _hk1 = live_faces.hist_key(
-                    0, np.asarray(face_hist), np.asarray(skip_hist),
-                    int(np.asarray(step_count)))
+                _hk1 = _hk_kw(
+                    live_faces, 0, np.asarray(face_hist),
+                    np.asarray(skip_hist), int(np.asarray(step_count)))
                 _nf1 = int(live_faces.n_faces(
                     order, spec_hist, int(np.asarray(step_count)),
                     int(np.asarray(vertex_idx)) + 1, face_hist, skip_hist,
-                    hist_key=_hk1))
+                    **_hk1))
                 _dist("faces_per_vertex", _nf1)
                 return np.int32(_nf1)
             # batched: one dispatch per vertex step (see _live_face_host)
@@ -407,8 +424,8 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None,
             _nfs = [int(live_faces.n_faces(
                         _order[i], _sh[i], int(_sc[i]), int(_vi[i]) + 1,
                         _fh[i], _kh[i],
-                        hist_key=live_faces.hist_key(
-                            i, _fh[i], _kh[i], int(_sc[i]))))
+                        **_hk_kw(live_faces, i, _fh[i], _kh[i],
+                                 int(_sc[i]))))
                     for i in range(_order.shape[0])]
             for _n in _nfs:
                 _dist("faces_per_vertex", _n)
@@ -468,9 +485,9 @@ def make_face_sizes_callback(live_faces, *, max_faces, max_axes,
                 sz, qt, _n = live_faces.face_dim_sizes(
                     order, spec_hist, int(np.asarray(step_count)),
                     int(np.asarray(vertex_idx)) + 1, face_hist, skip_hist,
-                    hist_key=live_faces.hist_key(
-                        0, np.asarray(face_hist), np.asarray(skip_hist),
-                        int(np.asarray(step_count))))
+                    **_hk_kw(live_faces, 0, np.asarray(face_hist),
+                             np.asarray(skip_hist),
+                             int(np.asarray(step_count))))
                 return (np.asarray(sz, np.int32)[:F, :N],
                         np.asarray(qt, np.float32)[:F])
             B = _order.shape[0]
@@ -483,8 +500,8 @@ def make_face_sizes_callback(live_faces, *, max_faces, max_axes,
                 sz, qt, _n = live_faces.face_dim_sizes(
                     _order[i], _sh[i], int(_sc[i]), int(_vi[i]) + 1,
                     _fh[i], _kh[i],
-                    hist_key=live_faces.hist_key(
-                        i, _fh[i], _kh[i], int(_sc[i])))
+                    **_hk_kw(live_faces, i, _fh[i], _kh[i],
+                             int(_sc[i])))
                 szs[i] = np.asarray(sz, np.int32)[:F, :N]
                 qts[i] = np.asarray(qt, np.float32)[:F]
             return szs, qts
@@ -610,9 +627,8 @@ def make_face_slot_legality_callback(live_faces, *, max_faces, max_axes,
         sz, qt, pr, cp, no, _n = live_faces.face_slot_legality(
             order, spec_hist, int(np.asarray(step_count)),
             int(np.asarray(vertex_idx)) + 1, face_hist, skip_hist,
-            hist_key=live_faces.hist_key(
-                env, np.asarray(face_hist), np.asarray(skip_hist),
-                int(np.asarray(step_count))))
+            **_hk_kw(live_faces, env, np.asarray(face_hist),
+                     np.asarray(skip_hist), int(np.asarray(step_count))))
         return (np.asarray(sz, np.int32)[:F, :S, :N],
                 np.asarray(qt, np.float32)[:F, :S, :NUM_FACE_QUANT_DTYPES],
                 np.asarray(pr, np.float32)[:F, :S, :N, :N],
@@ -754,9 +770,8 @@ def make_face_vertex_decide_callback(live_faces, *, max_faces, max_axes,
             lambda f, s, L: draw(f, s, L, *args),
             skips=np.asarray(skips),
             face_rows_hist=face_hist, face_skips_hist=skip_hist,
-            hist_key=live_faces.hist_key(
-                env, np.asarray(face_hist), np.asarray(skip_hist),
-                int(np.asarray(step_count))))
+            **_hk_kw(live_faces, env, np.asarray(face_hist),
+                     np.asarray(skip_hist), int(np.asarray(step_count))))
         return (np.asarray(dec.rows, np.int32)[:F, :S, :3],
                 np.asarray(dec.sizes, np.int32)[:F, :S, :N],
                 np.asarray(dec.quant, np.float32)[:F, :S, :NUM_FACE_QUANT_DTYPES],
