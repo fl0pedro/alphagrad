@@ -23,9 +23,11 @@ WHAT THE TWO RUNS ARE.
 
 Episodes 2 and 3 must agree. The first two episodes need no comparison here:
 they are the same process's, and that the process is reproducible at all is
-what `test_the_configuration_is_deterministic_at_all` proves separately. A
-comparison that did not separate those two questions could not say which of
-them had failed.
+what `test_checkpointing_off_and_on_give_the_same_short_run` proves
+separately. A comparison that did not separate those two questions could not
+say which of them had failed. The 50-against-25-plus-25 form the owner asked
+for is the same property over two separate processes and is run on the
+cluster; see the report of 2026-09-15.
 
 THE CONFIGURATION is the canonical deterministic CPU one from `tools/smoke.sh`
 with the policy gate's environment pins: `--cmp-type flops --mem-type
@@ -84,12 +86,17 @@ _ENV = {
 }
 
 
-def _run(work_dir: Path, tag: str, *extra: str) -> Path:
+def _run(work_dir: Path, tag: str, *extra: str, name: str = "eqrun") -> Path:
     """One trainer run. Returns ITS OWN directory, where its checkpoints are.
 
     Every run gets a directory of its own because with `--wandb disabled` the
     run directory is the working directory, and two runs sharing one would
     prune each other's checkpoints. Under wandb each run has its own already.
+
+    `--name` is the SAME for every run of one comparison, and `tag` names only
+    the episode dumps and the directory. A resume checks the whole argument
+    namespace, `--name` included, so two legs of one run that disagreed about
+    it would be refused -- correctly, and this file's first version was.
     """
     cwd = work_dir / f"dir_{tag}"
     cwd.mkdir()
@@ -97,7 +104,7 @@ def _run(work_dir: Path, tag: str, *extra: str) -> Path:
     env.update(_ENV)
     env["ALPHAGRAD_EQ_DUMP"] = str(work_dir / tag)
     r = subprocess.run(
-        [sys.executable, str(_TRAINER), *_COMMON, "--name", tag, *extra],
+        [sys.executable, str(_TRAINER), *_COMMON, "--name", name, *extra],
         cwd=str(cwd), env=env, capture_output=True, text=True,
         timeout=5400,
     )
@@ -155,21 +162,34 @@ def _checkpoint(work_dir: Path, episode: int) -> Path:
 
 
 @pytest.mark.slow
-def test_the_configuration_is_deterministic_at_all(tmp_path):
-    """Two identical runs must agree, or nothing else here means anything.
+def test_checkpointing_off_and_on_give_the_same_short_run(tmp_path):
+    """TWO things at once, and they cost one pair of runs.
 
-    This is the control. Without it a mismatch in the resume test could not
-    be attributed: it might be the resume, and it might be that the trainer
-    is not reproducible under this configuration in the first place.
+    First, the control: two runs of the same command must agree, or nothing
+    else in this file means anything. A mismatch in the resume test could
+    otherwise not be attributed -- it might be the resume, and it might be
+    that the trainer is not reproducible under this configuration at all.
+
+    Second, the owner's condition on the default: `--checkpoint-every 50` on
+    a run SHORTER than 50 episodes must be identical to `--checkpoint-every
+    0`. The only checkpoint such a run takes is the one at the end, which is
+    after the last episode, so no drain ever happens inside the loop and the
+    schedule is untouched. This is the pair that proves it.
     """
     work = tmp_path
-    _run(work, "ctl_a", "--episodes", "2", "--checkpoint-every", "0")
-    _run(work, "ctl_b", "--episodes", "2", "--checkpoint-every", "0")
+    _run(work, "ctl_off", "--episodes", "2", "--checkpoint-every", "0")
+    _run(work, "ctl_default", "--episodes", "2", "--checkpoint-every", "50")
     problems = []
     for ep in (0, 1):
-        problems += _diff(_dump(work, "ctl_a", ep),
-                          _dump(work, "ctl_b", ep), ep)
-    assert not problems, "two identical runs disagreed:\n" + "\n".join(problems)
+        problems += _diff(_dump(work, "ctl_off", ep),
+                          _dump(work, "ctl_default", ep), ep)
+    assert not problems, (
+        "checkpointing off and at its default disagreed on a 2-episode run:\n"
+        + "\n".join(problems))
+    # And the default did write its end-of-run checkpoint.
+    _checkpoint(work / "dir_ctl_default", 2)
+    assert not (work / "dir_ctl_off").joinpath(
+        "ppo_ckpt_ep000000002").exists()
 
 
 @pytest.mark.slow
