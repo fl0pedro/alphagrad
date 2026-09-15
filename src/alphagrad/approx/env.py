@@ -1787,6 +1787,28 @@ def current_env_slot() -> int:
 
 
 # ---------------------------------------------------------------------------
+# THE ROLLOUT SHARDS' MEASUREMENT RENDEZVOUS (--rollout-shards).
+#
+# With one shard per GPU, each shard's step callback would make its own pool
+# call, and `CpuApproxPool._pick()` sentinels every slot it cannot get an
+# actor for -- seven of eight shards would measure nothing. The rendezvous
+# gathers the shards' rows into ONE call instead. It is a process-wide object
+# because the callback closure is built at TRACE time, inside a jit, and
+# `tokenize` has nowhere else to find it. `None` = no shards.
+_SHARD_GATHER = [None]
+
+
+def set_shard_gather(gather) -> None:
+    """Install (or, with None, remove) the rollout shards' rendezvous."""
+    _SHARD_GATHER[0] = gather
+
+
+def shard_gather():
+    """The installed rendezvous, or None."""
+    return _SHARD_GATHER[0]
+
+
+# ---------------------------------------------------------------------------
 # THE PIPELINED TERMINAL MEASUREMENT (owner ruling 2026-09-14).
 #
 # The terminal rewards of episode e are read by exactly one thing, the PPO
@@ -8784,6 +8806,15 @@ class VertexEliminationEnv:
     # pytree child.
     _remote_pool: Any = None
     _remote_timeout_s: float = 60.0
+    # WHICH ROLLOUT SHARD THIS ENV BELONGS TO (--rollout-shards). Data
+    # parallelism over environments gives every GPU its own block of them and
+    # every shard its own copy of this env, on its own device. The pair rides
+    # in ``tree_flatten``'s aux data, so two shards are two different static
+    # arguments and each gets its own trace -- which is what lets the step
+    # callback of shard `i` be the one the rendezvous knows as `i`.
+    # ``(0, 1)`` is a run without shards and wraps nothing at all.
+    rollout_shard: int = 0
+    rollout_shards: int = 1
 
     def __init__(
         self,
@@ -8797,6 +8828,8 @@ class VertexEliminationEnv:
         axis_valid_static: Array | None = None,
         remote_pool: Any = None,
         remote_timeout_s: float = 60.0,
+        rollout_shard: int = 0,
+        rollout_shards: int = 1,
     ):
         object.__setattr__(self, "config", config)
         object.__setattr__(self, "args", tuple(args))
@@ -8804,6 +8837,12 @@ class VertexEliminationEnv:
         object.__setattr__(self, "eval_args_samples", eval_args_samples)
         object.__setattr__(self, "_remote_pool", remote_pool)
         object.__setattr__(self, "_remote_timeout_s", float(remote_timeout_s))
+        if not (0 <= int(rollout_shard) < int(rollout_shards)):
+            raise ValueError(
+                f"rollout_shard {rollout_shard} is not in "
+                f"0..{int(rollout_shards) - 1}")
+        object.__setattr__(self, "rollout_shard", int(rollout_shard))
+        object.__setattr__(self, "rollout_shards", int(rollout_shards))
 
         if num_envs is None:
             num_envs = jax.local_device_count()
@@ -8872,6 +8911,8 @@ class VertexEliminationEnv:
             axis_valid_static=self.axis_valid_static,
             remote_pool=self._remote_pool,
             remote_timeout_s=self._remote_timeout_s,
+            rollout_shard=self.rollout_shard,
+            rollout_shards=self.rollout_shards,
         )
 
     @classmethod
@@ -9015,6 +9056,7 @@ class VertexEliminationEnv:
         aux_data = (
             self.config, self.valid_vertices, self.num_envs,
             self._remote_pool, self._remote_timeout_s,
+            self.rollout_shard, self.rollout_shards,
         )
         return children, aux_data
 
@@ -9024,15 +9066,23 @@ class VertexEliminationEnv:
             children
         )
         # Back-compat: aux_data tuples produced before the remote-pool
-        # fields were added are 3-tuples; new ones are 5-tuples.
+        # fields were added are 3-tuples; the remote-pool ones are 5-tuples;
+        # the rollout-shard ones are 7.
+        rollout_shard, rollout_shards = 0, 1
         if len(aux_data) == 3:
             config, valid_vertices, num_envs = aux_data
             remote_pool = None
             remote_timeout_s = 60.0
+        elif len(aux_data) == 5:
+            (
+                config, valid_vertices, num_envs,
+                remote_pool, remote_timeout_s,
+            ) = aux_data
         else:
             (
                 config, valid_vertices, num_envs,
                 remote_pool, remote_timeout_s,
+                rollout_shard, rollout_shards,
             ) = aux_data
         return cls(
             config, args, consts, valid_vertices, num_envs, eval_args_samples,
@@ -9040,7 +9090,63 @@ class VertexEliminationEnv:
             axis_valid_static=axis_valid_static,
             remote_pool=remote_pool,
             remote_timeout_s=remote_timeout_s,
+            rollout_shard=rollout_shard,
+            rollout_shards=rollout_shards,
         )
+
+    def with_rollout_shard(self, shard: int, n_shards: int):
+        """A copy of this env as rollout shard `shard` of `n_shards`.
+
+        Everything bound on the env travels, exactly as in
+        :meth:`with_delta_window`: losing the measurement pool here would move
+        every measurement back into the driver in silence.
+        """
+        if (int(shard) == int(self.rollout_shard)
+                and int(n_shards) == int(self.rollout_shards)):
+            return self
+        return type(self)(
+            self.config,
+            self.args,
+            self.consts,
+            self.valid_vertices,
+            self.num_envs,
+            self.eval_args_samples,
+            axis_state_static=self.axis_state_static,
+            axis_valid_static=self.axis_valid_static,
+            remote_pool=self._remote_pool,
+            remote_timeout_s=self._remote_timeout_s,
+            rollout_shard=int(shard),
+            rollout_shards=int(n_shards),
+        )
+
+    def _shard_wrap(self, fn):
+        """The BATCHED step callback as rollout shard `self.rollout_shard`.
+
+        Without shards (`rollout_shards == 1`) this is the identity and the
+        trace is the one a run without the flag produced. With shards it is
+        the rendezvous of :mod:`common.rollout_shards`: the N shards deposit
+        their `E` environment rows, ONE of them calls `fn` once over all
+        `N*E` rows in global environment order, and each takes its own slice
+        back. The pool therefore still sees exactly one `evaluate_batch` per
+        step, and the terminal step still makes one submission under one
+        ticket.
+        """
+        if int(self.rollout_shards) <= 1:
+            return fn
+        g = shard_gather()
+        if g is None:
+            raise RuntimeError(
+                f"this env is rollout shard {self.rollout_shard} of "
+                f"{self.rollout_shards} but no measurement rendezvous is "
+                f"installed. `ppo.main` calls `env.set_shard_gather(...)` "
+                f"before it traces a shard; a caller that shards the rollout "
+                f"itself has to do the same.")
+        if int(g.n) != int(self.rollout_shards):
+            raise RuntimeError(
+                f"the installed measurement rendezvous is for {g.n} shards "
+                f"and this env is shard {self.rollout_shard} of "
+                f"{self.rollout_shards}.")
+        return g.wrap(int(self.rollout_shard), fn)
 
     def tokenize(self, init: bool = False, batched: bool = False):
         """Build the host-side function passed into ``io_callback``.
@@ -9072,8 +9178,10 @@ class VertexEliminationEnv:
                     face_joins=face_joins)
             # Only the STEP callback runs under vmap; reset() is called once,
             # unbatched, and must not be wrapped.
-            return (_batched_host(_fn, n_out=self.wire_arity)
-                    if (batched and _BATCHED_CALLBACK) else _fn)
+            if batched and _BATCHED_CALLBACK:
+                return self._shard_wrap(
+                    _batched_host(_fn, n_out=self.wire_arity))
+            return _fn
 
         # The pool's ``evaluate`` signature is
         # ``(order, specs, step, eval_samples, *, init)`` — but
@@ -9316,7 +9424,7 @@ class VertexEliminationEnv:
                 _trace("cb_batched.exit")
                 return (tk, ei, rw) if _eqn else (tk, rw)
 
-            return _remote_callback_batched
+            return self._shard_wrap(_remote_callback_batched)
 
         def _remote_callback(args, consts, order, specs, face_specs,
                              face_skips, face_joins, step, *eval_samples):

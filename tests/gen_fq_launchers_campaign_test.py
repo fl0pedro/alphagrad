@@ -195,6 +195,10 @@ def test_required_flags_are_all_defined_where_the_preflight_greps(
     for f in ("--approx-profile", "--cost-form", "--quality-floor",
               "--mem-channel", "--gate-winners-table", "--fixed-order",
               "--ray-measure", "--ray-measure-timeout", "--measure-pipeline",
+              # DATA PARALLELISM OVER ENVIRONMENTS (owner ruling 2026-09-15):
+              # an arm that inherited the single-device default would roll out
+              # an eighth of the environments its --num-envs implies.
+              "--rollout-shards",
               "--per-face-masks",
               "--face-none-bias", "--approx-add", "--terminal-rewards-only"):
         assert f in gen.REQUIRED_FLAGS, f
@@ -249,6 +253,10 @@ def test_every_campaign_arm_carries_the_required_flags(gen, campaign):
                      f" --ray-measure-timeout {gen.CAMPAIGN_RAY_MEASURE_TIMEOUT} ",
                      # PIPELINE THE MEASUREMENT (owner ruling 2026-09-14).
                      f" --measure-pipeline {gen.CAMPAIGN_MEASURE_PIPELINE} ",
+                     # ONE ROLLOUT SHARD PER GPU (owner ruling 2026-09-15),
+                     # and --num-envs is PER SHARD from that ruling on.
+                     f" --rollout-shards {gen.CAMPAIGN_ROLLOUT_SHARDS} ",
+                     " --num-envs 16 ",
                      " --plan-log auto ", " --episodes 250 ",
                      " --measure-toolchain-gate abort ",
                      " --reduce-axis-space physical ",
@@ -894,6 +902,11 @@ def test_ppo_argparse_accepts_every_campaign_command_line(gen, campaign):
         # 2026-09-14): the terminal step submits and the driver waits for the
         # rewards with the previous episode's update already on the GPU.
         assert ns.measure_pipeline == 1, a["name"]
+        # ONE ROLLOUT SHARD PER GPU THE JOB HOLDS (owner ruling 2026-09-15).
+        # --num-envs is PER SHARD, so the episode holds the product.
+        assert ns.rollout_shards == gen.CAMPAIGN_GPUS, a["name"]
+        assert ns.num_envs == 16, a["name"]
+        assert ns.rollout_shards * ns.num_envs == 128, a["name"]
         assert ns.face_none_bias == float(gen.FACE_NONE_BIAS_MVP), a["name"]
         assert ns.scale_face_head == float(gen.SCALE_FACE_HEAD_MVP), a["name"]
         assert ns.face_logit_clamp == float(gen.FACE_LOGIT_CLAMP_MVP), a["name"]

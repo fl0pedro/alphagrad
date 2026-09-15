@@ -235,6 +235,10 @@ REQUIRED_FLAGS = [
     # THE MEASUREMENT PIPELINE (owner ruling 2026-09-14).  Named so an arm
     # cannot inherit the trainer's synchronous default in silence.
     "--measure-pipeline",
+    # DATA PARALLELISM OVER ENVIRONMENTS (owner ruling 2026-09-15).  Named so
+    # an arm cannot inherit the trainer's single-device default in silence and
+    # roll out an eighth of the environments its --num-envs implies.
+    "--rollout-shards",
     "--cost-form",
     "--quality-floor",
     # The cost floor (.9, b2c89170): every training arm passes it explicitly,
@@ -658,7 +662,16 @@ SHARED_CLI = [
     ("--walk-rotate", None),
     ("--init-scheme", "classic"),
     ("--face-read", "last-row"),
+    # ENVIRONMENTS PER SHARD (owner ruling 2026-09-15).  --num-envs is what
+    # ONE GPU rolls out; --rollout-shards says how many GPUs do.
     ("--num-envs", "16"),
+    # DATA PARALLELISM OVER ENVIRONMENTS: one rollout shard per GPU the job
+    # holds, so an episode holds CAMPAIGN_GPUS * 16 environments and the PPO
+    # update runs on all of them concatenated.  See CAMPAIGN_ROLLOUT_SHARDS.
+    # The literal is CAMPAIGN_GPUS, which is defined further down this file
+    # than SHARED_CLI is built; the two are checked against each other where
+    # CAMPAIGN_ROLLOUT_SHARDS is defined, so they cannot drift apart.
+    ("--rollout-shards", "8"),
     ("--minibatches", "4"),
     ("--grad-window", "0"),
     # One PPO epoch makes the importance ratio identically 1 for the whole
@@ -1459,6 +1472,23 @@ CAMPAIGN_RAY_MEASURE_TIMEOUT = "600"
 # identically 1 at epoch 0 (the arms run --ppo-epochs 1).
 CAMPAIGN_MEASURE_PIPELINE = "1"
 
+# DATA PARALLELISM OVER ENVIRONMENTS (owner ruling 2026-09-15, "use the idle
+# GPUs for the rollout").  ONE ROLLOUT SHARD PER GPU THE JOB HOLDS, so an
+# episode rolls out CAMPAIGN_GPUS * --num-envs environments instead of
+# --num-envs, and the PPO update runs on all of them concatenated -- the same
+# program a single device would run for that many environments.  --num-envs is
+# PER SHARD from this ruling on.
+#
+# The measure actors keep their GPUs and now share them with a rollout shard.
+# The shards' per-step measurement callbacks rendezvous into ONE batched pool
+# call over every row, so the pool still sees one `evaluate_batch` per step and
+# no shard can starve another of actors.
+CAMPAIGN_ROLLOUT_SHARDS = str(CAMPAIGN_GPUS)
+assert dict(SHARED_CLI)["--rollout-shards"] == CAMPAIGN_ROLLOUT_SHARDS, (
+    "SHARED_CLI's --rollout-shards literal and CAMPAIGN_ROLLOUT_SHARDS must be "
+    "the same number of GPUs; SHARED_CLI is built before CAMPAIGN_GPUS exists, "
+    "so this is what keeps them equal.")
+
 # GATE G1 (ticket .45) on a node without a home: the sweep winners are read
 # from /Scratch.  THE TABLE IS THE SWEEP64 ONE, BY ORDER (owner ruling
 # 2026-09-13): 4029 rows at q >= 0.80 on Markowitz, 2969 on reverse.  The
@@ -1734,6 +1764,8 @@ def campaign_arm(*, phase: int, tag: str, profile: str, node: str, what: str,
         "--ray-measure": CAMPAIGN_RAY_MEASURE,
         "--ray-measure-timeout": CAMPAIGN_RAY_MEASURE_TIMEOUT,
         "--measure-pipeline": CAMPAIGN_MEASURE_PIPELINE,
+        # ONE ROLLOUT SHARD PER GPU (owner ruling 2026-09-15).
+        "--rollout-shards": CAMPAIGN_ROLLOUT_SHARDS,
         # THE GATE .45 INPUTS, the two the trainer cannot measure for itself.
         # G1's winners table is inherited from SHARED_CLI and resolved from
         # this arm's --fixed-order by `_merge_cli` (ONE mechanism, so a wave
