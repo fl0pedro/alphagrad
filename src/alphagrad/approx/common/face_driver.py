@@ -41,7 +41,42 @@ __all__ = [
     "make_face_vertex_decide_callback",
     "bind_step_callbacks",
     "EdgeSlotTable",
+    "callback_census",
+    "consume_callback_census",
 ]
+
+
+# ---------------------------------------------------------------------------
+# THE PER-STEP CALLBACK CENSUS (owner ruling 2026-09-15, item 1).
+#
+# One counter per HOST BODY, bumped once per `pure_callback` INVOCATION -- not
+# per environment: every body here is dispatched with
+# `vmap_method="broadcast_all"`, so one invocation serves the whole batch. The
+# census is therefore the number of device-to-host round trips the rollout
+# makes on the face path, which is the quantity the ruling is about, and it is
+# what `tests/face_callback_census_test.py` asserts on.
+#
+# It is a plain dict and it is always on: a dict increment is nanoseconds
+# against the milliseconds of every body it sits in, and a census that is only
+# collected under a flag is a census nobody reads.
+# ---------------------------------------------------------------------------
+_CB_CALLS: dict = {}
+
+
+def _census(name):
+    _CB_CALLS[name] = _CB_CALLS.get(name, 0) + 1
+
+
+def callback_census() -> dict:
+    """The invocation count per host body so far. Read-only."""
+    return dict(_CB_CALLS)
+
+
+def consume_callback_census() -> dict:
+    """The counts so far, and reset. For a per-episode reader."""
+    out = dict(_CB_CALLS)
+    _CB_CALLS.clear()
+    return out
 
 
 class EdgeSlotTable:
@@ -276,6 +311,7 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None,
     def _live_face_host(order, spec_hist, step_count, vertex_idx,
                         vertex_specs, face_rows, face_skips, f,
                         face_hist, skip_hist):
+        _census("faces.live_chunk")
         # face_hist/skip_hist are the PREFIX's per-face wires -- the (N,
         # MAX_FACES, FACE_SLOTS, 3) / (N, MAX_FACES) history arrays carried by
         # the env state, aligned with `order` exactly like `spec_hist` is.
@@ -404,6 +440,7 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None,
         # chunk callbacks that follow hit the entry it just built. Untimed,
         # that cost surfaced only as a device-side gap and was read as
         # `env.step` device time for two rounds of profiling.
+        _census("faces.live_count")
         _ct0 = _perf() if _perf is not None else None
         try:
             _order = np.asarray(order)
@@ -478,6 +515,7 @@ def make_face_sizes_callback(live_faces, *, max_faces, max_axes,
 
     def _sizes_host(order, spec_hist, step_count, vertex_idx,
                     face_hist, skip_hist):
+        _census("faces.live_sizes")
         _t0 = _perf() if _perf is not None else None
         try:
             _order = np.asarray(order)
@@ -522,10 +560,35 @@ def make_face_sizes_callback(live_faces, *, max_faces, max_axes,
 
 
 def make_face_slot_legality_callback(live_faces, *, max_faces, max_axes,
-                                     prof_sink=None):
+                                     prof_sink=None, with_count=False):
     """``cb(order, spec_hist, step_count, vertex_idx, face_hist, skip_hist)``
     -> ``(sizes (F,S,N) int32, quant (F,S) f32, pair (F,S,N,N) f32,
-    comp (F,S,N) f32, n_out (F,S) int32)``.
+    comp (F,S,N) f32, n_out (F,S) int32)``, plus ``n_faces ()`` under
+    ``with_count``.
+
+    ``with_count`` MERGES THE FACE COUNT INTO THIS ONE ROUND TRIP (owner
+    ruling 2026-09-15, item 1). ``make_face_callbacks``'s count callback and
+    this one fire back to back in ``Agent.sample_action_dynamic``, with
+    BYTE-IDENTICAL operands (the same prefix, the same history wires, the
+    same vertex) and no dependence either way, so the second dispatch buys
+    nothing but a device-to-host copy of the whole operand set and a host
+    round trip. Under ``with_count`` the count rides out of this call and
+    the count callback is not bound at all.
+
+    THE COUNT IS STILL :meth:`LiveFaceStream.n_faces`, NOT
+    ``face_slot_legality``'s sixth return value, and that is deliberate.
+    The two are not the same number: the legality probe returns
+    ``min(len(keys), F)`` and falls back to 0 when the prefix replay fails,
+    while ``n_faces`` RAISES when a vertex has more faces than the derived
+    bound or than the ``--face-wire-faces`` wire carries -- the guard that
+    keeps a narrow wire loud instead of silently dropping a vertex's tail.
+    Calling it here costs one enumeration on a tokenizer the legality probe
+    has already built and cached, and it keeps the merged callback's count
+    bit-identical to the unmerged one's.
+
+    Both halves keep their own ``prof_sink`` key (``faces.live_count`` and
+    ``faces.live_slot_legality``) and the two still sum to the merged wall,
+    so the ``[prof]`` line reads the same as before the merge.
 
     The ``--face-slot-frames`` sibling of :func:`make_face_sizes_callback`
     (ticket .18, D3): :meth:`LiveFaceStream.face_slot_legality` per slot
@@ -622,20 +685,41 @@ def make_face_slot_legality_callback(live_faces, *, max_faces, max_axes,
         import time as _time
         _perf = _time.perf_counter
 
+    # The per-call count clock, so the two halves of a MERGED call keep their
+    # own `prof_sink` keys and still sum to the merged wall (a list because
+    # `_one` writes it and `_host` reads it).
+    _count_secs = [0.0]
+
     def _one(order, spec_hist, step_count, vertex_idx, face_hist, skip_hist,
              env=0):
+        _hk = _hk_kw(live_faces, env, np.asarray(face_hist),
+                     np.asarray(skip_hist), int(np.asarray(step_count)))
         sz, qt, pr, cp, no, _n = live_faces.face_slot_legality(
             order, spec_hist, int(np.asarray(step_count)),
-            int(np.asarray(vertex_idx)) + 1, face_hist, skip_hist,
-            **_hk_kw(live_faces, env, np.asarray(face_hist),
-                     np.asarray(skip_hist), int(np.asarray(step_count))))
-        return (np.asarray(sz, np.int32)[:F, :S, :N],
-                np.asarray(qt, np.float32)[:F, :S, :NUM_FACE_QUANT_DTYPES],
-                np.asarray(pr, np.float32)[:F, :S, :N, :N],
-                np.asarray(cp, np.float32)[:F, :S, :N],
-                np.asarray(no, np.int32)[:F, :S])
+            int(np.asarray(vertex_idx)) + 1, face_hist, skip_hist, **_hk)
+        out = (np.asarray(sz, np.int32)[:F, :S, :N],
+               np.asarray(qt, np.float32)[:F, :S, :NUM_FACE_QUANT_DTYPES],
+               np.asarray(pr, np.float32)[:F, :S, :N, :N],
+               np.asarray(cp, np.float32)[:F, :S, :N],
+               np.asarray(no, np.int32)[:F, :S])
+        if not with_count:
+            return out
+        # THE SAME CALL THE COUNT CALLBACK MADE, on the tokenizer the probe
+        # above has already built: same arguments, same `hist_key`, so the
+        # same number and the same raise. See the docstring.
+        _c0 = _perf() if _perf is not None else None
+        nf = int(live_faces.n_faces(
+            order, spec_hist, int(np.asarray(step_count)),
+            int(np.asarray(vertex_idx)) + 1, face_hist, skip_hist, **_hk))
+        if _perf is not None:
+            _count_secs[0] += _perf() - _c0
+        _dist("faces_per_vertex", nf)
+        return out + (np.int32(nf),)
 
     def _host(order, spec_hist, step_count, vertex_idx, face_hist, skip_hist):
+        _census("faces.count_legality" if with_count
+                else "faces.live_slot_legality")
+        _count_secs[0] = 0.0
         _t0 = _perf() if _perf is not None else None
         try:
             _order = np.asarray(order)
@@ -648,6 +732,8 @@ def make_face_slot_legality_callback(live_faces, *, max_faces, max_axes,
                     np.zeros((B, F, S, N, N), np.float32),
                     np.zeros((B, F, S, N), np.float32),
                     np.zeros((B, F, S), np.int32))
+            if with_count:
+                outs = outs + (np.zeros((B,), np.int32),)
             _sh, _sc = np.asarray(spec_hist), np.asarray(step_count)
             _vi = np.asarray(vertex_idx)
             _fh, _kh = np.asarray(face_hist), np.asarray(skip_hist)
@@ -659,16 +745,23 @@ def make_face_slot_legality_callback(live_faces, *, max_faces, max_axes,
             return outs
         finally:
             if _perf is not None:
-                prof_sink("faces.live_slot_legality", _perf() - _t0)
+                _dt = _perf() - _t0
+                if with_count:
+                    prof_sink("faces.live_count", _count_secs[0])
+                    _dt -= _count_secs[0]
+                prof_sink("faces.live_slot_legality", _dt)
 
     def _cb(order, spec_hist, step_count, vertex_idx, face_hist, skip_hist):
+        _shapes = (jax.ShapeDtypeStruct((F, S, N), jnp.int32),
+                   jax.ShapeDtypeStruct((F, S, NUM_FACE_QUANT_DTYPES),
+                                        jnp.float32),
+                   jax.ShapeDtypeStruct((F, S, N, N), jnp.float32),
+                   jax.ShapeDtypeStruct((F, S, N), jnp.float32),
+                   jax.ShapeDtypeStruct((F, S), jnp.int32))
+        if with_count:
+            _shapes = _shapes + (jax.ShapeDtypeStruct((), jnp.int32),)
         return jax.pure_callback(
-            _host,
-            (jax.ShapeDtypeStruct((F, S, N), jnp.int32),
-             jax.ShapeDtypeStruct((F, S, NUM_FACE_QUANT_DTYPES), jnp.float32),
-             jax.ShapeDtypeStruct((F, S, N, N), jnp.float32),
-             jax.ShapeDtypeStruct((F, S, N), jnp.float32),
-             jax.ShapeDtypeStruct((F, S), jnp.int32)),
+            _host, _shapes,
             order, spec_hist, step_count, vertex_idx, face_hist, skip_hist,
             vmap_method="broadcast_all")
 
@@ -782,6 +875,7 @@ def make_face_vertex_decide_callback(live_faces, *, max_faces, max_axes,
 
     def _host(order, spec_hist, step_count, vertex_idx, face_hist, skip_hist,
               skips, *args):
+        _census("faces.vertex_decide")
         _t0 = _perf() if _perf is not None else None
         try:
             _order = np.asarray(order)

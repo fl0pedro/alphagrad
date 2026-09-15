@@ -3307,8 +3307,6 @@ class Agent(eqx.Module):
                 f_pair = jnp.broadcast_to(
                     _pair, (_F,) + _pair.shape)
                 f_comp = jnp.broadcast_to(_av, (_F,) + _av.shape)
-                _n_faces = face_count_fn(vertex_idx)
-                f_valid = (jnp.arange(_F) < _n_faces).astype(jnp.float32)
                 # --per-face-masks, SIZES half (workstream A1b). The
                 # masks above are static BY DESIGN on this path (per-face
                 # legality is enforced at APPLICATION), but the head's
@@ -3324,8 +3322,26 @@ class Agent(eqx.Module):
                 # the oracle path supplies, so everything downstream --
                 # `_face_loop`, the stored trajectory leaf, `_face_replay`
                 # -- is untouched.
+                #
+                # ONE ROUND TRIP FOR THE COUNT AND THE MASKS (owner ruling
+                # 2026-09-15, item 1). This call and the face count used to
+                # be two `pure_callback`s fired back to back with BYTE-
+                # IDENTICAL operands (the same prefix, the same history
+                # wires, the same vertex) and no dependence either way. The
+                # slot-legality callback now carries the count as its sixth
+                # output (`face_driver.make_face_slot_legality_callback`,
+                # `with_count`) and `face_count_fn` is not called on this
+                # path at all. The count is still `LiveFaceStream.n_faces`,
+                # so the narrow-wire guard and the value are unchanged.
+                _fsz = None
                 if face_sizes_fn is not None:
                     _fsz = face_sizes_fn(vertex_idx)
+                if _fsz is not None and len(_fsz) > 5:
+                    _n_faces = _fsz[5]
+                else:
+                    _n_faces = face_count_fn(vertex_idx)
+                f_valid = (jnp.arange(_F) < _n_faces).astype(jnp.float32)
+                if _fsz is not None:
                     f_sizes, f_quant = _fsz[0], _fsz[1]
                     if len(_fsz) > 2:
                         # --face-slot-frames (ticket .18): the per-SLOT
@@ -8443,9 +8459,15 @@ def main():
         # flag-off trace has no extra callback and no extra host work.
         # Per-SLOT, always (ticket .18): the per-face probe recorded the
         # RESULT tensor only and broadcast it to lhs / rhs / new.
+        # `with_count`: the face COUNT rides out of this same call, so the
+        # rollout step makes ONE host round trip for the count and the masks
+        # instead of two with identical operands (owner ruling 2026-09-15,
+        # item 1). `Agent.sample_action_dynamic` reads the sixth output and
+        # never calls `face_count_fn` on this path.
         _live_face_sizes = make_face_slot_legality_callback(
             _LIVE_FACES, max_faces=_F_FACES,
-            max_axes=MAX_AXES_PER_VERTEX, prof_sink=_env_prof_add)
+            max_axes=MAX_AXES_PER_VERTEX, prof_sink=_env_prof_add,
+            with_count=True)
         # The exact slot-2 masks (ticket .59 fault 2): the two-stage pass,
         # driven with the rollout's own stage-1 rows for slots 0 and 1 and
         # drawing nothing for slot 2, so what comes back is the legality of
@@ -14346,6 +14368,27 @@ def main():
                         + _cache_line,
                         file=sys.stderr,
                     )
+                # THE PER-STEP HOST ROUND TRIPS (owner ruling 2026-09-15,
+                # item 1). One counter per host body, bumped once per
+                # `pure_callback` INVOCATION (each serves the whole batch,
+                # `vmap_method="broadcast_all"`), so this line is the number
+                # of device-to-host round trips the face path made this
+                # episode. `faces.count_legality` is the MERGED count+mask
+                # call; a nonzero `faces.live_count` beside it means the
+                # merge is not engaged on this arm.
+                try:
+                    from alphagrad.approx.common.face_driver import (
+                        consume_callback_census as _ccc)
+                    _cen = _ccc()
+                    if _cen:
+                        tqdm.write(
+                            f"[cb-census ep={ep:3d}] "
+                            + "  ".join(f"{k}={v}"
+                                        for k, v in sorted(_cen.items())),
+                            file=sys.stderr,
+                        )
+                except Exception:
+                    pass
                 # Phase-0 per-decision attribution + the size distributions
                 # that size the bucket grids. Both are separately gated
                 # (ALPHAGRAD_PROFILE_POLICY / ALPHAGRAD_PROFILE_DIST) and
