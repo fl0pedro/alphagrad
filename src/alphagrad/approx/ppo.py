@@ -8520,6 +8520,22 @@ def main():
               f"environments = {num_envs} environments per episode, on "
               f"devices {[str(d) for d in _SHARD_DEVS]}; the PPO update runs "
               f"on all of them concatenated on {_SHARD_DEVS[0]}", flush=True)
+        # THE UPDATE'S MINIBATCH GROWS WITH THE SHARDS, and it is the thing
+        # that runs out of memory first: every shard's trajectory is moved to
+        # the trainer's device and the minibatch is `num_envs / minibatches`
+        # TRAJECTORIES under --grad-window 0. Measured: 8 shards x 16
+        # environments with --minibatches 4 asks for 32 trajectories in one
+        # minibatch and dies asking for 37.5 GiB on a 98 GB Blackwell (job
+        # 65822 arm s8), where 4 shards at 16 trajectories fits. Say the
+        # number at startup so the operator sizes --minibatches with the
+        # shards instead of discovering it an episode in.
+        _mb_traj = max(1, int(num_envs) // max(1, int(args.minibatches)))
+        print(f"[rollout-shards] --minibatches {args.minibatches} puts "
+              f"{_mb_traj} of the {num_envs} trajectories in one minibatch "
+              f"({envs_per_shard // max(1, int(args.minibatches))} without "
+              f"shards); the update runs on one device, so scale "
+              f"--minibatches with --rollout-shards to keep the minibatch "
+              f"the size it was", flush=True)
     # 8-component reward vector is still emitted by the env and used for
     # host-side display (top-N heaps, per-component means). Training-side
     # value / advantage path operates on the 3-vec (latency / peak_memory /
