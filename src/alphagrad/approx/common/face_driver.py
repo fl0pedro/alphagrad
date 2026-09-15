@@ -27,6 +27,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from alphagrad.approx.common.masks import NUM_FACE_QUANT_DTYPES
+from alphagrad.approx.common.rollout_shards import host_serial
 
 from alphagrad.approx.common.token_vocab import (
     DELTA_TOKEN_DTYPE as _TOKEN_DTYPE,
@@ -501,7 +502,7 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None,
         if emit_head:
             _shapes = _shapes + (jax.ShapeDtypeStruct((), jnp.int32),)
         return jax.pure_callback(
-            _live_face_host,
+            host_serial(_live_face_host),
             _shapes,
             order, spec_hist, step_count, vertex_idx, vertex_specs,
             face_rows, face_skips, f, face_hist, skip_hist,
@@ -553,7 +554,8 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None,
     def _live_face_count(order, spec_hist, step_count, vertex_idx,
                          face_hist, skip_hist):
         return jax.pure_callback(
-            _live_face_count_host, jax.ShapeDtypeStruct((), jnp.int32),
+            host_serial(_live_face_count_host),
+            jax.ShapeDtypeStruct((), jnp.int32),
             order, spec_hist, step_count, vertex_idx, face_hist, skip_hist,
             vmap_method="broadcast_all")
 
@@ -631,7 +633,7 @@ def make_face_sizes_callback(live_faces, *, max_faces, max_axes,
     def _sizes_cb(order, spec_hist, step_count, vertex_idx,
                   face_hist, skip_hist):
         return jax.pure_callback(
-            _sizes_host,
+            host_serial(_sizes_host),
             (jax.ShapeDtypeStruct((F, N), jnp.int32),
              jax.ShapeDtypeStruct((F,), jnp.float32)),
             order, spec_hist, step_count, vertex_idx, face_hist, skip_hist,
@@ -844,7 +846,7 @@ def make_face_slot_legality_callback(live_faces, *, max_faces, max_axes,
         if with_count:
             _shapes = _shapes + (jax.ShapeDtypeStruct((), jnp.int32),)
         return jax.pure_callback(
-            _host, _shapes,
+            host_serial(_host), _shapes,
             order, spec_hist, step_count, vertex_idx, face_hist, skip_hist,
             vmap_method="broadcast_all")
 
@@ -993,7 +995,7 @@ def make_face_vertex_decide_callback(live_faces, *, max_faces, max_axes,
     def _cb(order, spec_hist, step_count, vertex_idx, face_hist, skip_hist,
             skips, *args):
         return jax.pure_callback(
-            _host,
+            host_serial(_host),
             (jax.ShapeDtypeStruct((F, S, 3), jnp.int32),
              jax.ShapeDtypeStruct((F, S, N), jnp.int32),
              jax.ShapeDtypeStruct((F, S, NUM_FACE_QUANT_DTYPES), jnp.float32),

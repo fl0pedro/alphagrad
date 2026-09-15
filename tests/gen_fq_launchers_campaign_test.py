@@ -195,6 +195,10 @@ def test_required_flags_are_all_defined_where_the_preflight_greps(
     for f in ("--approx-profile", "--cost-form", "--quality-floor",
               "--mem-channel", "--gate-winners-table", "--fixed-order",
               "--ray-measure", "--ray-measure-timeout", "--measure-pipeline",
+              # DATA PARALLELISM OVER ENVIRONMENTS (owner ruling 2026-09-15):
+              # an arm that inherited a default would roll out a different
+              # number of environments than its --num-envs implies.
+              "--rollout-shards",
               "--tokenize-where", "--face-wire-faces",
               "--per-face-masks",
               "--face-none-bias", "--approx-add", "--terminal-rewards-only"):
@@ -250,6 +254,11 @@ def test_every_campaign_arm_carries_the_required_flags(gen, campaign):
                      f" --ray-measure-timeout {gen.CAMPAIGN_RAY_MEASURE_TIMEOUT} ",
                      # PIPELINE THE MEASUREMENT (owner ruling 2026-09-14).
                      f" --measure-pipeline {gen.CAMPAIGN_MEASURE_PIPELINE} ",
+                     # HOW MANY DEVICES ROLL AN EPISODE OUT (owner ruling
+                     # 2026-09-15), and --num-envs is PER SHARD from that
+                     # ruling on.
+                     f" --rollout-shards {gen.CAMPAIGN_ROLLOUT_SHARDS} ",
+                     " --num-envs 16 ",
                      # THE PER-STEP TOKENIZATION IS OFF THE MEASURE ACTORS
                      # (owner ruling 2026-09-15), which is what lets the
                      # pipeline hide a measurement behind the NEXT rollout.
@@ -901,6 +910,12 @@ def test_ppo_argparse_accepts_every_campaign_command_line(gen, campaign):
         # 2026-09-14): the terminal step submits and the driver waits for the
         # rewards with the previous episode's update already on the GPU.
         assert ns.measure_pipeline == 1, a["name"]
+        # HOW MANY DEVICES ROLL AN EPISODE OUT (owner ruling 2026-09-15).
+        # --num-envs is PER SHARD, so the episode holds the product, and the
+        # arm has to state both.
+        assert ns.rollout_shards == int(gen.CAMPAIGN_ROLLOUT_SHARDS), a["name"]
+        assert ns.rollout_shards >= 1, a["name"]
+        assert ns.num_envs == 16, a["name"]
         # AND THE TOKENIZATION IS OFF THE ACTORS (owner ruling 2026-09-15).
         # Without this the pipeline can only hide a measurement behind the
         # previous update, because the actors serve every rollout step.
