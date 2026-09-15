@@ -79,6 +79,24 @@ def test_a_sibling_call_of_the_same_step_verifies_instead_of_appending():
     assert st["verify"] == 3 * B, st
 
 
+def test_prefix_one_starts_a_new_episode_wherever_the_store_was():
+    """`env.reset` runs no step callback, so an episode's first env callback
+    lands at prefix 1 and never at 0. Prefix 1's whole history IS the row in
+    hand, so it starts fresh with nothing inferred."""
+    face_prefix_step(np.zeros((B,), np.int64), _row(-1), _skip(0), T)
+    for n in (1, 2, 3, 4):
+        face_prefix_step(np.full((B,), n), _row(n), _skip(n), T)
+    face_prefix_stats()
+    # a second episode on the same env object: no step 0, straight to 1
+    rows, skips, _j = face_prefix_step(np.ones((B,), np.int64),
+                                       _row(70), _skip(70), T)
+    np.testing.assert_array_equal(rows[0, 0], np.full((W, S, 3), 70, np.int32))
+    rows, skips, _j = face_prefix_step(np.full((B,), 2), _row(71), _skip(71), T)
+    np.testing.assert_array_equal(rows[0, 0], np.full((W, S, 3), 70, np.int32))
+    np.testing.assert_array_equal(rows[0, 1], np.full((W, S, 3), 71, np.int32))
+    assert face_prefix_stats()["append"] == 2 * B
+
+
 def test_a_gap_in_the_step_index_raises():
     """Never truncate, never resynchronise: the prefix cannot be rebuilt."""
     face_prefix_step(np.zeros((B,), np.int64), _row(-1), _skip(0), T)

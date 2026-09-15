@@ -2600,8 +2600,9 @@ def face_wire_faces() -> int:
 #      carries must MATCH the one stored) or n-1 (it is the first call of the
 #      step, and its row is appended).
 #   2. A REPEAT of a discarded episode restarts at `step_count == 0`, which
-#      empties the prefix. `face_prefix_reset` does the same explicitly, and
-#      ppo.py calls it at the top of every attempt.
+#      empties the prefix, and its first step then arrives at prefix 1, whose
+#      whole history IS the row in hand. `face_prefix_reset` empties it
+#      explicitly too, and ppo.py calls that at the top of every attempt.
 #   3. Rows below `step_count` never move: `env.step` shift-and-inserts at
 #      `idx = step_count` only. That is the same fact the pop-extend in
 #      `live_faces._tokenizer_at` and the key chain in `live_faces.hist_key`
@@ -2718,7 +2719,16 @@ def face_prefix_step(step_counts, rows, skips, steps, joins=None):
             raise RuntimeError(
                 f"face_prefix_step: env {i} is at prefix {n} and the history "
                 f"holds {T} steps")
-        if have[i] == n - 1:
+        if n == 1 or have[i] == n - 1:
+            # PREFIX 1 IS THE ROW IN HAND, whatever the store held before.
+            # Its history is rows [0, 1), which IS the row the device just
+            # sent, so nothing is inferred and nothing is resynchronised --
+            # and this is the only thing that tells the store an episode
+            # started. `env.reset` runs no step callback, so the env step
+            # callback's first call of an episode is at prefix 1 and never at
+            # 0; without this rule a second episode on the same env object
+            # would look like a gap (measured: 20 test modules that run two
+            # plans through one env).
             R[i, n - 1] = rows[i]
             K[i, n - 1] = skips[i]
             if joins is not None:
