@@ -10247,7 +10247,20 @@ class VertexEliminationEnv:
         # in hand: `new_face_specs[idx]` IS `face_rows`. The host extends its
         # prefix to `new_step` rows and hands `_callback` the very arrays it
         # used to be handed. ALPHAGRAD_FACE_ROW_WIRE=0 restores the operand.
-        _row_wire = face_row_wire()
+        # AND ONLY WHERE THE HOST CAN TELL THE ENVIRONMENTS APART.
+        # `_env_callback` dispatches through `pure_callback` with
+        # `vmap_method="expand_dims"` under ALPHAGRAD_BATCHED_CALLBACK, and the
+        # host then sees the WHOLE BATCH in index order, which is what makes
+        # the loop index the environment identity -- the same fact
+        # `EdgeSlotTable` and the per-env key chain rest on. Without it the
+        # dispatch is `io_callback`, which `vmap` runs once per environment
+        # with no batch axis and nothing on the wire saying which environment
+        # it is, so a host prefix would mix every environment's rows into slot
+        # 0. Measured: `--num-envs 2` under the sequential dispatch raised the
+        # step-index guard at step 2 (tests/popart_seed_init_test.py). The
+        # face callbacks are not affected -- they dispatch with
+        # `vmap_method="broadcast_all"` unconditionally.
+        _row_wire = face_row_wire() and _BATCHED_CALLBACK
         _fn = self.tokenize(batched=True, bound_dropped=_drop_bound)
         _cbout = _env_callback(
             _face_prefix_host(_fn, int(new_order.shape[-1]))
