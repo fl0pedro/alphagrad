@@ -117,7 +117,8 @@ def test_the_binned_split_is_uint8_on_the_host(shd_cache):
 def test_the_binned_cache_round_trips(shd_cache):
     path, _ = shd_cache
     x1, y1 = D.load_shd(-1)
-    npz = path / f"shd_train_binned_{D.SHD_TIME_BINS}x{D.SHD_CHANNELS}.npz"
+    npz = path / (f"shd_train_binned_{D.SHD_TIME_BINS}x{D.SHD_CHANNELS}_"
+                  f"{np.dtype(D._SHD_COUNT_DTYPE).name}.npz")
     assert npz.exists(), "the binned tensors were not cached"
     # Second load must come from the .npz, so remove the raw file first: if
     # anything still reads it the loader would try to download.

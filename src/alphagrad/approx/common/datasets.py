@@ -346,8 +346,13 @@ def _shd_binned(subset: str) -> tuple[np.ndarray, np.ndarray]:
     if hit is not None:
         return hit
     cache = _shd_cache_dir()
+    # THE NAME CARRIES THE FORMAT: bins, channels and the count dtype. A cache
+    # written under one binning must never be read back under another, and the
+    # only way to make that impossible is to let the file name say what is in
+    # it -- a stale file is then simply not found and is rebuilt.
     npz = cache / (f"shd_{subset}_binned_"
-                   f"{SHD_TIME_BINS}x{SHD_CHANNELS}.npz")
+                   f"{SHD_TIME_BINS}x{SHD_CHANNELS}_"
+                   f"{np.dtype(_SHD_COUNT_DTYPE).name}.npz")
     if npz.exists():
         with np.load(npz) as z:
             out = (z["x"], z["y"])
