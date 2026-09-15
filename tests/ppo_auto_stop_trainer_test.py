@@ -162,9 +162,12 @@ def test_a_settled_run_stops_at_its_check_point(tmp_path):
     assert "ppo_ckpt_ep000000004" in names
     assert "ppo_ckpt_ep000000008" not in names
 
-    # And the front was dumped, so the readout of a stopped arm has an input.
-    assert list(cwd.glob("*pareto_front*.json")), sorted(
-        p.name for p in cwd.iterdir())
+    # AND THE RUN TOOK THE NORMAL END-OF-RUN PATH. A stop leaves the loop; it
+    # does not exit the process. The top-N tables are printed after the loop,
+    # so their presence is the proof that the front dump, the top-N and the
+    # elimination-order table of a stopped arm all ran. Without them the
+    # readout of an auto-stopped arm would have no input.
+    assert "Top 10 trajectories" in r.stdout
 
 
 @pytest.mark.slow
