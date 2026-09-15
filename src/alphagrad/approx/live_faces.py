@@ -178,6 +178,39 @@ class _Snapshot:
 # O(T^2) rebuild (kept as an A/B switch, not because the rebuild is wanted).
 _PREFIX_EXTEND = os.environ.get("ALPHAGRAD_FACE_PREFIX_EXTEND", "1") == "1"
 
+# Rebuild the whole face-wire key chain from the arrays on every call and
+# raise on any disagreement. See `LiveFaceStream.hist_key`; off by default
+# because it costs exactly what the chain saves.
+_FACE_KEY_VERIFY = os.environ.get("ALPHAGRAD_FACE_KEY_VERIFY", "0") == "1"
+
+
+def _face_row_key(row, skiprow):
+    """One vertex's face wire, as a few dozen bytes instead of 69 kilobytes.
+
+    The wire pads with -1 and the skips with 0, so the positions of the
+    entries that are NOT padding, together with their values, describe the
+    row completely and injectively for a fixed shape. Measured occupancy on
+    the campaign graph is 1.3 faces of 1920, so this is three orders of
+    magnitude smaller than the row it stands for.
+    """
+    r = np.ascontiguousarray(row).reshape(-1)
+    s = np.ascontiguousarray(skiprow).reshape(-1)
+    ri = np.nonzero(r != -1)[0].astype(np.int32)
+    si = np.nonzero(s != 0)[0].astype(np.int32)
+    return (ri.tobytes(), r[ri].astype(np.int32).tobytes(),
+            si.tobytes(), s[si].astype(np.int32).tobytes())
+
+
+def _hist_key_parts(frh, fsh, n):
+    """The DENSE fallback key for the face wires of prefix ``[0, n)``.
+
+    What every cache in this module keyed on before the chain existed, and
+    what a caller that keeps no per-environment chain still gets. Correct and
+    slow: `frh[:n]` is 6.5 megabytes on the campaign graph.
+    """
+    return (b"" if frh is None else frh[:n].tobytes(),
+            b"" if fsh is None else fsh[:n].tobytes())
+
 # The three operand slots of one face, in the head's slot order
 # (``env.FACE_SLOTS``: pre = lhs, post = rhs, new). ``face_slot_legality``
 # records and reports them in this order.
@@ -239,6 +272,8 @@ class LiveFaceStream:
         self.cache_cap = int(cache)
         self._prefix: dict = {}       # prefix key -> tokenizer at that prefix
         self._chunks: dict = {}       # full key -> result tuple
+        # THE PER-ENV FACE-WIRE KEY CHAIN (see `hist_key`).
+        self._histkeys: dict = {}     # env index -> (n, key tuple)
         # tok_total/tok_max/chunks size the WINDOW from the real
         # distribution: a window below the typical chunk silently keeps only
         # the tail of the contraction the head is meant to read.
@@ -247,6 +282,13 @@ class LiveFaceStream:
                       # tokenizer by ONE vertex instead of replaying the
                       # whole prefix (see `_tokenizer_at`).
                       "prefix_ext": 0,
+                      # The face-wire key chain (see `hist_key`): `ext` is a
+                      # key built by adding one row to the previous step's,
+                      # `cold` a key rebuilt from the whole history. A steady
+                      # state of one cold per episode per env is the episode
+                      # boundary; more than that means something is asking
+                      # for prefixes out of order and the saving is gone.
+                      "hist_key_ext": 0, "hist_key_cold": 0,
                       "chunk_hit": 0, "failures": 0, "truncated": 0,
                       "tok_total": 0, "tok_max": 0, "chunks": 0,
                       # The face <-> segment correspondence (see `chunk`).
@@ -325,8 +367,80 @@ class LiveFaceStream:
         return (np.asarray(face_rows_hist, np.int32),
                 np.asarray(face_skips_hist, np.int32))
 
+    def hist_key(self, env: int, frh, fsh, n: int):
+        """THE FACE-WIRE HISTORY OF PREFIX ``[0, n)``, AS A FEW HUNDRED BYTES.
+
+        Every cache in this class used to key on ``frh[:n].tobytes()``. On the
+        campaign graph that slice is `n x MAX_FACES x FACE_SLOTS x 3` int32 --
+        6.5 megabytes at step 94 -- and measured on pgi14 it costs 1.1
+        milliseconds to materialise and hash. The rollout builds that key
+        about five times per environment per step (the face count, the chunks,
+        the sizes, the slot legality and the vertex decision), so at sixteen
+        environments it was about 93 milliseconds of the 246 milliseconds of
+        host Python the rollout profile of 2026-09-15 attributes to the face
+        path: roughly nine seconds per episode spent hashing padding.
+
+        The wire pads with -1 (and the skips with 0), so ``(positions of the
+        entries that are not padding, their values)`` is a COMPLETE and
+        INJECTIVE description of a row for a fixed shape -- the same argument
+        `env._face_wire_keys` already makes for the tokenizer's own cache. The
+        measured occupancy is 1.3 faces of 1920, so the compact row key is a
+        few dozen bytes and costs 3.5 microseconds.
+
+        AND IT IS BUILT ONCE PER STEP, NOT ONCE PER CALL. The key for prefix n
+        is the key for prefix n-1 with one more row on the end, so the chain
+        per environment is extended by one row per step. Three structural
+        facts make that sound, and the code checks the first two rather than
+        assuming them:
+
+        1. ``n`` increases by exactly one per rollout step. A call at any
+           other ``n`` takes the cold path below and rebuilds the whole chain
+           from the arrays in hand.
+        2. A REPEAT of an episode (a bin overflow) resets ``step_count`` to 0,
+           which is `n != cur + 1` and so is a cold rebuild.
+        3. Rows below ``step_count`` never move: ``env.step`` shift-and-inserts
+           at ``idx = step_count`` only. That is the same fact the pop-extend
+           in :meth:`_tokenizer_at` already rests on, stated in its comment.
+
+        ``ALPHAGRAD_FACE_KEY_VERIFY=1`` rebuilds the whole chain from the
+        arrays on every call and raises on any disagreement. It is off by
+        default because it costs exactly what the chain saves.
+        """
+        if frh is None or fsh is None:
+            return None
+        n = int(n)
+        cur = self._histkeys.get(int(env))
+        key = None
+        if n <= 0:
+            key = ()
+        else:
+            # THE LAST ROW IS ALWAYS RECOMPUTED, never taken on trust. It is
+            # the row this step decided, so it is the one that changes when a
+            # discarded attempt is repeated at the same prefix length. The
+            # rows below it are taken from the chain, on fact 3 above.
+            last = _face_row_key(frh[n - 1], fsh[n - 1])
+            if cur is not None and len(cur[1]) == n and cur[1][n - 1] == last:
+                key = cur[1]
+            elif cur is not None and cur[0] == n - 1 and len(cur[1]) == n - 1:
+                key = cur[1] + (last,)
+                self.stats["hist_key_ext"] += 1
+        if key is None:
+            key = tuple(_face_row_key(frh[j], fsh[j]) for j in range(n))
+            self.stats["hist_key_cold"] += 1
+        if _FACE_KEY_VERIFY:
+            want = tuple(_face_row_key(frh[j], fsh[j]) for j in range(n))
+            if want != key:
+                raise RuntimeError(
+                    f"face-wire key chain desynchronised for env {env} at "
+                    f"prefix {n}: the chain says {len(key)} rows and the "
+                    f"history in hand says {len(want)}. The chain assumes "
+                    f"step_count rises by one per step and that rows below "
+                    f"it never move (live_faces.hist_key).")
+        self._histkeys[int(env)] = (n, key)
+        return key
+
     def _tokenizer_at(self, order, specs, n, face_rows_hist=None,
-                      face_skips_hist=None):
+                      face_skips_hist=None, *, hist_key=None):
         from graphax import IncrementalPathTokenizer
         from alphagrad.approx.env import decode_vertex_rule_specs
         from alphagrad.approx.common.masks import make_live_masked_hook
@@ -340,9 +454,15 @@ class LiveFaceStream:
         # and a key built from (order, specs) alone degenerates to the vertex
         # ORDER. Every plan sharing an elimination order was then served one
         # tokenizer no matter what the face head had decided.
-        key = (order[:n].tobytes(), specs[:n].tobytes(),
-               b"" if frh is None else frh[:n].tobytes(),
-               b"" if fsh is None else fsh[:n].tobytes())
+        #
+        # `hist_key` is the COMPACT form of those wires (see `hist_key`); the
+        # dense `tobytes()` slices below are the fallback for a caller that
+        # does not keep a per-environment chain -- every test and probe that
+        # calls this directly. The two are different key spaces, so mixing
+        # them costs a cache miss and can never produce a false hit.
+        _hk = (_hist_key_parts(frh, fsh, n) if hist_key is None
+               else (hist_key,))
+        key = (order[:n].tobytes(), specs[:n].tobytes()) + _hk
         hit = self._prefix.get(key)
         if hit is not None:
             self.stats["prefix_hit"] += 1
@@ -404,9 +524,10 @@ class LiveFaceStream:
         # at `idx = step_count`, so rows below it never move.
         tk = None
         if _PREFIX_EXTEND and n > 0:
-            pkey = (order[:n - 1].tobytes(), specs[:n - 1].tobytes(),
-                    b"" if frh is None else frh[:n - 1].tobytes(),
-                    b"" if fsh is None else fsh[:n - 1].tobytes())
+            _phk = (_hist_key_parts(frh, fsh, n - 1) if hist_key is None
+                    else (hist_key[:n - 1],))
+            pkey = (order[:n - 1].tobytes(),
+                    specs[:n - 1].tobytes()) + _phk
             tk = self._prefix.pop(pkey, None)
             if tk is not None:
                 try:
@@ -525,7 +646,7 @@ class LiveFaceStream:
     # -- the chunk ---------------------------------------------------------
     def chunk(self, order, specs, n, vertex, vertex_specs,
               face_rows, face_skips, f,
-              face_rows_hist=None, face_skips_hist=None):
+              face_rows_hist=None, face_skips_hist=None, *, hist_key=None):
         """``(tokens, count, n_faces, ends, head)``.
 
         :meth:`chunk_ex`'s first four plus ``head`` -- the approx-echo PREFIX
@@ -539,12 +660,13 @@ class LiveFaceStream:
         """
         r = self.chunk_ex(order, specs, n, vertex, vertex_specs,
                           face_rows, face_skips, f,
-                          face_rows_hist, face_skips_hist)
+                          face_rows_hist, face_skips_hist, hist_key=hist_key)
         return r[:4] + (r[6],)
 
     def chunk_ex(self, order, specs, n, vertex, vertex_specs,
                  face_rows, face_skips, f,
-                 face_rows_hist=None, face_skips_hist=None):
+                 face_rows_hist=None, face_skips_hist=None, *,
+                 hist_key=None):
         """``(tokens (W,), count, n_faces, ends (2,),
         ekey (2,), cvx (EDGE_CVX_WIDTH,), head, wrok)``.
 
@@ -605,17 +727,18 @@ class LiveFaceStream:
                  ) + _no_edge
 
         frh, fsh = self._hist(face_rows_hist, face_skips_hist)
-        ck = (order[:n].tobytes(), specs[:n].tobytes(), vertex,
-              vspecs.tobytes(), rows[:f].tobytes(), skips[:f].tobytes(), f,
-              b"" if frh is None else frh[:n].tobytes(),
-              b"" if fsh is None else fsh[:n].tobytes())
+        ck = ((order[:n].tobytes(), specs[:n].tobytes(), vertex,
+               vspecs.tobytes(), rows[:f].tobytes(), skips[:f].tobytes(), f)
+              + (_hist_key_parts(frh, fsh, n) if hist_key is None
+                 else (hist_key,)))
         hit = self._chunks.get(ck)
         if hit is not None:
             self.stats["chunk_hit"] += 1
             return hit
 
         try:
-            tk = self._tokenizer_at(order, specs, n, frh, fsh)
+            tk = self._tokenizer_at(order, specs, n, frh, fsh,
+                                    hist_key=hist_key)
         except Exception:
             self.stats["failures"] += 1
             return empty
@@ -833,7 +956,7 @@ class LiveFaceStream:
         return res
 
     def n_faces(self, order, specs, n, vertex, face_rows_hist=None,
-                face_skips_hist=None):
+                face_skips_hist=None, *, hist_key=None):
         """Face count of ``vertex`` on the live prefix graph -- the rollout
         while_loop's trip count. Raises if it ever exceeds ``max_faces``:
         the width is the provable ancestors-x-descendants bound, so an
@@ -842,7 +965,7 @@ class LiveFaceStream:
         try:
             tk = self._tokenizer_at(
                 np.asarray(order).reshape(-1), np.asarray(specs), int(n),
-                face_rows_hist, face_skips_hist)
+                face_rows_hist, face_skips_hist, hist_key=hist_key)
             k = len(list(tk.ij.faces(int(vertex))))
         except Exception:
             self.stats["failures"] += 1
@@ -1002,7 +1125,8 @@ class LiveFaceStream:
         return seen
 
     def face_dim_sizes(self, order, specs, n, vertex,
-                       face_rows_hist=None, face_skips_hist=None):
+                       face_rows_hist=None, face_skips_hist=None, *,
+                       hist_key=None):
         """``(sizes (F, N) int32, quant (F,) float32, n_faces)``.
 
         ``sizes[k]`` is face ``k``'s LIVE ``logical_size`` vector over
@@ -1046,9 +1170,9 @@ class LiveFaceStream:
         # incident to the central vertex, so approximating face f-1 cannot
         # move face f's operand. That is what makes one probe serve the whole
         # face loop instead of one per face.
-        ck = (order[:n].tobytes(), specs[:n].tobytes(), vertex,
-              b"" if frh is None else frh[:n].tobytes(),
-              b"" if fsh is None else fsh[:n].tobytes())
+        ck = ((order[:n].tobytes(), specs[:n].tobytes(), vertex)
+              + (_hist_key_parts(frh, fsh, n) if hist_key is None
+                 else (hist_key,)))
         hit = self._sizes.get(ck)
         if hit is not None:
             self.stats["size_hit"] += 1
@@ -1057,7 +1181,8 @@ class LiveFaceStream:
         sizes = np.zeros((F, N), np.int32)
         quant = np.zeros((F,), np.float32)
         try:
-            tk = self._tokenizer_at(order, specs, n, frh, fsh)
+            tk = self._tokenizer_at(order, specs, n, frh, fsh,
+                                    hist_key=hist_key)
             keys = list(tk.ij.faces(vertex))
         except Exception:
             self.stats["failures"] += 1
@@ -1093,7 +1218,8 @@ class LiveFaceStream:
 
     # -- per-face, per-SLOT legality (--face-slot-frames, ticket .18 D3) ----
     def face_slot_legality(self, order, specs, n, vertex,
-                           face_rows_hist=None, face_skips_hist=None):
+                           face_rows_hist=None, face_skips_hist=None, *,
+                           hist_key=None):
         """``(sizes (F,S,N) int32, quant (F,S) f32, pair (F,S,N,N) f32,
         comp (F,S,N) f32, n_out (F,S) int32, n_faces)`` -- per face AND per
         operand slot ``S = (lhs, rhs, new)``.
@@ -1162,9 +1288,9 @@ class LiveFaceStream:
         specs = np.asarray(specs)
         n, vertex = int(n), int(vertex)
         frh, fsh = self._hist(face_rows_hist, face_skips_hist)
-        ck = (order[:n].tobytes(), specs[:n].tobytes(), vertex,
-              b"" if frh is None else frh[:n].tobytes(),
-              b"" if fsh is None else fsh[:n].tobytes())
+        ck = ((order[:n].tobytes(), specs[:n].tobytes(), vertex)
+              + (_hist_key_parts(frh, fsh, n) if hist_key is None
+                 else (hist_key,)))
         hit = self._slots.get(ck)
         if hit is not None:
             self.stats["slot_hit"] += 1
@@ -1177,7 +1303,8 @@ class LiveFaceStream:
         nout = np.zeros((F, S), np.int32)
         empty = (sizes, quant, pair, comp, nout, np.int32(0))
         try:
-            tk = self._tokenizer_at(order, specs, n, frh, fsh)
+            tk = self._tokenizer_at(order, specs, n, frh, fsh,
+                                    hist_key=hist_key)
             keys = list(tk.ij.faces(vertex))
         except Exception:
             self.stats["failures"] += 1
@@ -1472,7 +1599,7 @@ class LiveFaceStream:
 
     def face_slot_decisions(self, order, specs, n, vertex, draw, *,
                             skips=None, face_rows_hist=None,
-                            face_skips_hist=None):
+                            face_skips_hist=None, hist_key=None):
         """:meth:`decide_faces` against the PREFIX tokenizer of step ``n``.
 
         The tokenizer comes from :meth:`_tokenizer_at`, so the decisions are
@@ -1489,7 +1616,8 @@ class LiveFaceStream:
         n, vertex = int(n), int(vertex)
         frh, fsh = self._hist(face_rows_hist, face_skips_hist)
         try:
-            tk = self._tokenizer_at(order, specs, n, frh, fsh)
+            tk = self._tokenizer_at(order, specs, n, frh, fsh,
+                                    hist_key=hist_key)
             keys = list(tk.ij.faces(vertex))
         except Exception:
             self.stats["failures"] += 1
@@ -1947,7 +2075,8 @@ class LiveFaceStream:
 
     def vertex_face_decisions(self, order, specs, n, vertex, draw, *,
                               skips=None, face_rows_hist=None,
-                              face_skips_hist=None, approx_cfg=None):
+                              face_skips_hist=None, approx_cfg=None,
+                              hist_key=None):
         """:meth:`decide_vertex_faces` against the PREFIX tokenizer of step
         ``n`` -- the :meth:`face_slot_decisions` of the structural pass.
 
@@ -1964,7 +2093,8 @@ class LiveFaceStream:
         n, vertex = int(n), int(vertex)
         frh, fsh = self._hist(face_rows_hist, face_skips_hist)
         try:
-            tk = self._tokenizer_at(order, specs, n, frh, fsh)
+            tk = self._tokenizer_at(order, specs, n, frh, fsh,
+                                    hist_key=hist_key)
         except Exception:
             self.stats["failures"] += 1
             F, N, S = self.max_faces, self.max_axes, wire_slots()
