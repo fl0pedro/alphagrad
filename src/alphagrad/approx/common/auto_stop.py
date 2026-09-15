@@ -97,6 +97,18 @@ CHECK_POINTS = (250, 500)
 
 #: The mean scalar return must move by LESS than this against the previous
 #: window. Strictly less: a move of exactly 2 percent does not stop.
+#
+# A RUN WHOSE MEAN RETURN SITS AT FLOAT NOISE AROUND ZERO NEVER MEETS THIS
+# CONDITION, and that is deliberate. A RELATIVE move against a mean of 1e-10
+# is 40 percent when the mean shifts by 4e-11, which is nothing. Measured on
+# an arm with the quality channel out of the reward (`--rewards cmp mem`) and
+# the campaign's paired-log cost form, where a plan that IS rev-exact scores
+# exactly 0 on both cost slots: the mean return was -7e-10 and -4e-10 over two
+# settled windows, so condition 2 read 42 percent and the run correctly-by-the
+# -letter did not stop. No thesis arm is in that state -- all of A, B and C
+# carry the quality channel, so a settled arm's return is order 1 -- and the
+# rule is the owner's, so no absolute floor is invented here. It is named so
+# that a future arm that drops the quality channel knows why it never stops.
 RETURN_TOLERANCE = 0.02
 
 #: Arm A's collapse: the median terminal quality over the window is below

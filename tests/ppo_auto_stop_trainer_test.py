@@ -25,6 +25,16 @@ terminal plan does not change, and no terminal plan holds an approximation --
 which is exactly arm B's predicted behaviour, in miniature and on purpose.
 This is a test of the stop rule, not a claim about a real arm.
 
+WHY THE QUALITY CHANNEL IS IN THE REWARD HERE (``--rewards cmp mem acc``,
+which is also the trainer's own default, where `ppo_resume_equivalence_test`
+uses the two cost channels alone). Under the campaign's paired-log cost form
+a plan that IS rev-exact scores exactly 0 on both cost slots, so with the
+cost channels alone this arm's scalar return is float noise around zero --
+measured at -7e-10 and -4e-10 over two settled windows, which is a RELATIVE
+move of 42 percent and no stop. With quality in, a settled arm returns a
+steady 2.0 and the relative move is 0. See the note over `RETURN_TOLERANCE`
+in `common/auto_stop.py`; no thesis arm drops the quality channel.
+
 THE CONFIGURATION is the canonical deterministic CPU one from `tools/smoke.sh`
 with the policy gate's environment pins, the same one
 `ppo_resume_equivalence_test.py` uses, so no wall clock enters the reward.
@@ -50,8 +60,9 @@ _COMMON = [
     "--live-faces", "--set-pointer", "--dynamic-substeps",
     "--max-substeps", "1", "--incremental-encode", "--grad-window", "0",
     "--dataset", "none", "--cmp-type", "flops", "--mem-type", "peak_memory",
-    "--terminal-rewards-only", "--rewards", "cmp", "mem",
+    "--terminal-rewards-only", "--rewards", "cmp", "mem", "acc",
     "--lambda-cmp", "1", "--lambda-mem", "1", "--lambda-frob", "1",
+    "--lambda-acc", "2",
     "--advantage-norm", "popart", "--seed", "42", "--num-envs", "2",
     "--minibatches", "1", "--vocab-size", "512", "--wandb", "disabled",
     "--example", "Helmholtz", "--approx-profile", "none",
