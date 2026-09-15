@@ -8531,11 +8531,12 @@ def main():
         # shards instead of discovering it an episode in.
         _mb_traj = max(1, int(num_envs) // max(1, int(args.minibatches)))
         print(f"[rollout-shards] --minibatches {args.minibatches} puts "
-              f"{_mb_traj} of the {num_envs} trajectories in one minibatch "
-              f"({envs_per_shard // max(1, int(args.minibatches))} without "
-              f"shards); the update runs on one device, so scale "
-              f"--minibatches with --rollout-shards to keep the minibatch "
-              f"the size it was", flush=True)
+              f"{_mb_traj} of the {num_envs} trajectories in one minibatch, "
+              f"{_SHARDS if int(args.minibatches) <= envs_per_shard else 1} "
+              f"times what the same --minibatches put there at one shard; "
+              f"the update runs on ONE device, so scale --minibatches with "
+              f"--rollout-shards to keep the minibatch the size it was",
+              flush=True)
     # 8-component reward vector is still emitted by the env and used for
     # host-side display (top-N heaps, per-component means). Training-side
     # value / advantage path operates on the 3-vec (latency / peak_memory /
