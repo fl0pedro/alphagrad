@@ -6555,6 +6555,19 @@ def _face_dict_for_vertex(config, ij, v, face_row, face_skip,
     per_face: dict = {}
     face_row = np.asarray(face_row)
     face_skip = np.asarray(face_skip).reshape(-1)
+    # THE WIRE MUST BE AT LEAST AS WIDE AS THE ENUMERATION. The loop below
+    # BREAKS when the row runs out, which is the right answer for a caller
+    # that genuinely has fewer rows and the WRONG one for a narrowed wire
+    # (`--face-wire-faces`): the faces past the end would run exact while
+    # every counter reported a healthy run. That is the fault class the face
+    # width exists for -- eight silently dropped faces of the xent graph's
+    # vertex 9 -- so it raises here instead of running the tail.
+    _w = min(int(face_row.shape[0]), int(face_skip.shape[0]))
+    if len(keys) > _w:
+        raise RuntimeError(
+            f"vertex {v}: {len(keys)} faces and a face wire {_w} columns "
+            f"wide. Raise --face-wire-faces: the faces past {_w} carry no "
+            f"decision and would run exact in silence.")
     for f, key in enumerate(keys[:MAX_FACES]):
         if upto is not None and f >= int(upto):
             break
@@ -9989,6 +10002,18 @@ class VertexEliminationEnv:
         # still get the real thing.
         _drop_bound = _pool_owns_bound_operands(self._remote_pool)
         _z = jnp.zeros((1,), jnp.int32)
+        # THE NARROWED FACE WIRE (`--face-wire-faces`). The state keeps every
+        # column of the provable bound; this callback is handed the first
+        # `face_wire_faces()` of them. Measured on pgi15-gpu17, one episode of
+        # the campaign arm under an XLA trace: this instruction alone copies
+        # 11.1 gigabytes device to host per episode, 117 megabytes per step,
+        # and the profile of 2026-09-15 measured the occupancy at a median of
+        # one face per vertex against a cap of 1920. Nothing falls off the end
+        # in silence -- `_face_dict_for_vertex` raises when the wire is
+        # narrower than the enumeration, and the live-face count raises one
+        # step earlier, before the decisions are even written. The default is
+        # the full width, and then these slices are the identity.
+        _fw = face_wire_faces()
         _cbout = _env_callback(
             self.tokenize(batched=True, bound_dropped=_drop_bound),
             self._callback_shape,
@@ -9996,9 +10021,9 @@ class VertexEliminationEnv:
             _z if _drop_bound else self.consts,
             new_order,
             new_specs,
-            new_face_specs,
-            new_face_skips,
-            new_face_joins,
+            new_face_specs[:, :_fw],
+            new_face_skips[:, :_fw],
+            (None if new_face_joins is None else new_face_joins[:, :_fw]),
             new_step,
             *(() if _drop_bound
               else (self.eval_args_samples

@@ -5030,20 +5030,24 @@ def make_argparser() -> argparse.ArgumentParser:
              "instead of only with the update of e-1.")
     p.add_argument(
         "--face-wire-faces", type=int, default=0, metavar="N",
-        help="HOW MANY FACE COLUMNS THE LIVE-FACE HOST CALLBACKS CARRY. The "
-             "four per-step face callbacks take the whole elimination-prefix "
-             "history as an operand, which is (steps x MAX_FACES x slots x 3) "
-             "int32 -- 117 megabytes per callback per step at sixteen "
-             "environments on the campaign graph, and the rollout profile of "
-             "2026-09-15 measured 59.4 gigabytes copied device to host per "
-             "episode. The same profile measured the occupancy: median one "
-             "face per vertex, maximum thirteen in two episodes, 0.069 "
-             "percent of the cap. N hands those callbacks the first N columns "
-             "instead of all of them. THIS IS NOT A LOWERED BOUND: the state "
+        help="HOW MANY FACE COLUMNS THE HOST CALLBACKS CARRY. The four "
+             "per-step face callbacks AND the env step callback each take "
+             "the whole elimination-prefix face history as an operand, which "
+             "is (steps x MAX_FACES x slots x 3) int32 -- 117 megabytes per "
+             "callback per step at sixteen environments on the campaign "
+             "graph. Measured under an XLA trace on pgi15-gpu17: 59.4 "
+             "gigabytes copied device to host per episode, of which 48.2 is "
+             "the face callbacks and 11.1 the env callback, with the GPU idle "
+             "for three quarters of the rollout behind it. The rollout "
+             "profile of 2026-09-15 measured the occupancy: median one face "
+             "per vertex, maximum thirteen in two episodes, 0.069 percent of "
+             "the cap. N hands those callbacks the first N columns instead of "
+             "all of them; at N=64 the same episode copies 13.1 gigabytes and "
+             "its traced span halves. THIS IS NOT A LOWERED BOUND: the state "
              "keeps every column, and a vertex with more faces than N stops "
-             "the run at the face count, before its decisions are written. "
-             "0 (default) is the full width, which is the historical wire "
-             "byte for byte.")
+             "the run -- at the live-face count, before its decisions are "
+             "written, and again in the transform builder. 0 (default) is the "
+             "full width, which is the historical wire byte for byte.")
     p.add_argument(
         "--tokenize-actors", type=int, default=0, metavar="N",
         help="How many CPU-only actors --tokenize-where cpu-actors spawns. "
