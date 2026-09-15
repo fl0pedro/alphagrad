@@ -235,6 +235,11 @@ REQUIRED_FLAGS = [
     # THE MEASUREMENT PIPELINE (owner ruling 2026-09-14).  Named so an arm
     # cannot inherit the trainer's synchronous default in silence.
     "--measure-pipeline",
+    # WHERE THE PER-STEP TOKENIZATION RUNS (owner ruling 2026-09-15).  Named
+    # for the same reason: it decides whether the measure actors are free
+    # during a rollout, and therefore whether the pipeline overlaps a
+    # measurement with the NEXT rollout or only with the previous update.
+    "--tokenize-where",
     "--cost-form",
     "--quality-floor",
     # The cost floor (.9, b2c89170): every training arm passes it explicitly,
@@ -699,6 +704,13 @@ SHARED_CLI = [
     # episode's PPO update and waits for these rewards while it runs.  See
     # CAMPAIGN_MEASURE_PIPELINE for what the one-episode lag costs.
     ("--measure-pipeline", "1"),
+    # THE PER-STEP TOKENIZATION STAYS IN THE TRAINER (ruling 2026-09-15).  It
+    # measures nothing, so it needs no measure actor; routing it to the pool
+    # cost a Ray round trip per step AND held the actors, which is what made
+    # the measurement of e overlap only the update of e-1.  With the actors
+    # free for the whole of the next rollout, e's measurement now overlaps
+    # the ROLLOUT of e+1.  See CAMPAIGN_TOKENIZE_WHERE.
+    ("--tokenize-where", "local"),
     # LOGGED, NOT TRAINED: sparsity (weight 0) and the legacy Jacobian cosine
     # (subsampled).  Clipped relative Frobenius rides slot 8 automatically
     # because grad_cosine materialises the exact reference it needs.
@@ -1459,6 +1471,16 @@ CAMPAIGN_RAY_MEASURE_TIMEOUT = "600"
 # identically 1 at epoch 0 (the arms run --ppo-epochs 1).
 CAMPAIGN_MEASURE_PIPELINE = "1"
 
+# WHERE THE PER-STEP TOKENIZATION RUNS (owner ruling 2026-09-15).  A
+# non-terminal callback row measures nothing under terminal rewards: it
+# tokenizes the prefix, decides face legality and returns the delta
+# observation.  It was riding the measure actors, which cost a Ray round trip
+# on every step and, worse, kept the actors busy -- so the pipelined terminal
+# measurement could only be hidden behind the previous UPDATE.  Kept in the
+# trainer process the actors are idle for the whole of the next rollout, and
+# the measurement of episode e is hidden behind the ROLLOUT of e+1.
+CAMPAIGN_TOKENIZE_WHERE = "local"
+
 # GATE G1 (ticket .45) on a node without a home: the sweep winners are read
 # from /Scratch.  THE TABLE IS THE SWEEP64 ONE, BY ORDER (owner ruling
 # 2026-09-13): 4029 rows at q >= 0.80 on Markowitz, 2969 on reverse.  The
@@ -1734,6 +1756,7 @@ def campaign_arm(*, phase: int, tag: str, profile: str, node: str, what: str,
         "--ray-measure": CAMPAIGN_RAY_MEASURE,
         "--ray-measure-timeout": CAMPAIGN_RAY_MEASURE_TIMEOUT,
         "--measure-pipeline": CAMPAIGN_MEASURE_PIPELINE,
+        "--tokenize-where": CAMPAIGN_TOKENIZE_WHERE,
         # THE GATE .45 INPUTS, the two the trainer cannot measure for itself.
         # G1's winners table is inherited from SHARED_CLI and resolved from
         # this arm's --fixed-order by `_merge_cli` (ONE mechanism, so a wave
