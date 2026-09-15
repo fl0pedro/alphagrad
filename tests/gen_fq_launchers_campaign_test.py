@@ -195,7 +195,7 @@ def test_required_flags_are_all_defined_where_the_preflight_greps(
     for f in ("--approx-profile", "--cost-form", "--quality-floor",
               "--mem-channel", "--gate-winners-table", "--fixed-order",
               "--ray-measure", "--ray-measure-timeout", "--measure-pipeline",
-              "--tokenize-where",
+              "--tokenize-where", "--face-wire-faces",
               "--per-face-masks",
               "--face-none-bias", "--approx-add", "--terminal-rewards-only"):
         assert f in gen.REQUIRED_FLAGS, f
@@ -254,6 +254,8 @@ def test_every_campaign_arm_carries_the_required_flags(gen, campaign):
                      # (owner ruling 2026-09-15), which is what lets the
                      # pipeline hide a measurement behind the NEXT rollout.
                      f" --tokenize-where {gen.CAMPAIGN_TOKENIZE_WHERE} ",
+                     # AND THE FACE WIRE CARRIES THE COLUMNS THAT ARE USED.
+                     f" --face-wire-faces {gen.CAMPAIGN_FACE_WIRE_FACES} ",
                      " --plan-log auto ", " --episodes 250 ",
                      " --measure-toolchain-gate abort ",
                      " --reduce-axis-space physical ",
@@ -904,6 +906,10 @@ def test_ppo_argparse_accepts_every_campaign_command_line(gen, campaign):
         # previous update, because the actors serve every rollout step.
         assert ns.tokenize_where == gen.CAMPAIGN_TOKENIZE_WHERE, a["name"]
         assert ns.tokenize_where != "pool", a["name"]
+        # THE FACE WIRE IS NARROWED and it is a positive width: 0 would ship
+        # the whole 1920-column prefix history on every callback.
+        assert ns.face_wire_faces == int(gen.CAMPAIGN_FACE_WIRE_FACES), a["name"]
+        assert ns.face_wire_faces > 0, a["name"]
         assert ns.face_none_bias == float(gen.FACE_NONE_BIAS_MVP), a["name"]
         assert ns.scale_face_head == float(gen.SCALE_FACE_HEAD_MVP), a["name"]
         assert ns.face_logit_clamp == float(gen.FACE_LOGIT_CLAMP_MVP), a["name"]
