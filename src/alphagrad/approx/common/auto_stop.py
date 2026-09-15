@@ -203,7 +203,7 @@ def check_auto_stop_args(args) -> None:
             "--auto-stop with --checkpoint-every 0 is refused. An auto-stopped "
             "run ends before the episode count it was given, so the only way "
             "to continue it is to resume from a checkpoint, and with "
-            "--checkpoint-every 0 there is none. Either give "
+            "--checkpoint-every 0 there is nothing to resume from. Either give "
             "--checkpoint-every a positive number (the ruled value for the "
             "thesis arms is 50) or drop --auto-stop.")
     points = check_points(args)

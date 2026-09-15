@@ -13960,14 +13960,18 @@ def main():
         # Skips are counted separately and reported, never folded into the
         # approximation count: a skip is a distinct action class.
         if _AUTO_STOP is not None:
-            _as_qi = REWARD_INDEX.get(_QUALITY_METRIC)
+            # THE CHANNEL IS "quality", not `_QUALITY_METRIC`. The latter names
+            # the MEASURE (jac_cosine, grad cosine); the reward slot it lands
+            # in is called "quality" on every arm. The plan panels above read
+            # the same literal for the same reason.
+            _as_qi = REWARD_INDEX.get("quality")
             if (_as_qi is None or all_rets.ndim != 2
                     or all_rets.shape[1] <= int(_as_qi)):
                 raise RuntimeError(
-                    f"--auto-stop needs the {_QUALITY_METRIC!r} channel of the "
-                    f"terminal reward vector to run its collapse detector, and "
-                    f"this episode's reward vectors have shape "
-                    f"{all_rets.shape}.")
+                    f"--auto-stop needs the quality channel of the terminal "
+                    f"reward vector (the measure is {_QUALITY_METRIC!r}) to "
+                    f"run its collapse detector, and this episode's reward "
+                    f"vectors have shape {all_rets.shape}.")
             if true_return is None:
                 raise RuntimeError(
                     "--auto-stop needs the episode's true scalar return and "
