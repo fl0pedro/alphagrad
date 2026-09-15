@@ -7716,6 +7716,13 @@ def main():
             print(f"[tokenize-where] cpu-actors: {_n_tok} CPU-only actors "
                   f"serve the per-step tokenization; the {_n_actors} measure "
                   f"actors serve terminals only", flush=True)
+        # THE BOUND OPERANDS FOR LOCALLY SERVED ROWS. `env.step` hands the
+        # callback zero-length placeholders once the pool owns them, so a row
+        # tokenized in this process has to read the env's own concrete copy
+        # from here. Installed unconditionally: it costs one reference and it
+        # is what ALPHAGRAD_POOL_TERMINAL_LOCAL=1 needed as well.
+        _tok_env_mod.set_local_bound_operands(
+            env.args, env.consts, env.eval_args_samples)
         _tok_env_mod.set_tokenize_where(_TWHERE, pool=_tok_pool)
         # THE DEFERRED SUBMISSION. Under the deep pipeline the terminal step
         # packages its batch and the driver starts it after the previous

@@ -1863,6 +1863,33 @@ def tokenize_pool():
     return _TOKENIZE_POOL[0]
 
 
+# THE TRAINER'S OWN COPY OF THE BOUND OPERANDS.
+#
+# `VertexEliminationEnv.step` hands the callback ZERO-LENGTH PLACEHOLDERS for
+# `args`, `consts` and the eval samples whenever the pool already owns them as
+# an ObjectRef: marshalling tens of megabytes device-to-host on every one of
+# the ninety-five decisions, so a remote closure could throw them away, was
+# pure waste. A row served IN THIS PROCESS needs the real ones, and until
+# `--tokenize-where` there was no such row in that configuration -- the
+# comment at that call site claimed `ALPHAGRAD_POOL_TERMINAL_LOCAL=1` still
+# got the real thing, and it did not.
+#
+# So the driver installs the env's own concrete operands here, once, and the
+# locally served rows read them from here. They are the same constants a
+# measure actor tokenizes from (its own env's bound args), they do not change
+# between steps, and nothing is marshalled per step.
+_LOCAL_BOUND = [None]
+
+
+def set_local_bound_operands(args, consts, eval_samples=None) -> None:
+    """Install the concrete `(args, consts, eval_samples)` for local rows."""
+    _LOCAL_BOUND[0] = (args, consts, eval_samples)
+
+
+def local_bound_operands():
+    return _LOCAL_BOUND[0]
+
+
 class MeasureTicketError(RuntimeError):
     """Misuse of the pipelined-measurement ticket protocol."""
 
@@ -9158,7 +9185,8 @@ class VertexEliminationEnv:
             remote_timeout_s=remote_timeout_s,
         )
 
-    def tokenize(self, init: bool = False, batched: bool = False):
+    def tokenize(self, init: bool = False, batched: bool = False,
+                 bound_dropped: bool = False):
         """Build the host-side function passed into ``io_callback``.
 
         If ``self._remote_pool`` is set, return a closure that
@@ -9168,6 +9196,11 @@ class VertexEliminationEnv:
         proceeds. Otherwise fall back to the inline ``_callback``
         path (single-process, no Ray) for backward compatibility
         with ``ppo.py`` / non-Ray callers.
+
+        ``bound_dropped`` says the caller handed placeholders instead of the
+        real ``args`` / ``consts`` / eval samples, because the pool already
+        owns them. A row served in THIS process then reads them from
+        :func:`local_bound_operands` instead.
         """
         if self._remote_pool is None:
             # THE JOIN CHANNEL IS KEYWORD-ONLY ON `_callback`, ON PURPOSE.
@@ -9468,13 +9501,35 @@ class VertexEliminationEnv:
                     # terminal measurement. One key, and the arm the operator
                     # ran says which of the two it is.
                     _tl0 = time.perf_counter()
+                    # THE REAL BOUND OPERANDS. `step` handed this callback
+                    # zero-length placeholders when the pool owns them, so a
+                    # local row has to read the trainer's own copy instead --
+                    # the tokenizer builds its graph from `args` and `consts`
+                    # and a placeholder makes graphax refuse the jaxpr.
+                    if bound_dropped:
+                        _lb = local_bound_operands()
+                        if _lb is None:
+                            raise RuntimeError(
+                                "a row is served in the trainer process, but "
+                                "the pool owns the bound operands and none "
+                                "were installed. The driver must call "
+                                "env.set_local_bound_operands(env.args, "
+                                "env.consts, env.eval_args_samples) before "
+                                "the first rollout.")
+                        _l_args, _l_consts, _l_ev = _lb
+                        _l_ev = tuple(_l_ev or ())
+                    else:
+                        _l_args, _l_consts, _l_ev = None, None, None
                 for i in _local:
                     _out = _callback(
                         self.config,
-                        _cb_slot(args, i, E),
-                        _cb_slot(consts, i, E),
+                        (_l_args if bound_dropped
+                         else _cb_slot(args, i, E)),
+                        (_l_consts if bound_dropped
+                         else _cb_slot(consts, i, E)),
                         ro[i], rs[i], rf[i], rk[i], _sti[i],
-                        *[_cb_slot(x, i, E) for x in eval_samples],
+                        *(_l_ev if bound_dropped
+                          else [_cb_slot(x, i, E) for x in eval_samples]),
                         init=init, face_joins=rj[i],
                     )
                     tk[i] = _wire_row(_out[0], _tok_dt, "tokens")
@@ -9897,7 +9952,7 @@ class VertexEliminationEnv:
         _drop_bound = _pool_owns_bound_operands(self._remote_pool)
         _z = jnp.zeros((1,), jnp.int32)
         _cbout = _env_callback(
-            self.tokenize(batched=True),
+            self.tokenize(batched=True, bound_dropped=_drop_bound),
             self._callback_shape,
             _z if _drop_bound else self.args,
             _z if _drop_bound else self.consts,
