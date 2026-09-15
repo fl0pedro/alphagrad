@@ -2320,7 +2320,15 @@ _ATTN_ENTROPY_ON = os.environ.get("ALPHAGRAD_ATTN_ENTROPY", "1") == "1"
 @eqx.filter_jit
 def attention_entropy_diagnostic(agent, tokens,
                                  axis_state=None, axis_valid=None):
-    """Mean encoder attention-row entropy, or NaN when nothing applies."""
+    """Mean encoder attention-row entropy, or NaN when nothing applies.
+
+    THE PATH IS THE LOSS. This runs the FULL ``agent.encoder``, which reaches
+    ``palimpsa_mix``, the one reader with no path argument of its own. Since
+    owner ruling 2026-09-15 the rollout and the loss may read palimpsa with
+    different operators, so the diagnostic has to say which one its curve
+    describes. It is computed inside ``_episode_update``, beside the loss, so
+    it names the loss. With the two reads equal the block changes nothing.
+    """
     from alphagrad.approx.set_pointer import SetPointerVertexPolicy
     parts = []
     pol = getattr(agent, "vertex_policy", None)
@@ -2330,7 +2338,8 @@ def attention_entropy_diagnostic(agent, tokens,
         if agent.pos_enc is not None:
             x = agent.pos_enc(x)
         enc_mask = None if agent.pos_enc is not None else token_mask
-        enc_x = agent.encoder(x, mask=enc_mask, key=jrand.PRNGKey(0))
+        with _read_path("loss"):
+            enc_x = agent.encoder(x, mask=enc_mask, key=jrand.PRNGKey(0))
         # Same segment pooling SetPointerVertexPolicy.__call__ does, so the
         # slots this scores are the slots the pointer actually sees.
         n_slots = pol.num_vertices + 1
