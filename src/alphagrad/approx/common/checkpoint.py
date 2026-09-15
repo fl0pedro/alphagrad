@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import pickle
+import shutil as _shutil
 import signal
 from typing import Any, Callable, Optional
 
@@ -196,3 +197,464 @@ def install_sigterm_handler(save_callable: Callable[[], None]) -> None:
         os.kill(os.getpid(), signal.SIGTERM)
 
     signal.signal(signal.SIGTERM, _handler)
+
+
+# ===========================================================================
+# THE PPO TRAINER'S EXACT CHECKPOINT (owner ruling 2026-09-15)
+# ===========================================================================
+#
+# Everything above this line belongs to the RAY trainers (ppo_ray_worker,
+# mu0_ray_worker, gfn_ray_worker). It is a crash-resume convenience: it
+# swallows serialisation errors and keeps training. Nothing below shares that
+# behaviour. This half is for `src/alphagrad/approx/ppo.py` and its contract
+# is EXACT RESUME, so every failure here RAISES. A checkpoint that silently
+# lost a field would produce a resumed run that looks right and is not.
+#
+# THE FORMAT, AND WHY IT IS TWO FILES
+# -----------------------------------
+# One directory per checkpoint, named by the episode counter so the last two
+# are found by sorting. Inside it:
+#
+#   state.eqx   equinox `tree_serialise_leaves` of ONE dict holding every
+#               piece the next episode's ARITHMETIC reads: the policy
+#               parameters, the optimiser state, the probe trees and their
+#               optimiser states, the three PopArt accumulators, the global
+#               step, the RNG key, and the two host-side duals. equinox
+#               writes each leaf with `numpy.save`, so a float32 array, a
+#               uint32 key and a Python float all come back BIT for BIT, and
+#               `tree_deserialise_leaves` checks the type, the shape and the
+#               dtype of every leaf against the live template. That check is
+#               the reason for the format: an optimiser chain that changed
+#               between the save and the load fails loudly instead of
+#               restoring a tree that no longer matches the parameters.
+#
+#   meta.json   everything that is BOOKKEEPING rather than arithmetic: the
+#               episode counter, the two bin policies, the Pareto archive,
+#               the top-N heaps and the best-so-far record, the wandb run id
+#               and the whole argument namespace. These are read by people
+#               and by other tools (`pareto_front.json` has the same shape),
+#               and none of them is an array, so a binary format would only
+#               make them harder to diagnose. JSON round-trips a Python
+#               float64 exactly -- `repr` is round-trip exact -- and every
+#               other value here is an int, a string or a bool.
+#
+# WHY NOT ONE FORMAT. A single JSON would have to base64 the parameter
+# arrays, which is neither readable nor cheap. A single equinox file would
+# have to invent array encodings for a list of elimination sequences and for
+# the argument namespace, and would lose the diagnosability that is the whole
+# reason the meta half exists. The split is along a real seam: arrays that
+# have to come back bit for bit, and records that have to be readable.
+#
+# WHAT IS NOT IN THE CHECKPOINT, AND WHY
+# --------------------------------------
+# * The frozen KL reference policy. It is the identity-initialised agent and
+#   is rebuilt from `--seed` on every start, before the restore. Saving it
+#   would let a resume disagree with the run it continues about what the
+#   reference is.
+# * The wandb `Table` of elimination orders. wandb owns it, the resume
+#   re-attaches to the same run, and the table is append-only output.
+# * The measure actors. A checkpoint is taken at a QUIESCENT point of the
+#   episode pipeline, where no measurement ticket is in flight, so there is
+#   nothing of theirs to save. `save` asserts that.
+
+#: Bumped whenever the on-disk layout changes in a way a reader must notice.
+PPO_CKPT_FORMAT = 1
+
+#: Directory prefix. The episode counter is zero-padded so a plain sort of
+#: the directory listing is a sort by episode.
+PPO_CKPT_PREFIX = "ppo_ckpt_ep"
+
+#: The arguments a resume is allowed to change. `--episodes` because a resume
+#: may extend the run, and `--resume` itself because the first leg did not
+#: carry it. EVERY other difference raises: the checkpoint is a state of one
+#: configuration and restoring it under another one is not a resume.
+PPO_RESUME_EXEMPT_ARGS = frozenset({"episodes", "resume"})
+
+
+class CheckpointError(RuntimeError):
+    """Any failure of the exact-checkpoint path. Never swallowed."""
+
+
+def add_checkpoint_args(p) -> None:
+    """Install `--checkpoint-every` and `--resume` on the PPO argparser."""
+    p.add_argument(
+        "--checkpoint-every", type=int, default=50, metavar="N",
+        help="Write a checkpoint every N episodes and once at the end of the "
+             "run, into the run directory (the wandb run dir when wandb is "
+             "on, else the working directory). The last two checkpoints of a "
+             "run are kept and older ones are deleted. 0 turns checkpointing "
+             "OFF. A checkpoint is taken at a QUIESCENT point of the episode "
+             "pipeline, so under --measure-pipeline 1 it first drains the "
+             "pending episode, which runs that episode's PPO update one "
+             "iteration earlier than the pipeline would have. The drain is "
+             "therefore part of the schedule and two runs compare only at "
+             "equal --checkpoint-every. Under --measure-pipeline 0 nothing "
+             "is ever pending and the drain is a no-op.")
+    p.add_argument(
+        "--resume", type=str, default="", metavar="PATH",
+        help="Continue the run saved in the checkpoint directory PATH. The "
+             "argument namespace must match the one the checkpoint was "
+             "written with, except --episodes (a resume may extend the run) "
+             "and --resume itself; any other difference raises. When wandb "
+             "is on the resumed run attaches to the SAME wandb run by id.")
+
+
+def run_directory(wandb_on: bool = True) -> str:
+    """The run's output directory: the wandb run dir, else the cwd.
+
+    The same rule `_resolve_plan_log_path` and `_dump_pareto` use, so a run's
+    plan log, its Pareto dump and its checkpoints land together. `wandb_on`
+    is False under `--wandb disabled`, where wandb still holds a run object
+    with a directory of its own that nothing else of this run writes to.
+    """
+    d = "."
+    if wandb_on:
+        try:
+            import wandb as _wandb
+            d = _wandb.run.dir if _wandb.run is not None else "."
+        except Exception:
+            d = "."
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        d = "."
+    return d
+
+
+def checkpoint_dir_name(episode: int) -> str:
+    return f"{PPO_CKPT_PREFIX}{int(episode):09d}"
+
+
+def list_checkpoints(run_dir: str) -> list:
+    """Every checkpoint directory in `run_dir`, oldest episode first."""
+    if not run_dir or not os.path.isdir(run_dir):
+        return []
+    out = []
+    for name in os.listdir(run_dir):
+        if not name.startswith(PPO_CKPT_PREFIX):
+            continue
+        full = os.path.join(run_dir, name)
+        if os.path.isdir(full) and os.path.exists(
+                os.path.join(full, "meta.json")):
+            out.append(full)
+    return sorted(out)
+
+
+# ---------------------------------------------------------------------------
+# The bookkeeping objects, to and from plain JSON values.
+# ---------------------------------------------------------------------------
+
+def bin_policy_to_json(bp) -> dict:
+    """The MUTABLE state of an `episode_stream.BinPolicy`.
+
+    Only the state, never the configuration: the history window, the margin,
+    the cap and the floor come from the environment and the arguments and are
+    re-derived on the resumed run, where a difference has to surface as a
+    mismatch rather than be overwritten from the file.
+    """
+    return {
+        "log2": int(bp.log2),
+        "last_used": (None if bp.last_used is None else int(bp.last_used)),
+        "overflowed": bool(bp.overflowed),
+        "recent": [int(x) for x in bp.recent],
+        # Carried for the check below, not to be restored.
+        "initial": int(bp.initial),
+        "window": int(bp.window),
+        "margin": float(bp.margin),
+        "cap": int(bp.cap),
+        "floor": int(bp.floor),
+    }
+
+
+def bin_policy_from_json(bp, d: dict) -> None:
+    """Put a saved bin state back on a freshly built `BinPolicy`, in place."""
+    for field in ("initial", "window", "margin", "cap", "floor"):
+        live = getattr(bp, field)
+        saved = d[field]
+        live = float(live) if field == "margin" else int(live)
+        saved = float(saved) if field == "margin" else int(saved)
+        if live != saved:
+            raise CheckpointError(
+                f"the bin policy's {field} is {live} on this run and {saved} "
+                f"in the checkpoint. The bin is a compiled SHAPE, so a run "
+                f"that resumes under a different bin configuration is not the "
+                f"run that was saved.")
+    bp.log2 = int(d["log2"])
+    bp.last_used = (None if d["last_used"] is None else int(d["last_used"]))
+    bp.overflowed = bool(d["overflowed"])
+    bp.recent.clear()
+    for x in d["recent"]:
+        bp.recent.append(int(x))
+
+
+def pareto_archive_to_json(archive) -> dict:
+    """The archive's points, sequences and admission episodes, plus the
+    candidate log and the hypervolume reference."""
+    return {
+        "obj_names": [str(n) for n in archive.obj_names],
+        "obj_idx": [int(i) for i in archive.obj_idx],
+        "quality_floor": (None if archive.quality_floor is None
+                          else float(archive.quality_floor)),
+        "pts": [[float(x) for x in p] for p in archive.pts],
+        "seqs": list(archive.seqs),
+        "eps": [int(e) for e in archive.eps],
+        "all_candidates": list(archive.all_candidates),
+        "seen": sorted(str(s) for s in archive._seen),
+        "hv_ref": (None if archive._hv_ref is None
+                   else [float(x) for x in archive._hv_ref]),
+    }
+
+
+def pareto_archive_from_json(archive, d: dict) -> None:
+    """Refill a freshly built `ParetoArchive` from a saved one, in place."""
+    if [str(n) for n in archive.obj_names] != [str(n) for n in d["obj_names"]]:
+        raise CheckpointError(
+            f"the Pareto archive's objectives are {archive.obj_names} on this "
+            f"run and {d['obj_names']} in the checkpoint.")
+    if [int(i) for i in archive.obj_idx] != [int(i) for i in d["obj_idx"]]:
+        raise CheckpointError(
+            f"the Pareto archive's reward indices are {archive.obj_idx} on "
+            f"this run and {d['obj_idx']} in the checkpoint.")
+    archive.pts = [np.asarray(p, dtype=np.float64) for p in d["pts"]]
+    archive.seqs = list(d["seqs"])
+    archive.eps = [int(e) for e in d["eps"]]
+    archive.all_candidates = list(d["all_candidates"])
+    archive._seen = set(d["seen"])
+    archive._hv_ref = (None if d["hv_ref"] is None
+                       else np.asarray(d["hv_ref"], dtype=np.float64))
+
+
+def host_state_to_json(host_state: dict) -> dict:
+    """The trainer's `host_state`, minus the wall-clock origin.
+
+    `_wall_t0` is deliberately dropped. It is this process's `perf_counter`
+    origin and restoring another process's would make `time/wall_seconds`
+    meaningless. A resumed run's wall clock starts at its own start.
+    """
+    out = {}
+    for name in ("samplecounts", "collapsed_total"):
+        if name in host_state:
+            out[name] = int(host_state[name])
+    out["best_global_return"] = float(host_state["best_global_return"])
+    out["best_global_act_seq"] = host_state["best_global_act_seq"]
+    for name in ("top_n_total", "top_n_cmp", "top_n_mem", "top_n_acc"):
+        out[name] = [
+            [float(p[0]), int(p[1]), [float(x) for x in p[2]], p[3]]
+            for p in host_state[name]
+        ]
+    return out
+
+
+def host_state_from_json(host_state: dict, d: dict) -> None:
+    """Put a saved `host_state` back, in place, keeping this run's `_wall_t0`."""
+    for name in ("samplecounts", "collapsed_total"):
+        if name in d:
+            host_state[name] = int(d[name])
+    host_state["best_global_return"] = float(d["best_global_return"])
+    host_state["best_global_act_seq"] = d["best_global_act_seq"]
+    for name in ("top_n_total", "top_n_cmp", "top_n_mem", "top_n_acc"):
+        host_state[name] = [
+            (float(p[0]), int(p[1]), [float(x) for x in p[2]], p[3])
+            for p in d[name]
+        ]
+
+
+# ---------------------------------------------------------------------------
+# The argument namespace.
+# ---------------------------------------------------------------------------
+
+def args_to_json(args) -> dict:
+    """The whole argument namespace as plain JSON values."""
+    out = {}
+    for name, value in sorted(vars(args).items()):
+        out[name] = _jsonable(value)
+    return out
+
+
+def _jsonable(value):
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    raise CheckpointError(
+        f"an argument of type {type(value).__name__} cannot be written to the "
+        f"checkpoint's argument namespace: {value!r}. Add an encoding for it "
+        f"rather than dropping it -- a dropped argument is an argument a "
+        f"resume cannot check.")
+
+
+def check_resume_args(saved: dict, args) -> None:
+    """RAISE unless the live arguments match the saved ones.
+
+    Exempt: `--episodes`, because a resume may extend the run, and `--resume`
+    itself. Everything else is part of the state the checkpoint is a state OF.
+    """
+    live = args_to_json(args)
+    problems = []
+    for name in sorted(set(saved) | set(live)):
+        if name in PPO_RESUME_EXEMPT_ARGS:
+            continue
+        if name not in saved:
+            problems.append(f"  {name}: absent from the checkpoint, "
+                            f"{live[name]!r} on the command line")
+        elif name not in live:
+            problems.append(f"  {name}: {saved[name]!r} in the checkpoint, "
+                            f"absent on the command line")
+        elif saved[name] != live[name]:
+            problems.append(f"  {name}: {saved[name]!r} in the checkpoint, "
+                            f"{live[name]!r} on the command line")
+    if problems:
+        raise CheckpointError(
+            "the command line does not match the checkpoint's argument "
+            "namespace, so this is not a resume of that run:\n"
+            + "\n".join(problems)
+            + "\nOnly --episodes and --resume may differ.")
+    saved_eps = int(saved.get("episodes", 0))
+    live_eps = int(live["episodes"])
+    if live_eps < saved_eps:
+        raise CheckpointError(
+            f"--episodes {live_eps} is below the checkpoint's {saved_eps}. A "
+            f"resume may EXTEND a run; it cannot shorten one, because the "
+            f"learning-rate schedule's horizon is built from --episodes and a "
+            f"shorter horizon is a different schedule.")
+
+
+# ---------------------------------------------------------------------------
+# Save and load.
+# ---------------------------------------------------------------------------
+
+def _leaf_tag(leaf) -> str:
+    """A description of one leaf that is the same in two PROCESSES.
+
+    `repr` is not: a function or a plain object prints its address, and two
+    runs of the same program print two different ones. So an address-bearing
+    repr is reduced to the type alone, and every other leaf keeps its value.
+    """
+    t = type(leaf)
+    name = f"{t.__module__}.{t.__qualname__}"
+    r = repr(leaf)
+    if "0x" in r:
+        return name
+    return f"{name}:{r}"
+
+
+def _non_array_manifest(tree) -> list:
+    """Every leaf equinox will NOT write, as `path -> tag`.
+
+    equinox serialises array-like leaves and passes over the rest, returning
+    the TEMPLATE's value for them on load. That is silent state loss, which
+    this module does not allow, so the manifest is saved and compared.
+    """
+    import equinox as eqx
+    import jax.tree_util as jtu
+
+    out = []
+    for path, leaf in jtu.tree_flatten_with_path(tree)[0]:
+        if not eqx.is_array_like(leaf):
+            out.append([jtu.keystr(path), _leaf_tag(leaf)])
+    return out
+
+
+def save_ppo_checkpoint(run_dir, *, episode, tree, meta, keep=2) -> str:
+    """Write ONE checkpoint and prune all but the newest `keep`.
+
+    `tree` is the arithmetic half (see the header); `meta` is the bookkeeping
+    half and must already be JSON values. Returns the directory written.
+
+    The write is staged in a sibling `.writing` directory and renamed into
+    place, so a checkpoint directory that exists is a checkpoint that is
+    complete.
+    """
+    import equinox as eqx
+
+    if not run_dir:
+        raise CheckpointError("the checkpoint needs a run directory.")
+    os.makedirs(run_dir, exist_ok=True)
+    final = os.path.join(run_dir, checkpoint_dir_name(episode))
+    staging = final + ".writing"
+    if os.path.exists(staging):
+        _shutil.rmtree(staging)
+    os.makedirs(staging)
+
+    eqx.tree_serialise_leaves(os.path.join(staging, "state.eqx"), tree)
+
+    doc = dict(meta)
+    doc["format"] = PPO_CKPT_FORMAT
+    doc["episode"] = int(episode)
+    doc["non_array_leaves"] = _non_array_manifest(tree)
+    _atomic_write(
+        os.path.join(staging, "meta.json"),
+        json.dumps(doc, indent=1, sort_keys=True).encode("utf-8"),
+    )
+
+    if os.path.exists(final):
+        _shutil.rmtree(final)
+    os.rename(staging, final)
+
+    if keep is not None and int(keep) > 0:
+        existing = list_checkpoints(run_dir)
+        for stale in existing[:max(0, len(existing) - int(keep))]:
+            _shutil.rmtree(stale)
+    return final
+
+
+def read_ppo_meta(path: str) -> dict:
+    """The `meta.json` of a checkpoint directory. No template needed.
+
+    This is what the trainer reads BEFORE it builds anything, so an argument
+    mismatch is refused before a single array is allocated.
+    """
+    if not path:
+        raise CheckpointError("--resume needs a checkpoint directory.")
+    if not os.path.isdir(path):
+        raise CheckpointError(
+            f"--resume {path!r} is not a directory. It must be one of the "
+            f"'{PPO_CKPT_PREFIX}*' directories a run wrote.")
+    meta_path = os.path.join(path, "meta.json")
+    if not os.path.exists(meta_path):
+        raise CheckpointError(
+            f"--resume {path!r} holds no meta.json, so it is not a complete "
+            f"checkpoint.")
+    with open(meta_path) as fh:
+        doc = json.load(fh)
+    fmt = int(doc.get("format", -1))
+    if fmt != PPO_CKPT_FORMAT:
+        raise CheckpointError(
+            f"the checkpoint in {path!r} is format {fmt}; this build reads "
+            f"format {PPO_CKPT_FORMAT}.")
+    return doc
+
+
+def load_ppo_tree(path: str, template):
+    """The arithmetic half of a checkpoint, against a live `template`.
+
+    `template` must be the same dict of live objects `save_ppo_checkpoint`
+    was handed, freshly built by this run. equinox checks every leaf's type,
+    shape and dtype against it, and the non-array manifest is checked here,
+    so a checkpoint that does not fit this build raises instead of restoring
+    a tree that silently keeps some of the template's values.
+    """
+    import equinox as eqx
+
+    state_path = os.path.join(path, "state.eqx")
+    if not os.path.exists(state_path):
+        raise CheckpointError(
+            f"--resume {path!r} holds no state.eqx, so it is not a complete "
+            f"checkpoint.")
+    saved_manifest = [list(x) for x in read_ppo_meta(path).get(
+        "non_array_leaves", [])]
+    live_manifest = [list(x) for x in _non_array_manifest(template)]
+    if saved_manifest != live_manifest:
+        raise CheckpointError(
+            "the checkpoint's non-array leaves differ from this run's. "
+            "equinox does not write those leaves, so restoring would keep "
+            "this run's values for them and call the result a resume.\n"
+            f"  in the checkpoint: {saved_manifest}\n"
+            f"  on this run:       {live_manifest}")
+    return eqx.tree_deserialise_leaves(state_path, template)
