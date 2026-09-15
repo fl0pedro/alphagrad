@@ -38,7 +38,8 @@ from alphagrad.approx.common.datasets import (
     SHD_CHANNELS,
     SHD_CLASSES,
     SHD_TIME_BINS,
-    load_shd,
+    shd_sample,
+    shd_split_size,
 )
 
 #: The registered targets that HAVE time steps, i.e. the ones on which a
@@ -121,14 +122,23 @@ def _spike_sequence(key, dataset: str | None, dataset_size: int | None):
     train LIF_SNN_SHD shipped with, so a run that asks for no dataset still
     builds the same SHAPE and every archived LIF_SNN_SHD result reproduces.
     """
+    if dataset is not None and dataset not in ("shd", "none"):
+        raise ValueError(
+            f"--dataset {dataset} cannot feed an SHD target: a spike window is "
+            f"(T, {SHD_CHANNELS}) and nothing in {dataset} has that shape. Use "
+            f"--dataset shd for the real recordings, or --dataset none for the "
+            f"synthetic Poisson train.")
     if dataset == "shd":
-        x, y = load_shd(dataset_size)
-        n = int(x.shape[0])
+        n = shd_split_size(dataset_size)
         if n == 0:
             raise ValueError(
                 "the SHD subset is empty -- --dataset-size cut every sample")
+        # ONE recording reaches the device. The split stays uint8 on the host:
+        # the full train split as float32 is 2.28 GB, and the trainer plus its
+        # measure actors would each hold a copy of it.
         idx = int(jax.random.randint(key, (), 0, n))
-        return jnp.asarray(x[idx]), jnp.asarray(y[idx])
+        seq, tgt = shd_sample(idx)
+        return jnp.asarray(seq), jnp.asarray(tgt)
     k = jax.random.split(key, 2)
     seq = jax.random.bernoulli(
         k[0], 0.1, (SHD_TIME_BINS, SHD_CHANNELS)).astype(jnp.float32)

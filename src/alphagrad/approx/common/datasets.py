@@ -284,8 +284,17 @@ def _download_shd(cache: Path, subset: str) -> Path:
     return target
 
 
+# THE BINNED SPLIT IS uint8, ON THE HOST. The train split is 8156 x 100 x 700
+# cells; as float32 that is 2.28 GB on disk, in every process's RAM, and -- if
+# it were handed to jnp -- on every device, once for the trainer and once for
+# each measure actor. The measured maximum count in a 10 ms bin is 6, so uint8
+# is LOSSLESS here and costs a quarter of that. The one sample a target
+# actually consumes is widened to float32 when it is drawn.
+_SHD_COUNT_DTYPE = np.uint8
+
+
 def _bin_shd(path: Path) -> tuple[np.ndarray, np.ndarray]:
-    """Bin one raw SHD file to ``(x [N, T, 700] float32, y [N] uint8)``."""
+    """Bin one raw SHD file to ``(x [N, T, 700] uint8, y [N] uint8)``."""
     import h5py
 
     with h5py.File(path, "r") as fh:
@@ -293,7 +302,7 @@ def _bin_shd(path: Path) -> tuple[np.ndarray, np.ndarray]:
         units = fh["spikes"]["units"]
         labels = np.asarray(fh["labels"][:], dtype=np.uint8)
         n = int(labels.shape[0])
-        x = np.zeros((n, SHD_TIME_BINS, SHD_CHANNELS), dtype=np.float32)
+        x = np.zeros((n, SHD_TIME_BINS, SHD_CHANNELS), dtype=_SHD_COUNT_DTYPE)
         for i in range(n):
             t = np.asarray(times[i], dtype=np.float64)
             u = np.asarray(units[i], dtype=np.int64)
@@ -304,7 +313,15 @@ def _bin_shd(path: Path) -> tuple[np.ndarray, np.ndarray]:
                 raise ValueError(
                     f"{path.name} sample {i}: channel index out of range "
                     f"[0, {SHD_CHANNELS}): min {c.min()}, max {c.max()}")
-            np.add.at(x[i], (b, c), 1.0)
+            cell = np.zeros((SHD_TIME_BINS, SHD_CHANNELS), dtype=np.int32)
+            np.add.at(cell, (b, c), 1)
+            if cell.max() > np.iinfo(_SHD_COUNT_DTYPE).max:
+                raise ValueError(
+                    f"{path.name} sample {i}: a 10 ms bin holds "
+                    f"{cell.max()} spikes, more than "
+                    f"{_SHD_COUNT_DTYPE.__name__} can store; widen "
+                    f"_SHD_COUNT_DTYPE rather than clipping the count")
+            x[i] = cell.astype(_SHD_COUNT_DTYPE)
     if labels.size and int(labels.max()) >= SHD_CLASSES:
         raise ValueError(
             f"{path.name}: label {int(labels.max())} is outside "
@@ -312,47 +329,94 @@ def _bin_shd(path: Path) -> tuple[np.ndarray, np.ndarray]:
     return x, labels
 
 
+_SHD_BINNED: dict = {}
+
+
 def _shd_binned(subset: str) -> tuple[np.ndarray, np.ndarray]:
-    """The binned split, from the ``.npz`` cache or built and cached once."""
+    """The binned split ``(x uint8, y uint8 labels)``, on the HOST.
+
+    From the ``.npz`` cache beside the MNIST cache, or binned from the raw
+    ``.h5`` and cached once. Held per process in ``_SHD_BINNED`` so a second
+    ``--dataset-size`` does not re-read 570 MB.
+    """
     if subset not in _SHD_FILES:
         raise ValueError(
             f"SHD subset must be one of {sorted(_SHD_FILES)}, got {subset!r}")
+    hit = _SHD_BINNED.get(subset)
+    if hit is not None:
+        return hit
     cache = _shd_cache_dir()
     npz = cache / (f"shd_{subset}_binned_"
                    f"{SHD_TIME_BINS}x{SHD_CHANNELS}.npz")
     if npz.exists():
         with np.load(npz) as z:
-            return z["x"], z["y"]
-    raw = _download_shd(cache, subset)
-    x, y = _bin_shd(raw)
-    # Written through an OPEN HANDLE, then renamed: np.savez appends ".npz" to
-    # a path that does not already end in it, so passing a ".part" NAME wrote
-    # "<...>.npz.part.npz" and the rename then failed on a file that was never
-    # created. The rename is what makes a half-written cache impossible.
-    tmp = cache / (npz.name + ".part")
-    with open(tmp, "wb") as fh:
-        np.savez(fh, x=x, y=y)
-    tmp.replace(npz)
-    return x, y
+            out = (z["x"], z["y"])
+    else:
+        raw = _download_shd(cache, subset)
+        out = _bin_shd(raw)
+        # Written through an OPEN HANDLE, then renamed: np.savez appends ".npz"
+        # to a path that does not already end in it, so passing a ".part" NAME
+        # wrote "<...>.npz.part.npz" and the rename then failed on a file that
+        # was never created. The rename is what makes a half-written cache
+        # impossible.
+        tmp = cache / (npz.name + ".part")
+        with open(tmp, "wb") as fh:
+            np.savez(fh, x=out[0], y=out[1])
+        tmp.replace(npz)
+    _SHD_BINNED[subset] = out
+    return out
 
 
-def load_shd(dataset_size: int | None = -1, subset: str = "train"):
-    """SHD as ``(x [N, 100, 700] float32, y [N, 20] float32 one-hot)``.
+def shd_split_size(dataset_size: int | None = -1, subset: str = "train") -> int:
+    """How many recordings ``--dataset-size`` leaves in ``subset``."""
+    x, _ = _shd_binned(subset)
+    n = int(x.shape[0])
+    if dataset_size is not None and dataset_size > 0:
+        n = min(n, int(dataset_size))
+    return n
 
-    ``dataset_size > 0`` keeps the FIRST ``dataset_size`` samples -- the same
-    fixed-prefix subset rule :func:`load_dataset` applies to MNIST, so two
-    processes that were given the same number see the same samples in the same
-    slots and the trainer and its measure actors cannot disagree about which
-    recording a gradient was taken on.
+
+def shd_sample(index: int, subset: str = "train"):
+    """ONE recording as ``(x [100, 700] float32, y [20] float32 one-hot)``.
+
+    This is what a target's argument builder draws. It widens exactly one
+    recording, so the full split never leaves the host and never becomes
+    float32.
     """
-    ck = ("shd", int(dataset_size) if dataset_size is not None else None, subset)
+    x, y = _shd_binned(subset)
+    i = int(index)
+    if not 0 <= i < int(x.shape[0]):
+        raise IndexError(
+            f"SHD {subset} holds {int(x.shape[0])} recordings; asked for {i}")
+    one_hot = np.zeros((SHD_CLASSES,), dtype=np.float32)
+    one_hot[int(y[i])] = 1.0
+    return x[i].astype(np.float32), one_hot
+
+
+def load_shd(dataset_size: int | None = -1, subset: str = "train",
+             device: bool = True):
+    """THE WHOLE SPLIT as ``(x [N, 100, 700] float32, y [N, 20] one-hot)``.
+
+    ``dataset_size > 0`` keeps the FIRST ``dataset_size`` recordings -- the
+    same fixed-prefix subset rule :func:`load_dataset` applies to MNIST, so two
+    processes that were given the same number see the same recordings in the
+    same slots and the trainer and its measure actors cannot disagree about
+    which one a gradient was taken on.
+
+    ``device=False`` returns numpy and leaves the tensor on the host. THIS IS
+    A HEAVY CALL either way -- the full train split is 2.28 GB as float32 --
+    and nothing on the trainer's path makes it: the targets draw one recording
+    through :func:`shd_sample`.
+    """
+    ck = ("shd", int(dataset_size) if dataset_size is not None else None,
+          subset, bool(device))
     if ck in _DATASET_CACHE:
         return _DATASET_CACHE[ck]
     x_np, y_np = _shd_binned(subset)
-    y_np = np.eye(SHD_CLASSES, dtype=np.float32)[y_np]
-    if dataset_size is not None and dataset_size > 0:
-        x_np = x_np[:dataset_size]
-        y_np = y_np[:dataset_size]
-    result = (jnp.asarray(x_np), jnp.asarray(y_np))
+    n = shd_split_size(dataset_size, subset)
+    x_np = x_np[:n].astype(np.float32)
+    y_np = np.eye(SHD_CLASSES, dtype=np.float32)[y_np[:n]]
+    result = ((jnp.asarray(x_np), jnp.asarray(y_np)) if device
+              else (x_np, y_np))
     _DATASET_CACHE[ck] = result
     return result

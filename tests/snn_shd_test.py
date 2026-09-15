@@ -70,9 +70,11 @@ def shd_cache(tmp_path, monkeypatch):
     so the loader has to bin it and write the ``.npz`` itself."""
     monkeypatch.setenv("DSNN_SHD_DIR", str(tmp_path))
     D._DATASET_CACHE.clear()
+    D._SHD_BINNED.clear()
     raw = _write_raw_shd(tmp_path / "shd_train.h5")
     yield tmp_path, raw
     D._DATASET_CACHE.clear()
+    D._SHD_BINNED.clear()
 
 
 def test_shapes_and_dtypes(shd_cache):
@@ -99,6 +101,19 @@ def test_a_spike_lands_in_the_bin_its_time_names(shd_cache):
         assert x[i].sum() == float(keep.sum())
 
 
+def test_the_binned_split_is_uint8_on_the_host(shd_cache):
+    """The trainer never materialises the split as float32: 8156 recordings
+    are 2.28 GB that way, once per process. The measured maximum count in a
+    10 ms bin is 6, so uint8 is lossless."""
+    x, y = D._shd_binned("train")
+    assert x.dtype == np.uint8 and isinstance(x, np.ndarray)
+    assert y.dtype == np.uint8
+    seq, tgt = D.shd_sample(0)
+    assert seq.dtype == np.float32 and seq.shape == (D.SHD_TIME_BINS,
+                                                     D.SHD_CHANNELS)
+    assert tgt.shape == (D.SHD_CLASSES,) and float(tgt.sum()) == 1.0
+
+
 def test_the_binned_cache_round_trips(shd_cache):
     path, _ = shd_cache
     x1, y1 = D.load_shd(-1)
@@ -108,6 +123,7 @@ def test_the_binned_cache_round_trips(shd_cache):
     # anything still reads it the loader would try to download.
     (path / "shd_train.h5").unlink()
     D._DATASET_CACHE.clear()
+    D._SHD_BINNED.clear()
     x2, y2 = D.load_shd(-1)
     assert np.array_equal(np.asarray(x1), np.asarray(x2))
     assert np.array_equal(np.asarray(y1), np.asarray(y2))
@@ -118,14 +134,17 @@ def test_dataset_size_is_a_fixed_prefix_subset(shd_cache):
     D._DATASET_CACHE.clear()
     x3, y3 = D.load_shd(3)
     assert x3.shape[0] == 3 and y3.shape[0] == 3
+    assert D.shd_split_size(3) == 3 and D.shd_split_size(-1) == 6
     assert np.array_equal(np.asarray(x3), np.asarray(x_all)[:3])
     assert np.array_equal(np.asarray(y3), np.asarray(y_all)[:3])
-    # Deterministic: a second process-level load of the same number gives the
-    # same samples in the same slots, which is what lets the trainer and its
-    # measure actors agree about which recording a gradient was taken on.
+    # Deterministic: a second load of the same number gives the same
+    # recordings in the same slots, which is what lets the trainer and its
+    # measure actors agree about which one a gradient was taken on.
     D._DATASET_CACHE.clear()
+    D._SHD_BINNED.clear()
     x3b, _ = D.load_shd(3)
     assert np.array_equal(np.asarray(x3), np.asarray(x3b))
+    assert np.array_equal(np.asarray(x3)[1], D.shd_sample(1)[0])
 
 
 def test_load_dataset_routes_shd(shd_cache):
@@ -141,8 +160,8 @@ def test_the_target_consumes_the_real_recording(shd_cache):
                   grad_window=4, dataset_size=6)
     window = np.asarray(xs[0])
     assert window.shape == (4, D.SHD_CHANNELS)
-    x_all = np.asarray(D.load_shd(6)[0])
-    assert any(np.array_equal(window, x_all[i, -4:]) for i in range(6)), (
+    assert any(np.array_equal(window, D.shd_sample(i)[0][-4:])
+               for i in range(6)), (
         "the window is not the last 4 bins of any recording in the subset")
 
 
@@ -267,3 +286,15 @@ def test_adalif_shd_has_the_adaptive_signature():
         assert np.asarray(ada[i]).shape == np.asarray(lif[i]).shape
     assert infer_argnums("ADALIF_SNN_SHD") == (8, 9, 10)
     assert np.ndim(get_fn("ADALIF_SNN_SHD")(*ada)) == 0
+
+
+def test_a_dataset_the_target_cannot_consume_raises(shd_cache):
+    """--dataset mnist on an SHD target used to fall through to the synthetic
+    Poisson train, silently. A spike window is (T, 700) and nothing in MNIST
+    has that shape, so the name that cannot work says so."""
+    from alphagrad.approx.common.examples import get_args
+
+    with pytest.raises(ValueError) as ei:
+        get_args("ADALIF_SNN_SHD", jax.random.PRNGKey(0), dataset="mnist",
+                 grad_window=2)
+    assert "cannot feed an SHD target" in str(ei.value)
