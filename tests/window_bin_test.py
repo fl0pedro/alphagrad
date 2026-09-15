@@ -497,7 +497,7 @@ def test_advance_at_a_smaller_window_bin_gives_bit_identical_vertex_memory():
             StubAgent(), jnp.zeros(()), vs, vc,
             jnp.asarray(t), jnp.asarray(count, jnp.int32),
             jnp.asarray(2, jnp.int32),
-            window=window, participants=jnp.asarray(part))
+            window=window, participants=jnp.asarray(part), path="rollout")
 
     a = [np.asarray(x) for x in run(32768)]
     b = [np.asarray(x) for x in run(4096)]

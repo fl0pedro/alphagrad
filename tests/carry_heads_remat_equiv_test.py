@@ -105,7 +105,7 @@ def _loop(agent, K, d_tok, d_cnt, owner, part, *, remat):
         return CS.advance(
             agent, carry, vs, vc, dt, dc, ow,
             window=DELTA_W, participants=pa,
-            chunk=None, budget=jnp.asarray(DELTA_W, jnp.int32),
+            chunk=None, budget=jnp.asarray(DELTA_W, jnp.int32), path="rollout",
         )
 
     step = jax.checkpoint(_advance_k) if remat else _advance_k

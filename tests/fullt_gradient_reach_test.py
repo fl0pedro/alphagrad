@@ -114,7 +114,7 @@ def _step(agent, carry, vs, vc, dt, dc, ow, pa):
     return CS.advance(
         agent, carry, vs, vc, dt, dc, ow,
         window=DELTA_W, participants=pa,
-        chunk=None, budget=jnp.asarray(DELTA_W, jnp.int32),
+        chunk=None, budget=jnp.asarray(DELTA_W, jnp.int32), path="rollout",
     )
 
 

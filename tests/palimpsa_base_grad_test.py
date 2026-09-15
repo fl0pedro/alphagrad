@@ -113,7 +113,7 @@ def _step(a_head, a_base, s, *, legacy_base=None):
     _c, vs, vc = CS.advance(
         a_head, enc, vs, vc, s["d_tok"],
         jnp.asarray(DELTA_W, jnp.int32), jnp.asarray(2, jnp.int32),
-        window=DELTA_W, participants=s["part"], chunk=0)
+        window=DELTA_W, participants=s["part"], chunk=0, path="rollout")
     bm = legacy_base if legacy_base is not None else _base(a_base, s)
     return _scalar(CS.heads(a_head, vs, vc, base_mem=bm, preference=None))
 
@@ -186,13 +186,13 @@ def test_base_and_dynamic_memories_add_to_one_readout(setup):
     _c, ds, dc = CS.advance(
         a, enc, vs, vc, s["d_tok"],
         jnp.asarray(DELTA_W, jnp.int32), jnp.asarray(2, jnp.int32),
-        window=DELTA_W, participants=s["part"], chunk=0)
+        window=DELTA_W, participants=s["part"], chunk=0, path="rollout")
     joint = _vmem.read(bs + ds, bc + dc)
     # Same thing computed the accumulating way: fold the delta into the base.
     _c2, js, jc = CS.advance(
         a, enc, bs, bc, s["d_tok"],
         jnp.asarray(DELTA_W, jnp.int32), jnp.asarray(2, jnp.int32),
-        window=DELTA_W, participants=s["part"], chunk=0)
+        window=DELTA_W, participants=s["part"], chunk=0, path="rollout")
     np.testing.assert_allclose(np.asarray(joint), np.asarray(_vmem.read(js, jc)),
                                rtol=1e-6, atol=1e-6)
 

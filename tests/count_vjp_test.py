@@ -159,7 +159,7 @@ def _advance(agent, tok, count, owner, part, budget):
     return CS.advance(
         agent, carry, vs, vc, tok, count, owner,
         window=WINDOW, participants=part,
-        chunk=CHUNK, budget=budget,
+        chunk=CHUNK, budget=budget, path="rollout",
     )
 
 
@@ -430,7 +430,7 @@ def _stream_scalar(agent, s, budget):
             lambda c, u, w: CS.advance(
                 agent, c, u, w, s["stream"], cnt, ow,
                 start=off, row=row, window=WINDOW, participants=pa,
-                chunk=CHUNK, budget=budget))
+                chunk=CHUNK, budget=budget, path="rollout"))
         carry, vs, vc = step(carry, vs, vc)
         return (jnp.sum(carry.M * 1.0) + jnp.sum(carry.I * 2.0)
                 + jnp.sum(vs * 4.0) + jnp.sum(vc * 5.0))

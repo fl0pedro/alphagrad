@@ -56,6 +56,7 @@ from jax import lax
 
 from alphagrad.approx import vertex_memory as _vmem
 from alphagrad.approx.common import delta_fold as _fold
+from alphagrad.transformer.fast_palimpsa_pallas import read_path as _read_path
 
 __all__ = ["init_carry", "base_memory", "zero_memory", "zero_edge_memory",
            "advance", "heads"]
@@ -135,10 +136,16 @@ def init_carry(agent, base_tokens, base_count, *, window,
             agent, enc0, base_tokens, base_count,
             window=window, total_v=total_v, embd_dim=embd_dim,
             base_owners=base_owners, path=path)
-    enc1, rows0, valid0 = agent.encode_extend(
-        enc0, base_tokens, base_count, window=window, start=0, chunk=0,
-        path=path,
-    )
+    # THE PATH IS NAMED BY A BLOCK, not by an argument, on the two UNFOLDED
+    # branches of this module. The agent here may be a test STUB whose
+    # `encode_extend` takes no `path` keyword at all -- it carries its own
+    # recurrence and has no palimpsa read to choose -- so passing one would
+    # be a TypeError. A real agent's `encode_extend` defaults its `path` to
+    # the enclosing block, so it sees exactly the same answer.
+    with _read_path(path):
+        enc1, rows0, valid0 = agent.encode_extend(
+            enc0, base_tokens, base_count, window=window, start=0, chunk=0,
+        )
     # BASE ATTRIBUTION. The owners come from the tokenizer:
     # `IncrementalPathTokenizer.last_owner_ids()` gives the 1-based vertex
     # that produced each base token (0 = no owner: headers, the input list),
@@ -336,10 +343,12 @@ def advance(agent, enc_carry, vmem_sums, vmem_counts,
         # it is the branch production does not run (`_FOLD` is on by
         # default and the trainer always passes `participants`).
         delta_tokens = _stream_window(delta_tokens, start, row, window)
-    carry2, rows, valid = agent.encode_extend(
-        enc_carry, delta_tokens, delta_count,
-        window=window, start=0, chunk=chunk, budget=budget, path=path,
-    )
+    # A block, not an argument -- see `init_carry`.
+    with _read_path(path):
+        carry2, rows, valid = agent.encode_extend(
+            enc_carry, delta_tokens, delta_count,
+            window=window, start=0, chunk=chunk, budget=budget,
+        )
     _edge_out = ()
     if edge_mem is not None:
         # The SAME rows, scattered a third way: by the host-assigned edge
