@@ -2540,6 +2540,44 @@ def configure_max_faces(n: int) -> None:
 
 def consume_face_cap_stats() -> dict:
     return dict(_FACE_CAP_STATS)
+
+
+# THE FACE WIRE'S WIDTH ON THE *LIVE-FACE HOST CALLBACKS*, which is not the
+# state's width and must never be confused with it.
+#
+# `MAX_FACES` is the PROVABLE bound above, and the state keeps every column of
+# it. But the four per-step face callbacks take the whole elimination-prefix
+# history as an operand -- `(N, MAX_FACES, FACE_SLOTS, 3)` int32, 6.6 megabytes
+# per environment on the campaign graph -- and the rollout profile of
+# 2026-09-15 measured what that costs: 59.4 gigabytes copied device to host per
+# episode, 625 megabytes per step, four of the five callback instructions
+# moving 117 megabytes each. The same profile measured the OCCUPANCY: median 1
+# face per vertex, maximum 13 in two episodes, 0.069 percent of the cap.
+#
+# So the callbacks may be handed the first `face_wire_faces()` columns instead
+# of all of them. This is NOT a lowered bound and NOTHING is allowed to fall
+# off the end: `live_faces.n_faces` raises the moment a vertex has more faces
+# than the wire carries, before that vertex's decisions are ever written, and
+# `live_faces._decided` raises if a prefix row is narrower than the face list
+# it is being indexed by. 0 means "the full width", which is the historical
+# wire byte for byte.
+_FACE_WIRE_FACES = [0]
+
+
+def configure_face_wire_faces(n: int) -> None:
+    """Set the live-face callbacks' wire width (0 = the full MAX_FACES)."""
+    n = int(n)
+    if n < 0:
+        raise ValueError(
+            f"--face-wire-faces must be 0 (the full width) or positive, "
+            f"got {n}")
+    _FACE_WIRE_FACES[0] = n
+
+
+def face_wire_faces() -> int:
+    """The number of face columns the live-face callbacks are handed."""
+    n = _FACE_WIRE_FACES[0]
+    return MAX_FACES if n <= 0 else min(int(n), MAX_FACES)
 FACE_SLOTS = 3  # pre (lhs), post (rhs), new (res)
 NUM_AXIS_PAIRS = 4
 

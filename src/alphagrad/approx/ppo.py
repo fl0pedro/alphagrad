@@ -5029,6 +5029,22 @@ def make_argparser() -> argparse.ArgumentParser:
              "overlaps episode e's measurement with the ROLLOUT of e+1 "
              "instead of only with the update of e-1.")
     p.add_argument(
+        "--face-wire-faces", type=int, default=0, metavar="N",
+        help="HOW MANY FACE COLUMNS THE LIVE-FACE HOST CALLBACKS CARRY. The "
+             "four per-step face callbacks take the whole elimination-prefix "
+             "history as an operand, which is (steps x MAX_FACES x slots x 3) "
+             "int32 -- 117 megabytes per callback per step at sixteen "
+             "environments on the campaign graph, and the rollout profile of "
+             "2026-09-15 measured 59.4 gigabytes copied device to host per "
+             "episode. The same profile measured the occupancy: median one "
+             "face per vertex, maximum thirteen in two episodes, 0.069 "
+             "percent of the cap. N hands those callbacks the first N columns "
+             "instead of all of them. THIS IS NOT A LOWERED BOUND: the state "
+             "keeps every column, and a vertex with more faces than N stops "
+             "the run at the face count, before its decisions are written. "
+             "0 (default) is the full width, which is the historical wire "
+             "byte for byte.")
+    p.add_argument(
         "--tokenize-actors", type=int, default=0, metavar="N",
         help="How many CPU-only actors --tokenize-where cpu-actors spawns. "
              "0 (default) means as many as --ray-measure. They hold no GPU "
@@ -7821,6 +7837,22 @@ def main():
 
     _F_FACES = ENV_MAX_FACES
 
+    # THE LIVE-FACE CALLBACKS' WIRE WIDTH (--face-wire-faces), resolved here
+    # because MAX_FACES is only final after `configure_max_faces` above. It is
+    # NOT a lowered bound: the state keeps every column, and both guards in
+    # `live_faces` raise the moment a vertex has more faces than the wire
+    # carries. 0 gives the full width, which is the historical wire.
+    from alphagrad.approx import env as _fw_env_mod
+    _fw_env_mod.configure_face_wire_faces(
+        int(getattr(args, "face_wire_faces", 0) or 0))
+    _FACE_WIRE_W = _fw_env_mod.face_wire_faces()
+    if getattr(args, "face_actions", False) and _FACE_WIRE_W < ENV_MAX_FACES:
+        print(f"[face-wire] the live-face callbacks carry {_FACE_WIRE_W} of "
+              f"{ENV_MAX_FACES} face columns "
+              f"({100.0 * _FACE_WIRE_W / max(ENV_MAX_FACES, 1):.1f} percent "
+              f"of the prefix-history operand); a vertex with more faces "
+              f"than that stops the run", flush=True)
+
     # --per-face-masks (workstream A1). A PYTHON bool, read at trace time, so
     # with the flag off none of the extra arrays below is ever created: no new
     # callback output, no new trajectory leaf, no shape change anywhere.
@@ -9449,10 +9481,22 @@ def main():
                 # carry), while `_fh`/`_kh` are every decision already
                 # committed to the prefix. The prefix replay needs the latter
                 # or it rebuilds an exact graph the measurement never builds.
+                # THE NARROWED FACE WIRE (--face-wire-faces). The state keeps
+                # every column of the provable bound; these callbacks are
+                # handed the first `_FACE_WIRE_W` of them. The rollout profile
+                # of 2026-09-15 measured the full width at 117 megabytes per
+                # callback per step against a median occupancy of one face per
+                # vertex. Nothing falls off the end in silence:
+                # `live_faces.n_faces` raises the moment a vertex has more
+                # faces than the wire carries, before that vertex's decisions
+                # are written. `_FACE_WIRE_W` is MAX_FACES when the flag is
+                # off, and then this slice is the identity.
+                _fh_w = state.face_specs[:, :_FACE_WIRE_W]
+                _kh_w = state.face_skips[:, :_FACE_WIRE_W]
                 face_chunk_fn, face_count_fn = bind_step_callbacks(
                     _live_face_for(_W_BIN)[0], _live_face_count,
                     state.order, state.sparsity_specs, state.step_count,
-                    state.face_specs, state.face_skips,
+                    _fh_w, _kh_w,
                 )
                 if _PFM_LIVE_SIZES:
                     # Same prefix, same history arrays: the sizes are
@@ -9463,7 +9507,7 @@ def main():
                         _live_face_sizes,
                         state.order, state.sparsity_specs,
                         state.step_count,
-                        state.face_specs, state.face_skips,
+                        _fh_w, _kh_w,
                     )
                     if _live_face_decide is not None:
                         # Same prefix and history as the sizes: the stage-2
@@ -9473,8 +9517,8 @@ def main():
                                            _o=state.order,
                                            _s=state.sparsity_specs,
                                            _k=state.step_count,
-                                           _fh=state.face_specs,
-                                           _kh=state.face_skips):
+                                           _fh=_fh_w,
+                                           _kh=_kh_w):
                             return _live_face_decide(
                                 _o, _s, _k, _v, _fh, _kh, _skips, _rows)
 

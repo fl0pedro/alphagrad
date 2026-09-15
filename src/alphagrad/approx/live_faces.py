@@ -604,6 +604,19 @@ class LiveFaceStream:
         from alphagrad.approx.env import _face_dict_for_vertex
 
         keys = list(tk.ij.faces(int(vertex)))
+        # THE NARROWED WIRE MUST NOT DROP A DECISION SILENTLY. The builder
+        # BREAKS out of its loop when the row runs out (`f >= face_row.shape[0]`),
+        # which is right for a caller that genuinely has fewer rows and wrong
+        # for `--face-wire-faces`: a vertex with more faces than the wire
+        # carries would run its tail exactly while every counter reported a
+        # healthy run. That is the fault class MAX_FACES exists for, so it
+        # raises here instead.
+        _w = int(np.asarray(face_rows).shape[0])
+        if len(keys) > _w:
+            raise RuntimeError(
+                f"vertex {vertex} has {len(keys)} faces and the face wire "
+                f"carries {_w} columns; --face-wire-faces is too narrow and "
+                f"the faces past {_w} would run exact in silence.")
         ft = _face_dict_for_vertex(
             SimpleNamespace(jaxpr=self.jaxpr), tk.ij, int(vertex),
             face_rows, face_skips, keys=keys, upto=int(upto))
@@ -974,6 +987,19 @@ class LiveFaceStream:
             raise RuntimeError(
                 f"vertex {vertex}: {k} faces exceed the derived bound "
                 f"{self.max_faces}")
+        # AND THE WIRE MUST BE WIDE ENOUGH FOR THIS VERTEX, checked HERE,
+        # before the step that decides its faces has written anything. Under
+        # `--face-wire-faces` the history handed to the next step carries only
+        # the first columns; a vertex with more faces than that would have its
+        # tail decided this step and dropped from every later prefix.
+        if face_rows_hist is not None:
+            _w = int(np.asarray(face_rows_hist).shape[1])
+            if k > _w:
+                raise RuntimeError(
+                    f"vertex {vertex} has {k} faces and the live-face wire "
+                    f"carries {_w} columns (--face-wire-faces). Raise it: the "
+                    f"faces past {_w} would be decided this step and lost "
+                    f"from every later prefix.")
         return int(k)
 
     # -- per-face LIVE dim sizes (--per-face-masks, SIZES half) -------------
