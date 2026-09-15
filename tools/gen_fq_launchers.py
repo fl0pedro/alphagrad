@@ -236,9 +236,19 @@ REQUIRED_FLAGS = [
     # cannot inherit the trainer's synchronous default in silence.
     "--measure-pipeline",
     # DATA PARALLELISM OVER ENVIRONMENTS (owner ruling 2026-09-15).  Named so
-    # an arm cannot inherit the trainer's single-device default in silence and
-    # roll out an eighth of the environments its --num-envs implies.
+    # an arm states how many GPUs roll the episode out instead of inheriting a
+    # default, in either direction.
     "--rollout-shards",
+    # WHERE THE PER-STEP TOKENIZATION RUNS (owner ruling 2026-09-15).  Named
+    # for the same reason: it decides whether the measure actors are free
+    # during a rollout, and therefore whether the pipeline overlaps a
+    # measurement with the NEXT rollout or only with the previous update.
+    "--tokenize-where",
+    # HOW MANY FACE COLUMNS THE HOST CALLBACKS CARRY.  Named because a tree
+    # without the flag would ship the whole 1920-column prefix history on
+    # every callback -- 59.4 GB device to host per episode, measured -- while
+    # the preflight said yes.
+    "--face-wire-faces",
     "--cost-form",
     "--quality-floor",
     # The cost floor (.9, b2c89170): every training arm passes it explicitly,
@@ -389,8 +399,12 @@ SHARED_ENV = [
     # 12ed4936) printed ppo.py's own warning ("ALPHAGRAD_EXTEND_CHUNK is 0,
     # so every encode_extend scans all 32768 window steps ... 256 measured
     # well") and an episode took 275 s at 0.  ppo.py has no --extend-chunk
-    # flag (2026-09-14 audit).
-    ("ALPHAGRAD_EXTEND_CHUNK", "256"),
+    # flag (2026-09-14 audit).  32, not 256, since the rollout profile of
+    # 2026-09-15 (scratchpad profile-rollout.md, gpu15, fast read): the
+    # per-step cost outside the env callback was 363 ms at 256 and 226 ms
+    # at 32, 14.5 s per episode, no code change; 32 is the fast read's
+    # chunk, and the fold refuses a chunk that is not a multiple of it.
+    ("ALPHAGRAD_EXTEND_CHUNK", "32"),
     ("ALPHAGRAD_EXTEND_UNROLL", "32"),
     ("ALPHAGRAD_MULS_SENTINEL_CAP", "5e12"),
     # Project memory: ALWAYS skip the count pass (77% of host time) and use the
@@ -668,10 +682,10 @@ SHARED_CLI = [
     # DATA PARALLELISM OVER ENVIRONMENTS: one rollout shard per GPU the job
     # holds, so an episode holds CAMPAIGN_GPUS * 16 environments and the PPO
     # update runs on all of them concatenated.  See CAMPAIGN_ROLLOUT_SHARDS.
-    # The literal is CAMPAIGN_GPUS, which is defined further down this file
-    # than SHARED_CLI is built; the two are checked against each other where
-    # CAMPAIGN_ROLLOUT_SHARDS is defined, so they cannot drift apart.
-    ("--rollout-shards", "8"),
+    # ONE, for now.  The literal is checked against CAMPAIGN_ROLLOUT_SHARDS
+    # where that is defined, which is further down this file than SHARED_CLI is
+    # built, so the two cannot drift apart.
+    ("--rollout-shards", "1"),
     ("--minibatches", "4"),
     ("--grad-window", "0"),
     # One PPO epoch makes the importance ratio identically 1 for the whole
@@ -712,6 +726,25 @@ SHARED_CLI = [
     # episode's PPO update and waits for these rewards while it runs.  See
     # CAMPAIGN_MEASURE_PIPELINE for what the one-episode lag costs.
     ("--measure-pipeline", "1"),
+    # THE PER-STEP TOKENIZATION STAYS IN THE TRAINER (ruling 2026-09-15).  It
+    # measures nothing, so it needs no measure actor; routing it to the pool
+    # cost a Ray round trip per step AND held the actors, which is what made
+    # the measurement of e overlap only the update of e-1.  With the actors
+    # free for the whole of the next rollout, e's measurement now overlaps
+    # the ROLLOUT of e+1.  See CAMPAIGN_TOKENIZE_WHERE.
+    ("--tokenize-where", "local"),
+    # THE FACE WIRE CARRIES THE COLUMNS THAT ARE USED (ruling 2026-09-15).
+    # The four per-step face callbacks and the env step callback each take
+    # the whole elimination-prefix face history as an operand, sized by the
+    # provable bound MAX_FACES = 1920 on this graph.  Measured under an XLA
+    # trace on pgi15-gpu17, one episode at 16 environments: 59.4 GB copied
+    # device to host, the GPU idle for three quarters of the rollout behind
+    # it, against a MEASURED occupancy of a median of one face per vertex and
+    # a maximum of thirteen.  At 64 columns the same episode copies 2.4 GB
+    # and its traced span falls from 48.0 s to 14.7 s.  NOT a lowered bound:
+    # the state keeps every column and a vertex with more faces than this
+    # stops the run by name.  See CAMPAIGN_FACE_WIRE_FACES.
+    ("--face-wire-faces", "64"),
     # LOGGED, NOT TRAINED: sparsity (weight 0) and the legacy Jacobian cosine
     # (subsampled).  Clipped relative Frobenius rides slot 8 automatically
     # because grad_cosine materialises the exact reference it needs.
@@ -1473,21 +1506,42 @@ CAMPAIGN_RAY_MEASURE_TIMEOUT = "600"
 CAMPAIGN_MEASURE_PIPELINE = "1"
 
 # DATA PARALLELISM OVER ENVIRONMENTS (owner ruling 2026-09-15, "use the idle
-# GPUs for the rollout").  ONE ROLLOUT SHARD PER GPU THE JOB HOLDS, so an
-# episode rolls out CAMPAIGN_GPUS * --num-envs environments instead of
-# --num-envs, and the PPO update runs on all of them concatenated -- the same
-# program a single device would run for that many environments.  --num-envs is
-# PER SHARD from this ruling on.
+# GPUs for the rollout").  --num-envs is PER SHARD, and --rollout-shards says
+# how many devices roll an episode out.  The PPO update runs on the shards
+# concatenated, which is the same program a single device would run for that
+# many environments.
 #
-# The measure actors keep their GPUs and now share them with a rollout shard.
-# The shards' per-step measurement callbacks rendezvous into ONE batched pool
-# call over every row, so the pool still sees one `evaluate_batch` per step and
-# no shard can starve another of actors.
-CAMPAIGN_ROLLOUT_SHARDS = str(CAMPAIGN_GPUS)
+# ONE, FOR NOW (owner ruling 2026-09-15, the follow-up).  Sharding was measured
+# at 1, 4 and 8 shards on pgi15-gpu19 and it did not pay: the per-step host
+# callbacks are Python, one thread per shard is the most concurrency a single
+# process can have, and the host cost per environment does not fall.  It is
+# armed here at 1 until the host path is cheap enough that the device work it
+# hides is worth having.
+CAMPAIGN_ROLLOUT_SHARDS = "1"
 assert dict(SHARED_CLI)["--rollout-shards"] == CAMPAIGN_ROLLOUT_SHARDS, (
-    "SHARED_CLI's --rollout-shards literal and CAMPAIGN_ROLLOUT_SHARDS must be "
-    "the same number of GPUs; SHARED_CLI is built before CAMPAIGN_GPUS exists, "
-    "so this is what keeps them equal.")
+    "SHARED_CLI's --rollout-shards literal and CAMPAIGN_ROLLOUT_SHARDS must "
+    "agree; SHARED_CLI is built before this line runs, so this is what keeps "
+    "them equal.")
+
+# WHERE THE PER-STEP TOKENIZATION RUNS (owner ruling 2026-09-15).  A
+# non-terminal callback row measures nothing under terminal rewards: it
+# tokenizes the prefix, decides face legality and returns the delta
+# observation.  It was riding the measure actors, which cost a Ray round trip
+# on every step and, worse, kept the actors busy -- so the pipelined terminal
+# measurement could only be hidden behind the previous UPDATE.  Kept in the
+# trainer process the actors are idle for the whole of the next rollout, and
+# the measurement of episode e is hidden behind the ROLLOUT of e+1.
+CAMPAIGN_TOKENIZE_WHERE = "local"
+
+# HOW MANY FACE COLUMNS THE HOST CALLBACKS CARRY (owner ruling 2026-09-15).
+# 64 against a measured maximum of 13 faces on any vertex of this graph
+# (profile-rollout.md section 4: n=1520 vertices, median 1, p95 3, p99 11,
+# max 13, occupancy 0.069 percent of the 1920 cap), so just under five times
+# the largest thing ever seen.  The elimination order is FIXED on these arms,
+# so the face count of each vertex is a property of the order rather than of
+# the policy.  If a vertex ever exceeds this the run stops and the message
+# names the flag; it does not truncate.
+CAMPAIGN_FACE_WIRE_FACES = "64"
 
 # GATE G1 (ticket .45) on a node without a home: the sweep winners are read
 # from /Scratch.  THE TABLE IS THE SWEEP64 ONE, BY ORDER (owner ruling
@@ -1569,8 +1623,10 @@ NO_FLAG_ENV = [
      "(/Scratch/assmuth/mrg/runs/smoke_merged.sbatch) sets this and drains "
      "clean; the reward channels these arms train (cmp mem acc) do not "
      "need the count pass.  env.py has no --skip-count-ops flag."),
-    ("ALPHAGRAD_EXTEND_CHUNK", "256",
-     "chunk the encode_extend scan instead of walking the whole window.  "
+    ("ALPHAGRAD_EXTEND_CHUNK", "32",
+     "chunk the encode_extend scan instead of walking the whole window; "
+     "32 since the rollout profile of 2026-09-15 measured 14.5 s per "
+     "episode less than 256 at the fast read (the kernel's own chunk).  "
      "The same canary job (65443) printed ppo.py's own warning "
      "('ALPHAGRAD_EXTEND_CHUNK is 0, so every encode_extend scans all "
      "32768 window steps ... 256 measured well') and an episode took "
@@ -1764,8 +1820,10 @@ def campaign_arm(*, phase: int, tag: str, profile: str, node: str, what: str,
         "--ray-measure": CAMPAIGN_RAY_MEASURE,
         "--ray-measure-timeout": CAMPAIGN_RAY_MEASURE_TIMEOUT,
         "--measure-pipeline": CAMPAIGN_MEASURE_PIPELINE,
-        # ONE ROLLOUT SHARD PER GPU (owner ruling 2026-09-15).
+        # HOW MANY DEVICES ROLL AN EPISODE OUT (owner ruling 2026-09-15).
         "--rollout-shards": CAMPAIGN_ROLLOUT_SHARDS,
+        "--tokenize-where": CAMPAIGN_TOKENIZE_WHERE,
+        "--face-wire-faces": CAMPAIGN_FACE_WIRE_FACES,
         # THE GATE .45 INPUTS, the two the trainer cannot measure for itself.
         # G1's winners table is inherited from SHARED_CLI and resolved from
         # this arm's --fixed-order by `_merge_cli` (ONE mechanism, so a wave

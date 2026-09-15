@@ -58,6 +58,7 @@ __all__ = [
     "ShardGather",
     "ShardGatherTimeout",
     "resolve_devices",
+    "parse_shard_devices",
     "shard_env_range",
     "dispatch",
     "concat_shards",
@@ -91,11 +92,46 @@ def host_serial(fn):
 
 # ------------------------------------------------------------- the devices
 
-def resolve_devices(n_shards, devices=None):
-    """The device each rollout shard runs on: `devices[0..n-1]`.
+def parse_shard_devices(spec, n_shards):
+    """`"0,0,1"` -> `[0, 0, 1]`, one device INDEX per shard.
 
-    Shard 0 keeps device 0, which is the trainer's own device, so a run with
-    one shard places exactly what it placed before.
+    Empty or None means the default, one shard per device in order. A list
+    that names one device twice puts two shards ON THAT DEVICE, which is the
+    owner's item 5 of 2026-09-15: two half-batch shards interleaved on one
+    GPU, so that the device work of one half runs while the other half is on
+    the host. The shards are separate threads and separate traces, so nothing
+    else about them changes.
+    """
+    if spec is None or not str(spec).strip():
+        return None
+    out = []
+    for piece in str(spec).replace(" ", "").split(","):
+        if not piece:
+            continue
+        try:
+            out.append(int(piece))
+        except ValueError:
+            raise ValueError(
+                f"--rollout-shard-devices takes a comma separated list of "
+                f"device indices, one per shard; {piece!r} is not an "
+                f"integer.") from None
+    if len(out) != int(n_shards):
+        raise ValueError(
+            f"--rollout-shard-devices names {len(out)} devices and "
+            f"--rollout-shards asks for {int(n_shards)} shards. There has to "
+            f"be exactly one device per shard.")
+    return out
+
+
+def resolve_devices(n_shards, devices=None, mapping=None):
+    """The device each rollout shard runs on.
+
+    Without `mapping` that is `devices[0..n-1]`, one shard per device in
+    order. Shard 0 keeps device 0, which is the trainer's own device, so a run
+    with one shard places exactly what it placed before.
+
+    With `mapping` it is `[devices[i] for i in mapping]`, which may name one
+    device more than once. See :func:`parse_shard_devices`.
     """
     n = int(n_shards)
     if n < 1:
@@ -105,11 +141,24 @@ def resolve_devices(n_shards, devices=None):
         import jax
         devices = jax.local_devices()
     devices = list(devices)
+    if mapping is not None:
+        if len(mapping) != n:
+            raise ValueError(
+                f"--rollout-shard-devices names {len(mapping)} devices for "
+                f"{n} shards.")
+        bad = [i for i in mapping if not (0 <= int(i) < len(devices))]
+        if bad:
+            raise ValueError(
+                f"--rollout-shard-devices names device index or indices "
+                f"{bad}, and this process sees {len(devices)} devices: "
+                f"{devices}.")
+        return [devices[int(i)] for i in mapping]
     if n > len(devices):
         raise ValueError(
             f"--rollout-shards {n} needs {n} devices and this process sees "
             f"{len(devices)}: {devices}. A shard per GPU is the point; ask "
-            f"for no more shards than the job holds.")
+            f"for no more shards than the job holds, or name the placement "
+            f"with --rollout-shard-devices.")
     return devices[:n]
 
 

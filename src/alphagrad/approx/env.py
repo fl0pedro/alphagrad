@@ -1834,6 +1834,83 @@ _MEASURE_TICKETS: dict = {}
 _MEASURE_TICKET_SEQ = [0]
 _MEASURE_TICKET_OPEN = [None]
 
+# ---------------------------------------------------------------------------
+# WHERE THE PER-STEP TOKENIZATION RUNS (--tokenize-where, ruling 2026-09-15).
+#
+# A non-terminal callback row measures NOTHING under `terminal_rewards_only`:
+# it tokenizes the elimination prefix, decides face legality, and returns the
+# delta observation. Routing it to the measurement actors cost a Ray round
+# trip per step AND held the actors, so a terminal measurement left in flight
+# blocked the next rollout step for step.
+#
+# `pool`       -- the historical route: the measure actors serve it.
+# `local`      -- the trainer process serves it, as the non-pooled path
+#                 always has.
+# `cpu-actors` -- a SECOND pool of CPU-only actors serves it and the measure
+#                 pool is left for terminals only.
+#
+# A MODULE GLOBAL and not a field on the env, because the env is a JAX pytree
+# and the host callback only ever runs in the trainer process. `pool` is the
+# import-time value, so anything that never calls the setter behaves exactly
+# as it did before this existed.
+# ---------------------------------------------------------------------------
+_TOKENIZE_WHERE = ["pool"]
+_TOKENIZE_POOL = [None]
+# Does the terminal callback START its pool submission, or only package it for
+# the driver to start? See `start_measurement`.
+_MEASURE_DEFER = [False]
+TOKENIZE_WHERE_CHOICES = ("pool", "local", "cpu-actors")
+
+
+def set_tokenize_where(where: str, pool=None) -> None:
+    """Install the per-step tokenization route. Raises on an unknown one."""
+    where = str(where)
+    if where not in TOKENIZE_WHERE_CHOICES:
+        raise ValueError(
+            f"--tokenize-where {where!r} is not one of "
+            f"{list(TOKENIZE_WHERE_CHOICES)}")
+    if where == "cpu-actors" and pool is None:
+        raise ValueError(
+            "--tokenize-where cpu-actors needs the CPU-only pool handed in: "
+            "set_tokenize_where('cpu-actors', pool=<CpuApproxPool>)")
+    _TOKENIZE_WHERE[0] = where
+    _TOKENIZE_POOL[0] = pool
+
+
+def tokenize_where() -> str:
+    return _TOKENIZE_WHERE[0]
+
+
+def tokenize_pool():
+    return _TOKENIZE_POOL[0]
+
+
+# THE TRAINER'S OWN COPY OF THE BOUND OPERANDS.
+#
+# `VertexEliminationEnv.step` hands the callback ZERO-LENGTH PLACEHOLDERS for
+# `args`, `consts` and the eval samples whenever the pool already owns them as
+# an ObjectRef: marshalling tens of megabytes device-to-host on every one of
+# the ninety-five decisions, so a remote closure could throw them away, was
+# pure waste. A row served IN THIS PROCESS needs the real ones, and until
+# `--tokenize-where` there was no such row in that configuration -- the
+# comment at that call site claimed `ALPHAGRAD_POOL_TERMINAL_LOCAL=1` still
+# got the real thing, and it did not.
+#
+# So the driver installs the env's own concrete operands here, once, and the
+# locally served rows read them from here. They are the same constants a
+# measure actor tokenizes from (its own env's bound args), they do not change
+# between steps, and nothing is marshalled per step.
+_LOCAL_BOUND = [None]
+
+
+def set_local_bound_operands(args, consts, eval_samples=None) -> None:
+    """Install the concrete `(args, consts, eval_samples)` for local rows."""
+    _LOCAL_BOUND[0] = (args, consts, eval_samples)
+
+
+def local_bound_operands():
+    return _LOCAL_BOUND[0]
+
 
 class MeasureTicketError(RuntimeError):
     """Misuse of the pipelined-measurement ticket protocol."""
@@ -1854,8 +1931,8 @@ def open_measure_ticket() -> int:
     _MEASURE_TICKET_SEQ[0] += 1
     t = int(_MEASURE_TICKET_SEQ[0])
     _MEASURE_TICKET_OPEN[0] = t
-    _MEASURE_TICKETS[t] = {"future": None, "env_index": [], "n_envs": 0,
-                           "step": -1}
+    _MEASURE_TICKETS[t] = {"future": None, "deferred": None,
+                           "env_index": [], "n_envs": 0, "step": -1}
     return t
 
 
@@ -1884,22 +1961,72 @@ def pending_measure_tickets() -> list:
     return sorted(int(t) for t in _MEASURE_TICKETS)
 
 
-def _record_measure_submission(ticket, future, env_index, n_envs, step):
-    """Remember one pool submission so the driver can collect or drop it."""
+def _record_measure_submission(ticket, future, env_index, n_envs, step,
+                               deferred=None):
+    """Remember one pool submission so the driver can collect or drop it.
+
+    ``future`` is a submission that has already started. ``deferred`` is a
+    zero-argument callable that STARTS one, and exactly one of the two is
+    given. See :func:`start_measurement` for why the deep pipeline hands the
+    start to the driver.
+    """
     rec = _MEASURE_TICKETS.get(int(ticket))
     if rec is None:
         raise MeasureTicketError(
             f"measurement ticket {ticket} is not open; the driver must open "
             f"one before the rollout that submits under it.")
-    if rec["future"] is not None:
+    if (future is None) == (deferred is None):
+        raise MeasureTicketError(
+            f"measurement ticket {ticket}: give exactly one of a started "
+            f"future and a deferred starter.")
+    if rec["future"] is not None or rec["deferred"] is not None:
         raise MeasureTicketError(
             f"measurement ticket {ticket} already carries a submission for "
             f"rows {rec['env_index']}; a rollout submits its terminal plans "
             f"exactly once.")
     rec["future"] = future
+    rec["deferred"] = deferred
     rec["env_index"] = [int(i) for i in env_index]
     rec["n_envs"] = int(n_envs)
     rec["step"] = int(step)
+
+
+def measure_defer_enabled() -> bool:
+    """Does the terminal callback DEFER its submission to the driver?"""
+    return bool(_MEASURE_DEFER[0])
+
+
+def set_measure_defer(on: bool) -> None:
+    """Arm or disarm the deferred submission (the deep pipeline)."""
+    _MEASURE_DEFER[0] = bool(on)
+
+
+def start_measurement(ticket) -> bool:
+    """Start a DEFERRED submission. Returns False when there was none.
+
+    THE DEEP PIPELINE OWES THE ACTORS AN EMPTY WINDOW. It overlaps episode
+    e's measurement with the ROLLOUT of e+1, so at the end of that rollout
+    e+1's terminal step wants to submit while e has not been collected. If it
+    submitted there, e+1's measurement could start the moment e's returned --
+    and it would then be writing plan records into the actors while the
+    driver was still draining e's out of them.
+
+    So under the deep pipeline the terminal step only PACKAGES its batch, and
+    the driver starts it here: after it has collected e's rewards and drained
+    e's records, and before it takes the next rollout. One batch is in flight
+    at any time, and every record in an actor belongs to exactly one episode.
+    """
+    rec = _MEASURE_TICKETS.get(int(ticket))
+    if rec is None:
+        raise MeasureTicketError(
+            f"measurement ticket {ticket} was never opened, or has already "
+            f"been collected or dropped.")
+    start = rec["deferred"]
+    if start is None:
+        return False
+    rec["deferred"] = None
+    rec["future"] = start()
+    return True
 
 
 def collect_measurement(ticket) -> dict:
@@ -1914,11 +2041,19 @@ def collect_measurement(ticket) -> dict:
     another's trajectory, so it raises instead of filling a gap.
     """
     t = int(ticket)
-    rec = _MEASURE_TICKETS.pop(t, None)
+    rec = _MEASURE_TICKETS.get(t)
     if rec is None:
         raise MeasureTicketError(
             f"measurement ticket {t} was never opened, or has already been "
             f"collected or dropped.")
+    if rec["future"] is None and rec["deferred"] is not None:
+        # THE TICKET SURVIVES THIS. Collecting before the start is the
+        # driver's mistake and the measurement is still startable, so the
+        # record stays in the table rather than being popped on the way out.
+        raise MeasureTicketError(
+            f"measurement ticket {t} was packaged but never started: the "
+            f"driver must call start_measurement({t}) before collecting it.")
+    rec = _MEASURE_TICKETS.pop(t)
     fut = rec["future"]
     if fut is None:
         raise MeasureTicketError(
@@ -1958,6 +2093,11 @@ def drop_measurement(ticket) -> dict:
     `ray.cancel` on an actor task needs `force=True`, which kills the actor
     and its plan records with it.
 
+    A DEFERRED submission that was never started needs no drain at all: it
+    never reached an actor, so nothing there is measuring it and nothing there
+    holds a record of it. That is the one real simplification the deep
+    pipeline buys the discard.
+
     Returns ``{"rows": [...], "drained": bool}``; never raises on a ticket
     that carries no submission (a rollout can overflow before its terminal
     step).
@@ -1967,6 +2107,9 @@ def drop_measurement(ticket) -> dict:
     if rec is None:
         return {"rows": [], "drained": False}
     fut = rec["future"]
+    if fut is None and rec["deferred"] is not None:
+        return {"rows": list(rec["env_index"]), "drained": False,
+                "deferred": True}
     if fut is None:
         return {"rows": [], "drained": False}
     try:
@@ -2419,6 +2562,44 @@ def configure_max_faces(n: int) -> None:
 
 def consume_face_cap_stats() -> dict:
     return dict(_FACE_CAP_STATS)
+
+
+# THE FACE WIRE'S WIDTH ON THE *LIVE-FACE HOST CALLBACKS*, which is not the
+# state's width and must never be confused with it.
+#
+# `MAX_FACES` is the PROVABLE bound above, and the state keeps every column of
+# it. But the four per-step face callbacks take the whole elimination-prefix
+# history as an operand -- `(N, MAX_FACES, FACE_SLOTS, 3)` int32, 6.6 megabytes
+# per environment on the campaign graph -- and the rollout profile of
+# 2026-09-15 measured what that costs: 59.4 gigabytes copied device to host per
+# episode, 625 megabytes per step, four of the five callback instructions
+# moving 117 megabytes each. The same profile measured the OCCUPANCY: median 1
+# face per vertex, maximum 13 in two episodes, 0.069 percent of the cap.
+#
+# So the callbacks may be handed the first `face_wire_faces()` columns instead
+# of all of them. This is NOT a lowered bound and NOTHING is allowed to fall
+# off the end: `live_faces.n_faces` raises the moment a vertex has more faces
+# than the wire carries, before that vertex's decisions are ever written, and
+# `live_faces._decided` raises if a prefix row is narrower than the face list
+# it is being indexed by. 0 means "the full width", which is the historical
+# wire byte for byte.
+_FACE_WIRE_FACES = [0]
+
+
+def configure_face_wire_faces(n: int) -> None:
+    """Set the live-face callbacks' wire width (0 = the full MAX_FACES)."""
+    n = int(n)
+    if n < 0:
+        raise ValueError(
+            f"--face-wire-faces must be 0 (the full width) or positive, "
+            f"got {n}")
+    _FACE_WIRE_FACES[0] = n
+
+
+def face_wire_faces() -> int:
+    """The number of face columns the live-face callbacks are handed."""
+    n = _FACE_WIRE_FACES[0]
+    return MAX_FACES if n <= 0 else min(int(n), MAX_FACES)
 FACE_SLOTS = 3  # pre (lhs), post (rhs), new (res)
 NUM_AXIS_PAIRS = 4
 
@@ -6396,6 +6577,19 @@ def _face_dict_for_vertex(config, ij, v, face_row, face_skip,
     per_face: dict = {}
     face_row = np.asarray(face_row)
     face_skip = np.asarray(face_skip).reshape(-1)
+    # THE WIRE MUST BE AT LEAST AS WIDE AS THE ENUMERATION. The loop below
+    # BREAKS when the row runs out, which is the right answer for a caller
+    # that genuinely has fewer rows and the WRONG one for a narrowed wire
+    # (`--face-wire-faces`): the faces past the end would run exact while
+    # every counter reported a healthy run. That is the fault class the face
+    # width exists for -- eight silently dropped faces of the xent graph's
+    # vertex 9 -- so it raises here instead of running the tail.
+    _w = min(int(face_row.shape[0]), int(face_skip.shape[0]))
+    if len(keys) > _w:
+        raise RuntimeError(
+            f"vertex {v}: {len(keys)} faces and a face wire {_w} columns "
+            f"wide. Raise --face-wire-faces: the faces past {_w} carry no "
+            f"decision and would run exact in silence.")
     for f, key in enumerate(keys[:MAX_FACES]):
         if upto is not None and f >= int(upto):
             break
@@ -9148,7 +9342,8 @@ class VertexEliminationEnv:
                 f"{self.rollout_shards}.")
         return g.wrap(int(self.rollout_shard), fn)
 
-    def tokenize(self, init: bool = False, batched: bool = False):
+    def tokenize(self, init: bool = False, batched: bool = False,
+                 bound_dropped: bool = False):
         """Build the host-side function passed into ``io_callback``.
 
         If ``self._remote_pool`` is set, return a closure that
@@ -9158,6 +9353,11 @@ class VertexEliminationEnv:
         proceeds. Otherwise fall back to the inline ``_callback``
         path (single-process, no Ray) for backward compatibility
         with ``ppo.py`` / non-Ray callers.
+
+        ``bound_dropped`` says the caller handed placeholders instead of the
+        real ``args`` / ``consts`` / eval samples, because the pool already
+        owns them. A row served in THIS process then reads them from
+        :func:`local_bound_operands` instead.
         """
         if batched and int(self.rollout_shards) > 1 and not _BATCHED_CALLBACK:
             # THE RENDEZVOUS ONLY EXISTS FOR THE BATCHED CALLBACK. Without
@@ -9258,26 +9458,6 @@ class VertexEliminationEnv:
                       [np.ascontiguousarray(
                           np.asarray(_cb_slot(face_joins, i, E))[:_sti[i]])
                        for i in range(E)])
-                # THE POOL PROTOCOL DOES NOT CARRY THE JOIN BIT, AND SAYS SO.
-                # `CpuApproxPool.evaluate_batch` takes face_specs / face_skips
-                # and nothing else, so a remote row would be measured under
-                # the configuration's default container while the trainer
-                # stored the log-prob of the bit the head actually drew --
-                # finding 72's action/reward mismatch, one process boundary
-                # along. Rows served IN-PROCESS below DO carry it, so this is
-                # a pool-protocol gap and not a semantics gap; widening
-                # `cpu_approx_pool` / `cpu_approx_actors` / `cpu_approx_worker`
-                # by one keyword is the remaining work (ticket dsnn-3qm.56).
-                if face_joins is not None and _remote:
-                    raise NotImplementedError(
-                        "--approx-add choose decides the face join PER FACE, "
-                        "and the Ray measurement pool's protocol carries only "
-                        "face_specs / face_skips. The actors would measure "
-                        f"every merge under {approx_add()!r}'s default "
-                        "container while the stored log-prob scored the bit "
-                        "the head drew. Run choose without a measure pool, or "
-                        "with ALPHAGRAD_POOL_TERMINAL_LOCAL=1 and no "
-                        "non-terminal remote rows.")
                 _any_faces = any(
                     (f[..., 0] >= 0).any() or (k == 1).any()
                     or (f[..., 0] == COMPRESS_SENTINEL).any()
@@ -9290,26 +9470,88 @@ class VertexEliminationEnv:
                 # ALPHAGRAD_POOL_TERMINAL_LOCAL=1.
                 _term_local = os.environ.get(
                     "ALPHAGRAD_POOL_TERMINAL_LOCAL", "0") == "1"
+                _is_term = [_sti[i] >= int(ro[i].shape[0]) for i in range(E)]
+                # WHO RUNS THE PER-STEP TOKENIZATION (owner ruling
+                # 2026-09-15). A NON-TERMINAL row is tokenization and nothing
+                # else: under `terminal_rewards_only` `_callback_measured`
+                # returns right after the delta observation and never
+                # compiles or times anything. So it does not need a
+                # measurement actor -- and while it rides one, a terminal
+                # measurement left in flight blocks the next rollout step for
+                # step, because Ray runs one task per actor.
+                #
+                # `--tokenize-where` says where that work runs. `pool` is the
+                # historical route (the measure actors). `local` keeps it in
+                # the trainer process, which is what the non-pooled path has
+                # always done. `cpu-actors` sends it to a SECOND pool of
+                # CPU-only actors that measures nothing.
+                #
+                # THE TOKENS DO NOT DEPEND ON THE CHOICE. The stream for a
+                # prefix is a pure function of (jaxpr, argnums, consts, args,
+                # prefix, decoded rules, face wires); the incremental caches
+                # are caches, and a cold process replays the prefix to the
+                # same bytes. Only locality and IPC differ.
+                _twhere = tokenize_where()
+                _tokpool = tokenize_pool() if _twhere == "cpu-actors" else None
+                if _twhere == "cpu-actors" and _tokpool is None:
+                    raise RuntimeError(
+                        "--tokenize-where cpu-actors, but no tokenize pool "
+                        "was installed: env.set_tokenize_where('cpu-actors', "
+                        "pool=...) must be called with the CPU-only pool "
+                        "before the first rollout.")
                 _local = set(
                     i for i in range(E)
-                    if _term_local and _sti[i] >= int(ro[i].shape[0]))
-                _remote = [i for i in range(E) if i not in _local]
+                    if (_term_local and _is_term[i])
+                    or (_twhere == "local" and not _is_term[i]))
+                _tokrows = [i for i in range(E)
+                            if _twhere == "cpu-actors" and not _is_term[i]
+                            and i not in _local]
+                _tokset = set(_tokrows)
+                _remote = [i for i in range(E)
+                           if i not in _local and i not in _tokset]
                 # THE PIPELINED TERMINAL ROWS (owner ruling 2026-09-14). With
                 # a ticket open, a terminal row is SUBMITTED and left to the
                 # actors; its tokens and its reward come back as zeros and the
                 # driver fills the reward into the trajectory when it collects
                 # the ticket. Non-terminal rows are unaffected: they carry the
                 # tokenization the next step's encoder reads, so they are
-                # still measured synchronously here.
+                # still served synchronously here, wherever they are served.
                 _ticket = current_measure_ticket()
                 _pipe = []
                 if _ticket is not None:
-                    _pipe = [i for i in _remote
-                             if _sti[i] >= int(ro[i].shape[0])]
+                    _pipe = [i for i in _remote if _is_term[i]]
                     if _pipe:
                         _pipe_set = set(_pipe)
                         _remote = [i for i in _remote
                                    if i not in _pipe_set]
+                # THE POOL PROTOCOL DOES NOT CARRY THE JOIN BIT, AND SAYS SO.
+                # `CpuApproxPool.evaluate_batch` takes face_specs / face_skips
+                # and nothing else, so a remote row would be measured under
+                # the configuration's default container while the trainer
+                # stored the log-prob of the bit the head actually drew --
+                # finding 72's action/reward mismatch, one process boundary
+                # along. Rows served IN-PROCESS below DO carry it, so this is
+                # a pool-protocol gap and not a semantics gap; widening
+                # `cpu_approx_pool` / `cpu_approx_actors` / `cpu_approx_worker`
+                # by one keyword is the remaining work (ticket dsnn-3qm.56).
+                #
+                # THE CHECK STANDS AFTER THE CLASSIFICATION NOW. It used to
+                # stand above it and read `_remote`, a name Python binds
+                # locally further down, so a pooled `choose` run raised
+                # UnboundLocalError instead of this message. Reading the
+                # classified lists is also the honest test: under
+                # `--tokenize-where local` the non-terminal rows carry the
+                # join bit again and only the terminal ones leave the process.
+                if face_joins is not None and (_remote or _pipe or _tokrows):
+                    raise NotImplementedError(
+                        "--approx-add choose decides the face join PER FACE, "
+                        "and the Ray measurement pool's protocol carries only "
+                        "face_specs / face_skips. The actors would measure "
+                        f"every merge under {approx_add()!r}'s default "
+                        "container while the stored log-prob scored the bit "
+                        "the head drew. Run choose without a measure pool, or "
+                        "with ALPHAGRAD_POOL_TERMINAL_LOCAL=1 and no "
+                        "non-terminal remote rows.")
                 tk = np.zeros((E, _obs_w), _tok_dt)
                 ei = np.zeros((E, _obs_w), _eqn_dt) if _eqn else None
                 rw = np.zeros((E, NUM_REWARDS), np.float32)
@@ -9385,19 +9627,92 @@ class VertexEliminationEnv:
                             ei[i] = _wire_row(np.asarray(eqn_ids)[k2],
                                               _eqn_dt, "eqn_ids")
                         rw[i] = np.asarray(rewards)[k2]
+                if _tokrows:
+                    # --tokenize-where cpu-actors. The SAME wire, a DIFFERENT
+                    # pool: these actors hold no GPU and measure nothing, so
+                    # the measure pool stays free for the terminal plan that
+                    # is in flight behind them. `prof/tokenize_wait` is the
+                    # per-step host cost of this arm, the number
+                    # `prof/measure_wait` reports for `--tokenize-where pool`.
+                    _trace("tokenize_wait.enter")
+                    _tw0 = time.perf_counter()
+                    try:
+                        _tb = _tokpool.evaluate_batch(
+                            [ro[i] for i in _tokrows],
+                            [rs[i] for i in _tokrows],
+                            [_sti[i] for i in _tokrows],
+                            eval_samples=_ev,
+                            init=init,
+                            face_specs_batch=(
+                                [rf[i] for i in _tokrows] if _any_faces
+                                else None),
+                            face_skips_batch=(
+                                [rk[i] for i in _tokrows] if _any_faces
+                                else None),
+                            episode=(walk_episode() if walk_rotate_enabled()
+                                     else None),
+                        )
+                    finally:
+                        _twdt = time.perf_counter() - _tw0
+                        _prof_add("prof/tokenize_wait", _twdt)
+                        _prof_sample("prof/tokenize_wait", _twdt)
+                        _trace("tokenize_wait.exit")
+                    _t_tok, _r_tok = _tb[0], _tb[-2]
+                    _e_tok = _tb[1] if _eqn else None
+                    for k2, i in enumerate(_tokrows):
+                        tk[i] = _wire_row(np.asarray(_t_tok)[k2], _tok_dt,
+                                          "tokens")
+                        if _eqn:
+                            ei[i] = _wire_row(np.asarray(_e_tok)[k2],
+                                              _eqn_dt, "eqn_ids")
+                        rw[i] = np.asarray(_r_tok)[k2]
+                if _local:
+                    # `prof/tokenize_local` is the TRAINER-PROCESS half of the
+                    # per-step cost: under `--tokenize-where local` this loop
+                    # is the whole tokenization of the step, and under
+                    # ALPHAGRAD_POOL_TERMINAL_LOCAL=1 it also holds the
+                    # terminal measurement. One key, and the arm the operator
+                    # ran says which of the two it is.
+                    _tl0 = time.perf_counter()
+                    # THE REAL BOUND OPERANDS. `step` handed this callback
+                    # zero-length placeholders when the pool owns them, so a
+                    # local row has to read the trainer's own copy instead --
+                    # the tokenizer builds its graph from `args` and `consts`
+                    # and a placeholder makes graphax refuse the jaxpr.
+                    if bound_dropped:
+                        _lb = local_bound_operands()
+                        if _lb is None:
+                            raise RuntimeError(
+                                "a row is served in the trainer process, but "
+                                "the pool owns the bound operands and none "
+                                "were installed. The driver must call "
+                                "env.set_local_bound_operands(env.args, "
+                                "env.consts, env.eval_args_samples) before "
+                                "the first rollout.")
+                        _l_args, _l_consts, _l_ev = _lb
+                        _l_ev = tuple(_l_ev or ())
+                    else:
+                        _l_args, _l_consts, _l_ev = None, None, None
                 for i in _local:
                     _out = _callback(
                         self.config,
-                        _cb_slot(args, i, E),
-                        _cb_slot(consts, i, E),
+                        (_l_args if bound_dropped
+                         else _cb_slot(args, i, E)),
+                        (_l_consts if bound_dropped
+                         else _cb_slot(consts, i, E)),
                         ro[i], rs[i], rf[i], rk[i], _sti[i],
-                        *[_cb_slot(x, i, E) for x in eval_samples],
+                        *(_l_ev if bound_dropped
+                          else [_cb_slot(x, i, E) for x in eval_samples]),
                         init=init, face_joins=rj[i],
                     )
                     tk[i] = _wire_row(_out[0], _tok_dt, "tokens")
                     if _eqn:
                         ei[i] = _wire_row(_out[1], _eqn_dt, "eqn_ids")
                     rw[i] = np.asarray(_out[-1])
+                if _local:
+                    _tldt = time.perf_counter() - _tl0
+                    _prof_add("prof/tokenize_local", _tldt)
+                    _prof_sample("prof/tokenize_local", _tldt)
                 if _pipe:
                     # SUBMIT AND RETURN. `tk` and `rw` are already zeros for
                     # these rows and they stay that way: a zero delta header
@@ -9408,22 +9723,32 @@ class VertexEliminationEnv:
                     # collects the ticket.
                     _trace("measure_submit.enter")
                     _ms0 = time.perf_counter()
+                    _pipe_kw = dict(
+                        eval_samples=_ev,
+                        init=init,
+                        face_specs_batch=(
+                            [rf[i] for i in _pipe] if _any_faces
+                            else None),
+                        face_skips_batch=(
+                            [rk[i] for i in _pipe] if _any_faces
+                            else None),
+                        episode=(walk_episode() if walk_rotate_enabled()
+                                 else None),
+                    )
+                    _pipe_pos = ([ro[i] for i in _pipe],
+                                 [rs[i] for i in _pipe],
+                                 [_sti[i] for i in _pipe])
                     try:
-                        _fut = pool.submit_batch(
-                            [ro[i] for i in _pipe],
-                            [rs[i] for i in _pipe],
-                            [_sti[i] for i in _pipe],
-                            eval_samples=_ev,
-                            init=init,
-                            face_specs_batch=(
-                                [rf[i] for i in _pipe] if _any_faces
-                                else None),
-                            face_skips_batch=(
-                                [rk[i] for i in _pipe] if _any_faces
-                                else None),
-                            episode=(walk_episode() if walk_rotate_enabled()
-                                     else None),
-                        )
+                        if measure_defer_enabled():
+                            # PACKAGE ONLY. The driver starts it once the
+                            # previous episode is collected and drained; see
+                            # `start_measurement`.
+                            _fut = None
+                            _defer = (lambda _p=_pipe_pos, _k=_pipe_kw:
+                                      pool.submit_batch(*_p, **_k))
+                        else:
+                            _defer = None
+                            _fut = pool.submit_batch(*_pipe_pos, **_pipe_kw)
                     finally:
                         _msdt = time.perf_counter() - _ms0
                         _prof_add("prof/measure_submit", _msdt)
@@ -9431,7 +9756,7 @@ class VertexEliminationEnv:
                         _trace("measure_submit.exit")
                     _record_measure_submission(
                         _ticket, _fut, _pipe, E,
-                        int(_sti[_pipe[0]]))
+                        int(_sti[_pipe[0]]), deferred=_defer)
                 _cbdt = time.perf_counter() - _cb0
                 _prof_add("prof/env_cb_host", _cbdt)
                 _prof_sample("prof/env_cb_host", _cbdt)
@@ -9799,16 +10124,28 @@ class VertexEliminationEnv:
         # still get the real thing.
         _drop_bound = _pool_owns_bound_operands(self._remote_pool)
         _z = jnp.zeros((1,), jnp.int32)
+        # THE NARROWED FACE WIRE (`--face-wire-faces`). The state keeps every
+        # column of the provable bound; this callback is handed the first
+        # `face_wire_faces()` of them. Measured on pgi15-gpu17, one episode of
+        # the campaign arm under an XLA trace: this instruction alone copies
+        # 11.1 gigabytes device to host per episode, 117 megabytes per step,
+        # and the profile of 2026-09-15 measured the occupancy at a median of
+        # one face per vertex against a cap of 1920. Nothing falls off the end
+        # in silence -- `_face_dict_for_vertex` raises when the wire is
+        # narrower than the enumeration, and the live-face count raises one
+        # step earlier, before the decisions are even written. The default is
+        # the full width, and then these slices are the identity.
+        _fw = face_wire_faces()
         _cbout = _env_callback(
-            self.tokenize(batched=True),
+            self.tokenize(batched=True, bound_dropped=_drop_bound),
             self._callback_shape,
             _z if _drop_bound else self.args,
             _z if _drop_bound else self.consts,
             new_order,
             new_specs,
-            new_face_specs,
-            new_face_skips,
-            new_face_joins,
+            new_face_specs[:, :_fw],
+            new_face_skips[:, :_fw],
+            (None if new_face_joins is None else new_face_joins[:, :_fw]),
             new_step,
             *(() if _drop_bound
               else (self.eval_args_samples

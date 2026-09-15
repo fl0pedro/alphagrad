@@ -85,6 +85,35 @@ def test_more_shards_than_devices_is_refused_by_name():
         rs.resolve_devices(0, devs)
 
 
+def test_two_shards_can_be_placed_on_one_device():
+    """The owner's item 5: two half-batch shards interleaved on one GPU."""
+    rs = _rs()
+    devs = ["d0", "d1", "d2"]
+    assert rs.parse_shard_devices("", 2) is None
+    assert rs.parse_shard_devices(None, 2) is None
+    assert rs.parse_shard_devices("0,0", 2) == [0, 0]
+    assert rs.parse_shard_devices(" 0 , 2 ", 2) == [0, 2]
+    # Both shards land on the SAME device object.
+    got = rs.resolve_devices(2, devs, mapping=[0, 0])
+    assert got == ["d0", "d0"]
+    # More shards than devices is fine once the placement is named.
+    assert rs.resolve_devices(4, devs, mapping=[0, 0, 1, 1]) == [
+        "d0", "d0", "d1", "d1"]
+
+
+def test_a_shard_device_list_that_does_not_fit_is_refused():
+    rs = _rs()
+    devs = ["d0", "d1"]
+    with pytest.raises(ValueError) as exc:
+        rs.parse_shard_devices("0,0,0", 2)
+    assert "3" in str(exc.value) and "2" in str(exc.value)
+    with pytest.raises(ValueError):
+        rs.parse_shard_devices("0,x", 2)
+    with pytest.raises(ValueError) as exc:
+        rs.resolve_devices(2, devs, mapping=[0, 5])
+    assert "5" in str(exc.value)
+
+
 # ------------------------------------------------------------- the rendezvous
 
 def _drive(gather, fn, per_shard_args):
