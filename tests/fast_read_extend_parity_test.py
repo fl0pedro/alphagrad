@@ -585,11 +585,31 @@ def _step_state(agent, toks, count, read):
                 _os.environ[env] = val
 
 
-def test_a_matched_pair_leaves_the_epoch_zero_ratio_at_one(agent, tokens):
+@pytest.fixture(scope="module")
+def live_agent(agent):
+    """The same agent with every parameter nudged off its initial value.
+
+    WHY THE SHIPPED INIT CANNOT MEASURE THIS. At the classic init the vertex
+    pointer's output projection is exactly zero, so every vertex log-prob is
+    log(1/V) whatever the encoder computed -- measured: |logp| = 1.791759 =
+    ln(6) on all six vertices, and a drift of exactly 0.0 under a read that
+    had moved the vertex memory by 1.09. That is the head being deaf, not the
+    mismatch being harmless. A trained policy's head is not deaf, so the drift
+    is measured on one that is not either.
+    """
+    dyn, static = eqx.partition(agent, eqx.is_inexact_array)
+    leaves, treedef = jax.tree.flatten(dyn)
+    keys = jax.random.split(jax.random.PRNGKey(SEED + 1), len(leaves))
+    noised = [x + 0.05 * jax.random.normal(k, x.shape, x.dtype)
+              for x, k in zip(leaves, keys)]
+    return eqx.combine(jax.tree.unflatten(treedef, noised), static)
+
+
+def test_a_matched_pair_leaves_the_epoch_zero_ratio_at_one(live_agent, tokens):
     """The control for the case below. One operator on both sides and the
     two log-prob vectors are the SAME numbers, so the ratio is exactly 1."""
-    a, _ma = _step_state(agent, tokens, COUNT, "fast")
-    b, _mb = _step_state(agent, tokens, COUNT, "fast")
+    a, _ma = _step_state(live_agent, tokens, COUNT, "fast")
+    b, _mb = _step_state(live_agent, tokens, COUNT, "fast")
     assert np.array_equal(a, b)
     assert float(np.max(np.abs(a - b))) == 0.0
 
@@ -597,7 +617,7 @@ def test_a_matched_pair_leaves_the_epoch_zero_ratio_at_one(agent, tokens):
 @pytest.mark.parametrize("rollout,loss", [("exact", "fast"),
                                           ("fast", "exact")])
 def test_a_mismatched_pair_reports_its_epoch_zero_ratio_drift(
-        rollout, loss, agent, tokens, capsys):
+        rollout, loss, live_agent, tokens, capsys):
     """MEASURE AND REPORT, do not assert 1.
 
     With the rollout sampling under one operator and the loss scoring under
@@ -605,16 +625,20 @@ def test_a_mismatched_pair_reports_its_epoch_zero_ratio_drift(
     printed so a reader of the test output sees it; the assertion is the
     ceiling derived in the block comment above.
     """
-    lp_r, mem_r = _step_state(agent, tokens, COUNT, rollout)
-    lp_l, mem_l = _step_state(agent, tokens, COUNT, loss)
-    # THE CASE MUST NOT BE VACUOUS. If the two reads produced the same vertex
-    # memory then the drift below is zero because nothing changed, not
-    # because the mismatch is harmless, and the measurement would mean
-    # nothing.
+    lp_r, mem_r = _step_state(live_agent, tokens, COUNT, rollout)
+    lp_l, mem_l = _step_state(live_agent, tokens, COUNT, loss)
+    # THE CASE MUST NOT BE VACUOUS, from either end. If the two reads produced
+    # the same vertex memory then nothing changed upstream; if the head gives
+    # the same log-prob to every vertex then nothing downstream can respond.
+    # Either way a drift of zero would mean nothing, so both are pinned.
     mem_gap = float(np.max(np.abs(mem_l - mem_r)))
     assert mem_gap > 0.0, (
         "the two reads produced an identical vertex memory, so this case "
         "measures nothing")
+    spread = float(np.max(lp_r) - np.min(lp_r))
+    assert spread > 1e-3, (
+        f"the vertex head is uniform (log-prob spread {spread:.3e}), so no "
+        "read can move a log-prob and this case measures nothing")
     max_log = float(np.max(np.abs(lp_l - lp_r)))
     scale = float(np.max(np.abs(lp_r)))
     bound, n_chunks, rel_state = _drift_bound(COUNT, scale)
@@ -623,7 +647,7 @@ def test_a_mismatched_pair_reports_its_epoch_zero_ratio_drift(
               f"ratio/max_log={max_log:.6e}  "
               f"ratio={np.exp(max_log):.9f}  "
               f"bound={bound:.6e}  vertex-memory gap={mem_gap:.6e}  "
-              f"|logp|max={scale:.6f}  "
+              f"|logp|max={scale:.6f}  spread={spread:.6f}  "
               f"(N={COUNT} tokens = {n_chunks} chunks of {CHUNK_C}, "
               f"rel_state={rel_state:.6e}, kernel rel={KERNEL_REL:g})")
     assert max_log < bound, (
