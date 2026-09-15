@@ -41,25 +41,54 @@ WHAT THIS FILE PINS.
    complete and is therefore later still. The three moments are separated by
    device-side draws, so merging them means moving the neural face draw to the
    host, which is a different change with a different blast radius.
+
+THIS FILE IS MEANT TO RUN ALONE (``pytest tests/face_callback_census_test.py``),
+like ``tests/one_stream_claim_test.py`` and for the same reason: it drives the
+real policy path through ``policy_regression_gate.build_case``, and that module
+pins the interpreter at import time. The import block below restores the two
+scale knobs so a shared run has nothing to collide on.
 """
+from __future__ import annotations
+
 import os
+import pathlib
 import sys
 
-import jax.numpy as jnp
-import jax.random as jrand
-import numpy as np
-import pytest
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+# THE GATE PINS THE INTERPRETER AT MODULE SCOPE, AND IT HAS TO BE IMPORTED
+# BEFORE ANY ALPHAGRAD IMPORT. `env.py` freezes MAX_FACES / MAX_DELTA_TOKENS
+# into module constants at its first import, so a gate import that lands after
+# one is ten dead writes and a graph built at the wrong scale. Snapshot the two
+# scale knobs and put them back after env.py has frozen them, exactly as
+# tests/one_stream_claim_test.py does and for the same two reasons: a
+# standalone run still freezes env.py under the gate's pins, and a shared run
+# is left with no cross-module configuration conflict for the collection guard
+# to fail on.
+_SCALE_PINS = {k: os.environ.get(k) for k in
+               ("ALPHAGRAD_MAX_DELTA_TOKENS", "ALPHAGRAD_MAX_FACES")}
+import policy_regression_gate as _gate                            # noqa: E402
 
-from alphagrad.approx.common.face_driver import (  # noqa: E402
+import jax.numpy as jnp                                           # noqa: E402
+import jax.random as jrand                                        # noqa: E402
+import numpy as np                                                # noqa: E402
+
+from alphagrad.approx.common.face_driver import (                 # noqa: E402
     bind_sizes_callback,
     bind_step_callbacks,
     consume_callback_census,
     make_face_slot_legality_callback,
 )
+# This import has to be here, and only here: env.py must have frozen its
+# constants before the two scale knobs go back.
+from alphagrad.approx import env as _env_frozen                   # noqa: E402,F401
 
-import policy_regression_gate as _gate  # noqa: E402
+for _k, _v in _SCALE_PINS.items():
+    if _v is None:
+        os.environ.pop(_k, None)
+    else:
+        os.environ[_k] = _v
 
 
 STEPS = 6
