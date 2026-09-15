@@ -69,11 +69,17 @@ def test_the_prefix_grows_one_row_per_step_and_reads_back_whole():
 
 
 def test_a_sibling_call_of_the_same_step_verifies_instead_of_appending():
-    """Four callbacks a step ask at the same prefix; only the first extends."""
+    """Four callbacks a step ask at the same prefix; only the first extends.
+
+    At prefix 2, not 1: prefix 1 is the row in hand by construction and always
+    starts a fresh episode, so it has no sibling case to test.
+    """
     face_prefix_step(np.zeros((B,), np.int64), _row(-1), _skip(0), T)
-    face_prefix_step(np.ones((B,), np.int64), _row(7), _skip(7), T)
+    face_prefix_step(np.ones((B,), np.int64), _row(1), _skip(1), T)
+    face_prefix_stats()
+    face_prefix_step(np.full((B,), 2), _row(7), _skip(7), T)
     for _ in range(3):
-        face_prefix_step(np.ones((B,), np.int64), _row(7), _skip(7), T)
+        face_prefix_step(np.full((B,), 2), _row(7), _skip(7), T)
     st = face_prefix_stats()
     assert st["append"] == B, st
     assert st["verify"] == 3 * B, st
@@ -112,9 +118,10 @@ def test_a_row_that_changed_under_the_prefix_raises():
     was never measured on."""
     face_prefix_step(np.zeros((B,), np.int64), _row(-1), _skip(0), T)
     face_prefix_step(np.ones((B,), np.int64), _row(1), _skip(1), T)
+    face_prefix_step(np.full((B,), 2), _row(2), _skip(2), T)
     with pytest.raises(RuntimeError, match="carries a face row the host "
                                            "prefix does not hold"):
-        face_prefix_step(np.ones((B,), np.int64), _row(9), _skip(1), T)
+        face_prefix_step(np.full((B,), 2), _row(9), _skip(2), T)
 
 
 def test_step_zero_empties_the_prefix_and_so_does_the_reset():
