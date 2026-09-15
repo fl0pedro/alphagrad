@@ -1992,16 +1992,20 @@ def collect_measurement(ticket) -> dict:
     another's trajectory, so it raises instead of filling a gap.
     """
     t = int(ticket)
-    rec = _MEASURE_TICKETS.pop(t, None)
+    rec = _MEASURE_TICKETS.get(t)
     if rec is None:
         raise MeasureTicketError(
             f"measurement ticket {t} was never opened, or has already been "
             f"collected or dropped.")
-    fut = rec["future"]
-    if fut is None and rec["deferred"] is not None:
+    if rec["future"] is None and rec["deferred"] is not None:
+        # THE TICKET SURVIVES THIS. Collecting before the start is the
+        # driver's mistake and the measurement is still startable, so the
+        # record stays in the table rather than being popped on the way out.
         raise MeasureTicketError(
             f"measurement ticket {t} was packaged but never started: the "
             f"driver must call start_measurement({t}) before collecting it.")
+    rec = _MEASURE_TICKETS.pop(t)
+    fut = rec["future"]
     if fut is None:
         raise MeasureTicketError(
             f"measurement ticket {t} carries no submission: the rollout "

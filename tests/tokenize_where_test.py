@@ -109,8 +109,14 @@ class _RealPool:
                            face_skips_batch=kw.get("face_skips_batch"))
 
     def submit_batch(self, *args, **kw):
+        # Recorded in `submitted` and NOT in `rows`: the two lists are how a
+        # test tells a submission from an in-line measurement.
         self.submitted.append([int(s) for s in args[2]])
-        return _DoneFuture(self.evaluate_batch(*args, **kw))
+        return _DoneFuture(self._serve(
+            *args, eval_samples=kw.get("eval_samples"),
+            init=kw.get("init", False),
+            face_specs_batch=kw.get("face_specs_batch"),
+            face_skips_batch=kw.get("face_skips_batch")))
 
 
 def _pooled_env(env, pool):
