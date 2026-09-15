@@ -522,35 +522,38 @@ def test_the_mixer_refuses_to_guess_a_path_under_a_mismatched_pair(
 #   3. FROM THE STATE TO THE LOG-PROB. The vertex logits are a linear map of
 #      the pooled rows, and log-softmax is 2-Lipschitz in the sup norm of its
 #      input (|d log softmax_i| <= 2 |dx|_inf). A relative error rel_state on
-#      logits of magnitude |logp| therefore moves one action's log-prob by at
-#      most 2 * |logp| * rel_state. |logp| is floored at 1 so the bound does
-#      not collapse on a near-uniform head.
+#      logits whose log-probs have magnitude |logp| therefore moves a
+#      log-prob by at most 2 * |logp| * rel_state. |logp| is floored at 1 so
+#      the bound does not collapse on a near-uniform head, where every
+#      log-prob is close to zero and a relative bound would say nothing.
 #
 #          max_log_bound  =  2 * max(|logp|, 1) * rel_state(N)
 #
-#      At COUNT = 83 and this six-vertex head that is about 6e-2.
+#      At COUNT = 83 tokens and this six-vertex head that is 3.0e-2.
 #
-# The number MEASURED here is much smaller than the bound, and it is PRINTED
-# rather than asserted equal to anything: the point of the case is to publish
-# the drift, and the assertion is only a ceiling that a real regression would
-# break.
+# The quantity measured against it is the MAXIMUM over the head's actions of
+# |logp_loss - logp_rollout|, which is exactly what the trainer publishes as
+# `ratio/max_log`. It is PRINTED rather than asserted equal to anything: the
+# point of the case is to publish the drift, and the assertion is only a
+# ceiling that a real regression would break.
 KERNEL_REL = 5e-3
 
 
 def _drift_bound(count, logp):
-    import math
     n_chunks = -(-int(count) // CHUNK_C)
     rel_state = (1.0 + KERNEL_REL) ** n_chunks - 1.0
     return 2.0 * max(abs(float(logp)), 1.0) * rel_state, n_chunks, rel_state
 
 
-def _step_logp(agent, toks, count, read, action):
-    """One step's vertex log-prob, read end to end on ONE path's operator.
+def _step_state(agent, toks, count, read):
+    """One step, read end to end on ONE path's operator.
 
-    This is the quantity the PPO ratio is built from: the base encode, the
-    step's delta advance, the vertex head, log-softmax, one action. Running
-    it twice under two operators and subtracting IS `ratio/max_log` at
-    epoch 0.
+    Returns ``(logp, vmem_sums)``: the per-vertex log-prob vector the PPO
+    ratio is built from, and the vertex memory it came out of. The memory is
+    returned too so the case below can assert that the two operators really
+    did compute different numbers -- a drift of zero because the read never
+    changed would otherwise look like a drift of zero because the read is
+    harmless.
     """
     import os as _os
     from alphagrad.approx.common import carry_stream as _cs
@@ -565,14 +568,15 @@ def _step_logp(agent, toks, count, read, action):
             window=int(base.shape[0]), total_v=total_v,
             embd_dim=agent.embd_dim, path="rollout")
         vs0, vc0 = _cs.zero_memory(total_v, agent.embd_dim)
-        part = jnp.zeros((total_v + 1,), jnp.float32).at[0].set(1.0)
+        part = jnp.ones((total_v + 1,), jnp.float32)
         _c, vs, vc = _cs.advance(
             agent, enc0, vs0, vc0, toks, jnp.asarray(count, jnp.int32),
             jnp.asarray(0, jnp.int32), window=WINDOW, participants=part,
             path="rollout")
         vlog, _ctx, _val = _cs.heads(agent, vs, vc, base_mem=(bs, bc),
                                      preference=None)
-        return float(jax.nn.log_softmax(vlog)[action])
+        return (np.asarray(jax.nn.log_softmax(vlog), np.float64),
+                np.asarray(vs, np.float64))
     finally:
         for env, val in zip((ROLLOUT_ENV, LOSS_ENV), prev):
             if val is None:
@@ -583,10 +587,11 @@ def _step_logp(agent, toks, count, read, action):
 
 def test_a_matched_pair_leaves_the_epoch_zero_ratio_at_one(agent, tokens):
     """The control for the case below. One operator on both sides and the
-    two log-probs are the SAME number, so the ratio is exactly 1."""
-    a = _step_logp(agent, tokens, COUNT, "fast", 0)
-    b = _step_logp(agent, tokens, COUNT, "fast", 0)
-    assert a == b
+    two log-prob vectors are the SAME numbers, so the ratio is exactly 1."""
+    a, _ma = _step_state(agent, tokens, COUNT, "fast")
+    b, _mb = _step_state(agent, tokens, COUNT, "fast")
+    assert np.array_equal(a, b)
+    assert float(np.max(np.abs(a - b))) == 0.0
 
 
 @pytest.mark.parametrize("rollout,loss", [("exact", "fast"),
@@ -600,17 +605,27 @@ def test_a_mismatched_pair_reports_its_epoch_zero_ratio_drift(
     printed so a reader of the test output sees it; the assertion is the
     ceiling derived in the block comment above.
     """
-    lp_rollout = _step_logp(agent, tokens, COUNT, rollout, 0)
-    lp_loss = _step_logp(agent, tokens, COUNT, loss, 0)
-    max_log = abs(lp_loss - lp_rollout)
-    bound, n_chunks, rel_state = _drift_bound(COUNT, lp_rollout)
+    lp_r, mem_r = _step_state(agent, tokens, COUNT, rollout)
+    lp_l, mem_l = _step_state(agent, tokens, COUNT, loss)
+    # THE CASE MUST NOT BE VACUOUS. If the two reads produced the same vertex
+    # memory then the drift below is zero because nothing changed, not
+    # because the mismatch is harmless, and the measurement would mean
+    # nothing.
+    mem_gap = float(np.max(np.abs(mem_l - mem_r)))
+    assert mem_gap > 0.0, (
+        "the two reads produced an identical vertex memory, so this case "
+        "measures nothing")
+    max_log = float(np.max(np.abs(lp_l - lp_r)))
+    scale = float(np.max(np.abs(lp_r)))
+    bound, n_chunks, rel_state = _drift_bound(COUNT, scale)
     with capsys.disabled():
         print(f"\n[ratio drift] rollout={rollout} loss={loss}  "
-              f"logp_rollout={lp_rollout:.6f} logp_loss={lp_loss:.6f}  "
-              f"ratio/max_log={max_log:.3e}  ratio={np.exp(max_log):.6f}  "
-              f"bound={bound:.3e} "
+              f"ratio/max_log={max_log:.6e}  "
+              f"ratio={np.exp(max_log):.9f}  "
+              f"bound={bound:.6e}  vertex-memory gap={mem_gap:.6e}  "
+              f"|logp|max={scale:.6f}  "
               f"(N={COUNT} tokens = {n_chunks} chunks of {CHUNK_C}, "
-              f"rel_state={rel_state:.3e}, kernel rel={KERNEL_REL:g})")
+              f"rel_state={rel_state:.6e}, kernel rel={KERNEL_REL:g})")
     assert max_log < bound, (
         f"epoch-0 ratio drift {max_log:.3e} exceeds the derived bound "
         f"{bound:.3e}")
