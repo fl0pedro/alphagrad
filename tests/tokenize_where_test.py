@@ -274,7 +274,13 @@ def test_a_mixed_step_splits_terminal_from_non_terminal_under_local():
     assert measure.submitted == [[4, 4]]
     assert measure.rows == []          # row 1 was tokenized in the trainer
     assert E.measure_ticket_rows(t) == [0, 2]
-    E.collect_measurement(t)
+    # Not collectable: one environment of the three never reached a terminal
+    # step, and a collect with a gap would put one environment's measurement
+    # on another's trajectory. Dropped instead, which is what a discarded
+    # attempt does.
+    with pytest.raises(E.MeasureTicketError):
+        E.collect_measurement(t)
+    E.drop_measurement(t)
 
 
 # ------------------------------------------------ 2. the bytes do not move
