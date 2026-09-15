@@ -120,6 +120,7 @@ from alphagrad.approx.env import (
 from alphagrad.approx.common.token_vocab import incr_token_vocab
 from alphagrad.approx.common import carry_stream as _carry_stream
 from alphagrad.approx.common.face_driver import (
+    bind_decide_callback,
     bind_sizes_callback,
     bind_step_callbacks,
     build_live_face_stream,
@@ -9182,6 +9183,15 @@ def main():
         """Called at the top of EVERY attempt, including the repeats."""
         _EP_HOST_SNAP[0] = _ep_env_mod.episode_telemetry_snapshot()
         _ep_env_mod.set_plan_log_attempt(_EP_ATTEMPT[0])
+        # THE HOST FACE PREFIX IS RESET WITH THE ATTEMPT (owner ruling
+        # 2026-09-15, item 2). It is not in the telemetry snapshot: it is a
+        # buffer the callbacks write in place, and `_telemetry_copy` shares
+        # array leaves on purpose, so a snapshot of it would be the very array
+        # the repeat overwrites. Its correct value at the top of any attempt is
+        # "no rows", which is what this says. The repeat's own first callback
+        # at `step_count == 0` empties it again, so this is the second of two
+        # guards rather than the only one.
+        _ep_env_mod.face_prefix_reset()
 
     def _ep_discard(result, pool_drain: bool = True):
         """Roll a discarded attempt back, in the trainer AND in the actors.
@@ -9538,15 +9548,16 @@ def main():
                     if _live_face_decide is not None:
                         # Same prefix and history as the sizes: the stage-2
                         # masks must be composed on the tokenizer state the
-                        # stage-1 masks were read from.
-                        def face_decide_fn(_v, _skips, _rows,
-                                           _o=state.order,
-                                           _s=state.sparsity_specs,
-                                           _k=state.step_count,
-                                           _fh=_fh_w,
-                                           _kh=_kh_w):
-                            return _live_face_decide(
-                                _o, _s, _k, _v, _fh, _kh, _skips, _rows)
+                        # stage-1 masks were read from. Bound through
+                        # face_driver so this closure narrows to the step's
+                        # ROW exactly as the other two do (owner ruling
+                        # 2026-09-15, item 2); it used to be written out here
+                        # and was the one binding the row wire would have
+                        # missed.
+                        face_decide_fn = bind_decide_callback(
+                            _live_face_decide,
+                            state.order, state.sparsity_specs,
+                            state.step_count, _fh_w, _kh_w)
 
             if args.dynamic_substeps:
                 # Live per-vertex DIAG/COMPRESS masks for the current graph

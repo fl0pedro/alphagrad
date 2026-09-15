@@ -40,6 +40,7 @@ __all__ = [
     "fit_chunk_to_window",
     "make_face_vertex_decide_callback",
     "bind_step_callbacks",
+    "bind_decide_callback",
     "EdgeSlotTable",
     "callback_census",
     "consume_callback_census",
@@ -149,6 +150,80 @@ class EdgeSlotTable:
         for k in self.stats:
             self.stats[k] = 0
         return out
+
+
+# ---------------------------------------------------------------------------
+# THE ROW WIRE (owner ruling 2026-09-15, item 2).
+#
+# Every callback here used to ride with the whole elimination-prefix face
+# history, `(N, W, FACE_SLOTS, 3)` int32 plus `(N, W)` skips, once per call and
+# about four calls per rollout step. The rows below `step_count` are the same
+# bytes every time. The device now sends ONE ROW -- the last row of the call's
+# own prefix -- and `env.face_prefix_step` keeps the rest; see its block
+# comment for the three structural facts and the guard that raises instead of
+# resynchronising.
+#
+# The mode is read ONCE, because the bind that slices the row and the host body
+# that expands it have to agree and there is nothing on the wire that says
+# which of the two shapes arrived.
+# ---------------------------------------------------------------------------
+_ROW_WIRE = [None]
+
+
+def _row_wire() -> bool:
+    if _ROW_WIRE[0] is None:
+        from alphagrad.approx.env import face_row_wire
+        _ROW_WIRE[0] = bool(face_row_wire())
+    return _ROW_WIRE[0]
+
+
+def _prefix_operands(face_hist, skip_hist, step_count, row_wire=None):
+    """The two face-history operands a bind hands its callback.
+
+    Under the row wire that is row ``step_count - 1``, the last row of the
+    prefix `[0, step_count)` the call is about: a device gather, so the full
+    history never leaves the device. At step 0 the index is clamped to 0 and
+    the row is ignored -- the host empties its prefix at `n == 0`.
+
+    ``row_wire=False`` KEEPS THE WHOLE HISTORY ON THE WIRE, and one caller
+    needs that: the host prefix is extended one row per step and can only be
+    read forward, while AlphaZero's tree search asks for prefixes in tree
+    order, revisiting shorter ones (``az_gumbel._face_plan``, once per
+    candidate per widening round). A rollout's prefixes are monotone; a
+    search's are not.
+    """
+    if not (_row_wire() if row_wire is None else bool(row_wire)):
+        return face_hist, skip_hist
+    _i = jnp.maximum(jnp.asarray(step_count, jnp.int32) - 1, 0)
+    return (jnp.take(face_hist, _i, axis=0),
+            jnp.take(skip_hist, _i, axis=0))
+
+
+def _prefix_hist(order, step_count, face_row, skip_row):
+    """The host side of :func:`_prefix_operands`: rows in, history out.
+
+    WHICH OF THE TWO ARRIVED IS READ OFF THE SHAPE, not off the mode. A face
+    history has exactly one axis more than a row -- ``(N, W, S, 3)`` against
+    ``(W, S, 3)`` per environment, one more of each under a batch -- so the two
+    are never confusable, and a caller that still binds the whole history (the
+    test harnesses, ``az_gumbel``, anything that builds its own closure) is
+    handed straight through instead of having to be told about the wire.
+
+    ``order`` carries the batch (``(B, N)`` batched, ``(N,)`` per env) and the
+    episode length ``N``, which is what the host buffer is sized by.
+    """
+    _o = np.asarray(order)
+    _b = _o.ndim >= 2
+    _r = np.asarray(face_row)
+    _k = np.asarray(skip_row)
+    if _r.ndim != (4 if _b else 3):
+        return _r, _k                      # already a history
+    from alphagrad.approx.env import face_prefix_step
+    if not _b:
+        _r, _k = _r[None], _k[None]
+    R, K, _J = face_prefix_step(
+        np.asarray(step_count).reshape(-1), _r, _k, int(_o.shape[-1]))
+    return (R, K) if _b else (R[0], K[0])
 
 
 def _hk_kw(live_faces, env, frh, fsh, n):
@@ -312,6 +387,8 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None,
                         vertex_specs, face_rows, face_skips, f,
                         face_hist, skip_hist):
         _census("faces.live_chunk")
+        face_hist, skip_hist = _prefix_hist(
+            order, step_count, face_hist, skip_hist)
         # face_hist/skip_hist are the PREFIX's per-face wires -- the (N,
         # MAX_FACES, FACE_SLOTS, 3) / (N, MAX_FACES) history arrays carried by
         # the env state, aligned with `order` exactly like `spec_hist` is.
@@ -441,6 +518,8 @@ def make_face_callbacks(live_faces, *, window, prof_sink=None,
         # that cost surfaced only as a device-side gap and was read as
         # `env.step` device time for two rounds of profiling.
         _census("faces.live_count")
+        face_hist, skip_hist = _prefix_hist(
+            order, step_count, face_hist, skip_hist)
         _ct0 = _perf() if _perf is not None else None
         try:
             _order = np.asarray(order)
@@ -516,6 +595,8 @@ def make_face_sizes_callback(live_faces, *, max_faces, max_axes,
     def _sizes_host(order, spec_hist, step_count, vertex_idx,
                     face_hist, skip_hist):
         _census("faces.live_sizes")
+        face_hist, skip_hist = _prefix_hist(
+            order, step_count, face_hist, skip_hist)
         _t0 = _perf() if _perf is not None else None
         try:
             _order = np.asarray(order)
@@ -719,6 +800,8 @@ def make_face_slot_legality_callback(live_faces, *, max_faces, max_axes,
     def _host(order, spec_hist, step_count, vertex_idx, face_hist, skip_hist):
         _census("faces.count_legality" if with_count
                 else "faces.live_slot_legality")
+        face_hist, skip_hist = _prefix_hist(
+            order, step_count, face_hist, skip_hist)
         _count_secs[0] = 0.0
         _t0 = _perf() if _perf is not None else None
         try:
@@ -876,6 +959,8 @@ def make_face_vertex_decide_callback(live_faces, *, max_faces, max_axes,
     def _host(order, spec_hist, step_count, vertex_idx, face_hist, skip_hist,
               skips, *args):
         _census("faces.vertex_decide")
+        face_hist, skip_hist = _prefix_hist(
+            order, step_count, face_hist, skip_hist)
         _t0 = _perf() if _perf is not None else None
         try:
             _order = np.asarray(order)
@@ -923,13 +1008,16 @@ def make_face_vertex_decide_callback(live_faces, *, max_faces, max_axes,
 
 
 def bind_sizes_callback(sizes_cb, order, spec_hist, step_count,
-                        face_hist, skip_hist):
+                        face_hist, skip_hist, *, row_wire=None):
     """Bind this step's prefix to ``face_sizes_fn(vertex_idx)``.
 
     The sibling of :func:`bind_step_callbacks`, kept separate so the
     historical ``(chunk, count)`` pair -- and every caller that unpacks it --
     is untouched when ``--per-face-masks`` is off.
     """
+
+    face_hist, skip_hist = _prefix_operands(
+        face_hist, skip_hist, step_count, row_wire=row_wire)
 
     def face_sizes_fn(_v, _o=order, _s=spec_hist, _k=step_count,
                       _fh=face_hist, _kh=skip_hist):
@@ -938,16 +1026,44 @@ def bind_sizes_callback(sizes_cb, order, spec_hist, step_count,
     return face_sizes_fn
 
 
+def bind_decide_callback(decide_cb, order, spec_hist, step_count,
+                         face_hist, skip_hist, *, row_wire=None):
+    """Bind this step's prefix to ``decide_fn(vertex, skips, stage-1 rows)``.
+
+    The third sibling of :func:`bind_step_callbacks`, and it exists for the
+    row wire: ppo.py built this closure inline over the whole history, which
+    is the one operand the wire is about. Same prefix and same history as the
+    sizes bind, which the stage-2 masks require -- they have to be composed on
+    the tokenizer state the stage-1 masks were read from.
+    """
+    face_hist, skip_hist = _prefix_operands(
+        face_hist, skip_hist, step_count, row_wire=row_wire)
+
+    def face_decide_fn(_v, _skips, _rows, _o=order, _s=spec_hist,
+                       _k=step_count, _fh=face_hist, _kh=skip_hist):
+        return decide_cb(_o, _s, _k, _v, _fh, _kh, _skips, _rows)
+
+    return face_decide_fn
+
+
 def bind_step_callbacks(chunk_cb, count_cb, order, spec_hist, step_count,
-                        face_hist, skip_hist):
+                        face_hist, skip_hist, *, row_wire=None):
     """Bind this step's prefix to ``(face_chunk_fn, face_count_fn)``.
 
-    The FULL per-face history rides along: the face loop supplies the CURRENT
-    vertex's in-flight decisions (``_rows``/``_skips``), while ``face_hist``/
+    The per-face history is what the face loop's ``_rows``/``_skips`` are NOT:
+    those are the CURRENT vertex's in-flight decisions, while ``face_hist``/
     ``skip_hist`` are every decision already committed to the prefix. The
     prefix replay needs the latter or it rebuilds an exact graph the
     measurement never builds.
+
+    ``face_hist``/``skip_hist`` are still the whole history here. Only ONE ROW
+    of it goes on the wire (:func:`_prefix_operands`) -- the slice is a device
+    gather, so the rest never leaves the device, and the host keeps the prefix
+    it replays from (``env.face_prefix_step``).
     """
+
+    face_hist, skip_hist = _prefix_operands(
+        face_hist, skip_hist, step_count, row_wire=row_wire)
 
     def face_chunk_fn(_f, _v, _vspecs, _rows, _skips,
                       _o=order, _s=spec_hist, _k=step_count,
