@@ -99,11 +99,13 @@ def test_a_row_key_separates_the_same_value_at_a_different_face():
 
 
 def test_a_row_key_is_far_smaller_than_the_row():
-    """The whole point. 1920 columns of padding become a few dozen bytes."""
-    frh, fsh = _blank()
-    _decide(frh, fsh, 0, face=0)
-    k = LF._face_row_key(frh[0], fsh[0])
-    assert sum(len(x) for x in k) < frh[0].nbytes // 100
+    """The whole point, at the CAMPAIGN's width. 1920 face columns of
+    padding with one decision in them become a few dozen bytes."""
+    row = -np.ones((1920, SLOTS, 3), np.int32)
+    skip = np.zeros((1920,), np.int32)
+    row[7, 0] = np.asarray((1, 2, 3), np.int32)
+    k = LF._face_row_key(row, skip)
+    assert sum(len(x) for x in k) < row.nbytes // 1000
 
 
 # --------------------------------------------------------- 2. the chain
