@@ -847,9 +847,16 @@ def _face_plan(agent, precomputed, enc_carry, avail,
     it does for PPO. Reimplementing the face loop here instead would be a
     second copy of the pipeline this whole change exists to remove.
     """
+    # THE WHOLE HISTORY ON THE WIRE, not the row (owner ruling 2026-09-15,
+    # item 2). The rollout hands its callbacks one row per step and the host
+    # keeps the prefix, which rests on `step_count` rising by exactly one per
+    # call. A tree search does not: this function runs once per surviving
+    # candidate per widening round, and the search revisits shorter prefixes in
+    # tree order. The host prefix can only be read forward, so AZ keeps the
+    # operand it always had.
     face_chunk_fn, face_count_fn = bind_step_callbacks(
         _live_face, _live_face_count, order, spec_hist, step_count,
-        face_hist, skip_hist)
+        face_hist, skip_hist, row_wire=False)
     (vertex_idx, actions, _vdist, _od, _id, _jd, _ed, _kd, _qlp,
      _vp, _vc, face_out, value, v_context) = agent.sample_action_dynamic(
         None, avail, AXIS_STATE, AXIS_VALID, FACT_TABLES, OP_OVERRIDE, key,
