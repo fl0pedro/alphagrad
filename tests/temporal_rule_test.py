@@ -35,7 +35,17 @@ and that its off-diagonal is exactly zero -- which is why ``Diag`` on that edge
 costs nothing there and why the approximation lives in the CROSS-LAYER blocks.
 """
 
-import math
+import os
+
+# FLOAT64, SET BEFORE JAX IS IMPORTED. Half the claims here say EXACT, and at
+# float32 the distance between the attachment and its reference is set by the
+# conditioning of a spiking prefix (measured 3.6e-4 on the 700-128-20 target),
+# not by the design -- a test that says exact has to measure the design. The
+# repo's trustworthy suite shape is one process per module
+# (``suite_per_module.sh``, CONTEXT.md), so the variable lands before this
+# module's ``import jax``. The fixture below refuses to run on float32 rather
+# than quietly measuring something else.
+os.environ.setdefault("JAX_ENABLE_X64", "1")
 
 import jax
 import jax.numpy as jnp
@@ -186,9 +196,16 @@ def x64():
     spiking prefix (measured 3.6e-4 on the 700-128-20 target), not by the
     design. A test that says "exact" has to measure the design.
     """
-    jax.config.update("jax_enable_x64", True)
+    if not jax.config.jax_enable_x64:
+        jax.config.update("jax_enable_x64", True)
+    if not jax.config.jax_enable_x64:
+        raise RuntimeError(
+            "this module needs float64 and jax is already running on float32. "
+            "Run it in its own process (suite_per_module.sh does), or export "
+            "JAX_ENABLE_X64=1 before pytest starts. A float32 run of these "
+            "tests would measure the conditioning of a spiking prefix and "
+            "call it the exactness of the attachment.")
     yield
-    jax.config.update("jax_enable_x64", False)
 
 
 # ---------------------------------------------------------------------------
