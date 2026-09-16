@@ -68,6 +68,10 @@ def _args(rule, **kw):
                        temporal_rule=rule, step_position=T_PIN, **kw)
 
 
+def _n_bytes(xs, frm):
+    return sum(int(np.asarray(x).nbytes) for x in xs[frm:])
+
+
 # ---------------------------------------------------------------------------
 # 1. The three graphs
 # ---------------------------------------------------------------------------
@@ -188,7 +192,7 @@ def test_a_wrong_given_shape_raises():
     st = R.zero_state()
     W = R.rsnn_weights(jax.random.PRNGKey(0))
     bad = tuple(W) + tuple(jnp.zeros((2, 2, 2)) for _ in RSNN_CARRY_BLOCKS)
-    with pytest.raises(ValueError, match="d state / d W is"):
+    with pytest.raises(ValueError, match="Nothing else is a container"):
         attach_rsnn_past(st, W, bad)
     with pytest.raises(ValueError, match="does not match the state"):
         attach_rsnn_future(jnp.array(0.0), st,
@@ -745,3 +749,153 @@ def test_the_declared_slots_must_match_the_arrays():
         envmod._grad_cosine_quality(
             _Cfg(liar), lambda *a: a, lambda *a: a,
             [jnp.zeros((2,)), jnp.zeros((2,))], None, 1)
+
+
+# ---------------------------------------------------------------------------
+# 9. THE CARRY FOLLOWS THE PLAN (owner ruling 2026-09-16)
+#
+# The given temporal edge is no longer a snapshot of the exact carry. It is
+# the RULE, run over the whole prefix (rtrl) or suffix (bptt), so the value
+# arriving at step t carries the error that rule accumulated over the
+# recording -- and, for rtrl, it is stored in the CONTAINER that rule implies.
+# That container is the point: an approximation applied inside the graph
+# cannot shrink an argument, so the eligibility trace is the only thing the
+# memory channel can ever see.
+# ---------------------------------------------------------------------------
+
+def test_the_two_containers_are_told_apart_by_shape():
+    from graphax.examples.neuromorphic import rsnn_carry_container
+    h, n_in = R.RSNN_HIDDEN, SHD_CHANNELS
+    assert rsnn_carry_container((0, 0), (h,), (h, n_in),
+                                (h, h, n_in)) == "dense"
+    assert rsnn_carry_container((0, 0), (h,), (h, n_in),
+                                (h, n_in)) == "compact"
+    with pytest.raises(ValueError, match="Nothing else is a container"):
+        rsnn_carry_container((0, 0), (h,), (h, n_in), (3, 3))
+
+
+def test_the_compact_container_is_the_store_the_approximation_buys():
+    """225.74 MB against 2.12 MB. THE MEMORY CHANNEL CANNOT SEE ANY OTHER
+    saving: the carry is an ARGUMENT, and nothing a plan does inside the
+    graph shrinks an argument."""
+    xs_d = _args("rtrl", carry_container="exact")
+    xs_e = _args("rtrl", carry_container="eprop")
+    assert len(xs_d) == len(xs_e) == 16 + 14, "the rule selector must not move"
+    dense = sum(int(np.asarray(x).nbytes) for x in xs_d[19:])
+    compact = sum(int(np.asarray(x).nbytes) for x in xs_e[19:])
+    assert dense == 225_738_752
+    assert compact == 2_129_920
+    assert dense // compact > 100
+
+
+def test_the_reference_weights_lead_either_container():
+    for cont in ("exact", "eprop"):
+        xs = _args("rtrl", carry_container=cont)
+        for slot, ref in zip((7, 8, 9), (16, 17, 18)):
+            np.testing.assert_array_equal(np.asarray(xs[slot]),
+                                          np.asarray(xs[ref]))
+
+
+def test_the_forward_value_does_not_move_between_containers():
+    """The attached weight delta is exactly zero in both, so the loss is the
+    same to the last bit. A container that moved the loss would be measuring
+    a different function, not the same one more cheaply."""
+    fn = ex.get_fn("RSNN_SHD")
+    a = fn(*_args("rtrl", carry_container="exact"))
+    b = fn(*_args("rtrl", carry_container="eprop"))
+    c = fn(*_args("tbptt"))
+    assert float(a) == float(b) == float(c)
+
+
+def test_the_compact_carry_expands_to_the_recursion():
+    seq, y, _ = R._draw_recording(jax.random.PRNGKey(1), None, -1)
+    W = R.rsnn_weights(jax.random.PRNGKey(1))
+    compact = R.carry_traces(seq, 9, W)
+    expanded = R.eprop_traces(seq, 9, W)[3:]
+    assert len(compact) == len(expanded) == len(RSNN_CARRY_BLOCKS)
+    for (s, w), c, e in zip(RSNN_CARRY_BLOCKS, compact, expanded):
+        assert tuple(c.shape) == tuple(W[w].shape), (s, w)
+        assert e.ndim == c.ndim + 1
+
+
+def test_the_readout_block_against_the_readout_weight_is_exact():
+    """``(Uo, Wo)[m, k, j] = delta(m, k) * g[j]``: the readout feeds nothing
+    back, so that block is a leaky filter of the hidden SPIKES and the compact
+    form loses nothing at all."""
+    seq, y, _ = R._draw_recording(jax.random.PRNGKey(1), None, -1)
+    W = R.rsnn_weights(jax.random.PRNGKey(1))
+    exact = R.carried_jacobians(seq, 9, W)[3:]
+    trace = R.eprop_traces(seq, 9, W)[3:]
+    k = RSNN_CARRY_BLOCKS.index((4, 2))
+    a = np.asarray(trace[k], np.float64)
+    b = np.asarray(exact[k], np.float64)
+    assert np.linalg.norm(a - b) / np.linalg.norm(b) < 1e-6
+
+
+def test_the_bptt_adjoint_follows_the_plan_too():
+    """The container does not move for bptt -- an adjoint is 532 numbers
+    either way -- but the VALUE does: the state-to-state Jacobian is block
+    diagonalised at every step of the suffix."""
+    seq, y, _ = R._draw_recording(jax.random.PRNGKey(1), None, -1)
+    W = R.rsnn_weights(jax.random.PRNGKey(1))
+    st = tuple(jax.lax.stop_gradient(x)
+               for x in R.prefix_state(seq, 40, W)(*W))
+    lam_e = R.future_adjoints(seq, y, 40, W, st, "exact")
+    lam_p = R.future_adjoints(seq, y, 40, W, st, "eprop")
+    assert len(lam_e) == len(lam_p) == 5
+    for a, b in zip(lam_e, lam_p):
+        assert a.shape == b.shape
+    ae = np.concatenate([np.asarray(x, np.float64).ravel() for x in lam_e])
+    ap = np.concatenate([np.asarray(x, np.float64).ravel() for x in lam_p])
+    assert np.linalg.norm(ae) > 0
+    assert not np.allclose(ae, ap), "the block diagonal changed nothing"
+
+
+def test_the_container_raises_off_the_recurrent_target():
+    with pytest.raises(ValueError, match="carries no temporal edge"):
+        ex.get_args("ADALIF_SNN", jax.random.PRNGKey(1),
+                    carry_container="eprop")
+    with pytest.raises(ValueError, match="not one of"):
+        ex.get_args("RSNN_SHD", jax.random.PRNGKey(1), dataset=None,
+                    carry_container="banana")
+
+
+def test_the_plan_record_says_which_container_the_carry_arrived_in():
+    import alphagrad.approx.env as envmod
+    for cont in ("exact", "eprop"):
+        ex.get_args("RSNN_SHD", jax.random.PRNGKey(3), dataset=None,
+                    temporal_rule="rtrl", step_position=5,
+                    carry_container=cont)
+        envmod._PROBE_META.clear()
+        envmod._PLAN_RECORDS.clear()
+        envmod._record_plan({"order": [1, 2]})
+        rec = envmod._PLAN_RECORDS[-1]
+        envmod._PLAN_RECORDS.clear()
+        assert rec["carry_container"] == cont
+        assert rec["step_position"]["carry"] == cont
+
+
+@pytest.mark.parametrize("cont", ["exact", "eprop"])
+def test_the_graph_shape_does_not_move_with_the_step_position_per_container(cont):
+    seen = set()
+    for t in (1, 40, 99):
+        xs = ex.get_args("RSNN_SHD", jax.random.PRNGKey(1), dataset=None,
+                         temporal_rule="rtrl", step_position=t,
+                         carry_container=cont)
+        jx = _jaxpr_of(xs)
+        n_valid = sum(1 for i, e in enumerate(jx.eqns, 1)
+                      if e.outvars[0] not in jx.outvars)
+        seen.add((len(jx.eqns), n_valid))
+    assert len(seen) == 1, f"the graph moved with t under {cont}: {seen}"
+
+
+def test_the_generator_draws_the_container_it_was_asked_for():
+    for cont in ("exact", "eprop"):
+        gen = ex.data_gen("RSNN_SHD", dataset=None, key=jax.random.PRNGKey(1),
+                          temporal_rule="rtrl", carry_container=cont)
+        data = gen(jax.random.split(jax.random.PRNGKey(5), 5))
+        xs = ex.get_args("RSNN_SHD", jax.random.PRNGKey(1), dataset=None,
+                         temporal_rule="rtrl", carry_container=cont)
+        for slot, d in zip(gen.data_slots, data):
+            assert jnp.shape(d) == jnp.shape(xs[slot]), (cont, slot)
+        assert gen.meta(jax.random.split(jax.random.PRNGKey(5), 5))["carry"] == cont

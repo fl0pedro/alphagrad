@@ -489,9 +489,11 @@ def eprop_traces(seq, t, weights):
     """:func:`carry_traces`, EXPANDED to the dense block shapes.
 
     The same recursion and the same numbers, written into the container
-    :func:`carried_jacobians` uses, so the two are directly comparable block
-    for block. This is the form the earlier probes and tests compare against;
-    :func:`carry_traces` is what a run actually carries.
+    :func:`carried_jacobians` uses, so the two are DROP-IN interchangeable as
+    the ``rtrl`` given values (three reference weights, then eleven blocks)
+    and directly comparable block for block. This is the form the earlier
+    probes and tests compare against; :func:`carry_traces` is what a run
+    actually carries, and it is 106 times smaller.
     """
     from graphax.examples.neuromorphic import RSNN_CARRY_BLOCKS
 
@@ -509,7 +511,7 @@ def eprop_traces(seq, t, weights):
         else:
             out.append(jnp.eye(m.shape[0])[:, :, None] * m[:, None, :])
     sg = jax.lax.stop_gradient
-    return tuple(sg(x) for x in out)
+    return tuple(sg(x) for x in weights) + tuple(sg(x) for x in out)
 
 
 def carry_under_plan(seq, t, weights, container: str = "exact", *,
