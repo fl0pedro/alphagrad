@@ -676,8 +676,25 @@ def rsnn_data_gen(key=None, *, dataset: str | None = None,
     def fn(keys):
         return _draw(keys)
 
+    @jax.jit
+    def _draw_exact(keys):
+        """The SAME draw with the EXACT carry. The quality reference."""
+        t = _t(keys)
+        sg = jax.lax.stop_gradient
+        state_prev = tuple(
+            sg(x) for x in prefix_state(seq, t, weights)(*weights))
+        head = (seq[t], y) + state_prev + weights
+        if rule == "tbptt":
+            given = ()
+        elif rule == "rtrl":
+            given = carry_under_plan(seq, t, weights, "exact",
+                                     check_zeros=False)
+        else:
+            given = future_adjoints(seq, y, t, weights, state_prev, "exact")
+        return head + tuple(given)
+
     def meta(keys):
-        """``{t, T, recording, rule}`` of the draw ``keys`` produces."""
+        """``{t, T, recording, rule, carry}`` of the draw ``keys`` produces."""
         return {"t": int(_t(keys)), "T": T, "recording": int(rec),
                 "rule": rule, "carry": cont}
 
@@ -690,6 +707,21 @@ def rsnn_data_gen(key=None, *, dataset: str | None = None,
     #: Redraw per (environment, episode) rather than once per process.
     fn.resample_per_env_episode = True
     fn.meta = meta
+    # THE QUALITY REFERENCE, when the carry itself is approximated (owner
+    # ruling 2026-09-16). The in-band gradient cosine scores the plan against
+    # the rev-exact plan ON THE SAME ARGUMENTS, so an approximation that lives
+    # in an ARGUMENT is invisible to it: both sides read the same approximated
+    # carry and the cosine is 1.0 whatever the rule did over the recording.
+    # A generator whose draw is itself approximated therefore has to publish
+    # the EXACT draw at the SAME step position, and the quality channel takes
+    # its reference from `jax.grad` of the target on that. Then the number
+    # reward slot 6 holds is the error the rule ACCUMULATED over the whole
+    # recording, which is what it has to be. Absent under `exact`, where the
+    # in-band reference is already the truth.
+    if cont != "exact":
+        def reference_draw(keys):
+            return _draw_exact(keys)
+        fn.reference_draw = reference_draw
     return fn
 
 

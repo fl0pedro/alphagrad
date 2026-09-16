@@ -4648,6 +4648,45 @@ def paired_ref_summary(records) -> dict:
     }
 
 
+def _dense_cosine(jac_exact, jac_approx):
+    """``(cos, rel_frob)`` of two gradient pytrees, leaf by leaf, DENSE.
+
+    The plain accumulator, for the one case ``_quality_metrics`` cannot serve:
+    the reference is ``jax.grad``'s pytree and the candidate is jacve's, so the
+    two do not carry the same container and the exact-structure check of
+    ticket .62 would refuse them. Shapes still have to match leaf for leaf --
+    a mismatch here is a real defect and RAISES, exactly as it does there.
+    This is the same comparison ``_grad_oracle_check`` makes.
+    """
+    leaves_a = _gradient_leaves(jac_approx)
+    leaves_e = jax.tree_util.tree_leaves(jac_exact)
+    if len(leaves_a) != len(leaves_e):
+        raise GradientStructureMismatch(
+            f"[grad_cosine] the oracle reference has {len(leaves_e)} leaves "
+            f"and the plan's gradient {len(leaves_a)}")
+    dot = ee = aa = rr = 0.0
+    for i, (e, a) in enumerate(zip(leaves_e, leaves_a)):
+        if a is None:
+            raise GradientStructureMismatch(
+                f"[grad_cosine] the plan's gradient leaf {i} is a dead path")
+        a_arr = a.dense() if _is_sparse_tensor(a) else a
+        e_np = np.asarray(e, dtype=np.float64)
+        a_np = np.asarray(a_arr, dtype=np.float64)
+        if a_np.shape != e_np.shape and a_np.shape == e_np.shape[::-1]:
+            a_np = a_np.T
+        if a_np.shape != e_np.shape:
+            raise GradientStructureMismatch(
+                f"[grad_cosine] leaf {i}: the oracle reference has shape "
+                f"{e_np.shape} and the plan's gradient {a_np.shape}")
+        dot += float(np.sum(e_np * a_np))
+        ee += float(np.sum(e_np ** 2))
+        aa += float(np.sum(a_np ** 2))
+        rr += float(np.sum((e_np - a_np) ** 2))
+    if ee <= 0.0 or aa <= 0.0:
+        return 0.0, 1.0
+    return dot / math.sqrt(ee * aa), math.sqrt(rr) / math.sqrt(ee)
+
+
 def _quality_metrics(jac_exact, jac_approx, *, align: bool = False,
                      site: str = "grad_cosine"):
     """`(cosine_sim, relative_frobenius)` of `jac_approx` against `jac_exact`.
@@ -5262,8 +5301,10 @@ def grad_oracle_submission(config, base_args, episode):
     if data is None:
         return None
     a = list(jax.device_get(list(base_args)))
-    for slot in range(min(2, len(data))):
-        a[slot] = np.asarray(data[slot])
+    # THE DECLARED SLOTS, not the first two: a generator whose draw is a
+    # carried state puts arrays further along the tuple.
+    for slot, d in zip(_data_slots(config, data), data):
+        a[slot] = np.asarray(d)
     return int(probe_seed), a
 
 
@@ -5541,8 +5582,30 @@ def probe_meta() -> dict:
     return dict(_PROBE_META)
 
 
+def _data_slots(config, data) -> tuple:
+    """WHICH ARGUMENT SLOTS a probe batch fills.
+
+    The generator's own statement (``data_slots``), or the contiguous
+    ``0 .. len(data) - 1`` when it makes none -- which is what every image and
+    token generator fills and is byte-identical to the positional assumption
+    this replaces. A generator whose draw is a carried state and a block of
+    given values further along the tuple cannot be read positionally.
+    """
+    slots = getattr(config.data_gen, "data_slots", None)
+    if slots is None:
+        return tuple(range(len(data)))
+    slots = tuple(int(i) for i in slots)
+    if len(slots) != len(data):
+        raise ValueError(
+            f"the data generator declares {len(slots)} slots {slots} and "
+            f"returned {len(data)} arrays. A generator's `data_slots` is the "
+            f"contract every refresher reads; a mismatch would put one of its "
+            f"arrays in the wrong argument.")
+    return slots
+
+
 def _probe_batch(config, base_args, role: str = "train",
-                 episode: int | None = None, index: int = 0):
+                 episode: int | None = None, index: int = 0, draw=None):
     """The probe batch: real data from ``config.data_gen`` at ``_walk_seed``.
 
     ``role`` is ``"train"`` (the batch the Adam walk steps on) or ``"eval"``
@@ -5564,6 +5627,11 @@ def _probe_batch(config, base_args, role: str = "train",
     """
     if config.data_gen is None:
         return None
+    # ``draw`` is an ALTERNATIVE producer for the same (role, episode, index)
+    # SEED -- the generator's own `reference_draw`, which answers the same
+    # step position in the exact container. Same seed, different tuple, its
+    # own cache entry.
+    draw = config.data_gen if draw is None else draw
     # THE KEY CARRIES THE EPISODE. ``_walk_seed`` already folds (role,
     # episode) into the seed, and the seed is in the key, so a new episode
     # cannot be served a stale batch -- which is exactly the bug that made the
@@ -5583,7 +5651,7 @@ def _probe_batch(config, base_args, role: str = "train",
         _ep = walk_episode() if episode is None else int(episode)
         _seed += (_PROBE_EPISODE_STRIDE * int(_ep)
                   + _PROBE_ENV_STRIDE * (current_env_slot() + 1))
-    _key = (id(config.data_gen), _seed,
+    _key = (id(config.data_gen), id(draw), _seed,
             tuple(getattr(a, "shape", ()) for a in base_args[:2]))
     hit = _PROBE_BATCH.get(_key)
     if hit is not None:
@@ -5592,7 +5660,7 @@ def _probe_batch(config, base_args, role: str = "train",
         return hit[0]
     k = jrand.PRNGKey(_seed)
     keys = jrand.split(k, 5)
-    data = config.data_gen(keys)
+    data = draw(keys)
     data = tuple(jax.device_get(d) for d in data)
     _meta_fn = getattr(config.data_gen, "meta", None)
     meta = dict(_meta_fn(keys)) if _meta_fn is not None else {}
@@ -5725,27 +5793,50 @@ def _grad_cosine_quality(config, compiled_approx, ref_ex, ref_key, base_args,
         # and identical to the line below for them, but false for a generator
         # whose draw is a carried state and a block of given values further
         # along the tuple.
-        _slots = getattr(config.data_gen, "data_slots", None)
-        _slots = (tuple(range(len(data))) if _slots is None
-                  else tuple(int(i) for i in _slots))
-        if len(_slots) != len(data):
-            raise ValueError(
-                f"the data generator declares {len(_slots)} slots and "
-                f"returned {len(data)} arrays; one of them would land in the "
-                f"wrong argument.")
+        _slots = _data_slots(config, data)
         for slot, d in zip(_slots, data):
             a[slot] = jax.device_put(jnp.asarray(d), device)
+        # THE REFERENCE, when the DRAW ITSELF is approximated. The in-band
+        # cosine scores the plan against the rev-exact plan ON THE SAME
+        # ARGUMENTS, so an approximation that lives in an ARGUMENT -- the
+        # temporal carry a rule accumulated over a whole recording -- is
+        # invisible to it: both sides read the same approximated value and the
+        # cosine reads 1.0 whatever the rule did. A generator that draws an
+        # approximated value publishes `reference_draw`, the EXACT draw at the
+        # SAME step position, and the reference comes from `jax.grad` of the
+        # target on that instead. Then reward slot 6 holds the error the rule
+        # ACCUMULATED over the recording (owner ruling 2026-09-16).
+        _ref_draw = getattr(config.data_gen, "reference_draw", None)
+        _oracle_ref = (_ref_draw is not None and config.target_fun is not None
+                       and bool(getattr(config, "scalar_target", False)))
         _seed = _walk_seed("train", None) + 104729 * int(k)
         try:
             out_a = compiled_approx(*a)
-            out_e = _cosine_reference(ref_ex, ref_key, a, device, _seed)
+            if _oracle_ref:
+                r_data = _probe_batch(config, base_args, role="train",
+                                      index=k, draw=_ref_draw)
+                ar = list(base_args)
+                for slot, d in zip(_data_slots(config, r_data), r_data):
+                    ar[slot] = jax.device_put(jnp.asarray(d), device)
+                jac_e = jax.grad(config.target_fun, argnums=config.argnums,
+                                 has_aux=config.has_aux)(*ar)
+                jac_e = jac_e[0] if config.has_aux else jac_e
+                out_e = None
+            else:
+                # The CACHED REV-EXACT REFERENCE, not a same-order exact
+                # program: one executable for the process, one execution per
+                # probe batch (agent/ref16, owner ruling 2026-09-18).
+                out_e = _cosine_reference(ref_ex, ref_key, a, device, _seed)
+                jac_e = out_e[1] if config.has_aux else out_e
         except Exception:
             return None
         jac_a = out_a[1] if config.has_aux else out_a
-        jac_e = out_e[1] if config.has_aux else out_e
-        cos, rel = _quality_metrics(jac_e, jac_a)
+        if _oracle_ref:
+            cos, rel = _dense_cosine(jac_e, jac_a)
+        else:
+            cos, rel = _quality_metrics(jac_e, jac_a)
         cos = float(cos)
-        if cos == 0.0:
+        if cos == 0.0 and not _oracle_ref:
             # A ZERO REFERENCE IS NOT A BAD PLAN. The cosine is undefined when
             # the EXACT gradient is identically zero, and the formula above
             # then returns 0.0 -- the worst possible score, handed to a plan
