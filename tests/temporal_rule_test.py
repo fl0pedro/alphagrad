@@ -969,7 +969,7 @@ def test_the_oracle_reference_makes_the_accumulated_error_visible():
     W = R.rsnn_weights(jax.random.PRNGKey(1))
     st = tuple(jax.lax.stop_gradient(x)
                for x in R.prefix_state(seq, t, W)(*W))
-    head = (seq[t], y) + st + tuple(W)
+    head = (seq[t], y) + st + tuple(W) + R._consts()
     g_ap = jax.grad(fn, argnums=argnums)(
         *(head + R.carry_under_plan(seq, t, W, "eprop", check_zeros=False)))
     g_ex = jax.grad(fn, argnums=argnums)(
@@ -991,7 +991,7 @@ def test_the_oracle_reference_is_not_the_same_number_as_the_in_band_one():
     t = 40
     st = tuple(jax.lax.stop_gradient(x)
                for x in R.prefix_state(seq, t, W)(*W))
-    head = (seq[t], y) + st + tuple(W)
+    head = (seq[t], y) + st + tuple(W) + R._consts()
     g_ap = jax.grad(fn, argnums=argnums)(
         *(head + R.carry_under_plan(seq, t, W, "eprop", check_zeros=False)))
     g_ex = jax.grad(fn, argnums=argnums)(
