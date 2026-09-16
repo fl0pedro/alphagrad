@@ -1560,3 +1560,47 @@ def test_the_eval_tag_never_pulls_a_big_slot_off_the_device():
     small = jnp.zeros((5, 700), jnp.float32)
     tag = CP._eval_tag((small, _Trap()))
     assert isinstance(tag, bytes) and len(tag) == 16
+
+
+@pytest.mark.parametrize("container", ["diag", "reduce", "skip"])
+def test_the_wires_travel_by_position_and_the_carry_rows_are_exact(container):
+    """A PLAN IS INDEXED BY (ELIMINATION STEP, FACE POSITION). A face KEY is a
+    pair of stable var indices on the LIVE graph and every elimination
+    rewires it, so the keys a body vertex shows depend on what the carry
+    block left behind, which is exactly what the container changes. The wires
+    therefore move to the transported order's positions and the faces are
+    enumerated again on the variant's own replay."""
+    import alphagrad.approx.env as envmod
+    lm, CP, env = _env_for("rtrl")
+    jx = env.config.jaxpr
+    valid = sorted(int(v) for v in env.valid_vertices)
+    mask = CP.carry_scope_mask(jx)
+    order = [int(v) for v in sorted(valid, reverse=True)]
+    T = len(order)
+    mf = envmod.MAX_FACES
+    specs = np.full((T, envmod.MAX_RULES_PER_VERTEX, 3), -1, dtype=np.int32)
+    specs[:, :, 2] = 0
+    faces = np.full((T, mf, envmod.FACE_SLOTS, 3), -1, dtype=np.int32)
+    skips = np.zeros((T, mf), dtype=np.int32)
+    # a Diag on face 0 of EVERY vertex, body and carry alike
+    faces[:, 0, 0] = np.array([0, 0, -1], dtype=np.int32)
+    var = CP.measurement_env(container)
+    o2, s2, f2, k2, j2 = CP.transport_wires(
+        order, var, specs, faces, skips, None)
+    assert sorted(o2) == sorted(var["valid"])
+    assert f2.shape[1:] == faces.shape[1:]
+    vmap = var["vertex_map"]
+    pos2 = {int(v): i for i, v in enumerate(o2)}
+    for k, v in enumerate(order):
+        j = vmap.get(v)
+        if j is None:
+            continue
+        np.testing.assert_array_equal(f2[pos2[j]], faces[k])
+    # every CARRY vertex of the variant carries an all-exact row: its
+    # approximation is what chose the container
+    for v in var["alt_carry"]:
+        if int(v) not in pos2:
+            continue
+        row = f2[pos2[int(v)]]
+        assert int(row[..., 0].max()) == -1, v
+        assert int(k2[pos2[int(v)]].max()) == 0, v

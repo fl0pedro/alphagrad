@@ -67,8 +67,8 @@ _SPEC: dict | None = None
 _BASE: dict | None = None
 
 #: container name -> the built variant. A variant is a dict with the keys
-#: ``config``, ``args``, ``consts``, ``vertex_map``, ``var_map``,
-#: ``carry_vertices`` and ``valid``.
+#: ``config``, ``args``, ``consts``, ``vertex_map``, ``alt_carry`` and
+#: ``valid``.
 _VARIANTS: dict = {}
 
 #: (container, base-draw digest, count) -> the eval samples that variant
@@ -338,14 +338,13 @@ def _build_variant(container: str) -> dict:
                             target_fun=fn, data_gen=gen)
     consts = tuple(cj.literals)
     args = tuple(xs)
-    vmap, var_map, alt_carry = _alignment(base_cfg.jaxpr, cj.jaxpr)
+    vmap, alt_carry = _alignment(base_cfg.jaxpr, cj.jaxpr)
     return {
         "container": container,
         "config": cfg,
         "args": args,
         "consts": consts,
         "vertex_map": vmap,
-        "var_map": var_map,
         "alt_carry": alt_carry,
         "valid": set(valid_vertices(cj.jaxpr, args, consts, tuple(argnums))),
     }
@@ -407,26 +406,13 @@ def _eqn_signature(eqn):
 
 
 def _alignment(base_jaxpr, alt_jaxpr):
-    """``(vertex_map, var_map, alt_carry_vertices)``, or raise.
+    """``(vertex_map, alt_carry_vertices)``, or raise.
 
     The two programs differ only inside the carry block. Everything outside
     it is aligned by POSITION and CHECKED equation by equation, so a change to
     the model that moved a step-body equation would raise here instead of
-    silently landing a plan's faces on other faces.
-
-    ``var_map`` carries the FACE KEYS across. A face key is a pair of stable
-    var indices (``graphax.core._stable_var_index``), so the map is built from
-    the operands and the outputs of the aligned equations -- which also maps
-    the five values the carry block hands to the step body, whatever produced
-    them: an ``add`` of the attachment in one program, a graph input in the
-    truncated one.
+    silently landing a plan on a different step body.
     """
-    try:                                    # jax >= 0.4.31
-        from jax.extend.core import Literal
-    except ImportError:                     # older / internal layout
-        from jax._src.core import Literal
-    from graphax.core import _stable_var_index
-
     b_mask = carry_scope_mask(base_jaxpr)
     a_mask = carry_scope_mask(alt_jaxpr)
     b_body = [i for i, m in enumerate(b_mask) if not m]
@@ -448,32 +434,8 @@ def _alignment(base_jaxpr, alt_jaxpr):
                 f"two must be the same step body.")
 
     vertex_map = {i + 1: j + 1 for i, j in zip(b_body, a_body)}
-    bidx = _stable_var_index(base_jaxpr)
-    aidx = _stable_var_index(alt_jaxpr)
-    var_map: dict = {}
-
-    def _pair(bv, av):
-        if isinstance(bv, Literal) or isinstance(av, Literal):
-            return
-        b, a = bidx.get(bv), aidx.get(av)
-        if b is None or a is None:
-            return
-        seen = var_map.setdefault(b, a)
-        if seen != a:
-            raise ValueError(
-                f"variable {b} of the policy's graph maps to both {seen} and "
-                f"{a} of the measured graph. The step-body alignment is not "
-                f"a function and the plan cannot be carried across.")
-
-    for i, j in zip(b_body, a_body):
-        be, ae = base_jaxpr.eqns[i], alt_jaxpr.eqns[j]
-        for bv, av in zip(be.invars, ae.invars):
-            _pair(bv, av)
-        for bv, av in zip(be.outvars, ae.outvars):
-            _pair(bv, av)
-
     alt_carry = tuple(j + 1 for j, m in enumerate(a_mask) if m)
-    return vertex_map, var_map, alt_carry
+    return vertex_map, alt_carry
 
 
 def transport_order(o_list, variant) -> list:
@@ -520,48 +482,54 @@ def transport_order(o_list, variant) -> list:
     return out
 
 
-def transport_faces(ft_by_vertex, variant):
-    """The per-face transforms, carried onto the variant's graph.
+def transport_wires(o_list, variant, rule_specs, face_specs, face_skips,
+                    face_joins=None):
+    """The plan's WIRE ARRAYS, carried onto the variant's graph.
 
-    The carry block's own faces are NOT carried: their approximation is what
-    chose the container and it is realized in the value and in the store. What
-    comes across is the step body's faces, under the face keys the variant's
-    own stable var index gives them.
+    A PLAN IS INDEXED BY (ELIMINATION STEP, FACE POSITION), NOT BY FACE KEY.
+    That is what the policy emits and it is the only thing that survives the
+    move: a face KEY is ``(in_edge, out_edge)`` under the live graph's stable
+    var index, and every elimination REWIRES the graph, so the keys a body
+    vertex shows after the carry block has been eliminated are the keys THAT
+    carry block left behind. Two containers leave different ones. Measured,
+    job 66101: a real policy plan asked for face ``(52, 85)`` of body vertex
+    51, and the compact container's graph has no such pair.
+
+    So the wires travel by POSITION. Each step-body vertex keeps its own rows
+    at its new position in the transported order, and the variant's carry
+    vertices get all-exact rows -- their approximation is what chose the
+    container, and it is realized in the value and in the store. The caller
+    then enumerates the faces on the VARIANT's own replay, which is what
+    ``_face_transforms_for_order`` does on the policy's graph.
+
+    Returns ``(order, rule_specs, face_specs, face_skips, face_joins)``, the
+    last four as arrays of the same widths they came in with.
     """
-    if not ft_by_vertex:
-        return None
+    order = transport_order(o_list, variant)
+    pos = {}
+    for k, v in enumerate(order):
+        pos.setdefault(int(v), k)
     vmap = variant["vertex_map"]
-    var_map = variant["var_map"]
-    out: dict = {}
-    for v, per_face in ft_by_vertex.items():
+
+    rs = np.asarray(rule_specs)
+    fs = np.asarray(face_specs)
+    sk = np.asarray(face_skips)
+    jn = None if face_joins is None else np.asarray(face_joins)
+    T = len(order)
+    rs2 = np.full((T,) + rs.shape[1:], -1, dtype=np.int32)
+    rs2[:, :, 2] = 0
+    fs2 = np.full((T,) + fs.shape[1:], -1, dtype=np.int32)
+    sk2 = np.zeros((T,) + sk.shape[1:], dtype=np.int32)
+    jn2 = None if jn is None else np.zeros((T,) + jn.shape[1:], dtype=np.int32)
+
+    for k, v in enumerate(o_list):
         j = vmap.get(int(v))
         if j is None:
-            continue
-        moved = {}
-        for key, entry in per_face.items():
-            a, b = int(key[0]), int(key[1])
-            a2, b2 = var_map.get(a), var_map.get(b)
-            if a2 is None or b2 is None:
-                raise ValueError(
-                    f"face {key} of step-body vertex {v} names a variable "
-                    f"the two graphs do not share. Every operand of an "
-                    f"aligned step-body equation is mapped, so this is a "
-                    f"face the alignment does not describe and the plan "
-                    f"cannot be carried across.")
-            moved[(a2, b2)] = entry
-        if moved:
-            out[j] = moved
-    return out or None
-
-
-def transport_transforms(transforms, variant):
-    """The per-vertex transform list, carried onto the variant's graph."""
-    if not transforms:
-        return []
-    vmap = variant["vertex_map"]
-    out = []
-    for v, hooks in transforms:
-        j = vmap.get(int(v))
-        if j is not None:
-            out.append((j, hooks))
-    return out
+            continue                       # a carry vertex: nothing travels
+        k2 = pos[j]
+        rs2[k2] = rs[k]
+        fs2[k2] = fs[k]
+        sk2[k2] = sk[k]
+        if jn2 is not None:
+            jn2[k2] = jn[k]
+    return order, rs2, fs2, sk2, jn2

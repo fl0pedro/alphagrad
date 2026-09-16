@@ -8122,6 +8122,63 @@ def _face_transforms_for_order(config, consts, args, o_list, specs_list,
     return out
 
 
+def _decode_vertex_transforms(config, o_list, specs_list):
+    """``(transforms, tok_rules_by_v)`` for one order and its per-vertex rows.
+
+    Each row in ``sparsity_specs`` is ``[base_idx1, base_idx2, factor]``; the
+    decode resolves the logical axis indices and the legacy -1 (gcd) / 0
+    (drop) / 1 (no-op) sentinels into explicit ``Diag(i, j, factor)`` entries
+    with a strictly positive integer factor, which is the only form graphax's
+    ``apply_diag`` accepts. Slots with factor 0 (legacy drop-axes) or 1
+    (legacy no-op) are skipped: drop has no replacement under the new API and
+    no-op is dead weight. A rule must also fit EVERY non-literal invar of the
+    equation, because graphax's ``_eliminate_vertex`` applies each transform
+    to every incoming edge and ``apply_diag`` raises when the primal axis
+    index is out of range for any of them (a division by a scalar denominator
+    has one ``(n,)`` edge and one ``()`` edge, and a Diag with ``j=1`` only
+    fits the first).
+
+    MODULE LEVEL because it is called TWICE: once on the policy's graph, and
+    once on the program a plan's carry container implies, which is a
+    different jaxpr with a different vertex numbering.
+    """
+    transforms: list[tuple[int, tuple]] = []
+    tok_rules_by_v: dict[int, tuple] = {}
+    for v_idx, v in enumerate(o_list):
+        rules = decode_vertex_rule_specs(
+            config.jaxpr, int(v), specs_list[v_idx])
+        # TOKENIZER-side rules are the SAME rules: the decode no longer
+        # depends on the vertex's position in the prefix, so the observation
+        # and the measured graph cannot disagree about a COMPRESS.
+        tok_rules = rules
+        if rules or tok_rules:
+            if getattr(config, "per_face", False):
+                # graphax invokes a CALLABLE transform once per face, handing
+                # it that face's live operand, so this is where per-path
+                # legality is decided. Rules that do not fit a given face are
+                # skipped for that face only, not for the whole vertex.
+                from alphagrad.approx.common.masks import make_live_masked_hook
+                _face_stats = _PER_FACE_STATS
+                if rules:
+                    transforms.append(
+                        (int(v),
+                         (make_live_masked_hook(rules, stats=_face_stats,
+                                                gated=True),))
+                    )
+                # The tokenizer eliminates its OWN graph copy with equivalent
+                # hooks but no stats sink: the measured graph's hooks own the
+                # applied and skipped counters.
+                if tok_rules:
+                    tok_rules_by_v[int(v)] = (
+                        make_live_masked_hook(tok_rules),)
+            else:
+                if rules:
+                    transforms.append((int(v), tuple(rules)))
+                if tok_rules:
+                    tok_rules_by_v[int(v)] = tuple(tok_rules)
+    return transforms, tok_rules_by_v
+
+
 def _callback(
     config: EnvConfig,
     args,
@@ -8342,40 +8399,8 @@ def _callback_measured(
     # primal axis index is out of range for any of them (e.g. a div by
     # a scalar denominator has one (n,) edge and one () edge — a Diag
     # with j=1 only fits the first).
-    transforms: list[tuple[int, tuple]] = []
-    tok_rules_by_v: dict[int, tuple] = {}
-    for v_idx, v in enumerate(o_list):
-        rules = decode_vertex_rule_specs(
-            config.jaxpr, int(v), specs_list[v_idx])
-        # TOKENIZER-side rules are the SAME rules: the decode no longer
-        # depends on the vertex's position in the prefix, so the observation
-        # and the measured graph cannot disagree about a COMPRESS.
-        tok_rules = rules
-        if rules or tok_rules:
-            if getattr(config, "per_face", False):
-                # graphax invokes a CALLABLE transform once per face, handing
-                # it that face's live operand — so this is where per-path
-                # legality is decided. Rules that don't fit a given face are
-                # skipped for that face only (not for the whole vertex).
-                from alphagrad.approx.common.masks import make_live_masked_hook
-                _face_stats = _PER_FACE_STATS
-                if rules:
-                    transforms.append(
-                        (int(v),
-                         (make_live_masked_hook(rules, stats=_face_stats,
-                                                gated=True),))
-                    )
-                # The tokenizer eliminates its OWN graph copy with equivalent
-                # hooks but no stats sink — the measured graph's hooks own the
-                # applied/skipped counters.
-                if tok_rules:
-                    tok_rules_by_v[int(v)] = (
-                        make_live_masked_hook(tok_rules),)
-            else:
-                if rules:
-                    transforms.append((int(v), tuple(rules)))
-                if tok_rules:
-                    tok_rules_by_v[int(v)] = tuple(tok_rules)
+    transforms, tok_rules_by_v = _decode_vertex_transforms(
+        config, o_list, specs_list)
 
     _pf("cb.decode")
     if os.environ.get("ALPHAGRAD_INCREMENTAL_TOKENS", "1") == "1":
@@ -8552,6 +8577,13 @@ def _callback_measured(
     # RECORD keeps the policy's own order and wires, which is what the reader
     # of the log needs: the plan the policy emitted, plus the container it
     # implied.
+    # A PLAN TRAVELS BY POSITION, NOT BY FACE KEY. A face key is a pair of
+    # stable var indices on the LIVE graph, and every elimination rewires it,
+    # so the keys a body vertex shows depend on what the carry block left
+    # behind -- which is exactly what the container changes. The wire arrays
+    # move to the transported order's positions and the faces are enumerated
+    # again on the variant's own replay, the way the policy's graph enumerates
+    # them.
     _rec_order = o_list
     _carry_container = None
     if is_terminal and _carry.armed():
@@ -8559,12 +8591,29 @@ def _callback_measured(
             config, o_list, _faces_np, _skips_np, partial_specs)
         _variant = _carry.measurement_env(_carry_container)
         if _variant is not None:
-            o_list = _carry.transport_order(o_list, _variant)
-            ft_by_vertex = _carry.transport_faces(ft_by_vertex, _variant)
-            transforms = _carry.transport_transforms(transforms, _variant)
+            (o_list, _m_specs, _m_faces, _m_skips, _m_joins) = \
+                _carry.transport_wires(
+                    o_list, _variant, partial_specs, _faces_np, _skips_np,
+                    _joins_np)
             config = _variant["config"]
             args = _variant["args"]
             consts = _variant["consts"]
+            specs_list = _m_specs.tolist()
+            transforms, _ = _decode_vertex_transforms(
+                config, o_list, specs_list)
+            _m_have = bool(
+                len(o_list) and (np.any(_m_skips == 1)
+                                 or np.any(_m_faces[..., 0] >= 0)
+                                 or np.any(_m_faces[..., 0] == COMPRESS_SENTINEL)
+                                 or np.any(_m_faces[..., 0] == QUANT_SENTINEL)))
+            ft_by_vertex = (
+                _face_transforms_for_order(
+                    config, consts, args, o_list, specs_list,
+                    _m_faces, _m_skips,
+                    wire_sig=_face_wire_keys(_m_faces, _m_skips, len(o_list),
+                                             _m_joins),
+                    face_joins_list=_m_joins)
+                if _m_have else None)
             # THE VARIANT'S OWN EVAL SAMPLES. They cannot be the base ones --
             # the shapes of the given values move with the container -- so
             # they are drawn from a DIGEST of the base draw, which every
