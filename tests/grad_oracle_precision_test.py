@@ -93,10 +93,13 @@ def cfg(monkeypatch):
 def test_both_sides_of_the_oracle_run_at_the_oracle_precision(cfg, monkeypatch):
     """The reader is called once per side and must report "highest" twice.
 
-    The ambient precision is asserted NOT to be "highest" first, so a green
-    test cannot come from a process that happens to be configured that way.
+    The whole test runs under a DIFFERENT ambient precision, so a green result
+    cannot come from a process that was already configured that way (the full
+    suite is one process and another module can leave the global set), and the
+    last assertion shows the context does not leak.
     """
-    assert envmod._matmul_precision() != envmod._GRAD_ORACLE_PRECISION
+    ambient = "bfloat16"
+    assert ambient != envmod._GRAD_ORACLE_PRECISION
 
     real = envmod._matmul_precision
     seen = []
@@ -106,18 +109,19 @@ def test_both_sides_of_the_oracle_run_at_the_oracle_precision(cfg, monkeypatch):
         return seen[-1]
 
     monkeypatch.setattr(envmod, "_matmul_precision", spy)
-    envmod._grad_oracle_check(cfg, _EXACT_EXISTS, list(_ARGS), None,
-                              _complete_order())
-
-    assert seen == [envmod._GRAD_ORACLE_PRECISION,
-                    envmod._GRAD_ORACLE_PRECISION], (
-        "the oracle must read the live matmul precision once before the "
-        f"elimination and once before jax.grad; got {seen}")
-    assert envmod._GRAD_ORACLE_LAST_PRECISION == {
-        "plan": envmod._GRAD_ORACLE_PRECISION,
-        "reference": envmod._GRAD_ORACLE_PRECISION}
-    # The context is a context: it must not leak past the check.
-    assert envmod._matmul_precision() != envmod._GRAD_ORACLE_PRECISION
+    with jax.default_matmul_precision(ambient):
+        assert real() == ambient
+        envmod._grad_oracle_check(cfg, _EXACT_EXISTS, list(_ARGS), None,
+                                  _complete_order())
+        assert seen == [envmod._GRAD_ORACLE_PRECISION,
+                        envmod._GRAD_ORACLE_PRECISION], (
+            "the oracle must read the live matmul precision once before the "
+            f"elimination and once before jax.grad; got {seen}")
+        assert envmod._GRAD_ORACLE_LAST_PRECISION == {
+            "plan": envmod._GRAD_ORACLE_PRECISION,
+            "reference": envmod._GRAD_ORACLE_PRECISION}
+        # The context is a context: it must not leak past the check.
+        assert real() == ambient
 
 
 def test_the_check_passes_on_an_exact_order(cfg):
