@@ -10566,6 +10566,13 @@ class VertexEliminationEnv:
                             else None),
                         episode=(walk_episode() if walk_rotate_enabled()
                                  else None),
+                        # THE ENVIRONMENT ROWS of these slots. `_ENV_SLOT` is
+                        # a fact of the in-process batch loop and does not
+                        # cross the Ray hop, so the row travels in the
+                        # request; a probe batch redrawn per environment
+                        # (owner ruling 2026-09-16) reads it back through
+                        # `current_env_slot`.
+                        env_rows=list(_pipe),
                     )
                     _pipe_pos = ([ro[i] for i in _pipe],
                                  [rs[i] for i in _pipe],

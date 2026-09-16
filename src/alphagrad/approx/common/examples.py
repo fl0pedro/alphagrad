@@ -28,6 +28,7 @@ from alphagrad.approx.common.snn_shd import (
     refuse_legacy_snn_env,
     resolve_grad_window,
     shd_args,
+    shd_data_gen,
 )
 from alphagrad.approx.common.rsnn_shd import (
     RSNN_ARGNUMS,
@@ -133,7 +134,8 @@ def _vision_base(fn_str):
 
 
 def data_gen(fn_str: str, dataset: str | None = None, dataset_size: int | None = -1,
-             key=None, temporal_rule: str | None = None):
+             key=None, temporal_rule: str | None = None,
+             grad_window: int | None = None):
     """Return a `keys -> data` jit-able function used to refresh dataset args.
 
     Returns `None` if the example does not have a data generator (most analytic
@@ -167,6 +169,20 @@ def data_gen(fn_str: str, dataset: str | None = None, dataset_size: int | None =
         return rsnn_data_gen(key, dataset=dataset, dataset_size=dataset_size,
                              temporal_rule=resolve_temporal_rule(
                                  fn_str, temporal_rule))
+    if fn_str in SHD_TARGETS:
+        # THE SAME DEFECT, THE SAME FIX, on the two multi-copy SHD targets.
+        # They have no temporal rule and no step position; what moves in a
+        # draw is WHERE the gradient window sits in the recording, which is
+        # the same quantity under a different name. Without a generator their
+        # quality channel read 0.0 as well.
+        if key is None:
+            raise ValueError(
+                f"data_gen({fn_str!r}) needs the same `key` that was passed "
+                f"to get_args: the generator redraws the gradient window on "
+                f"the recording and the weights the run itself drew.")
+        return shd_data_gen(fn_str, resolve_grad_window(fn_str, grad_window),
+                            key=key, dataset=dataset,
+                            dataset_size=dataset_size)
     if fn_str == "Helmholtz":
 
         @jax.jit

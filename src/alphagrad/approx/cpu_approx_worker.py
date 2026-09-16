@@ -215,6 +215,7 @@ class CpuApproximationServer:
         face_specs: Any = None,
         face_skips: Any = None,
         episode: int | None = None,
+        env_row: int | None = None,
     ):
         """Run the per-step reward pipeline once.
 
@@ -242,6 +243,16 @@ class CpuApproximationServer:
                            with the trainer instead of pinning the episode it
                            was spawned on. `None` leaves the actor's
                            environment untouched.
+        * `env_row`      — optional trainer ENVIRONMENT ROW this request came
+                           from. The in-process batched callback publishes it
+                           through `env._ENV_SLOT`, but a pooled request
+                           crosses a process boundary and the row does not
+                           come with it, so `env.current_env_slot()` read -1
+                           in every actor. That is what a probe batch redrawn
+                           PER ENVIRONMENT needs (owner ruling 2026-09-16),
+                           and it is also the `env_index` the plan record
+                           stamps for gate G5's join. `None` leaves the slot
+                           unknown, exactly as before.
 
         Returns
         -------
@@ -261,6 +272,13 @@ class CpuApproximationServer:
             # is the only reader and it is a no-op unless --walk-rotate.
             from alphagrad.approx.env import set_walk_episode as _set_walk_ep
             _set_walk_ep(int(episode))
+        # THE ENVIRONMENT ROW, republished into this process. Same argument as
+        # `episode` above: the row is a fact of the trainer's batch loop and
+        # it does not survive the Ray hop on its own.
+        from alphagrad.approx.env import _ENV_SLOT as _env_slot_cell
+        _slot_was = _env_slot_cell[0]
+        if env_row is not None:
+            _env_slot_cell[0] = int(env_row)
         order_j = jnp.asarray(order, dtype=jnp.int32)
         specs_j = jnp.asarray(sparsity_specs, dtype=jnp.int32)
         es = (
@@ -457,6 +475,10 @@ class CpuApproximationServer:
             if _delta:
                 return sentinel_tokens, sentinel_reward
             return sentinel_tokens, sentinel_eqn_ids, sentinel_reward
+        finally:
+            # The slot belongs to THIS request, not to the actor. Restoring it
+            # is what keeps a raising measurement from stamping the next one.
+            _env_slot_cell[0] = _slot_was
 
     def precompile(self, order: Any, sparsity_specs: Any, step: int) -> bool:
         """STAGE-2 async: compile-only warm of the shared cluster cache.
@@ -755,6 +777,7 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *, seed: int = 0)
     gen = data_gen(
         args.example, dataset=dataset_for_call, dataset_size=args.dataset_size,
         key=args_key, temporal_rule=getattr(args, "temporal_rule", None),
+        grad_window=getattr(args, "target_grad_window", None),
     )
     # Gradient mode: THIS env (inside the CpuApproximationActor) does the actual
     # pooled measurement, so the grad-mode wrapping + jaxpr + argnums must mirror

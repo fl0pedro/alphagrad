@@ -540,6 +540,7 @@ class PPORayWorker:
             dataset_size=self.args.dataset_size,
             key=args_key,
             temporal_rule=getattr(self.args, "temporal_rule", None),
+            grad_window=getattr(self.args, "target_grad_window", None),
         )
         # THE SCALAR-LOSS GRAPH (+ optional deprecated seed-vertex form)
         # with the matching argnums, IDENTICALLY to the measure

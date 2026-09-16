@@ -570,6 +570,7 @@ class CpuApproxPool:
         face_specs: Any = None,
         face_skips: Any = None,
         episode: int | None = None,
+        env_row: int | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Dispatch one ``(order, specs, step)`` request to a pool
         actor and return ``(tokens, eqn_ids, reward)`` as numpy arrays.
@@ -638,6 +639,7 @@ class CpuApproxPool:
                 face_skips=(None if face_skips is None
                             else np.asarray(face_skips, dtype=np.int32)),
                 episode=(None if episode is None else int(episode)),
+                env_row=(None if env_row is None else int(env_row)),
             )
             # Per-actor cold/warm timeout. ``timeout_for`` returns 0
             # when the user requested no-timeout (``--cpu-callback-timeout 0``);
@@ -741,6 +743,7 @@ class CpuApproxPool:
         face_specs_batch: "Sequence[Any] | None" = None,
         face_skips_batch: "Sequence[Any] | None" = None,
         episode: int | None = None,
+        env_rows: "Sequence[int] | None" = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Phase-2 memory-mitigation probe #8: optional batch dedup.
 
@@ -758,7 +761,7 @@ class CpuApproxPool:
                 eval_samples=eval_samples, init=init,
                 face_specs_batch=face_specs_batch,
                 face_skips_batch=face_skips_batch,
-                episode=episode,
+                episode=episode, env_rows=env_rows,
             )
         N = len(order_batch)
         # Build canonical key per slot; first-seen slot is the representative.
@@ -774,6 +777,11 @@ class CpuApproxPool:
                  np.asarray(face_specs_batch[i], dtype=np.int32).tobytes()),
                 (b"" if face_skips_batch is None else
                  np.asarray(face_skips_batch[i], dtype=np.int32).tobytes()),
+                # THE ENVIRONMENT ROW IS PART OF THE REQUEST. Two slots with
+                # the same plan but different rows can draw different probe
+                # batches (owner ruling 2026-09-16), so merging them would
+                # broadcast one row's quality reading onto another's record.
+                (-1 if env_rows is None else int(env_rows[i])),
             )
             if key in rep_of:
                 slot_to_rep[i] = rep_of[key]
@@ -788,7 +796,7 @@ class CpuApproxPool:
                 eval_samples=eval_samples, init=init,
                 face_specs_batch=face_specs_batch,
                 face_skips_batch=face_skips_batch,
-                episode=episode,
+                episode=episode, env_rows=env_rows,
             )
         _u = self._evaluate_batch_impl(
             [order_batch[i] for i in uniq_idx],
@@ -800,6 +808,8 @@ class CpuApproxPool:
             face_skips_batch=(None if face_skips_batch is None else
                               [face_skips_batch[i] for i in uniq_idx]),
             episode=episode,
+            env_rows=(None if env_rows is None else
+                      [env_rows[i] for i in uniq_idx]),
         )
         t_u, r_u, s_u = _u[0], _u[-2], _u[-1]
         e_u = _u[1] if self._emit_eqn_ids else None
@@ -831,6 +841,7 @@ class CpuApproxPool:
         face_specs_batch: "Sequence[Any] | None" = None,
         face_skips_batch: "Sequence[Any] | None" = None,
         episode: int | None = None,
+        env_rows: "Sequence[int] | None" = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Dispatch N requests concurrently. Returns
         ``(tokens_stack, eqn_ids_stack, rewards_stack, sentinel_mask)``
@@ -853,6 +864,15 @@ class CpuApproxPool:
         N = len(order_batch)
         if not (len(specs_batch) == N and len(step_batch) == N):
             raise ValueError(f"batch length mismatch: orders {N}, specs {len(specs_batch)}, steps {len(step_batch)}")
+        # THE TRAINER'S ENVIRONMENT ROW PER SLOT. Carried in the request for
+        # the same reason `episode` is: it is a fact of the trainer's batch
+        # loop that does not survive the Ray hop, and a probe batch redrawn
+        # per environment needs it (owner ruling 2026-09-16).
+        if env_rows is not None and len(env_rows) != N:
+            raise ValueError(
+                f"env_rows has {len(env_rows)} entries for {N} slots; the "
+                f"row is what a per-environment draw is keyed by, so a "
+                f"mismatch would key it wrong.")
 
         # Pre-allocate output buffers + sentinel mask.
         tokens_out = np.zeros((N, self._max_tokens), dtype=self._token_dtype)
@@ -967,6 +987,8 @@ class CpuApproxPool:
                             None if face_skips_batch is None else
                             np.asarray(face_skips_batch[i], dtype=np.int32)),
                         episode=(None if episode is None else int(episode)),
+                        env_row=(None if env_rows is None
+                                 else int(env_rows[i])),
                     )
                     f_timeouts[i] = self._timeout_for(actor)
                 except Exception as _exc:
@@ -1115,6 +1137,8 @@ class CpuApproxPool:
                             eval_samples=samples_arg,
                             init=bool(init),
                             episode=(None if episode is None else int(episode)),
+                            env_row=(None if env_rows is None
+                                     else int(env_rows[i])),
                         )
                         rto = self._timeout_for(fresh)
                         _rres = (ray.get(rf) if rto <= 0.0

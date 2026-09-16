@@ -319,6 +319,9 @@ def test_the_plan_record_carries_the_step_position():
 
     ex.get_args("RSNN_SHD", jax.random.PRNGKey(3), dataset=None,
                 step_position=5)
+    # No probe batch has been drawn here, so the builder's own tuple is what
+    # the record reports (see `_record_plan`).
+    envmod._PROBE_META.clear()
     envmod._PLAN_RECORDS.clear()
     envmod._record_plan({"order": [1, 2]})
     rec = envmod._PLAN_RECORDS[-1]
@@ -499,3 +502,246 @@ def test_eprop_is_a_real_approximation_when_the_recurrence_is_full(
     assert exact_results["eprop_vs_exact_V_full"] > 1e-4
     assert exact_results["eprop_gradient_rel"] > 1e-5
     assert exact_results["eprop_gradient_cos"] < 1.0
+
+
+# ---------------------------------------------------------------------------
+# 8. THE DATA GENERATOR, and the step position per environment and per episode
+#
+# The gradient cosine is reward slot 6 and it scores the plan's gradient
+# against the rev-exact one ON A PROBE BATCH. The SHD family had no data
+# generator, so the channel was undefined and read 0.0 for every plan on every
+# SHD target (RSNN_SHD, ADALIF_SNN_SHD and LIF_SNN_SHD alike). On the
+# recurrent target everything that changes with the step position IS data --
+# the input frame, the carried state and the rule's given values -- so the
+# generator that samples a new step position is the same object that arms the
+# quality channel, and one mechanism answers both.
+# ---------------------------------------------------------------------------
+
+def _gen(rule, **kw):
+    return ex.data_gen("RSNN_SHD", dataset=None, key=jax.random.PRNGKey(1),
+                       temporal_rule=rule, **kw)
+
+
+@pytest.mark.parametrize("rule,n_given", [("tbptt", 0), ("bptt", 5),
+                                          ("rtrl", 14)])
+def test_the_generator_declares_the_slots_it_fills(rule, n_given):
+    gen = _gen(rule)
+    assert gen is not None, "the SHD family had no data generator at all"
+    slots = gen.data_slots
+    assert slots == tuple(range(0, 10)) + tuple(range(16, 16 + n_given))
+    data = gen(jax.random.split(jax.random.PRNGKey(5), 5))
+    assert len(data) == len(slots)
+
+
+@pytest.mark.parametrize("rule", ["tbptt", "bptt", "rtrl"])
+def test_the_draw_has_the_shape_of_the_slots_it_replaces(rule):
+    gen = _gen(rule)
+    xs = ex.get_args("RSNN_SHD", jax.random.PRNGKey(1), dataset=None,
+                     temporal_rule=rule)
+    data = gen(jax.random.split(jax.random.PRNGKey(5), 5))
+    for slot, d in zip(gen.data_slots, data):
+        assert jnp.shape(d) == jnp.shape(xs[slot]), f"slot {slot}"
+        assert jnp.asarray(d).dtype == jnp.asarray(xs[slot]).dtype
+
+
+@pytest.mark.parametrize("rule", ["tbptt", "bptt", "rtrl"])
+def test_the_generator_hands_back_the_runs_own_weights(rule):
+    """THE WEIGHTS ARE PART OF THE DRAW ON PURPOSE.
+
+    `generate_eval_samples` redraws every differentiated slot a generator does
+    NOT cover. Under `rtrl` the given values lead with three REFERENCE
+    weights whose whole job is to equal slots 7 to 9 bit for bit, so that the
+    attached ``W - W_ref`` is exactly zero and no forward value moves. A
+    generator that left the weights out would have had them redrawn and that
+    equality broken in silence.
+    """
+    gen = _gen(rule)
+    xs = ex.get_args("RSNN_SHD", jax.random.PRNGKey(1), dataset=None,
+                     temporal_rule=rule)
+    data = dict(zip(gen.data_slots, gen(jax.random.split(
+        jax.random.PRNGKey(5), 5))))
+    for slot in (7, 8, 9):
+        np.testing.assert_array_equal(np.asarray(data[slot]),
+                                      np.asarray(xs[slot]))
+    if rule == "rtrl":
+        for slot, w in zip((16, 17, 18), (7, 8, 9)):
+            np.testing.assert_array_equal(np.asarray(data[slot]),
+                                          np.asarray(data[w]))
+
+
+def test_the_generator_needs_the_runs_key():
+    with pytest.raises(ValueError, match="needs the same `key`"):
+        ex.data_gen("RSNN_SHD", dataset=None)
+
+
+@pytest.mark.parametrize("example", ["LIF_SNN_SHD", "ADALIF_SNN_SHD"])
+def test_the_older_shd_targets_have_a_generator_too(example):
+    """The same defect and the same fix. They have no temporal rule, so what
+    a draw moves is WHERE the gradient window sits in the recording."""
+    gen = ex.data_gen(example, dataset=None, key=jax.random.PRNGKey(1),
+                      grad_window=1)
+    assert gen is not None
+    assert gen.data_slots == tuple(range(0, 11))
+    xs = ex.get_args(example, jax.random.PRNGKey(1), dataset=None,
+                     grad_window=1)
+    data = gen(jax.random.split(jax.random.PRNGKey(5), 5))
+    assert len(data) == 11
+    for slot, d in zip(gen.data_slots, data):
+        assert jnp.shape(d) == jnp.shape(xs[slot]), f"slot {slot}"
+
+
+@pytest.mark.parametrize("rule", ["tbptt", "bptt", "rtrl"])
+def test_the_graph_shape_does_not_move_with_the_step_position(rule):
+    """THE SAFETY PROPERTY OF A SAMPLED STEP POSITION.
+
+    ``t`` is drawn per environment and per episode, so a graph that changed
+    shape with it would change the action space mid-run. The prefix and the
+    suffix are masked scans over the whole recording, so it does not.
+    """
+    seen = set()
+    for t in (1, 7, 40, 63, 99):
+        xs = ex.get_args("RSNN_SHD", jax.random.PRNGKey(1), dataset=None,
+                         temporal_rule=rule, step_position=t)
+        jx = _jaxpr_of(xs)
+        n_valid = sum(1 for i, e in enumerate(jx.eqns, 1)
+                      if e.outvars[0] not in jx.outvars)
+        n_faces = _face_count(jx, xs)
+        seen.add((len(jx.eqns), n_valid, n_faces))
+    assert len(seen) == 1, f"the graph moved with t: {seen}"
+
+
+def _jaxpr_of(xs):
+    fn = ex.get_fn("RSNN_SHD")
+    cj = jax.make_jaxpr(fn)(*xs)
+    jx, _ = _inline_call_primitives(cj.jaxpr, cj.literals)
+    return jx
+
+
+def _face_count(jx, xs):
+    """Every live face of the reverse order, counted on one replay."""
+    from graphax import faces_of
+    from graphax.incremental import IncrementalJaxpr
+    fn = ex.get_fn("RSNN_SHD")
+    cj = jax.make_jaxpr(fn)(*xs)
+    _, consts = _inline_call_primitives(cj.jaxpr, cj.literals)
+    argnums = ex.infer_argnums("RSNN_SHD")
+    ij = IncrementalJaxpr(jx, tuple(argnums), list(consts), list(xs),
+                          track_faces=False)
+    valid = [i for i, e in enumerate(jx.eqns, 1)
+             if e.outvars[0] not in jx.outvars]
+    n = 0
+    for v in sorted(valid, reverse=True):
+        n += len(faces_of(ij.graph, ij.tgraph, int(v), jx))
+        ij.eliminate(v, (), None)
+    return n
+
+
+def _probe_t(envmod, cfg, args, episode, slot):
+    envmod._PROBE_BATCH.clear()
+    os.environ["ALPHAGRAD_WALK_EPISODE"] = str(int(episode))
+    envmod._ENV_SLOT[0] = int(slot)
+    try:
+        envmod._probe_batch(cfg, list(args), role="train", index=0)
+        return int(envmod.probe_meta()["t"])
+    finally:
+        envmod._ENV_SLOT[0] = -1
+        os.environ.pop("ALPHAGRAD_WALK_EPISODE", None)
+        envmod._PROBE_BATCH.clear()
+
+
+class _Cfg:
+    """The two fields `_probe_batch` reads."""
+    def __init__(self, gen):
+        self.data_gen = gen
+
+
+def test_the_step_position_moves_per_environment_and_per_episode():
+    """OWNER RULING 2026-09-16. Sampled uniformly over the recording PER
+    ENVIRONMENT AND PER EPISODE. Before this the probe batch was drawn once
+    per process, so every environment of every episode measured one step."""
+    import alphagrad.approx.env as envmod
+    gen = _gen("tbptt")
+    cfg = _Cfg(gen)
+    xs = ex.get_args("RSNN_SHD", jax.random.PRNGKey(1), dataset=None)
+    seen = {}
+    for ep in range(3):
+        for slot in range(4):
+            seen[(ep, slot)] = _probe_t(envmod, cfg, xs, ep, slot)
+    assert len(set(seen.values())) > 6, (
+        f"the draw barely moved over 12 (episode, environment) pairs: {seen}")
+    by_env = {ep: {s: t for (e, s), t in seen.items() if e == ep}
+              for ep in range(3)}
+    for ep, row in by_env.items():
+        assert len(set(row.values())) > 1, (
+            f"episode {ep} gave one step position to every environment: {row}")
+    for slot in range(4):
+        col = {ep: seen[(ep, slot)] for ep in range(3)}
+        assert len(set(col.values())) > 1, (
+            f"environment {slot} kept one step position across episodes: {col}")
+
+
+def test_the_same_environment_and_episode_give_the_same_step_position():
+    """The trainer and every measure actor build their probe from the same
+    seed, so an actor measuring a different step than the search acts on would
+    be invisible."""
+    import alphagrad.approx.env as envmod
+    cfg = _Cfg(_gen("tbptt"))
+    xs = ex.get_args("RSNN_SHD", jax.random.PRNGKey(1), dataset=None)
+    a = _probe_t(envmod, cfg, xs, 2, 3)
+    b = _probe_t(envmod, cfg, xs, 2, 3)
+    assert a == b
+
+
+def test_a_generator_with_no_per_env_draw_is_unchanged():
+    """Every image and token generator keeps the one-batch-per-process
+    behaviour: the fold is armed by the generator, not by the env."""
+    import alphagrad.approx.env as envmod
+    calls = []
+
+    def plain(keys):
+        calls.append(1)
+        return (jnp.zeros((2,)), jnp.zeros((2,)))
+
+    cfg = _Cfg(plain)
+    for slot in range(3):
+        envmod._ENV_SLOT[0] = slot
+        envmod._probe_batch(cfg, [jnp.zeros((2,)), jnp.zeros((2,))])
+    envmod._ENV_SLOT[0] = -1
+    envmod._PROBE_BATCH.clear()
+    assert len(calls) == 1, "the env slot leaked into a generator that never asked"
+
+
+def test_the_plan_record_says_which_step_the_probe_measured():
+    import alphagrad.approx.env as envmod
+    cfg = _Cfg(_gen("bptt"))
+    xs = ex.get_args("RSNN_SHD", jax.random.PRNGKey(1), dataset=None,
+                     temporal_rule="bptt", step_position=3)
+    t = _probe_t(envmod, cfg, xs, 1, 1)
+    envmod._PROBE_META.clear()
+    envmod._ENV_SLOT[0] = 1
+    os.environ["ALPHAGRAD_WALK_EPISODE"] = "1"
+    try:
+        envmod._probe_batch(cfg, list(xs), role="train", index=0)
+        envmod._PLAN_RECORDS.clear()
+        envmod._record_plan({"order": [1, 2]})
+        rec = envmod._PLAN_RECORDS[-1]
+    finally:
+        envmod._PLAN_RECORDS.clear()
+        envmod._PROBE_BATCH.clear()
+        envmod._PROBE_META.clear()
+        envmod._ENV_SLOT[0] = -1
+        os.environ.pop("ALPHAGRAD_WALK_EPISODE", None)
+    assert rec["step_position"]["t"] == t
+    assert rec["step_position"]["rule"] == "bptt"
+
+
+def test_the_declared_slots_must_match_the_arrays():
+    import alphagrad.approx.env as envmod
+
+    def liar(keys):
+        return (jnp.zeros((2,)),)
+    liar.data_slots = (0, 1)
+    with pytest.raises(ValueError, match="declares 2 slots"):
+        envmod._grad_cosine_quality(
+            _Cfg(liar), lambda *a: a, lambda *a: a,
+            [jnp.zeros((2,)), jnp.zeros((2,))], None, 1)

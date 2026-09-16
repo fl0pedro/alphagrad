@@ -226,6 +226,121 @@ def adalif_shd_args(grad_window: int, *, key=None, dataset: str | None = None,
             W1, W2, W3, alpha, beta, rho, thresh)
 
 
+def shd_data_slots(example: str) -> tuple[int, ...]:
+    """The argument slots :func:`shd_data_gen` returns, in order.
+
+    Slot 0 is the spike window, slot 1 the target, slots 2 to 7 the detached
+    carry the pre-window forward produced, and slots 8 to 10 the weights. The
+    decays and the threshold (11 onwards) are constants and are left alone.
+
+    THE WEIGHTS ARE AMONG THEM because the carry is a FUNCTION of them: a
+    refresher that redrew the weights and kept the carry would hand the graph
+    a state no weight set ever produced, and the quality channel would then
+    score the plan on an incoherent point.
+    """
+    if example not in SHD_TARGETS:
+        raise ValueError(
+            f"{example!r} is not an SHD target; expected one of "
+            f"{sorted(SHD_TARGETS)}")
+    return tuple(range(0, 11))
+
+
+def shd_data_gen(example: str, grad_window: int, *, key=None,
+                 dataset: str | None = None, dataset_size: int | None = -1):
+    """``keys -> the data-dependent argument slots``, at a SAMPLED window.
+
+    WHY THIS EXISTS. Reward slot 6 is the gradient cosine, and the gradient
+    cosine needs a data generator: it scores the plan's gradient against the
+    rev-exact one ON A PROBE BATCH. The SHD family had none, so the channel
+    was undefined and read 0.0 for every plan on every SHD target, and a
+    Lagrangian arm with a quality floor could not run on any of them.
+
+    WHAT A DRAW IS. The recording is fixed -- one recording, drawn from the
+    run's own key, exactly as :func:`shd_args` draws it -- and what moves is
+    WHERE the gradient window sits in it. The window start ``p`` is drawn
+    uniformly from ``1 .. T - N``, the first ``p`` steps run as the detached
+    pre-window forward, and the window is the ``N`` steps from ``p``. That is
+    the same quantity the recurrent target calls a STEP POSITION, on a target
+    whose graph carries ``N`` step copies instead of one.
+
+    THE GRAPH SHAPE DOES NOT MOVE WITH ``p``. The warm-up is a masked scan
+    over the whole recording and the window is a dynamic slice of fixed
+    length, so the traced graph is the same graph at every window position.
+    """
+    from graphax.examples.neuromorphic import ada_lif, lif_cb
+
+    if example not in SHD_TARGETS:
+        raise ValueError(
+            f"{example!r} is not an SHD target; expected one of "
+            f"{sorted(SHD_TARGETS)}")
+    n = int(grad_window)
+    key = jax.random.PRNGKey(1) if key is None else key
+    k = jax.random.split(key, 2)
+    full_seq, S_target = _spike_sequence(k[0], dataset, dataset_size)
+    W1, W2, W3 = _weights(k[1])
+    h, n_out = 128, SHD_CLASSES
+    T = int(full_seq.shape[0])
+    if T - n < 1:
+        raise ValueError(
+            f"a gradient window of {n} leaves no warm-up in a {T}-step "
+            f"recording; the window position has nothing to move over.")
+    ada = example == "ADALIF_SNN_SHD"
+    alpha = jnp.array(0.9); beta = jnp.array(0.8); thresh = jnp.array(0.3)
+    rho = jnp.array(0.95)
+    slots = shd_data_slots(example)
+
+    def _p(keys):
+        return jax.random.randint(keys[0], (), 1, T - n + 1)
+
+    def _warmup(p):
+        """The carry after steps ``0 .. p-1``, as a masked scan."""
+        z = (jnp.zeros((h,)), jnp.zeros((h,)), jnp.zeros((n_out,)),
+             jnp.zeros((h,)), jnp.zeros((h,)), jnp.zeros((n_out,)))
+
+        def body(st, inp):
+            u, x = inp
+            U1, U2, U3, C1, C2, C3 = st
+            if ada:
+                U1n, C1n, s1 = ada_lif(U1, C1, W1 @ x, alpha, beta, rho, thresh)
+                U2n, C2n, s2 = ada_lif(U2, C2, W2 @ s1, alpha, beta, rho, thresh)
+                U3n, C3n, s3 = ada_lif(U3, C3, W3 @ s2, alpha, beta, rho, thresh)
+            else:
+                U1n, C1n, s1 = lif_cb(U1, C1, W1 @ x, alpha, beta, thresh)
+                U2n, C2n, s2 = lif_cb(U2, C2, W2 @ s1, alpha, beta, thresh)
+                U3n, C3n, s3 = lif_cb(U3, C3, W3 @ s2, alpha, beta, thresh)
+            nxt = (U1n, U2n, U3n, C1n, C2n, C3n)
+            keep = u < p
+            return tuple(jnp.where(keep, a, b) for a, b in zip(nxt, st)), None
+
+        out, _ = jax.lax.scan(body, z, (jnp.arange(T), full_seq))
+        return out
+
+    @jax.jit
+    def _draw(keys):
+        p = _p(keys)
+        sg = jax.lax.stop_gradient
+        carry = tuple(sg(x) for x in _warmup(p))
+        window = jax.lax.dynamic_slice(
+            full_seq, (p, jnp.int32(0)), (n, SHD_CHANNELS))
+        return (window, S_target) + carry + (W1, W2, W3)
+
+    def fn(keys):
+        return _draw(keys)
+
+    def meta(keys):
+        """``{t, T, window}`` of the draw ``keys`` produces.
+
+        ``t`` is the FIRST step of the window, so the field means the same
+        thing it means on the recurrent target and a reader does not have to
+        know which target wrote the record."""
+        return {"t": int(_p(keys)), "T": T, "window": n, "example": example}
+
+    fn.data_slots = slots
+    fn.resample_per_env_episode = True
+    fn.meta = meta
+    return fn
+
+
 def shd_args(example: str, grad_window: int, *, key=None,
              dataset: str | None = None, dataset_size: int | None = -1):
     """Dispatch on the target name. Raises on anything not an SHD target."""

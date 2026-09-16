@@ -7762,6 +7762,7 @@ def main():
     gen = data_gen(
         args.example, dataset=dataset_for_call, dataset_size=args.dataset_size,
         key=args_key, temporal_rule=args.temporal_rule,
+        grad_window=args.target_grad_window,
     )
     # TARGET SETUP -- routed through the shared builder so the trainer and
     # every measure-actor construct the IDENTICAL graph (jaxpr / vertex+action
