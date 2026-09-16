@@ -220,6 +220,7 @@ class CpuApproximationActor:
         face_specs=None,
         face_skips=None,
         episode: int | None = None,
+        env_row: int | None = None,
     ):
         # ``episode`` IS NOT OPTIONAL AT THE WIRE. 4c4d872 gave
         # ``CpuApproxPool.evaluate`` / ``evaluate_batch`` an ``episode``
@@ -234,11 +235,26 @@ class CpuApproximationActor:
         # NO plan was measured at all, every terminal reward was the
         # degenerate sentinel, and the failure was visible only as
         # [SENTINEL] lines the trainer does not gate on.
+        #
+        # ``env_row`` IS THE SAME DEFECT, A SECOND TIME. The per-environment
+        # step-position draw of 2026-09-16 gave the pool an ``env_rows``
+        # field and both dispatch sites forward it as ``env_row=``, and the
+        # server has accepted it from the start -- but this wrapper did not.
+        # MEASURED, job 66096 on pgi15-gpu19: every pooled dispatch of a
+        # three-episode run died with
+        #   TypeError: got an unexpected keyword argument 'env_row'
+        # and all four terminal plans of every episode came back
+        # sentinelled. It is not specific to the recurrent target: the field
+        # is passed on EVERY pooled call, so the whole campaign would have
+        # measured nothing.
+        # ``tests/pool_dispatch_signature_test.py`` now binds the pool's own
+        # dispatch keywords against this signature and the server's, so a
+        # third one cannot land.
         return self._impl.evaluate(
             order, sparsity_specs, step,
             eval_samples=eval_samples, init=init, point_idx=point_idx,
             face_specs=face_specs, face_skips=face_skips,
-            episode=episode,
+            episode=episode, env_row=env_row,
         )
 
     def evaluate_batch(self, batch: Sequence[tuple]):
