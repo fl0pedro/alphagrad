@@ -268,6 +268,97 @@ def test_a_previous_window_at_exactly_zero_is_handled_by_a_named_rule():
 
 
 # ---------------------------------------------------------------------------
+# 3b. The absolute floor. The owner's ruling of 2026-09-16.
+# ---------------------------------------------------------------------------
+
+def test_a_move_below_the_absolute_floor_counts_as_no_move():
+    """The measured case, job 65938: two settled windows at float noise around
+    zero, -6.98e-10 against -4.08e-10, which the relative test reads as a 41.6
+    percent move. The absolute move is 2.9e-10, far below 1e-6, so the run is
+    settled and stops."""
+    mon = _monitor()
+    _fill(mon, 0, _W - 1, ret=-6.98e-10)
+    _fill(mon, _W, 2 * _W - 1, ret=-4.08e-10)
+    d = mon.decide(_CHECK)
+    n = d["reason"]["numbers"]
+    c = d["reason"]["conditions"]
+    # The relative test on its own says the return moved by 41.6 percent.
+    assert n["relative_return_move"] > 0.4
+    assert n["absolute_return_move"] == pytest.approx(2.9e-10, rel=1e-6)
+    assert c["return_move_below_absolute_floor"] is True
+    assert c["return_moved_less_than_tolerance"] is True
+    assert d["stop"] is True
+    assert "below the floor" in d["message"]
+
+
+def test_a_move_of_exactly_the_absolute_floor_is_not_below_it():
+    """Strictly below, in the same way the 2 percent test is strictly below.
+
+    The floor is moved to 4.0 for this one case so that every number in it is
+    exact in binary floating point and the boundary is a boundary and not a
+    rounding question. The relative move is infinite here, so nothing else can
+    carry the condition and the run does not stop."""
+    mon = _monitor(return_absolute_floor=4.0)
+    _fill(mon, 0, _W - 1, ret=0.0)
+    _fill(mon, _W, 2 * _W - 1, ret=4.0)
+    d = mon.decide(_CHECK)
+    assert d["reason"]["numbers"]["absolute_return_move"] == 4.0
+    assert d["reason"]["conditions"][
+        "return_move_below_absolute_floor"] is False
+    assert d["reason"]["conditions"][
+        "return_moved_less_than_tolerance"] is False
+    assert d["stop"] is False
+
+    # A move under the same floor is under it, and then the run stops.
+    mon = _monitor(return_absolute_floor=4.0)
+    _fill(mon, 0, _W - 1, ret=0.0)
+    _fill(mon, _W, 2 * _W - 1, ret=2.0)
+    d = mon.decide(_CHECK)
+    assert d["reason"]["conditions"][
+        "return_move_below_absolute_floor"] is True
+    assert d["stop"] is True
+
+
+def test_the_absolute_floor_does_not_excuse_a_real_move():
+    """A settled arm's return is order 1, and there the floor changes nothing:
+    a 10 percent move of a return near 100 is 10 reward units, so the relative
+    test is still the one that decides."""
+    d = _settled(ret=110.0).decide(_CHECK)
+    assert d["reason"]["numbers"]["absolute_return_move"] == pytest.approx(10.0)
+    assert d["reason"]["conditions"][
+        "return_move_below_absolute_floor"] is False
+    assert d["reason"]["conditions"][
+        "return_moved_less_than_tolerance"] is False
+    assert d["stop"] is False
+
+
+def test_the_absolute_floor_rescues_a_run_whose_previous_window_is_zero():
+    """A previous window at exactly 0 gives a relative move of infinity. When
+    the recent window is at float noise the absolute rule still applies, and
+    that is the whole point of having it."""
+    mon = _monitor()
+    _fill(mon, 0, _W - 1, ret=0.0)
+    _fill(mon, _W, 2 * _W - 1, ret=1e-12)
+    d = mon.decide(_CHECK)
+    assert d["reason"]["numbers"]["relative_return_move"] == float("inf")
+    assert d["reason"]["conditions"][
+        "return_move_below_absolute_floor"] is True
+    assert d["stop"] is True
+
+
+def test_the_ruled_absolute_floor_is_one_millionth():
+    assert autostop.RETURN_ABSOLUTE_FLOOR == 1e-6
+    assert _monitor().return_absolute_floor == 1e-6
+    assert _settled().decide(_CHECK)["reason"][
+        "return_absolute_floor"] == 1e-6
+
+
+def test_a_negative_absolute_floor_is_refused():
+    with pytest.raises(autostop.AutoStopError):
+        _monitor(return_absolute_floor=-1.0)
+
+
+# ---------------------------------------------------------------------------
 # 4. The window itself.
 # ---------------------------------------------------------------------------
 
@@ -403,6 +494,7 @@ def test_the_reason_file_is_strict_json_and_names_every_condition(tmp_path):
     assert doc["check_point"] == _CHECK
     assert set(doc["conditions"]) == {
         "archive_admitted_nothing", "return_moved_less_than_tolerance",
+        "return_move_below_absolute_floor",
         "collapse_or_plan_frozen", "collapse_detector_fired",
         "collapse_quality", "collapse_identity", "plan_did_not_change"}
     assert doc["numbers"]["mean_return_recent"] == 100.0
