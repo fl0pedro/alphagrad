@@ -72,14 +72,24 @@ for RD in "$SRC_WANDB"/run-*; do
   [ -n "$NAME" ] || continue
   echo "$NAME" | grep -Eq "$NAME_RE" || continue
 
-  D=$DEST/$NAME
-  # A finished run whose copy is already verified is not copied again.
+  # ONE DESTINATION DIRECTORY PER LEG, NOT PER RUN.  A resumed run gets a
+  # NEW wandb run directory even though it keeps the same wandb run id:
+  # smoke_condC_nn256 (job 66056 then 66057) wrote episodes 0-4 into
+  # run-20260916_163822-cscx8i2q and episodes 5-9 into
+  # run-20260916_164211-cscx8i2q, each with a plan log of the SAME file name.
+  # Copying both into one destination would have let the second leg's plan
+  # log replace the first leg's, and half the run would be gone. So the
+  # wandb directory name -- which sorts by start time -- is a level of its
+  # own under the run name.
+  LEG=$(basename "$RD")
+  D=$DEST/$NAME/$LEG
+  # A finished leg whose copy is already verified is not copied again.
   if timeout $T test -f "$D/COPY_COMPLETE" 2>/dev/null; then
     NEW=$(find "$F" -newer "$D/COPY_COMPLETE" -type f 2>/dev/null | head -1)
     if [ -z "$NEW" ]; then SKIPPED=$((SKIPPED+1)); continue; fi
   fi
 
-  say "copying $NAME  (from $RD)"
+  say "copying $NAME leg $LEG  (from $RD)"
   if ! timeout $T mkdir -p "$D/files" 2>/dev/null; then
     say "  the export stalled on mkdir $D -- left incomplete, will retry"
     FAILED=$((FAILED+1)); continue
@@ -92,15 +102,16 @@ for RD in "$SRC_WANDB"/run-*; do
     say "  rsync of $NAME did not finish -- left incomplete, will retry"
     FAILED=$((FAILED+1)); continue
   fi
-  # the slurm log of every job of this run, beside the run directory
+  # The slurm log of every job of this run, one level up: the logs belong to
+  # the RUN, and a resumed run has one per leg with the job id in the name.
   for SL in "$SRC_LOGS"/"$NAME"_*.log; do
     [ -f "$SL" ] || continue
-    timeout $T cp -p "$SL" "$D/" 2>/dev/null
+    timeout $T cp -p "$SL" "$DEST/$NAME/" 2>/dev/null
   done
 
   # --- rule 2: the checksum list is taken on the SOURCE and checked on the
   #     DESTINATION.  Nothing is marked complete until sha256sum -c passes.
-  MAN=$STATE/manifest_$NAME.sha256
+  MAN=$STATE/manifest_${NAME}_$LEG.sha256
   ( cd "$F" && find . -type f -print0 | sort -z \
       | xargs -0 sha256sum ) > "$MAN" 2>/dev/null
   if ! timeout $((T*20)) bash -c "cd \"$D/files\" && sha256sum -c --quiet \"$MAN\"" >>"$LOG" 2>&1; then
@@ -116,7 +127,7 @@ for RD in "$SRC_WANDB"/run-*; do
     say "  the export stalled writing COPY_COMPLETE for $NAME -- will retry"
     FAILED=$((FAILED+1)); continue
   fi
-  say "  $NAME complete: $N files verified"
+  say "  $NAME leg $LEG complete: $N files verified"
   COPIED=$((COPIED+1))
 done
 
