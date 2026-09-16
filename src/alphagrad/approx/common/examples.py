@@ -33,8 +33,9 @@ from alphagrad.approx.common.snn_shd import (
 from alphagrad.approx.common.rsnn_shd import (
     RSNN_ARGNUMS,
     RSNN_TARGET,
+    RSNN_W2_ARGNUMS,
+    RSNN_W2_TARGET,
     is_rsnn,
-    resolve_carry_container,
     resolve_temporal_rule,
     rsnn_args,
     rsnn_data_gen,
@@ -395,7 +396,11 @@ def get_args(fn_str: str, key, dataset: str | None = None,
     one step on a temporal target.
     """
     rule = resolve_temporal_rule(fn_str, temporal_rule)
-    resolve_carry_container(fn_str, carry_container)
+    if carry_container is not None and not is_rsnn(fn_str):
+        raise ValueError(
+            f"a carry container was asked of --example {fn_str}, which "
+            f"carries no temporal edge. The container is how a CARRIED value "
+            f"is stored and it is defined only on the recurrent SHD targets.")
     if is_rsnn(fn_str):
         # THE ONE-STEP RECURRENT TARGET (owner ruling 2026-09-16). It has NO
         # gradient window: the graph is always one recurrent step and the
@@ -656,7 +661,7 @@ def get_fn(fn_str: str):
     # ALREADY THE LOSS. ``LIF_SNN_SHD`` / ``ADALIF_SNN_SEQ`` reduce inside the
     # model and return 0-d. Nothing is added: the model IS the target.
     if base in ("LIF_SNN_SHD", "ADALIF_SNN_SHD", "ADALIF_SNN_SEQ",
-                RSNN_TARGET):
+                RSNN_TARGET, RSNN_W2_TARGET):
         return raw
 
     # NO TRAINING LOSS -- exempt, deliberately. See the block comment.
@@ -941,6 +946,10 @@ def infer_argnums(fn_str: str) -> tuple[int, ...]:
     # would be exact rather than an approximation.
     if fn_str == RSNN_TARGET:
         return RSNN_ARGNUMS
+    # THE TWO-COPY WINDOW carries a second input frame ahead of the label, so
+    # its three weights sit one slot further along.
+    if fn_str == RSNN_W2_TARGET:
+        return RSNN_W2_ARGNUMS
     if "Encoder" in fn_str or "Decoder" in fn_str:
         # (x, y, *weights) -> every weight arg, matching the vision models.
         # Resolve the BASE name: ``graphax.examples`` has ``Encoder``, never

@@ -760,7 +760,17 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *, seed: int = 0)
 
     dataset_arg = None if args.dataset == "none" else args.dataset
     from alphagrad.approx.common.snn_shd import SHD_TARGETS
-    from alphagrad.approx.common.rsnn_shd import is_rsnn
+    from alphagrad.approx.common.rsnn_shd import (is_rsnn,
+                                                  resolve_temporal_rule,
+                                                  target_example)
+    # THE TARGET THE RULE BUILDS. The trainer resolves it before the args
+    # dict travels, so this is normally already resolved; resolving it again
+    # here is the idempotent way to make the actor and the trainer build the
+    # SAME graph even if the dict was built by hand.
+    _rule = resolve_temporal_rule(args.example,
+                                  getattr(args, "temporal_rule", None))
+    args.example = target_example(args.example, _rule)
+    args.temporal_rule = _rule
     use_dataset = (
         dataset_arg is not None
         and (args.example.endswith("NeuralNetwork")
@@ -773,13 +783,11 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *, seed: int = 0)
                   grad_window=getattr(args, "target_grad_window", None),
                   dataset_size=args.dataset_size,
                   temporal_rule=getattr(args, "temporal_rule", None),
-                  step_position=getattr(args, "step_position", None),
-                  carry_container=getattr(args, "carry_container", None))
+                  step_position=getattr(args, "step_position", None))
     gen = data_gen(
         args.example, dataset=dataset_for_call, dataset_size=args.dataset_size,
         key=args_key, temporal_rule=getattr(args, "temporal_rule", None),
         grad_window=getattr(args, "target_grad_window", None),
-        carry_container=getattr(args, "carry_container", None),
     )
     # Gradient mode: THIS env (inside the CpuApproximationActor) does the actual
     # pooled measurement, so the grad-mode wrapping + jaxpr + argnums must mirror
@@ -911,6 +919,16 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *, seed: int = 0)
         quality_rewarded=_quality_is_rewarded(args),
     )
 
+    # THE CARRY CONTAINER FOLLOWS THE PLAN (owner rulings 2026-09-16). The
+    # actor measures plans, so it needs the same builder the trainer has.
+    from alphagrad.approx.common import carry_plan as _carry_plan
+    _carry_plan.register(
+        args, args_key, args.example, args.temporal_rule,
+        env.config, env.args, env.consts,
+        dataset=dataset_for_call, dataset_size=args.dataset_size,
+        step_position=getattr(args, "step_position", None))
+
     num_eval = int(getattr(args, "num_eval_samples", 10) or 10)
     eval_samples = generate_eval_samples(env, eval_key, num_eval)
+    _carry_plan.note_eval_draw(eval_key, num_eval)
     return eqx.tree_at(lambda e: e.eval_args_samples, env, eval_samples)

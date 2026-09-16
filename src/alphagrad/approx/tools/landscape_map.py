@@ -138,11 +138,14 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument("--target-grad-window", type=int, default=None, metavar="N")
     # A replay must rebuild the SAME graph the run trained on, so the two
     # things that change the recurrent target's graph are accepted here too.
-    p.add_argument("--temporal-rule", choices=["tbptt", "bptt", "rtrl"],
+    p.add_argument("--temporal-rule",
+                   choices=["tbptt", "bptt", "rtrl", "window2"],
                    default=None)
     p.add_argument("--step-position", type=int, default=None, metavar="T")
-    p.add_argument("--carry-container", choices=["exact", "eprop"],
-                   default=None)
+    # --carry-container IS GONE (owner ruling 2026-09-16, A). The container
+    # follows the PLAN, per plan, and this tool measures plans: a singleton
+    # plan with Diag on the carried face IS the e-prop container, and the
+    # measurement builds that program itself.
     p.add_argument("--hidden-dim", type=int, default=256)
     p.add_argument("--vocab-size", type=int, default=512)
     p.add_argument("--embd-dim", type=int, default=128)
@@ -510,7 +513,15 @@ def build_env(args):
     key, args_key = jrand.split(key)
 
     from alphagrad.approx.common.snn_shd import SHD_TARGETS
-    from alphagrad.approx.common.rsnn_shd import is_rsnn
+    from alphagrad.approx.common.rsnn_shd import (is_rsnn,
+                                                  resolve_temporal_rule,
+                                                  target_example)
+    # THE TARGET THE RULE BUILDS (owner ruling 2026-09-16). --temporal-rule
+    # window2 is a two-copy graph with no given edge and its own registered
+    # target, resolved here exactly as the trainer resolves it.
+    args.temporal_rule = resolve_temporal_rule(
+        args.example, getattr(args, "temporal_rule", None))
+    args.example = target_example(args.example, args.temporal_rule)
     dataset_arg = None if args.dataset == "none" else args.dataset
     use_dataset = dataset_arg is not None and (
         args.example.endswith("NeuralNetwork")
@@ -524,13 +535,11 @@ def build_env(args):
                   grad_window=getattr(args, "target_grad_window", None),
                   dataset_size=args.dataset_size,
                   temporal_rule=getattr(args, "temporal_rule", None),
-                  step_position=getattr(args, "step_position", None),
-                  carry_container=getattr(args, "carry_container", None))
+                  step_position=getattr(args, "step_position", None))
     gen = data_gen(args.example, dataset=dataset_for_call,
                    dataset_size=args.dataset_size, key=args_key,
                    temporal_rule=getattr(args, "temporal_rule", None),
-                   grad_window=getattr(args, "target_grad_window", None),
-                   carry_container=getattr(args, "carry_container", None))
+                   grad_window=getattr(args, "target_grad_window", None))
     target_fn, xs, argnums = grad_target_setup(args, target_fn, xs, args.example)
     closed_jaxpr = _traced_inlined(target_fn, xs)
 
@@ -575,8 +584,19 @@ def build_env(args):
     print(f"[landscape] face width: derived bound {bound} "
           f"(in force: {envmod.MAX_FACES})", flush=True)
 
+    # THE CARRY CONTAINER FOLLOWS THE PLAN (owner rulings 2026-09-16). The
+    # same registration the trainer makes, so this tool measures a plan
+    # through the same seam the campaign does.
+    from alphagrad.approx.common import carry_plan as _carry_plan
+    _carry_plan.register(
+        args, args_key, args.example, args.temporal_rule,
+        env.config, env.args, env.consts,
+        dataset=dataset_for_call, dataset_size=args.dataset_size,
+        step_position=getattr(args, "step_position", None))
+
     key, eval_key = jrand.split(key)
     eval_samples = generate_eval_samples(env, eval_key, args.num_eval_samples)
+    _carry_plan.note_eval_draw(eval_key, args.num_eval_samples)
     env = eqx.tree_at(lambda e: e.eval_args_samples, env, eval_samples)
     return env, eval_samples, closed_jaxpr
 

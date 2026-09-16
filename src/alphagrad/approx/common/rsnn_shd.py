@@ -59,11 +59,32 @@ from alphagrad.approx.common.datasets import (
 #: The registered name of the one-step recurrent target.
 RSNN_TARGET = "RSNN_SHD"
 
-#: The targets on which ``--temporal-rule`` is defined.
-TEMPORAL_RULE_TARGETS: frozenset[str] = frozenset({RSNN_TARGET})
+#: The registered name of the TWO-COPY WINDOW target, the fourth SNN arm.
+RSNN_W2_TARGET = "RSNN_SHD_W2"
 
-#: The three rules. ``tbptt`` is the baseline and the default.
-TEMPORAL_RULES: tuple[str, ...] = ("tbptt", "bptt", "rtrl")
+#: The targets on which ``--temporal-rule`` is defined.
+TEMPORAL_RULE_TARGETS: frozenset[str] = frozenset({RSNN_TARGET,
+                                                   RSNN_W2_TARGET})
+
+#: The four rules, which are the four SNN arms of the thesis matrix (owner
+#: ruling 2026-09-16).
+#:
+#: ``tbptt``    no temporal edge. The truncated baseline, and the default.
+#: ``bptt``     one step body plus the given FUTURE adjoint over the suffix.
+#: ``rtrl``     one step body plus the given PAST Jacobian over the prefix.
+#: ``window2``  TWO step copies joined by the temporal edge and NO given edge.
+#:              The one arm where the policy picks the direction of the
+#:              temporal credit itself, because the temporal edge is an
+#:              ordinary edge of the graph and the order across it is free.
+TEMPORAL_RULES: tuple[str, ...] = ("tbptt", "bptt", "rtrl", "window2")
+
+#: The rules that attach a GIVEN temporal edge, and therefore the rules on
+#: which the carry container is a question at all.
+GIVEN_EDGE_RULES: tuple[str, ...] = ("bptt", "rtrl")
+
+#: The dtype the ``Quant`` class stores a carried value in. One name, read
+#: from graphax so the producer and the attachment cannot disagree.
+CARRY_QUANT_DTYPE = jnp.bfloat16
 
 #: Hidden layer size. 128, matching the older SHD targets, so the carried
 #: Jacobian is the same order of magnitude as theirs (226 MB against 218 MB).
@@ -72,6 +93,11 @@ RSNN_HIDDEN = 128
 
 #: The weight argument slots. ``V`` is one of them.
 RSNN_ARGNUMS: tuple[int, int, int] = (7, 8, 9)
+
+#: The weight argument slots of the TWO-COPY WINDOW target. It carries a
+#: second input frame ahead of the label, so every slot after the frames moves
+#: one along.
+RSNN_W2_ARGNUMS: tuple[int, int, int] = (8, 9, 10)
 
 #: THE CONSTANTS, at the loader's 10 ms bin, chosen by the learning gate.
 #:
@@ -128,18 +154,28 @@ def decay_constants() -> tuple[float, float, float, float]:
 
 
 def is_rsnn(example: str | None) -> bool:
-    return bool(example) and str(example) == RSNN_TARGET
+    """Is ``example`` one of the recurrent SHD targets?
+
+    Both of them: the one-step body and the two-copy window. They share the
+    model, the recording, the weights and the argument builder, and the
+    temporal rule is what tells them apart.
+    """
+    return bool(example) and str(example) in TEMPORAL_RULE_TARGETS
 
 
 def resolve_temporal_rule(example: str | None, rule, *,
                           flag: str = "--temporal-rule") -> str:
     """The temporal rule for ``example``, or raise.
 
-    ``None`` resolves to ``tbptt`` on the recurrent target, which is the
-    baseline and the graph a run gets when it says nothing. A VALUE on any
-    other target is a hard error: the rule names how the state carried between
-    steps enters the gradient, and a target with no carried state has nothing
-    for it to name.
+    ``None`` resolves to ``tbptt`` on the one-step target, which is the
+    baseline and the graph a run gets when it says nothing, and to
+    ``window2`` on the two-copy target, which is the only rule that target
+    has. A VALUE on any other target is a hard error: the rule names how the
+    state carried between steps enters the gradient, and a target with no
+    carried state has nothing for it to name.
+
+    ``window2`` on the ONE-STEP target is legal and is how a run asks for the
+    window arm; :func:`target_example` then resolves the target it builds.
     """
     if not is_rsnn(example):
         if rule is not None:
@@ -150,6 +186,13 @@ def resolve_temporal_rule(example: str | None, rule, *,
                 f"{sorted(TEMPORAL_RULE_TARGETS)}. Drop the flag or change "
                 f"the target.")
         return None
+    if is_window2(example):
+        if rule is not None and str(rule) != "window2":
+            raise ValueError(
+                f"{flag} {rule} was passed with --example {example}, which IS "
+                f"the two-copy window. That target has no given edge, so the "
+                f"only rule it can run is window2.")
+        return "window2"
     if rule is None:
         return "tbptt"
     r = str(rule)
@@ -192,12 +235,66 @@ def _step_loss(Uo, y):
     return jnp.sum(-y * jax.nn.log_softmax(Uo))
 
 
-def prefix_state(seq, t, weights, state0=None):
+@jax.custom_jvp
+def narrow_derivative(x):
+    """Identity on the value, :data:`CARRY_QUANT_DTYPE` on the derivative.
+
+    THE ``Quant`` CLASS, APPLIED AT EVERY STEP. Put this on the state carried
+    between two steps of the prefix or the suffix and the derivative that
+    crosses that step boundary is rounded to the narrow dtype and back, while
+    the forward value does not move by one bit. Under forward mode it is the
+    tangent -- one column of the influence matrix -- that is rounded; under
+    reverse mode it is the cotangent -- the adjoint. Either way the statement
+    is the same: the temporal derivative this rule carries is held in low
+    precision, and the error it accumulates over the recording is what the
+    quality channel then prices.
+
+    The rounding is a pair of ``convert_element_type``, which is linear, so
+    the rule transposes and ``jax.jacrev`` may be taken through it.
+    """
+    return x
+
+
+@narrow_derivative.defjvp
+def _narrow_derivative_jvp(primals, tangents):
+    x, = primals
+    xd, = tangents
+    return x, xd.astype(CARRY_QUANT_DTYPE).astype(xd.dtype)
+
+
+@jax.custom_jvp
+def mean_derivative(x):
+    """Identity on the value, the axis MEAN on the derivative.
+
+    THE ``Reduce`` CLASS ON AN ADJOINT, APPLIED AT EVERY STEP. Making an axis
+    implicit means one value is stored and read as a replication along the
+    axis (CONTEXT.md, Implicit axis). The projection onto that replicated
+    subspace is the mean, and it is symmetric, so the same rule serves the
+    tangent and, transposed, the cotangent. Put this on the state carried
+    between two steps of the SUFFIX and the adjoint is projected onto its
+    constant subspace at every step, which is exactly a carried value whose
+    only axis is implicit.
+    """
+    return x
+
+
+@mean_derivative.defjvp
+def _mean_derivative_jvp(primals, tangents):
+    x, = primals
+    xd, = tangents
+    return x, jnp.broadcast_to(jnp.mean(xd), xd.shape)
+
+
+def prefix_state(seq, t, weights, state0=None, *, narrow: bool = False):
     """``s_(t-1)``: the state after steps ``0 .. t-1`` of ``seq``.
 
     Written as a function of the weights so the same code gives the VALUE and,
     under ``jax.jacrev``, the carried Jacobian. One ``lax.scan``, so the traced
     graph does not grow with ``t``.
+
+    ``narrow`` puts :func:`narrow_derivative` on the state at every step, so
+    the derivative this prefix carries is held in the narrow dtype. The
+    forward value is unchanged bit for bit.
 
     ``t`` MAY BE A TRACED VALUE. The scan walks the WHOLE recording and step
     ``u`` writes its result only while ``u < t``; the steps at and after ``t``
@@ -217,6 +314,8 @@ def prefix_state(seq, t, weights, state0=None):
     def run(W, V, Wo):
         def body(st, inp):
             u, x = inp
+            if narrow:
+                st = tuple(narrow_derivative(a) for a in st)
             nxt = cell(x, *st, W, V, Wo, *c)
             keep = u < t
             return tuple(jnp.where(keep, a, b) for a, b in zip(nxt, st)), None
@@ -240,16 +339,22 @@ def suffix_adjoint(seq, t, weights, state_t, container: str = "exact"):
     the carry and contributes nothing to the gradient, because ``where``
     selects the injected value there.
 
-    ``container`` says WHICH RULE the suffix runs (owner ruling 2026-09-16).
-    ``exact`` is backpropagation through time. ``eprop`` replaces the
-    state-to-state Jacobian by its block diagonal at EVERY step of the suffix,
-    so the adjoint that arrives at ``t`` is the one the approximated rule
-    would actually carry, with the error it accumulated over the whole
-    suffix. The CONTAINER does not move here and there is nothing for it to
-    shrink: an adjoint is one number per state component either way, 532 of
-    them, 2.1 kB. Only the value moves.
+    ``container`` says WHICH RULE the suffix runs (owner ruling 2026-09-16):
+    the plan's classes on the future adjoint's face, applied at EVERY step of
+    the suffix, so the adjoint that arrives at ``t`` carries the error the
+    rule accumulated over the whole suffix.
+
+    ``diag``    the state-to-state Jacobian is replaced by its block diagonal
+                at every step. The store does not move -- an adjoint is one
+                number per state component either way -- only the value does.
+    ``reduce``  the adjoint is projected onto its constant subspace at every
+                step (:func:`mean_derivative`), so its only axis is implicit
+                and the store falls to one number per component.
+    ``quant``   the adjoint is rounded to the narrow dtype at every step
+                (:func:`narrow_derivative`).
     """
-    cell = _cell() if container == "exact" else _blockdiag_cell(container)
+    c_kind = _container(container)
+    cell = _blockdiag_cell("eprop") if c_kind.diag else _cell()
     c = _consts()
     W, V, Wo = weights
     T = int(seq.shape[0])
@@ -259,6 +364,10 @@ def suffix_adjoint(seq, t, weights, state_t, container: str = "exact"):
             u, x = inp
             inject = u == t + 1
             st_u = tuple(jnp.where(inject, a, b) for a, b in zip(st, carry))
+            if c_kind.reduce:
+                st_u = tuple(mean_derivative(a) for a in st_u)
+            if c_kind.quant:
+                st_u = tuple(narrow_derivative(a) for a in st_u)
             nxt = cell(x, *st_u, W, V, Wo, *c)
             return nxt, jnp.where(u > t, _step_loss(nxt[4], y), 0.0)
         _, losses = jax.lax.scan(
@@ -278,7 +387,8 @@ def step_target_loss(seq, y, t, weights, state_prev):
     return _step_loss(nxt[4], y), nxt
 
 
-def carried_jacobians(seq, t, weights, *, check_zeros: bool = True):
+def carried_jacobians(seq, t, weights, *, check_zeros: bool = True,
+                      narrow: bool = False):
     """The RTRL attachment tuple: three reference weights, then ELEVEN blocks.
 
     Block ``(s, w)`` is ``d s_(t-1)^s / d W_w``, taken by reverse-mode
@@ -290,12 +400,16 @@ def carried_jacobians(seq, t, weights, *, check_zeros: bool = True):
     ``check_zeros`` asserts the four blocks that CANNOT be non-zero (the
     readout weight feeds nothing back) really are zero, so the eleven carried
     blocks are the whole influence matrix and not a silent truncation.
+
+    ``narrow`` runs the same recursion with the derivative held in the narrow
+    dtype at every step -- the ``Quant`` class applied at every step of the
+    prefix.
     """
     from graphax.examples.neuromorphic import (
         RSNN_CARRY_BLOCKS, RSNN_STATE_NAMES, RSNN_WEIGHT_NAMES,
         RSNN_ZERO_BLOCKS)
 
-    run = prefix_state(seq, t, weights)
+    run = prefix_state(seq, t, weights, narrow=narrow)
     jac = jax.jacrev(run, argnums=(0, 1, 2))(*weights)
     if check_zeros:
         for s_i, w_i in RSNN_ZERO_BLOCKS:
@@ -313,33 +427,89 @@ def carried_jacobians(seq, t, weights, *, check_zeros: bool = True):
             + tuple(sg(jac[s_i][w_i]) for s_i, w_i in RSNN_CARRY_BLOCKS))
 
 
-#: The carry containers a run can ask for.
-#:
-#: ``exact``  the exact influence matrix, dense, 225.74 MB. The carry the
-#:            detached reverse-mode prefix produces.
-#: ``eprop``  THE PLAN, RUN OVER THE PREFIX. The block-diagonal recursion of
-#:            Zenke and Neftci applied at EVERY step, stored in the container
-#:            it implies: 2.12 MB of eligibility traces.
-CARRY_CONTAINERS: tuple[str, ...] = ("exact", "eprop")
+# ---------------------------------------------------------------------------
+# THE CARRY CONTAINER (owner rulings, 2026-09-16)
+# ---------------------------------------------------------------------------
+# THE PLAN-PRODUCED CARRY IS THE ONLY MODE. There is no run-level flag any
+# more. The exact carry is simply the plan with NO approximation on the
+# carried-Jacobian face, and every other container is the plan's own classes
+# on that face, applied at every step of the prefix (or of the suffix, for
+# the future adjoint).
+#
+#   no class   the exact influence matrix, dense, 225.74 MB. Exact RTRL.
+#   Diag       the block-diagonal recursion of Zenke and Neftci at every
+#              step: e-prop, one eligibility trace per synapse, 2.12 MB.
+#   Reduce     a coarser trace: the presynaptic axis is IMPLICIT, so the
+#              carried value is the exact axis mean and the contraction reads
+#              it as a replication.
+#   Quant      a low-precision trace: the derivative that crosses each step
+#              is held in bfloat16 and the blocks are stored there.
+#   Skip       NO CARRY AT ALL. The given tuple is empty and the rule the
+#              measurement compiles is truncated backpropagation through time.
+#
+# Combinations are ordinary: ``diag+quant`` is a low-precision eligibility
+# trace, ``diag+reduce`` a trace with one axis collapsed, and so on.
+
+#: The canonical name of the container a plan with no class on the carried
+#: face implies.
+EXACT_CONTAINER = "exact"
+
+#: The canonical name of the container a ``Skip`` on the carried face
+#: implies. It is not a storage form: it says there is no carried value, and
+#: the measured program is the truncated one.
+SKIP_CONTAINER = "skip"
 
 
-def resolve_carry_container(example: str | None, container,
-                            *, flag: str = "--carry-container") -> str:
-    """The carry container for ``example``, or raise."""
-    if not is_rsnn(example):
-        if container is not None and str(container) != "exact":
-            raise ValueError(
-                f"{flag} {container} was passed with --example {example}, "
-                f"which carries no temporal edge. The container names how the "
-                f"given temporal value is stored; it is defined only on "
-                f"{sorted(TEMPORAL_RULE_TARGETS)}.")
-        return "exact"
+def carry_containers() -> tuple[str, ...]:
+    """Every container name a plan can imply, ``skip`` included."""
+    from graphax.examples.neuromorphic import RSNN_CARRY_CONTAINERS
+    return tuple(RSNN_CARRY_CONTAINERS) + (SKIP_CONTAINER,)
+
+
+def _container(container):
+    """A container name (or :class:`CarryContainer`) as a CarryContainer."""
+    from graphax.examples.neuromorphic import (
+        CarryContainer, carry_container_from_name)
+    if isinstance(container, CarryContainer):
+        return container
     if container is None:
-        return "exact"
-    c = str(container)
-    if c not in CARRY_CONTAINERS:
-        raise ValueError(f"{flag} {c!r} is not one of {list(CARRY_CONTAINERS)}")
-    return c
+        return CarryContainer()
+    if str(container) == SKIP_CONTAINER:
+        raise ValueError(
+            "the skip container has no storage form: a Skip on the carried "
+            "face means there is no carried value at all and the measured "
+            "rule is tbptt. The caller decides that, not the producer.")
+    return carry_container_from_name(container)
+
+
+def container_name(container) -> str:
+    """The canonical name of ``container``."""
+    if container is not None and str(container) == SKIP_CONTAINER:
+        return SKIP_CONTAINER
+    return _container(container).name
+
+
+def container_from_classes(classes) -> str:
+    """The container name the plan's CLASSES on the carried face imply.
+
+    ``classes`` is any iterable of the four class names of CONTEXT.md
+    (``diag``, ``reduce``, ``quant``, ``skip``) plus ``none``, which is the
+    identity and contributes nothing. ``skip`` DOMINATES: a face whose
+    contraction is declined carries no value, so nothing else about the
+    container can matter.
+    """
+    from graphax.examples.neuromorphic import CarryContainer
+    seen = {str(c) for c in classes}
+    unknown = seen - {"none", "diag", "reduce", "quant", "skip"}
+    if unknown:
+        raise ValueError(
+            f"{sorted(unknown)} are not action classes. The four classes are "
+            f"diag, reduce, quant and skip (CONTEXT.md), and none is the "
+            f"identity.")
+    if "skip" in seen:
+        return SKIP_CONTAINER
+    return CarryContainer("diag" in seen, "reduce" in seen,
+                          "quant" in seen).name
 
 
 def _blockdiag_cell(container: str):
@@ -372,7 +542,8 @@ def _blockdiag_cell(container: str):
     return bd_cell
 
 
-def carry_traces(seq, t, weights):
+def carry_traces(seq, t, weights, *, reduce: bool = False,
+                 quant: bool = False):
     """THE PLAN, RUN OVER THE PREFIX: the eleven blocks in COMPACT form.
 
     Zenke and Neftci (arXiv 2010.11931) approximate real-time recurrent
@@ -431,12 +602,24 @@ def carry_traces(seq, t, weights):
     vd = jnp.diag(V)[:, None]
     T = int(seq.shape[0])
 
-    zW = jnp.zeros((h, n_in))
-    zV = jnp.zeros((h, h))
+    # REDUCE makes the presynaptic axis IMPLICIT, so every trace is stored
+    # once for the whole axis. The recursion is linear in the direct term and
+    # every other coefficient is independent of ``i``, so the mean of the
+    # trace over ``i`` obeys the SAME recursion with the direct term replaced
+    # by its own mean -- the stored value is the exact axis mean, and the
+    # approximation is entirely in reading it back as a replication.
+    wW = 1 if reduce else n_in
+    wV = 1 if reduce else h
+
+    zW = jnp.zeros((h, wW))
+    zV = jnp.zeros((h, wV))
     init = (zero_state(),
             (zW, zW, zW, zW),          # eS, eI, eU, ea  for W
             (zV, zV, zV, zV),          # eS, eI, eU, ea  for V
             zW, zV, jnp.zeros((h,)))   # f_W, f_V, g
+
+    def _narrow(a):
+        return a.astype(CARRY_QUANT_DTYPE).astype(a.dtype)
 
     def body(carry, inp):
         u, x = inp
@@ -456,18 +639,36 @@ def carry_traces(seq, t, weights):
             na = rho * ea + nS
             return (nS, nI, nU, na)
 
-        nW = step(trW, jnp.broadcast_to(x[None, :], (h, n_in)))
-        nV = step(trV, jnp.broadcast_to(S_prev[None, :], (h, h)))
+        if reduce:
+            dW = jnp.broadcast_to(jnp.mean(x), (h, 1))
+            dV = jnp.broadcast_to(jnp.mean(S_prev), (h, 1))
+        else:
+            dW = jnp.broadcast_to(x[None, :], (h, n_in))
+            dV = jnp.broadcast_to(S_prev[None, :], (h, h))
+        nW = step(trW, dW)
+        nV = step(trV, dV)
         nfW = a_out * fW + (1.0 - a_out) * nW[0]
         nfV = a_out * fV + (1.0 - a_out) * nV[0]
         ng = a_out * g + (1.0 - a_out) * S
         keep = u < t
         new = (nxt, nW, nV, nfW, nfV, ng)
+        if quant:
+            # THE TRACE IS HELD IN LOW PRECISION AT EVERY STEP, which is what
+            # a quantized trace means. The forward state ``nxt`` is not
+            # touched: the rule's precision is not the model's.
+            new = (nxt,) + jax.tree_util.tree_map(_narrow, new[1:])
         return jax.tree_util.tree_map(
             lambda p, q: jnp.where(keep, p, q), new, carry), None
 
     (st, trW, trV, fW, fV, g), _ = jax.lax.scan(
         body, init, (jnp.arange(T), seq))
+
+    # (Uo, Wo)[m, k, j] = delta(m, k) * g[j]: every row of the compact
+    # (n_out, h) form is the same filter, which is what the block diagonal of
+    # a delta is. Under REDUCE the hidden axis of ``Wo`` is the implicit one,
+    # so the stored value is that filter's own mean.
+    gw = (jnp.broadcast_to(jnp.mean(g), (n_out, 1)) if reduce
+          else jnp.broadcast_to(g[None, :], (n_out, h)))
 
     blocks = {
         (0, 0): trW[0], (0, 1): trV[0],
@@ -476,13 +677,99 @@ def carry_traces(seq, t, weights):
         (3, 0): trW[3], (3, 1): trV[3],
         # The readout blocks, exact, in the weight's own shape.
         (4, 0): fW, (4, 1): fV,
-        # (Uo, Wo)[m, k, j] = delta(m, k) * g[j]: every row of the compact
-        # (n_out, h) form is the same filter, which is what the block diagonal
-        # of a delta is.
-        (4, 2): jnp.broadcast_to(g[None, :], (n_out, h)),
+        (4, 2): gw,
     }
     sg = jax.lax.stop_gradient
     return tuple(sg(blocks[b]) for b in RSNN_CARRY_BLOCKS)
+
+
+def reduced_columns(seq, t, weights, *, quant: bool = False):
+    """THE PLAN, RUN OVER THE PREFIX, with the presynaptic axis IMPLICIT.
+
+    The ``Reduce`` class with no ``Diag`` beside it. The exact recursion is
+    ``G_u = A_u G_(u-1) + F_u`` on the full influence matrix; making the
+    presynaptic axis implicit stores one value for the whole axis, and because
+    ``A_u`` does not depend on that axis the mean over it obeys the same
+    recursion:
+
+        r_u[., j] = A_u r_(u-1)[., j] + mean_i F_u[., j, i]
+
+    So the stored value is the EXACT axis mean of the influence matrix and the
+    approximation lives entirely in the contraction, which reads it back as a
+    replication along the axis. That is what an implicit axis is.
+
+    ONE ``jax.jvp`` OF THE CELL PER STORED COLUMN does both terms at once: a
+    tangent ``r_(u-1)[., j]`` on the five state components gives ``A_u r``, and
+    a tangent ``e_j (x) (1/n) 1`` on the weight gives the averaged direct term.
+    The columns are vmapped, so one step costs three vmapped cell tangents
+    over 128, 128 and 20 columns -- against the 89 600 columns the exact
+    recursion would need, which is why the exact carry is taken by
+    :func:`carried_jacobians` instead.
+    """
+    from graphax.examples.neuromorphic import RSNN_CARRY_BLOCKS
+
+    cell = _cell()
+    c = _consts()
+    W, V, Wo = weights
+    h, n_in, n_out = RSNN_HIDDEN, SHD_CHANNELS, SHD_CLASSES
+    T = int(seq.shape[0])
+    zeros_w = (jnp.zeros_like(W), jnp.zeros_like(V), jnp.zeros_like(Wo))
+    zeros_c = tuple(jnp.zeros_like(a) for a in c)
+    #: The stored columns per weight: one per index of the weight's FIRST
+    #: axis, because the LAST axis is the implicit one.
+    n_cols = (h, h, n_out)
+
+    def _narrow(a):
+        return a.astype(CARRY_QUANT_DTYPE).astype(a.dtype)
+
+    def push(st, x, cols, w_idx):
+        """``A_u cols + mean_i F_u`` for every column of weight ``w_idx``."""
+        shape = weights[w_idx].shape
+        scale = 1.0 / float(shape[1])
+
+        def one(col, j):
+            # The direction of column ``j``: the row indicator times the mean
+            # over the implicit axis. Built here rather than materialised as
+            # a (rows, rows, implicit) table, which would be 46 MB for W.
+            direction = jnp.zeros(shape).at[j].set(scale)
+            wt = list(zeros_w)
+            wt[w_idx] = direction
+            primals = (x,) + tuple(st) + tuple(weights) + tuple(c)
+            tangents = ((jnp.zeros_like(x),) + tuple(col) + tuple(wt)
+                        + zeros_c)
+            _, out_t = jax.jvp(cell, primals, tangents)
+            return tuple(out_t)
+        return jax.vmap(one)(cols, jnp.arange(n_cols[w_idx]))
+
+    def zero_cols(n):
+        return tuple(jnp.zeros((n,) + a.shape) for a in zero_state())
+
+    init = (zero_state(), zero_cols(h), zero_cols(h), zero_cols(n_out))
+
+    def body(carry, inp):
+        u, x = inp
+        st, cW, cV, cWo = carry
+        nxt = cell(x, *st, W, V, Wo, *c)
+        new = (nxt, push(st, x, cW, 0), push(st, x, cV, 1),
+               push(st, x, cWo, 2))
+        if quant:
+            new = (nxt,) + jax.tree_util.tree_map(_narrow, new[1:])
+        keep = u < t
+        return jax.tree_util.tree_map(
+            lambda p, q: jnp.where(keep, p, q), new, carry), None
+
+    (_st, cW, cV, cWo), _ = jax.lax.scan(
+        body, init, (jnp.arange(T), seq))
+
+    cols = (cW, cV, cWo)
+    sg = jax.lax.stop_gradient
+    out = []
+    for s, w in RSNN_CARRY_BLOCKS:
+        # ``cols[w][s]`` is (column, state); the block wants (state, column,
+        # 1) -- the state axes first and the implicit axis stored once.
+        block = jnp.moveaxis(cols[w][s], 0, -1)[..., None]
+        out.append(sg(block))
+    return tuple(out)
 
 
 def eprop_traces(seq, t, weights):
@@ -514,39 +801,58 @@ def eprop_traces(seq, t, weights):
     return tuple(sg(x) for x in weights) + tuple(sg(x) for x in out)
 
 
-def carry_under_plan(seq, t, weights, container: str = "exact", *,
+def carry_under_plan(seq, t, weights, container="exact", *,
                      check_zeros: bool = True):
     """The ``rtrl`` given tuple the PLAN implies (owner ruling 2026-09-16).
 
-    ``exact``  the dense influence matrix, from a detached reverse-mode pass
-               over the prefix. 225.74 MB.
-    ``eprop``  the plan run over the whole prefix: the block diagonal applied
-               at EVERY step, in the container that implies. 2.12 MB.
+    ``container`` is the set of classes the plan put on the carried-Jacobian
+    face, applied at EVERY step of the prefix:
 
-    Both return three reference weights and eleven blocks, so the varargs
-    COUNT that selects the temporal rule is the same either way and only the
-    SHAPES move.
+    ``exact``          the dense influence matrix, from a detached
+                       reverse-mode pass over the prefix. 225.74 MB.
+    ``diag``           the block diagonal at every step: the eligibility
+                       traces of e-prop, 2.12 MB.
+    ``reduce``         the exact recursion with the presynaptic axis
+                       implicit; see :func:`reduced_columns`.
+    ``quant``          the exact recursion with the derivative held narrow at
+                       every step, stored narrow.
+    combinations       compose, in that order.
+
+    Every container returns three reference weights and eleven blocks, so the
+    varargs COUNT that selects the temporal rule is the same for all of them
+    and only the SHAPES and the DTYPE move.
     """
-    if container not in CARRY_CONTAINERS:
-        raise ValueError(f"carry container {container!r} is not one of "
-                         f"{list(CARRY_CONTAINERS)}")
-    if container == "exact":
-        return carried_jacobians(seq, t, weights, check_zeros=check_zeros)
+    c = _container(container)
+    if c.diag:
+        blocks = carry_traces(seq, t, weights, reduce=c.reduce, quant=c.quant)
+    elif c.reduce:
+        blocks = reduced_columns(seq, t, weights, quant=c.quant)
+    else:
+        blocks = carried_jacobians(
+            seq, t, weights, check_zeros=check_zeros, narrow=c.quant)[3:]
+    if c.quant:
+        blocks = tuple(b.astype(CARRY_QUANT_DTYPE) for b in blocks)
     sg = jax.lax.stop_gradient
-    return (tuple(sg(W) for W in weights) + carry_traces(seq, t, weights))
+    return tuple(sg(W) for W in weights) + tuple(blocks)
 
 
-def future_adjoints(seq, y, t, weights, state_prev, container: str = "exact"):
+def future_adjoints(seq, y, t, weights, state_prev, container="exact"):
     """The BPTT attachment: five adjoints ``lambda_(t+1) = dL_(>t)/ds_t``.
 
-    ``container`` selects which rule the suffix runs; see
-    :func:`suffix_adjoint`."""
-    if container not in CARRY_CONTAINERS:
-        raise ValueError(f"carry container {container!r} is not one of "
-                         f"{list(CARRY_CONTAINERS)}")
+    ``container`` selects which rule the suffix runs and how the result is
+    stored; see :func:`suffix_adjoint`. Under ``reduce`` the state axis is
+    implicit and each adjoint is stored as ONE number of extent 1; under
+    ``quant`` the five adjoints are stored narrow."""
+    c = _container(container)
     _, state_t = step_target_loss(seq, y, t, weights, state_prev)
-    tail = suffix_adjoint(seq, t, weights, state_t, container)
+    tail = suffix_adjoint(seq, t, weights, state_t, c)
     lam = jax.grad(lambda st: tail(st, y))(tuple(state_t))
+    if c.reduce:
+        # The projection ran at every step, so the adjoint is already constant
+        # along its axis; storing the mean stores it once, exactly.
+        lam = tuple(jnp.mean(x, keepdims=True) for x in lam)
+    if c.quant:
+        lam = tuple(x.astype(CARRY_QUANT_DTYPE) for x in lam)
     sg = jax.lax.stop_gradient
     return tuple(sg(x) for x in lam)
 
@@ -562,20 +868,29 @@ def last_step_position() -> dict:
     return dict(_LAST_STEP_POSITION)
 
 
-def sampled_step_position(key, T: int):
+def step_position_bound(T: int, rule) -> int:
+    """One past the largest legal step position for ``rule``.
+
+    ``window2`` needs ``t`` AND ``t + 1`` inside the recording, so its last
+    legal position is ``T - 2``. Every other rule may sit at the last step.
+    """
+    return int(T) - 1 if str(rule) == "window2" else int(T)
+
+
+def sampled_step_position(key, T: int, rule=None):
     """The drawn step position, as an ARRAY. Traceable and vmappable.
 
-    ``t`` is drawn uniformly from ``1 .. T-1``. ``t = 0`` is excluded because
-    its carried state is the zero state and every given quantity is zero
-    there, which makes the three rules identical and hides what the run is
-    measuring.
+    ``t`` is drawn uniformly from ``1`` up to :func:`step_position_bound`.
+    ``t = 0`` is excluded because its carried state is the zero state and
+    every given quantity is zero there, which makes the rules identical and
+    hides what the run is measuring.
     """
-    return jax.random.randint(key, (), 1, int(T))
+    return jax.random.randint(key, (), 1, step_position_bound(T, rule))
 
 
-def sample_step_position(key, T: int) -> int:
+def sample_step_position(key, T: int, rule=None) -> int:
     """:func:`sampled_step_position` as a Python int, for the host paths."""
-    return int(sampled_step_position(key, T))
+    return int(sampled_step_position(key, T, rule))
 
 
 #: The argument slots the DATA GENERATOR fills, by rule. Slots 0 and 1 are the
@@ -598,9 +913,30 @@ def rsnn_data_slots(rule: str) -> tuple[int, ...]:
     which this target is defined (see WEIGHT_SCALE).
     """
     from graphax.examples.neuromorphic import RSNN_GIVEN_LENGTHS
+    if str(rule) == "window2":
+        # Two input frames, the label, the five carried state components and
+        # the three weights. There are no given values in this arm.
+        return tuple(range(0, 11))
     n_given = {v: n for n, v in RSNN_GIVEN_LENGTHS.items()}[str(rule)]
     return (tuple(range(0, 10))
             + tuple(range(RSNN_HEAD_SLOTS, RSNN_HEAD_SLOTS + n_given)))
+
+
+def target_example(example: str | None, rule) -> str | None:
+    """The EXAMPLE the temporal rule builds, which is not always ``example``.
+
+    ``--temporal-rule window2`` is not another given edge on the one-step
+    body; it is a DIFFERENT graph, two step copies wide, with no given edge at
+    all. It therefore has its own registered target, and this is the one place
+    that says so. Every other rule keeps the target it was asked for.
+    """
+    if is_rsnn(example) and rule is not None and str(rule) == "window2":
+        return RSNN_W2_TARGET
+    return example
+
+
+def is_window2(example: str | None) -> bool:
+    return bool(example) and str(example) == RSNN_W2_TARGET
 
 
 def rsnn_data_gen(key=None, *, dataset: str | None = None,
@@ -639,7 +975,13 @@ def rsnn_data_gen(key=None, *, dataset: str | None = None,
     if rule not in TEMPORAL_RULES:
         raise ValueError(f"temporal rule {rule!r} is not one of "
                          f"{list(TEMPORAL_RULES)}")
-    cont = resolve_carry_container(RSNN_TARGET, carry_container)
+    cont = container_name(carry_container)
+    if rule not in GIVEN_EDGE_RULES and cont != EXACT_CONTAINER:
+        raise ValueError(
+            f"carry container {cont!r} was asked of the {rule} generator, "
+            f"which attaches no given temporal edge. A container is how a "
+            f"CARRIED value is stored, so it is a question only on "
+            f"{list(GIVEN_EDGE_RULES)}.")
     key = jax.random.PRNGKey(1) if key is None else key
     k = jax.random.split(key, 3)
     seq, y, rec = _draw_recording(k[0], dataset, dataset_size)
@@ -648,22 +990,30 @@ def rsnn_data_gen(key=None, *, dataset: str | None = None,
     slots = rsnn_data_slots(rule)
 
     def _t(keys):
-        return sampled_step_position(keys[0], T)
+        return sampled_step_position(keys[0], T, rule)
 
-    @jax.jit
-    def _draw(keys):
-        t = _t(keys)
+    def _head(t):
         sg = jax.lax.stop_gradient
         state_prev = tuple(
             sg(x) for x in prefix_state(seq, t, weights)(*weights))
-        head = (seq[t], y) + state_prev + weights
-        if rule == "tbptt":
+        if rule == "window2":
+            return (seq[t], seq[t + 1], y) + state_prev + weights, state_prev
+        return (seq[t], y) + state_prev + weights, state_prev
+
+    def _build(t, container):
+        head, state_prev = _head(t)
+        if rule in ("tbptt", "window2"):
             given = ()
         elif rule == "rtrl":
-            given = carry_under_plan(seq, t, weights, cont, check_zeros=False)
+            given = carry_under_plan(seq, t, weights, container,
+                                     check_zeros=False)
         else:
-            given = future_adjoints(seq, y, t, weights, state_prev, cont)
-        out = head + tuple(given)
+            given = future_adjoints(seq, y, t, weights, state_prev, container)
+        return head + tuple(given)
+
+    @jax.jit
+    def _draw(keys):
+        out = _build(_t(keys), cont)
         if len(out) != len(slots):
             raise ValueError(
                 f"the {rule} generator built {len(out)} arrays for "
@@ -679,19 +1029,7 @@ def rsnn_data_gen(key=None, *, dataset: str | None = None,
     @jax.jit
     def _draw_exact(keys):
         """The SAME draw with the EXACT carry. The quality reference."""
-        t = _t(keys)
-        sg = jax.lax.stop_gradient
-        state_prev = tuple(
-            sg(x) for x in prefix_state(seq, t, weights)(*weights))
-        head = (seq[t], y) + state_prev + weights
-        if rule == "tbptt":
-            given = ()
-        elif rule == "rtrl":
-            given = carry_under_plan(seq, t, weights, "exact",
-                                     check_zeros=False)
-        else:
-            given = future_adjoints(seq, y, t, weights, state_prev, "exact")
-        return head + tuple(given)
+        return _build(_t(keys), EXACT_CONTAINER)
 
     def meta(keys):
         """``{t, T, recording, rule, carry}`` of the draw ``keys`` produces."""
@@ -718,10 +1056,13 @@ def rsnn_data_gen(key=None, *, dataset: str | None = None,
     # reward slot 6 holds is the error the rule ACCUMULATED over the whole
     # recording, which is what it has to be. Absent under `exact`, where the
     # in-band reference is already the truth.
-    if cont != "exact":
+    if cont != EXACT_CONTAINER:
         def reference_draw(keys):
             return _draw_exact(keys)
         fn.reference_draw = reference_draw
+    #: The container this generator draws, so a measurement can ask.
+    fn.carry_container = cont
+    fn.temporal_rule = rule
     return fn
 
 
@@ -735,6 +1076,10 @@ def rsnn_args(key=None, *, dataset: str | None = None,
     three weights 7 to 9, the six constants 10 to 15, then the rule's given
     values.
 
+    Under ``window2`` the target is ``RSNN_SHD_W2`` and the tuple is the two
+    input frames, the label, the five carried state components, the three
+    weights and the six constants, with NO given values.
+
     ``step_position`` pins ``t``; ``None`` draws it uniformly from the key
     (see :func:`sample_step_position`). The recording is drawn from the same
     key, so two processes given the same seed build the same tuple.
@@ -745,22 +1090,32 @@ def rsnn_args(key=None, *, dataset: str | None = None,
     if rule not in TEMPORAL_RULES:
         raise ValueError(f"temporal rule {rule!r} is not one of "
                          f"{list(TEMPORAL_RULES)}")
-    cont = resolve_carry_container(RSNN_TARGET, carry_container)
+    cont = container_name(carry_container)
+    if rule not in GIVEN_EDGE_RULES and cont != EXACT_CONTAINER:
+        raise ValueError(
+            f"carry container {cont!r} was asked of rule {rule}, which "
+            f"attaches no given temporal edge. A container is how a CARRIED "
+            f"value is stored, so it is a question only on "
+            f"{list(GIVEN_EDGE_RULES)}.")
     key = jax.random.PRNGKey(1) if key is None else key
     k = jax.random.split(key, 3)
     seq, y, rec = _draw_recording(k[0], dataset, dataset_size)
     weights = rsnn_weights(k[1])
     T = int(seq.shape[0])
-    t = (sample_step_position(k[2], T) if step_position is None
+    hi = step_position_bound(T, rule)
+    t = (sample_step_position(k[2], T, rule) if step_position is None
          else int(step_position))
-    if not 0 <= t < T:
-        raise ValueError(f"step position {t} is outside 0 .. {T - 1}")
+    if not 0 <= t < hi:
+        raise ValueError(f"step position {t} is outside 0 .. {hi - 1} for "
+                         f"rule {rule}")
     _LAST_STEP_POSITION.clear()
     _LAST_STEP_POSITION.update({"t": t, "T": T, "recording": rec,
                                 "rule": rule, "carry": cont})
 
     sg = jax.lax.stop_gradient
     state_prev = tuple(sg(x) for x in prefix_state(seq, t, weights)(*weights))
+    if rule == "window2":
+        return ((seq[t], seq[t + 1], y) + state_prev + weights + _consts())
     head = (seq[t], y) + state_prev + weights + _consts()
 
     if rule == "tbptt":

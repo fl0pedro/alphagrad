@@ -20,6 +20,7 @@ from jax.tree_util import register_pytree_node_class
 
 import numpy as np
 
+from alphagrad.approx.common import carry_plan as _carry
 from alphagrad.approx.common.relations import compute_eqn_ids_from_tokens
 from alphagrad.approx.common.token_vocab import (
     DELTA_HEADER_SLOTS,
@@ -2226,6 +2227,13 @@ def plan_log_attempt() -> int:
     return int(_PLAN_LOG_ATTEMPT[0])
 
 
+#: THE CONTAINER THE PLAN JUST MEASURED IMPLIED (owner ruling 2026-09-16).
+#: Written by `_callback_measured` at the container seam and read by
+#: `_record_plan`, which is the one choke point every record passes through.
+#: `None` on every target that carries no temporal edge.
+_PLAN_CARRY: list = [None]
+
+
 def _record_plan(rec: dict) -> None:
     if len(_PLAN_RECORDS) >= _plan_log_cap():
         _PLAN_LOG_DROPPED[0] += 1
@@ -2247,12 +2255,16 @@ def _record_plan(rec: dict) -> None:
     _pos = probe_meta() or last_step_position()
     if _pos:
         rec["step_position"] = _pos
-        # WHICH CONTAINER THE CARRY ARRIVED IN (owner ruling 2026-09-16). The
-        # given temporal value is the RULE run over the recording, and the
-        # container it is stored in is what the memory channel sees, so a
-        # record that does not name it cannot be read against another.
-        if _pos.get("carry") is not None:
-            rec["carry_container"] = str(_pos["carry"])
+    # WHICH CONTAINER THE CARRY ARRIVED IN (owner ruling 2026-09-16). The
+    # given temporal value is the RULE run over the recording, and the
+    # container it is stored in is what the memory channel sees, so a record
+    # that does not name it cannot be read against another. It is a property
+    # of the PLAN, not of the run: the plan's own classes on the carried face
+    # chose it, and `_callback_measured` publishes the choice it acted on.
+    if _PLAN_CARRY[0] is not None:
+        rec["carry_container"] = str(_PLAN_CARRY[0])
+    elif _pos and _pos.get("carry") is not None:
+        rec["carry_container"] = str(_pos["carry"])
     _PLAN_RECORDS.append(rec)
 
 
@@ -5806,7 +5818,18 @@ def _grad_cosine_quality(config, compiled_approx, ref_ex, ref_key, base_args,
         # SAME step position, and the reference comes from `jax.grad` of the
         # target on that instead. Then reward slot 6 holds the error the rule
         # ACCUMULATED over the recording (owner ruling 2026-09-16).
+        # A SKIP ON THE CARRIED FACE CHANGES THE TARGET, NOT ONLY THE DRAW.
+        # Skip means NO CARRY, so the measured program is the truncated one,
+        # and its own exact gradient is the truncated gradient -- which would
+        # score 1.0 and hide that the plan threw the whole prefix away. The
+        # reference has to come from the rule the ARM runs, on the arm's own
+        # target and argument tuple. `reference_oracle` is how a generator
+        # says that, and `reference_draw` stays the same statement for the
+        # ordinary case where only the draw is approximated.
+        _ref_oracle = getattr(config.data_gen, "reference_oracle", None)
         _ref_draw = getattr(config.data_gen, "reference_draw", None)
+        if _ref_oracle is not None:
+            _ref_draw = _ref_oracle["draw"]
         _oracle_ref = (_ref_draw is not None and config.target_fun is not None
                        and bool(getattr(config, "scalar_target", False)))
         _seed = _walk_seed("train", None) + 104729 * int(k)
@@ -5815,10 +5838,19 @@ def _grad_cosine_quality(config, compiled_approx, ref_ex, ref_key, base_args,
             if _oracle_ref:
                 r_data = _probe_batch(config, base_args, role="train",
                                       index=k, draw=_ref_draw)
-                ar = list(base_args)
-                for slot, d in zip(_data_slots(config, r_data), r_data):
+                if _ref_oracle is None:
+                    ar = list(base_args)
+                    _r_slots = _data_slots(config, r_data)
+                    _r_target = config.target_fun
+                    _r_argnums = config.argnums
+                else:
+                    ar = list(_ref_oracle["args"])
+                    _r_slots = tuple(_ref_oracle["slots"])
+                    _r_target = _ref_oracle["target"]
+                    _r_argnums = tuple(_ref_oracle["argnums"])
+                for slot, d in zip(_r_slots, r_data):
                     ar[slot] = jax.device_put(jnp.asarray(d), device)
-                jac_e = jax.grad(config.target_fun, argnums=config.argnums,
+                jac_e = jax.grad(_r_target, argnums=_r_argnums,
                                  has_aux=config.has_aux)(*ar)
                 jac_e = jac_e[0] if config.has_aux else jac_e
                 out_e = None
@@ -8507,6 +8539,45 @@ def _callback_measured(
                          jnp.array(_hit_slots, dtype=jnp.float32))
 
     # ------------------------------------------------------------------
+    # THE CARRY CONTAINER, PER PLAN (owner rulings 2026-09-16, A and B).
+    # ------------------------------------------------------------------
+    # Placed HERE, after the tokens and before anything is compiled, because
+    # that is exactly the seam the rulings describe: the POLICY sees the step
+    # body with the dense carry edge (the tokens above are built from
+    # `config`, always), and the MEASUREMENT compiles the consistent
+    # recursion -- the plan applied at every step of the prefix or the suffix
+    # -- with the carry in the container that choice implies.
+    #
+    # Everything below this point runs on the swapped program. The plan
+    # RECORD keeps the policy's own order and wires, which is what the reader
+    # of the log needs: the plan the policy emitted, plus the container it
+    # implied.
+    _rec_order = o_list
+    _carry_container = None
+    if is_terminal and _carry.armed():
+        _carry_container = _carry.container_for_plan(
+            config, o_list, _faces_np, _skips_np, partial_specs)
+        _variant = _carry.measurement_env(_carry_container)
+        if _variant is not None:
+            o_list = _carry.transport_order(o_list, _variant)
+            ft_by_vertex = _carry.transport_faces(ft_by_vertex, _variant)
+            transforms = _carry.transport_transforms(transforms, _variant)
+            config = _variant["config"]
+            args = _variant["args"]
+            consts = _variant["consts"]
+            _alt_eval = _carry.eval_samples_for(_carry_container)
+            if _alt_eval is not None:
+                eval_samples = tuple(_alt_eval)
+            elif eval_samples:
+                raise RuntimeError(
+                    f"the {_carry_container} container needs its own eval "
+                    f"samples and none were drawn. The site that calls "
+                    f"generate_eval_samples must also call "
+                    f"carry_plan.note_eval_draw with the same key and count.")
+    _PLAN_CARRY[0] = _carry_container
+    _pf("cb.carry_container")
+
+    # ------------------------------------------------------------------
     # Compute family — graphax counters (always) → muls_adds_fmas, max_io_sum.
     # ------------------------------------------------------------------
     # Phase breadcrumb (ALPHAGRAD_DEBUG_MEASURE=1): printed BEFORE the two
@@ -9885,8 +9956,11 @@ def _callback_measured(
 
     # ---- A6 PLAN LOG: this plan, win or lose -------------------------
     if _plan_log_on:
+        # THE POLICY'S OWN ORDER, not the transported one: the record is what
+        # the policy emitted, and the container it implied is a field beside
+        # it (`_PLAN_CARRY`, read in `_record_plan`).
         _record_terminal_plan(
-            order=o_list, rule_specs=partial_specs,
+            order=_rec_order, rule_specs=partial_specs,
             face_specs=_faces_np, face_skips=_skips_np,
             face_joins=_joins_np,
             reward_vec=_reward_slots,

@@ -118,13 +118,13 @@ from alphagrad.approx.common.temporal_order import (
     build_order_constraint as _build_order_constraint,
     describe as _describe_order,
 )
+from alphagrad.approx.common import carry_plan as _carry_plan
 from alphagrad.approx.common.snn_shd import SHD_TARGETS as _SHD_TARGETS
 from alphagrad.approx.common.rsnn_shd import (
     TEMPORAL_RULES as _TEMPORAL_RULES,
     is_rsnn as _is_rsnn,
     last_step_position as _last_step_position,
-    CARRY_CONTAINERS as _CARRY_CONTAINERS,
-    resolve_carry_container as _resolve_carry_container,
+    target_example as _target_example,
     resolve_temporal_rule as _resolve_temporal_rule,
 )
 from alphagrad.approx.common.schedules import cosine_warmup_exp_decay_lr
@@ -5541,9 +5541,12 @@ def make_argparser() -> argparse.ArgumentParser:
              "both EXACT; the face where the given quantity meets the step is "
              "where an e-prop-like approximation (Zenke and Neftci 2020) "
              "lives. RAISES on any target without time steps.")
-    p.add_argument(
-        "--carry-container", choices=list(_CARRY_CONTAINERS), default=None,
-        help='WHICH CONTAINER THE GIVEN TEMPORAL VALUE ARRIVES IN, and which rule produced it (--example RSNN_SHD; owner ruling 2026-09-16). The given edge is not a snapshot of the exact carry any more: it is the RULE run over the whole prefix (rtrl) or suffix (bptt), so the value arriving at step t carries the error that rule accumulated over the recording, not the error of one approximated step. exact (default): the influence matrix from a detached reverse-mode pass, dense, 225.74 MB over the eleven carried blocks; for bptt, plain backpropagation through time. eprop: the block diagonal of Zenke and Neftci applied at EVERY step. For rtrl that is one eligibility trace per synapse and the container shrinks with it -- 2.12 MB, a factor of 106, which is the whole point of the approximation and the only way the memory channel can see it. For bptt the state-to-state Jacobian is block-diagonalised at every suffix step; the adjoint is 532 numbers either way, so only its value moves. RAISES on any target that carries no temporal edge.')
+    # --carry-container IS GONE (owner ruling 2026-09-16, A). The
+    # plan-produced carry is the ONLY mode and the container follows the
+    # PLAN's approximation on the carried-Jacobian face, per plan, on the
+    # measurement side (common/carry_plan.py). A run-level flag would have
+    # been one container for every plan of the run, which is exactly what
+    # the ruling removed.
     p.add_argument(
         "--step-position", type=int, default=None, metavar="T",
         help="Pin the step position t of the recurrent target instead of "
@@ -7517,8 +7520,12 @@ def main():
     # every actor and the run record carry the SAME rule. An actor that read a
     # different rule would measure a different graph than the search acts on.
     args.temporal_rule = _resolve_temporal_rule(args.example, args.temporal_rule)
-    args.carry_container = _resolve_carry_container(
-        args.example, args.carry_container)
+    # THE TARGET THE RULE BUILDS. --temporal-rule window2 is not another
+    # given edge on the one-step body; it is a two-copy graph with no given
+    # edge at all, and it has its own registered target. Resolved HERE, in
+    # the same place and for the same reason the rule is: the trainer, every
+    # measure actor and the run record must name one target.
+    args.example = _target_example(args.example, args.temporal_rule)
     # Knobs that became flags (dsnn-3qm.44) are REFUSED if a launcher still
     # exports them, never read: an ignored export would run the knob OFF.
     from alphagrad.approx.common.agent_factory import refuse_removed_env_knobs
@@ -7760,8 +7767,7 @@ def main():
                   grad_window=args.target_grad_window,
                   dataset_size=args.dataset_size,
                   temporal_rule=args.temporal_rule,
-                  step_position=args.step_position,
-                  carry_container=args.carry_container)
+                  step_position=args.step_position)
     if args.temporal_rule is not None:
         _pos = _last_step_position()
         print(f"[cfg] --temporal-rule {args.temporal_rule}: step t={_pos.get('t')} "
@@ -7772,7 +7778,6 @@ def main():
         args.example, dataset=dataset_for_call, dataset_size=args.dataset_size,
         key=args_key, temporal_rule=args.temporal_rule,
         grad_window=args.target_grad_window,
-        carry_container=args.carry_container,
     )
     # TARGET SETUP -- routed through the shared builder so the trainer and
     # every measure-actor construct the IDENTICAL graph (jaxpr / vertex+action
@@ -7984,6 +7989,17 @@ def main():
     # once we know whether one exists (owner ruling 2026-09-18 / dsnn-dfw.22:
     # a Ray CPU actor when a pool is up, built with it and torn down with it;
     # see the block below the --ray-measure setup).
+
+    # THE CARRY CONTAINER FOLLOWS THE PLAN (owner rulings 2026-09-16, A and
+    # B). The policy acts on THIS env, which carries the dense carry edge; the
+    # measurement builds the program that each plan's own classes on the
+    # carried face imply. This is where that builder learns what the target
+    # was made from. A no-op on every target with no given temporal edge.
+    _carry_plan.register(
+        args, args_key, args.example, args.temporal_rule,
+        env.config, env.args, env.consts,
+        dataset=dataset_for_call, dataset_size=args.dataset_size,
+        step_position=args.step_position)
 
     # THE BASE STREAM, once, on the host. `len(base_tokens())` depends only on
     # the jaxpr -- not on the elimination order -- so this is a constant every
@@ -16513,6 +16529,12 @@ def main():
                 bool(args.preference_conditioned))
 
         eval_samples = generate_eval_samples(env, ep_eval_key, args.num_eval_samples)
+        # THE SAME DRAW, FOR EVERY CONTAINER. A plan whose classes on the
+        # carried face imply a container is measured on a program whose given
+        # values have other shapes, so it needs its own eval samples -- at
+        # the SAME key and count, or two containers would be compared on two
+        # different recordings. A no-op off the recurrent targets.
+        _carry_plan.note_eval_draw(ep_eval_key, args.num_eval_samples)
         env_episode = eqx.tree_at(lambda e: e.eval_args_samples, env, eval_samples)
         # The eval samples ride the env and are drawn afresh every episode, so
         # a per-shard copy from the previous episode is a STALE SAMPLE. Drop

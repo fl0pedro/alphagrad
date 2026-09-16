@@ -533,8 +533,7 @@ class PPORayWorker:
                       grad_window=getattr(self.args, "target_grad_window", None),
                       dataset_size=self.args.dataset_size,
                       temporal_rule=getattr(self.args, "temporal_rule", None),
-                      step_position=getattr(self.args, "step_position", None),
-                      carry_container=getattr(self.args, "carry_container", None))
+                      step_position=getattr(self.args, "step_position", None))
         gen = data_gen(
             self.args.example,
             dataset=dataset_for_call,
@@ -542,7 +541,6 @@ class PPORayWorker:
             key=args_key,
             temporal_rule=getattr(self.args, "temporal_rule", None),
             grad_window=getattr(self.args, "target_grad_window", None),
-            carry_container=getattr(self.args, "carry_container", None),
         )
         # THE SCALAR-LOSS GRAPH (+ optional deprecated seed-vertex form)
         # with the matching argnums, IDENTICALLY to the measure
