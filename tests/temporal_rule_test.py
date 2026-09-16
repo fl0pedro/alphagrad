@@ -35,6 +35,7 @@ and that its off-diagonal is exactly zero -- which is why ``Diag`` on that edge
 costs nothing there and why the approximation lives in the CROSS-LAYER blocks.
 """
 
+import math
 import os
 
 # FLOAT64, SET BEFORE JAX IS IMPORTED. Half the claims here say EXACT, and at
