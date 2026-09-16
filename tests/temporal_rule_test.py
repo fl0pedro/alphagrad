@@ -274,7 +274,7 @@ def test_the_default_is_tbptt_on_the_target_and_nothing_elsewhere():
 
 def test_an_unknown_rule_raises():
     with pytest.raises(ValueError, match="not one of"):
-        R.resolve_temporal_rule("RSNN_SHD", "eprop")
+        R.resolve_temporal_rule("RSNN_SHD", "banana")
 
 
 def test_the_gradient_window_raises_on_the_recurrent_target():
@@ -763,15 +763,45 @@ def test_the_declared_slots_must_match_the_arrays():
 # memory channel can ever see.
 # ---------------------------------------------------------------------------
 
-def test_the_two_containers_are_told_apart_by_shape():
+def test_the_containers_are_told_apart_by_shape_and_dtype():
     from graphax.examples.neuromorphic import rsnn_carry_container
     h, n_in = R.RSNN_HIDDEN, SHD_CHANNELS
-    assert rsnn_carry_container((0, 0), (h,), (h, n_in),
-                                (h, h, n_in)) == "dense"
-    assert rsnn_carry_container((0, 0), (h,), (h, n_in),
-                                (h, n_in)) == "compact"
+    f32, bf16 = jnp.float32, jnp.bfloat16
+
+    def name(shape, dtype=f32):
+        return rsnn_carry_container((0, 0), (h,), (h, n_in), shape,
+                                    dtype).name
+
+    assert name((h, h, n_in)) == "exact"
+    assert name((h, n_in)) == "diag"
+    assert name((h, h, 1)) == "reduce"
+    assert name((h, 1)) == "diag+reduce"
+    assert name((h, h, n_in), bf16) == "quant"
+    assert name((h, n_in), bf16) == "diag+quant"
+    assert name((h, 1), bf16) == "diag+reduce+quant"
     with pytest.raises(ValueError, match="Nothing else is a container"):
         rsnn_carry_container((0, 0), (h,), (h, n_in), (3, 3))
+
+
+def test_every_container_name_round_trips():
+    from graphax.examples.neuromorphic import (RSNN_CARRY_CONTAINERS,
+                                               carry_container_from_name)
+    assert "exact" in RSNN_CARRY_CONTAINERS
+    assert len(RSNN_CARRY_CONTAINERS) == 8
+    for n in RSNN_CARRY_CONTAINERS:
+        assert carry_container_from_name(n).name == n
+    with pytest.raises(ValueError, match="is not one of"):
+        carry_container_from_name("banana")
+
+
+def test_skip_dominates_and_none_is_the_identity():
+    assert R.container_from_classes([]) == "exact"
+    assert R.container_from_classes(["none"]) == "exact"
+    assert R.container_from_classes(["diag"]) == "diag"
+    assert R.container_from_classes(["quant", "diag"]) == "diag+quant"
+    assert R.container_from_classes(["diag", "skip"]) == "skip"
+    with pytest.raises(ValueError, match="are not action classes"):
+        R.container_from_classes(["banana"])
 
 
 def test_the_compact_container_is_the_store_the_approximation_buys():
@@ -779,7 +809,7 @@ def test_the_compact_container_is_the_store_the_approximation_buys():
     saving: the carry is an ARGUMENT, and nothing a plan does inside the
     graph shrinks an argument."""
     xs_d = _args("rtrl", carry_container="exact")
-    xs_e = _args("rtrl", carry_container="eprop")
+    xs_e = _args("rtrl", carry_container="diag")
     assert len(xs_d) == len(xs_e) == 16 + 14, "the rule selector must not move"
     dense = sum(int(np.asarray(x).nbytes) for x in xs_d[19:])
     compact = sum(int(np.asarray(x).nbytes) for x in xs_e[19:])
@@ -789,7 +819,7 @@ def test_the_compact_container_is_the_store_the_approximation_buys():
 
 
 def test_the_reference_weights_lead_either_container():
-    for cont in ("exact", "eprop"):
+    for cont in ("exact", "diag"):
         xs = _args("rtrl", carry_container=cont)
         for slot, ref in zip((7, 8, 9), (16, 17, 18)):
             np.testing.assert_array_equal(np.asarray(xs[slot]),
@@ -802,7 +832,7 @@ def test_the_forward_value_does_not_move_between_containers():
     a different function, not the same one more cheaply."""
     fn = ex.get_fn("RSNN_SHD")
     a = fn(*_args("rtrl", carry_container="exact"))
-    b = fn(*_args("rtrl", carry_container="eprop"))
+    b = fn(*_args("rtrl", carry_container="diag"))
     c = fn(*_args("tbptt"))
     assert float(a) == float(b) == float(c)
 
@@ -841,7 +871,7 @@ def test_the_bptt_adjoint_follows_the_plan_too():
     st = tuple(jax.lax.stop_gradient(x)
                for x in R.prefix_state(seq, 40, W)(*W))
     lam_e = R.future_adjoints(seq, y, 40, W, st, "exact")
-    lam_p = R.future_adjoints(seq, y, 40, W, st, "eprop")
+    lam_p = R.future_adjoints(seq, y, 40, W, st, "diag")
     assert len(lam_e) == len(lam_p) == 5
     for a, b in zip(lam_e, lam_p):
         assert a.shape == b.shape
@@ -854,7 +884,7 @@ def test_the_bptt_adjoint_follows_the_plan_too():
 def test_the_container_raises_off_the_recurrent_target():
     with pytest.raises(ValueError, match="carries no temporal edge"):
         ex.get_args("ADALIF_SNN", jax.random.PRNGKey(1),
-                    carry_container="eprop")
+                    carry_container="diag")
     with pytest.raises(ValueError, match="not one of"):
         ex.get_args("RSNN_SHD", jax.random.PRNGKey(1), dataset=None,
                     carry_container="banana")
@@ -862,12 +892,13 @@ def test_the_container_raises_off_the_recurrent_target():
 
 def test_the_plan_record_says_which_container_the_carry_arrived_in():
     import alphagrad.approx.env as envmod
-    for cont in ("exact", "eprop"):
+    for cont in ("exact", "diag"):
         ex.get_args("RSNN_SHD", jax.random.PRNGKey(3), dataset=None,
                     temporal_rule="rtrl", step_position=5,
                     carry_container=cont)
         envmod._PROBE_META.clear()
         envmod._PLAN_RECORDS.clear()
+        envmod._PLAN_CARRY[0] = None
         envmod._record_plan({"order": [1, 2]})
         rec = envmod._PLAN_RECORDS[-1]
         envmod._PLAN_RECORDS.clear()
@@ -875,7 +906,7 @@ def test_the_plan_record_says_which_container_the_carry_arrived_in():
         assert rec["step_position"]["carry"] == cont
 
 
-@pytest.mark.parametrize("cont", ["exact", "eprop"])
+@pytest.mark.parametrize("cont", ["exact", "diag"])
 def test_the_graph_shape_does_not_move_with_the_step_position_per_container(cont):
     seen = set()
     for t in (1, 40, 99):
@@ -890,7 +921,7 @@ def test_the_graph_shape_does_not_move_with_the_step_position_per_container(cont
 
 
 def test_the_generator_draws_the_container_it_was_asked_for():
-    for cont in ("exact", "eprop"):
+    for cont in ("exact", "diag"):
         gen = ex.data_gen("RSNN_SHD", dataset=None, key=jax.random.PRNGKey(1),
                           temporal_rule="rtrl", carry_container=cont)
         data = gen(jax.random.split(jax.random.PRNGKey(5), 5))
@@ -911,7 +942,7 @@ def test_the_generator_publishes_an_exact_reference_draw_only_when_it_needs_one(
                         temporal_rule="rtrl", carry_container="exact")
     assert getattr(plain, "reference_draw", None) is None
     approx = ex.data_gen("RSNN_SHD", dataset=None, key=jax.random.PRNGKey(1),
-                         temporal_rule="rtrl", carry_container="eprop")
+                         temporal_rule="rtrl", carry_container="diag")
     ref = getattr(approx, "reference_draw")
     keys = jax.random.split(jax.random.PRNGKey(5), 5)
     a = approx(keys)
@@ -941,7 +972,7 @@ def test_the_oracle_reference_makes_the_accumulated_error_visible():
     W = R.rsnn_weights(jax.random.PRNGKey(1))
     st = tuple(jax.lax.stop_gradient(x) for x in R.prefix_state(seq, t, W)(*W))
     head = (seq[t], y) + st + tuple(W)
-    g_p = R.carry_under_plan(seq, t, W, "eprop", check_zeros=False)
+    g_p = R.carry_under_plan(seq, t, W, "diag", check_zeros=False)
     g_e = R.carry_under_plan(seq, t, W, "exact", check_zeros=False)
     ap, exa = head + g_p, head + g_e
     full_p = head + R._consts() + g_p
@@ -952,7 +983,7 @@ def test_the_oracle_reference_makes_the_accumulated_error_visible():
         return ap
     stub.data_slots = slots
     stub.resample_per_env_episode = False
-    stub.meta = lambda keys: {"t": t, "T": int(seq.shape[0]), "carry": "eprop"}
+    stub.meta = lambda keys: {"t": t, "T": int(seq.shape[0]), "carry": "diag"}
     stub.reference_draw = lambda keys: exa
 
     class _C:
@@ -966,7 +997,7 @@ def test_the_oracle_reference_makes_the_accumulated_error_visible():
     cfg.has_aux = False
     cfg.argnums = argnums
     xs = list(ex.get_args("RSNN_SHD", jax.random.PRNGKey(1), dataset=None,
-                          temporal_rule="rtrl", carry_container="eprop"))
+                          temporal_rule="rtrl", carry_container="diag"))
 
     def exact_plan(*a):
         return list(jax.grad(fn, argnums=argnums)(*a))
@@ -1000,7 +1031,7 @@ def test_without_the_reference_draw_the_same_channel_reads_one():
     W = R.rsnn_weights(jax.random.PRNGKey(1))
     st = tuple(jax.lax.stop_gradient(x) for x in R.prefix_state(seq, t, W)(*W))
     head = (seq[t], y) + st + tuple(W)
-    ap = head + R.carry_under_plan(seq, t, W, "eprop", check_zeros=False)
+    ap = head + R.carry_under_plan(seq, t, W, "diag", check_zeros=False)
 
     def stub(keys):
         return ap
@@ -1015,7 +1046,7 @@ def test_without_the_reference_draw_the_same_channel_reads_one():
     cfg.has_aux = False
     cfg.argnums = argnums
     xs = list(ex.get_args("RSNN_SHD", jax.random.PRNGKey(1), dataset=None,
-                          temporal_rule="rtrl", carry_container="eprop"))
+                          temporal_rule="rtrl", carry_container="diag"))
 
     def exact_plan(*a):
         return list(jax.grad(fn, argnums=argnums)(*a))
@@ -1041,7 +1072,7 @@ def test_the_oracle_reference_is_not_the_same_number_as_the_in_band_one():
                for x in R.prefix_state(seq, t, W)(*W))
     head = (seq[t], y) + st + tuple(W) + R._consts()
     g_ap = jax.grad(fn, argnums=argnums)(
-        *(head + R.carry_under_plan(seq, t, W, "eprop", check_zeros=False)))
+        *(head + R.carry_under_plan(seq, t, W, "diag", check_zeros=False)))
     g_ex = jax.grad(fn, argnums=argnums)(
         *(head + R.carry_under_plan(seq, t, W, "exact", check_zeros=False)))
     a = np.concatenate([np.asarray(x, np.float64).ravel() for x in g_ap])
@@ -1050,3 +1081,391 @@ def test_the_oracle_reference_is_not_the_same_number_as_the_in_band_one():
     oracle = float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))
     assert abs(same_args - 1.0) < 1e-9
     assert oracle < 1.0 - 1e-6, oracle
+
+
+# ---------------------------------------------------------------------------
+# 12. THE CONTAINER FOLLOWS THE PLAN, PER CLASS (owner rulings 2026-09-16)
+#
+# The plan-produced carry is the ONLY mode. The exact carry is the plan with
+# no approximation on the carried-Jacobian face, and every other container is
+# the plan's own classes on that face, applied at every step of the prefix:
+#
+#   none    exact real time recurrent learning
+#   Diag    e-prop, the block-diagonal trace
+#   Reduce  a coarser trace, the presynaptic axis collapsed
+#   Quant   a low precision trace
+#   Skip    no carry at all, which is truncated backpropagation through time
+#
+# Realized on the MEASUREMENT side: the policy always sees the step body with
+# the dense carry edge, and the measurement compiles the consistent recursion
+# with the carry in the container that choice implies.
+# ---------------------------------------------------------------------------
+
+CLASS_CONTAINERS = ("exact", "diag", "reduce", "quant", "diag+quant",
+                    "diag+reduce")
+
+
+def _carry_bytes(container):
+    xs = _args("rtrl", carry_container=container)
+    return sum(int(np.asarray(x).nbytes) for x in xs[19:])
+
+
+@pytest.mark.parametrize("container", CLASS_CONTAINERS)
+def test_the_carry_arrives_in_the_container_the_class_implies(container):
+    """Shape AND bytes, per class. The attachment reads the container off the
+    block itself, so this is the same question the measured program asks."""
+    from graphax.examples.neuromorphic import rsnn_carry_container
+    xs = _args("rtrl", carry_container=container)
+    assert len(xs) == 16 + 14, "the rule selector must not move"
+    states = tuple(xs[2:7])
+    weights = tuple(xs[7:10])
+    for (s, w), J in zip(RSNN_CARRY_BLOCKS, xs[19:]):
+        c = rsnn_carry_container((s, w), states[s].shape, weights[w].shape,
+                                 J.shape, J.dtype)
+        assert c.name == container, ((s, w), c.name)
+
+
+def test_every_approximated_container_is_smaller_than_the_exact_one():
+    """A Reduce and a Quant plan each produce a carry SMALLER than the exact
+    one. That is the only thing the memory channel can ever see: an
+    approximation applied inside the graph cannot shrink an argument."""
+    exact = _carry_bytes("exact")
+    assert exact == 225_738_752
+    for container in CLASS_CONTAINERS[1:]:
+        assert _carry_bytes(container) < exact, container
+    assert _carry_bytes("diag") == 2_129_920
+    # Quant halves the dense store; Reduce collapses one axis of it.
+    assert _carry_bytes("quant") == exact // 2
+    assert _carry_bytes("reduce") < _carry_bytes("quant")
+
+
+def test_skip_on_the_carried_face_means_no_carry_at_all():
+    """Skip is not a storage form. The measured rule is the truncated one and
+    the given tuple is empty, so the program IS the t-BPTT program."""
+    assert R.container_from_classes(["skip"]) == R.SKIP_CONTAINER
+    with pytest.raises(ValueError, match="no storage form"):
+        R._container(R.SKIP_CONTAINER)
+    tb = _args("tbptt")
+    assert len(tb) == 16
+
+
+def test_the_forward_value_does_not_move_between_any_two_containers():
+    """Every container attaches a weight delta that is exactly zero, so the
+    loss is the same to the last bit. A container that moved the loss would
+    be measuring a different function, not the same one more cheaply."""
+    fn = ex.get_fn("RSNN_SHD")
+    base = float(fn(*_args("tbptt")))
+    for container in CLASS_CONTAINERS:
+        assert float(fn(*_args("rtrl", carry_container=container))) == base, \
+            container
+
+
+def test_the_reduce_container_is_the_exact_axis_mean():
+    """Making an axis implicit stores ONE value for the whole axis, and the
+    projection onto that replicated subspace is the mean. The recursion
+    commutes with it, so the stored value is the exact mean of the influence
+    matrix and the approximation is entirely in the contraction."""
+    seq, y, _ = R._draw_recording(jax.random.PRNGKey(1), None, -1)
+    W = R.rsnn_weights(jax.random.PRNGKey(1))
+    t = 9
+    jac = jax.jacrev(R.prefix_state(seq, t, W), argnums=(0, 1, 2))(*W)
+    red = R.carry_under_plan(seq, t, W, "reduce")[3:]
+    worst = 0.0
+    for i, (s, w) in enumerate(RSNN_CARRY_BLOCKS):
+        want = jnp.mean(jac[s][w], axis=-1)[..., None]
+        assert tuple(red[i].shape) == tuple(want.shape), (s, w)
+        scale = float(jnp.max(jnp.abs(want))) + 1e-30
+        worst = max(worst, float(jnp.max(jnp.abs(red[i] - want))) / scale)
+    assert worst < 1e-2, worst
+
+
+def test_the_quant_container_is_the_same_recursion_held_narrow():
+    seq, y, _ = R._draw_recording(jax.random.PRNGKey(1), None, -1)
+    W = R.rsnn_weights(jax.random.PRNGKey(1))
+    t = 9
+    qnt = R.carry_under_plan(seq, t, W, "quant")[3:]
+    exact = R.carry_under_plan(seq, t, W, "exact")[3:]
+    for a, b in zip(qnt, exact):
+        assert a.dtype == jnp.bfloat16
+        assert tuple(a.shape) == tuple(b.shape)
+    a = np.concatenate([np.asarray(x, np.float64).ravel() for x in qnt])
+    b = np.concatenate([np.asarray(x, np.float64).ravel() for x in exact])
+    assert not np.array_equal(a, b), "a narrow store that lost nothing"
+    cos = float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))
+    assert cos > 0.99, cos
+
+
+def test_the_diag_container_is_the_eprop_recursion():
+    """The e-prop test of agent/rtrl, asked of the container the plan picks."""
+    seq, y, _ = R._draw_recording(jax.random.PRNGKey(1), None, -1)
+    W = R.rsnn_weights(jax.random.PRNGKey(1))
+    t = 9
+    got = R.carry_under_plan(seq, t, W, "diag")[3:]
+    want = R.carry_traces(seq, t, W)
+    assert len(got) == len(want) == len(RSNN_CARRY_BLOCKS)
+    for a, b in zip(got, want):
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+
+@pytest.mark.parametrize("container", ["reduce", "quant"])
+def test_a_reduce_and_a_quant_plan_score_below_one(container):
+    """The gradient the container's carry produces is not the exact one, so
+    the quality the record shows is below 1.0. Scored against the ORACLE --
+    the exact carry on the same step -- because both sides of the in-band
+    cosine would read the same approximated argument."""
+    fn = ex.get_fn("RSNN_SHD")
+    argnums = tuple(ex.infer_argnums("RSNN_SHD"))
+    seq, y, _ = R._draw_recording(jax.random.PRNGKey(1), None, -1)
+    W = R.rsnn_weights(jax.random.PRNGKey(1))
+    t = 40
+    st = tuple(jax.lax.stop_gradient(x)
+               for x in R.prefix_state(seq, t, W)(*W))
+    head = (seq[t], y) + st + tuple(W) + R._consts()
+    g_ap = jax.grad(fn, argnums=argnums)(
+        *(head + R.carry_under_plan(seq, t, W, container, check_zeros=False)))
+    g_ex = jax.grad(fn, argnums=argnums)(
+        *(head + R.carry_under_plan(seq, t, W, "exact", check_zeros=False)))
+    a = np.concatenate([np.asarray(x, np.float64).ravel() for x in g_ap])
+    b = np.concatenate([np.asarray(x, np.float64).ravel() for x in g_ex])
+    cos = float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))
+    assert cos < 1.0 - 1e-6, (container, cos)
+
+
+def test_the_adjoint_containers_are_the_two_a_vector_can_express():
+    """``diag`` moves the VALUE of an adjoint and not its store; ``reduce``
+    stores one number per component; ``quant`` stores it narrow."""
+    seq, y, _ = R._draw_recording(jax.random.PRNGKey(1), None, -1)
+    W = R.rsnn_weights(jax.random.PRNGKey(1))
+    t = 40
+    st = tuple(jax.lax.stop_gradient(x)
+               for x in R.prefix_state(seq, t, W)(*W))
+    lam_e = R.future_adjoints(seq, y, t, W, st, "exact")
+    lam_r = R.future_adjoints(seq, y, t, W, st, "reduce")
+    lam_q = R.future_adjoints(seq, y, t, W, st, "quant")
+    for a in lam_r:
+        assert tuple(a.shape) == (1,)
+    for a, b in zip(lam_q, lam_e):
+        assert a.dtype == jnp.bfloat16 and a.shape == b.shape
+    bytes_e = sum(int(np.asarray(x).nbytes) for x in lam_e)
+    assert sum(int(np.asarray(x).nbytes) for x in lam_r) < bytes_e
+    assert sum(int(np.asarray(x).nbytes) for x in lam_q) < bytes_e
+    xs = _args("bptt", carry_container="reduce")
+    assert len(xs) == 16 + 5
+    assert all(tuple(x.shape) == (1,) for x in xs[16:])
+
+
+# ---------------------------------------------------------------------------
+
+# THE ENV IS BUILT ONCE PER RULE. Building it draws the carry, which is a
+# reverse-mode Jacobian of a hundred-step scan; six tests that each built
+# their own would spend minutes on the same object.
+_ENVS: dict = {}
+
+
+def _env_for(rule):
+    """A landscape_map env on the synthetic Poisson recording, no dataset."""
+    import alphagrad.approx.tools.landscape_map as lm
+    from alphagrad.approx.common import carry_plan as CP
+    hit = _ENVS.get(rule)
+    if hit is not None:
+        # carry_plan is module state; re-register so a test that reset it
+        # still sees this env.
+        CP.register(hit["args_ns"], hit["key"], "RSNN_SHD", rule,
+                    hit["env"].config, hit["env"].args, hit["env"].consts,
+                    dataset=None, dataset_size=-1, step_position=T_PIN)
+        return lm, CP, hit["env"]
+    argv = ["--example", "RSNN_SHD", "--dataset", "none",
+            "--temporal-rule", rule, "--step-position", str(T_PIN),
+            "--num-eval-samples", "1", "--num-data-points", "1",
+            "--reps-per-point", "1", "--out-dir", "/tmp/carry_test"]
+    args = lm.make_argparser().parse_args(argv)
+    import jax.random as jrand
+    env, eval_samples, cj = lm.build_env(args)
+    key, args_key = jrand.split(jrand.PRNGKey(args.seed))
+    _ENVS[rule] = {"env": env, "args_ns": args, "key": args_key}
+    return lm, CP, env
+
+
+def test_the_seam_is_armed_only_on_a_rule_with_a_given_edge():
+    from alphagrad.approx.common import carry_plan as CP
+    _env_for("rtrl")
+    assert CP.armed()
+    _env_for("tbptt")
+    assert not CP.armed()
+
+
+@pytest.mark.parametrize("container",
+                         ["diag", "reduce", "quant", "diag+quant", "skip"])
+def test_every_container_builds_its_own_program_and_the_plan_transports(
+        container):
+    lm, CP, env = _env_for("rtrl")
+    base_valid = sorted(int(v) for v in env.valid_vertices)
+    var = CP.measurement_env(container)
+    assert var is not None
+    # THE STEP BODY IS THE SAME, EQUATION FOR EQUATION. `_alignment` checks
+    # the primitive and the output shape of every one of them and raises
+    # otherwise, so a non-empty map is a checked map.
+    assert var["vertex_map"]
+    mask = CP.carry_scope_mask(env.config.jaxpr)
+    body = [i + 1 for i, m in enumerate(mask) if not m]
+    assert sorted(var["vertex_map"]) == body
+    order = [int(v) for v in sorted(base_valid, reverse=True)]
+    moved = CP.transport_order(order, var)
+    assert sorted(moved) == sorted(var["valid"])
+    assert len(set(moved)) == len(moved)
+
+
+def test_the_container_a_plan_implies_is_read_off_its_wires():
+    import alphagrad.approx.env as envmod
+    lm, CP, env = _env_for("rtrl")
+    jx = env.config.jaxpr
+    valid = sorted(int(v) for v in env.valid_vertices)
+    mask = CP.carry_scope_mask(jx)
+    carry_v = [v for v in valid if mask[v - 1]
+               and jx.eqns[v - 1].primitive.name == "dot_general"]
+    assert carry_v, "the dense carry block contracts with a dot_general"
+    order = np.asarray([v for v in valid if mask[v - 1]]
+                       + sorted((v for v in valid if not mask[v - 1]),
+                                reverse=True), dtype=np.int32)
+    inv = lm.face_inventory(env, order)
+    picked = [e for e in inv if int(e["vertex"]) in set(carry_v)]
+    assert picked
+
+    def wires_for(row, kind=None):
+        if kind == "SKIP":
+            return [{"k": int(e["k"]), "f": int(e["f"]), "kind": "SKIP"}
+                    for e in picked]
+        return [{"k": int(e["k"]), "f": int(e["f"]), "slot": 0,
+                 "row": list(row), "kind": "X"} for e in picked]
+
+    from graphax.sparse.micro_actions import COMPRESS_KINDS, QUANT_DTYPES
+    cases = {
+        "exact": [],
+        "diag": wires_for([0, 0, -1]),
+        "reduce": wires_for([envmod.COMPRESS_SENTINEL, 0,
+                             COMPRESS_KINDS.index("mean")]),
+        "quant": wires_for([envmod.QUANT_SENTINEL,
+                            QUANT_DTYPES.index("bfloat16"), 0]),
+        "skip": wires_for(None, "SKIP"),
+    }
+    for want, wires in cases.items():
+        plan = {"specs": None, "face_specs": None, "face_skips": None,
+                "wires": wires}
+        specs, faces, skips = lm.get_plan_arrays(plan, len(order))
+        got = CP.container_for_plan(env.config, [int(v) for v in order],
+                                    faces, skips, specs)
+        assert got == want, (want, got)
+
+
+def test_a_wire_on_the_step_body_does_not_move_the_container():
+    """The container follows the plan's classes on the CARRIED face only. A
+    Diag somewhere else in the step body is an ordinary approximation."""
+    lm, CP, env = _env_for("rtrl")
+    jx = env.config.jaxpr
+    valid = sorted(int(v) for v in env.valid_vertices)
+    mask = CP.carry_scope_mask(jx)
+    order = np.asarray(sorted(valid, reverse=True), dtype=np.int32)
+    inv = lm.face_inventory(env, order)
+    body = [e for e in inv if not mask[int(e["vertex"]) - 1]]
+    assert body
+    wires = [{"k": int(body[0]["k"]), "f": int(body[0]["f"]), "slot": 0,
+              "row": [0, 0, -1], "kind": "X"}]
+    plan = {"specs": None, "face_specs": None, "face_skips": None,
+            "wires": wires}
+    specs, faces, skips = lm.get_plan_arrays(plan, len(order))
+    assert CP.container_for_plan(env.config, [int(v) for v in order],
+                                 faces, skips, specs) == "exact"
+
+
+def test_the_skip_variant_scores_against_the_arms_own_rule():
+    """A truncated program's own exact gradient is the truncated gradient, so
+    scoring against it would read 1.0 for a plan that threw the whole prefix
+    away. The generator publishes the arm's rule as the reference instead."""
+    lm, CP, env = _env_for("rtrl")
+    var = CP.measurement_env("skip")
+    ref = getattr(var["config"].data_gen, "reference_oracle", None)
+    assert ref is not None
+    assert ref["target"] is env.config.target_fun
+    assert tuple(ref["argnums"]) == tuple(env.config.argnums)
+    assert len(ref["args"]) == len(env.args)
+    # the non-skip containers keep the in-band reference draw, which is the
+    # exact carry of the SAME rule and the same target
+    diag = CP.measurement_env("diag")
+    assert getattr(diag["config"].data_gen, "reference_oracle", None) is None
+    assert getattr(diag["config"].data_gen, "reference_draw", None) is not None
+
+
+def test_a_step_body_that_stops_matching_raises():
+    """The transport is checked, not assumed: two programs whose step bodies
+    differ cannot carry a plan between them."""
+    lm, CP, env = _env_for("rtrl")
+    other = _jaxpr_of(ex.get_args(R.RSNN_W2_TARGET, jax.random.PRNGKey(1),
+                                  dataset=None, temporal_rule="window2",
+                                  step_position=T_PIN))
+    with pytest.raises(ValueError, match="disagree about the STEP BODY"):
+        CP._alignment(env.config.jaxpr, other)
+
+
+
+# ---------------------------------------------------------------------------
+# 14. THE FOURTH ARM: two step copies, no given edge, free order
+# ---------------------------------------------------------------------------
+
+def test_window2_is_the_fourth_rule_and_its_own_target():
+    assert R.TEMPORAL_RULES == ("tbptt", "bptt", "rtrl", "window2")
+    assert R.target_example("RSNN_SHD", "window2") == R.RSNN_W2_TARGET
+    assert R.target_example("RSNN_SHD", "rtrl") == "RSNN_SHD"
+    assert R.target_example("NeuralNetwork", None) == "NeuralNetwork"
+    assert R.is_rsnn(R.RSNN_W2_TARGET)
+    assert ex.infer_argnums(R.RSNN_W2_TARGET) == (8, 9, 10)
+
+
+def test_the_window_arm_has_no_given_edge():
+    xs = ex.get_args(R.RSNN_W2_TARGET, jax.random.PRNGKey(1), dataset=None,
+                     temporal_rule="window2", step_position=T_PIN)
+    # two input frames, the label, five state components, three weights, six
+    # constants: seventeen, and nothing after them
+    assert len(xs) == 17
+    assert xs[0].shape == xs[1].shape == (SHD_CHANNELS,)
+    assert xs[2].shape == (SHD_CLASSES,)
+    assert xs[8].shape == (R.RSNN_HIDDEN, SHD_CHANNELS)
+    fn = ex.get_fn(R.RSNN_W2_TARGET)
+    assert float(fn(*xs)) == float(fn(*xs))
+
+
+def test_the_window_arm_carries_two_step_scopes():
+    xs = ex.get_args(R.RSNN_W2_TARGET, jax.random.PRNGKey(1), dataset=None,
+                     temporal_rule="window2", step_position=T_PIN)
+    jx = _jaxpr_of(xs)
+    tags = to.step_tags(jx)
+    assert set(int(t) for t in tags) >= {0, 1}
+
+
+def test_the_window_arm_refuses_a_container_and_a_foreign_rule():
+    with pytest.raises(ValueError, match="attaches no given temporal edge"):
+        ex.get_args("RSNN_SHD", jax.random.PRNGKey(1), dataset=None,
+                    temporal_rule="window2", carry_container="diag")
+    with pytest.raises(ValueError, match="only rule it can run is window2"):
+        R.resolve_temporal_rule(R.RSNN_W2_TARGET, "rtrl")
+    assert R.resolve_temporal_rule(R.RSNN_W2_TARGET, None) == "window2"
+
+
+def test_the_window_arms_step_position_leaves_room_for_the_second_copy():
+    T = 100
+    assert R.step_position_bound(T, "window2") == T - 1
+    assert R.step_position_bound(T, "rtrl") == T
+    seen = set()
+    for i in range(64):
+        seen.add(R.sample_step_position(jax.random.PRNGKey(i), T, "window2"))
+    assert seen and max(seen) <= T - 2 and min(seen) >= 1
+
+
+def test_the_window_generator_fills_eleven_slots():
+    gen = ex.data_gen(R.RSNN_W2_TARGET, dataset=None,
+                      key=jax.random.PRNGKey(1), temporal_rule="window2")
+    assert tuple(gen.data_slots) == tuple(range(11))
+    data = gen(jax.random.split(jax.random.PRNGKey(5), 5))
+    xs = ex.get_args(R.RSNN_W2_TARGET, jax.random.PRNGKey(1), dataset=None,
+                     temporal_rule="window2")
+    for slot, d in zip(gen.data_slots, data):
+        assert jnp.shape(d) == jnp.shape(xs[slot]), slot
