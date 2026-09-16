@@ -16529,12 +16529,6 @@ def main():
                 bool(args.preference_conditioned))
 
         eval_samples = generate_eval_samples(env, ep_eval_key, args.num_eval_samples)
-        # THE SAME DRAW, FOR EVERY CONTAINER. A plan whose classes on the
-        # carried face imply a container is measured on a program whose given
-        # values have other shapes, so it needs its own eval samples -- at
-        # the SAME key and count, or two containers would be compared on two
-        # different recordings. A no-op off the recurrent targets.
-        _carry_plan.note_eval_draw(ep_eval_key, args.num_eval_samples)
         env_episode = eqx.tree_at(lambda e: e.eval_args_samples, env, eval_samples)
         # The eval samples ride the env and are drawn afresh every episode, so
         # a per-shard copy from the previous episode is a STALE SAMPLE. Drop

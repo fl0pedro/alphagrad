@@ -71,20 +71,16 @@ _BASE: dict | None = None
 #: ``carry_vertices`` and ``valid``.
 _VARIANTS: dict = {}
 
-#: The draw the eval samples of the current episode were made from, so a
-#: variant can rebuild its own at the same keys.
-_EVAL_DRAW: dict | None = None
-
-#: container name -> the eval samples of the current draw.
+#: (container, base-draw digest, count) -> the eval samples that variant
+#: draws. Bounded, and cleared when it grows.
 _EVAL_SAMPLES: dict = {}
 
 
 def reset() -> None:
     """Forget everything. For tests, and for a process that rebuilds."""
-    global _SPEC, _BASE, _EVAL_DRAW
+    global _SPEC, _BASE
     _SPEC = None
     _BASE = None
-    _EVAL_DRAW = None
     _VARIANTS.clear()
     _EVAL_SAMPLES.clear()
 
@@ -128,19 +124,53 @@ def register(args_like, key, example, temporal_rule, config, args, consts,
     _BASE = {"config": config, "args": tuple(args), "consts": consts}
 
 
-def note_eval_draw(key, num_samples: int) -> None:
-    """Record the key and the count the episode's eval samples were drawn at.
+def _eval_key(eval_samples):
+    """The key a variant draws ITS eval samples from.
 
-    The variants need their OWN eval samples -- the shapes of the given values
-    move with the container -- and they must be the SAME draw, at the same
-    step positions, or the cost channels of two containers would be measured
-    on two different recordings.
+    THE BASE DRAW DECIDES IT. A variant's eval samples cannot be the base
+    ones -- the shapes of the given values move with the container -- so the
+    question is only how the two are tied together. They are tied by a DIGEST
+    of the base draw: the trainer, every Ray measure actor and
+    ``tools/landscape_map`` then derive the SAME variant samples from the same
+    base samples, without the episode's key having to travel to an actor that
+    is handed arrays. The digest changes with the episode exactly as the base
+    draw does, so a variant's samples are redrawn per episode too.
+
+    The recording and the weights are the run's own in every container (the
+    generator draws them from the run key), so what differs between a
+    container's samples and the base ones is the sampled STEP POSITIONS -- and
+    the graph, its vertex count, its face count and every cost channel are
+    step-independent by construction on this target.
     """
-    global _EVAL_DRAW
-    if _SPEC is None:
-        return
-    _EVAL_SAMPLES.clear()
-    _EVAL_DRAW = {"key": key, "num_samples": int(num_samples)}
+    import jax.random as jrand
+    return jrand.PRNGKey(int.from_bytes(_eval_tag(eval_samples)[:4], "little"))
+
+
+#: Arrays this big or bigger are hashed by their SHAPE and DTYPE only. The
+#: carried Jacobian is 226 MB per sample and hashing its content on every
+#: callback would cost more than the measurement; what moves between two
+#: episodes' draws is the STEP POSITION, and every small slot -- the input
+#: frame and the five carried state components -- moves with it.
+_TAG_CONTENT_MAX = 1 << 20
+
+
+def _eval_tag(eval_samples) -> bytes:
+    """A cheap content digest of one episode's eval draw.
+
+    A big slot is never pulled off the device: its shape and dtype go into
+    the digest and its content does not.
+    """
+    import hashlib
+    h = hashlib.blake2b(digest_size=16)
+    for a in eval_samples:
+        shape = tuple(int(d) for d in getattr(a, "shape", ()))
+        dtype = np.dtype(getattr(a, "dtype", np.float32))
+        h.update(repr(shape).encode())
+        h.update(dtype.str.encode())
+        nbytes = int(np.prod(shape)) * dtype.itemsize if shape else dtype.itemsize
+        if nbytes < _TAG_CONTENT_MAX:
+            h.update(np.asarray(a).tobytes())
+    return h.digest()
 
 
 # ---------------------------------------------------------------------------
@@ -337,29 +367,33 @@ def measurement_env(container: str) -> dict | None:
     return v
 
 
-def eval_samples_for(container: str):
-    """The episode's eval samples, redrawn in ``container``.
+def eval_samples_for(container: str, eval_samples):
+    """This episode's eval samples, redrawn in ``container``.
 
-    The same key and the same count, so the step positions and the recording
-    are the ones the base draw used and only the container moves.
+    Keyed by a digest of the base draw (:func:`_eval_key`), so every process
+    that measures this plan builds the same ones, and cached per (container,
+    digest) so an episode draws them once however many plans it measures.
     """
-    if _EVAL_DRAW is None:
+    if not eval_samples:
         return None
-    hit = _EVAL_SAMPLES.get(container)
-    if hit is not None:
-        return hit
     var = measurement_env(container)
     if var is None:
         return None
+    n = int(len(eval_samples[0]))
+    tag = (container, _eval_tag(eval_samples), n)
+    hit = _EVAL_SAMPLES.get(tag)
+    if hit is not None:
+        return hit
     from alphagrad.approx.common.eval_samples import generate_eval_samples
 
     class _Shim:
         config = var["config"]
         args = var["args"]
 
-    out = generate_eval_samples(_Shim, _EVAL_DRAW["key"],
-                                _EVAL_DRAW["num_samples"])
-    _EVAL_SAMPLES[container] = out
+    out = generate_eval_samples(_Shim, _eval_key(eval_samples), n)
+    if len(_EVAL_SAMPLES) > 64:
+        _EVAL_SAMPLES.clear()
+    _EVAL_SAMPLES[tag] = out
     return out
 
 

@@ -8565,15 +8565,14 @@ def _callback_measured(
             config = _variant["config"]
             args = _variant["args"]
             consts = _variant["consts"]
-            _alt_eval = _carry.eval_samples_for(_carry_container)
-            if _alt_eval is not None:
-                eval_samples = tuple(_alt_eval)
-            elif eval_samples:
-                raise RuntimeError(
-                    f"the {_carry_container} container needs its own eval "
-                    f"samples and none were drawn. The site that calls "
-                    f"generate_eval_samples must also call "
-                    f"carry_plan.note_eval_draw with the same key and count.")
+            # THE VARIANT'S OWN EVAL SAMPLES. They cannot be the base ones --
+            # the shapes of the given values move with the container -- so
+            # they are drawn from a DIGEST of the base draw, which every
+            # process that measures this plan computes the same way and which
+            # moves per episode exactly as the base draw does.
+            if eval_samples:
+                eval_samples = tuple(
+                    _carry.eval_samples_for(_carry_container, eval_samples))
     _PLAN_CARRY[0] = _carry_container
     _pf("cb.carry_container")
 

@@ -1519,3 +1519,44 @@ def test_a_small_gradient_scores_the_angle_and_not_its_size():
         a = tuple(x * scale for x in a0)
         got = float(envmod._quality_metrics(e, a)[0])
         assert abs(got - ref) < 1e-4, (scale, got, ref)
+
+
+def test_a_variant_draws_its_own_eval_samples_from_the_base_draw():
+    """The variant's samples cannot be the base ones -- the shapes move with
+    the container -- so they are tied to them by a DIGEST of the base draw.
+    Every process that measures the plan then builds the same ones, and they
+    move per episode exactly as the base draw does."""
+    from alphagrad.approx.common import carry_plan as CP
+    lm, _CP, env = _env_for("rtrl")
+    base = tuple(env.eval_args_samples)
+    a = CP.eval_samples_for("diag", base)
+    b = CP.eval_samples_for("diag", base)
+    assert a is b, "the same draw must not be rebuilt"
+    var = CP.measurement_env("diag")
+    assert len(a) == len(var["args"])
+    for got, want in zip(a, var["args"]):
+        assert tuple(got.shape[1:]) == tuple(want.shape), got.shape
+    # a DIFFERENT episode's base draw gives a different variant draw
+    moved = list(base)
+    moved[0] = moved[0] + 1.0
+    c = CP.eval_samples_for("diag", tuple(moved))
+    assert c is not a
+    assert not np.array_equal(np.asarray(a[0]), np.asarray(c[0]))
+
+
+def test_the_eval_tag_never_pulls_a_big_slot_off_the_device():
+    """The carried Jacobian is 226 MB per sample. Hashing its CONTENT on
+    every callback would cost more than the measurement, so a slot at or over
+    the cap contributes its shape and its dtype and nothing else."""
+    from alphagrad.approx.common import carry_plan as CP
+
+    class _Trap:
+        shape = (5, 128, 128, 700)
+        dtype = np.dtype("float32")
+
+        def __array__(self, *a, **k):
+            raise AssertionError("a big slot was pulled off the device")
+
+    small = jnp.zeros((5, 700), jnp.float32)
+    tag = CP._eval_tag((small, _Trap()))
+    assert isinstance(tag, bytes) and len(tag) == 16

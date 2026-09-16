@@ -596,7 +596,6 @@ def build_env(args):
 
     key, eval_key = jrand.split(key)
     eval_samples = generate_eval_samples(env, eval_key, args.num_eval_samples)
-    _carry_plan.note_eval_draw(eval_key, args.num_eval_samples)
     env = eqx.tree_at(lambda e: e.eval_args_samples, env, eval_samples)
     return env, eval_samples, closed_jaxpr
 

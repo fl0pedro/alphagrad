@@ -930,5 +930,4 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *, seed: int = 0)
 
     num_eval = int(getattr(args, "num_eval_samples", 10) or 10)
     eval_samples = generate_eval_samples(env, eval_key, num_eval)
-    _carry_plan.note_eval_draw(eval_key, num_eval)
     return eqx.tree_at(lambda e: e.eval_args_samples, env, eval_samples)
