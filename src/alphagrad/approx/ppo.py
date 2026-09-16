@@ -82,6 +82,7 @@ from alphagrad.approx.common.order import (
 from alphagrad.approx.common.schedules import cosine_warmup_exp_decay_lr
 from alphagrad.approx.env import (
     quality_metric as _env_quality_metric,
+    grad_oracle_tol as _env_grad_oracle_tol,
     APPROX_ADD_CHOICES,
     APPROX_ADD_CLI,
     APPROX_ADD_DEFAULT,
@@ -5086,8 +5087,13 @@ def make_argparser() -> argparse.ArgumentParser:
         "--grad-oracle", choices=["reference", "off"], default="reference",
         help="Oracle A (ticket dsnn-3qm.62): check the exact gradient of every "
              "elimination order ONCE per process against jax.grad on the probe "
-             "batch before it serves as the grad-cosine reference; a "
-             "disagreement (rel L2 > 1e-4) aborts the run. Published as "
+             "batch before it serves as the grad-cosine reference. Both sides "
+             "run at matmul precision 'highest' (ticket dsnn-df8: the default "
+             "float32 dot is TF32 here, and a TF32 reference is further from "
+             "the truth than the bar it guards). A disagreement (rel L2 > "
+             f"{_env_grad_oracle_tol():.0e}, ALPHAGRAD_GRAD_ORACLE_TOL) "
+             "REFUSES that order: its plan record is written as refused with a "
+             "sentinel reward and the run CONTINUES. Published as "
              "ALPHAGRAD_GRAD_ORACLE so the measure actors read the same value. "
              "off disables the check.")
     p.add_argument(
@@ -7397,8 +7403,10 @@ def main():
     # ORACLE A (ticket .62), same transport: env.grad_oracle is the one reader.
     os.environ["ALPHAGRAD_GRAD_ORACLE"] = str(args.grad_oracle)
     print(f"[alphagrad] gradient oracle (--grad-oracle) = {args.grad_oracle}"
-          + (" (exact gradient vs jax.grad once per process and order; a "
-             "disagreement aborts)" if args.grad_oracle == "reference"
+          + (" (exact gradient vs jax.grad once per process and order, both "
+             f"sides at matmul precision highest; rel L2 > "
+             f"{_env_grad_oracle_tol():.0e} refuses that order and the run "
+             "continues)" if args.grad_oracle == "reference"
              else " (no check)"), flush=True)
     print(f"[alphagrad] memory channel (reward slot 5, --mem-channel) = "
           f"{args.mem_channel}"

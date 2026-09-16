@@ -4787,11 +4787,43 @@ _GRAD_ORACLE_TOL_ENV = "ALPHAGRAD_GRAD_ORACLE_TOL"
 _GRAD_ORACLE_DONE: set = set()
 _GRAD_ORACLE_STATS = {"checks": 0, "rel_l2_max": 0.0}
 
+# THE BAR THE ORACLE ENFORCES. One constant, read by the check and by the
+# ``--grad-oracle`` help of ppo.py, so the help cannot drift from the code
+# again (it said 1e-4 until 2026-09-16, ticket dsnn-df8).
+_GRAD_ORACLE_TOL = 1e-3
+
+# THE MATMUL PRECISION BOTH SIDES OF THE ORACLE RUN AT (ticket dsnn-df8).
+# The default float32 dot on this hardware is TF32: 10 mantissa bits, about
+# 5e-4 relative error per product. Measured on pgi15-gpu17 on TransformerLM,
+# ``jax.grad`` in float32 at the default precision sits 1.054e-3 from the
+# float64 truth -- FURTHER from the truth than the 1e-3 gate it is supposed
+# to guard -- while the same call at "highest" sits 9.4e-7 from it. Running
+# both sides at "highest" therefore removes the mechanism behind 47 of the 48
+# refusals seen on the free-order TLM run, instead of widening the gate.
+_GRAD_ORACLE_PRECISION = "highest"
+
+# The reference (``jax.grad`` of the target on the probe batch) DOES NOT
+# DEPEND ON THE ELIMINATION ORDER, so it is computed once per process,
+# device and probe batch and reused by every order. See
+# :func:`_grad_oracle_reference` for the key.
+_GRAD_ORACLE_REF: dict = {}
+_GRAD_ORACLE_REF_MAX = 8
+_GRAD_ORACLE_REF_STATS = {"hits": 0, "misses": 0}
+
+# What the oracle SAW as the live matmul precision on each side, recorded by
+# the check so a test can prove the "highest" context was active for the
+# elimination AND for jax.grad.
+_GRAD_ORACLE_LAST_PRECISION: dict = {"plan": None, "reference": None}
+
 
 class GradientOracleFailure(RuntimeError):
     """The exact gradient of an elimination order disagrees with ``jax.grad``
-    (oracle A, ticket dsnn-3qm.62). The run aborts: every quality number of
-    that order would be measured against a wrong reference."""
+    (oracle A, ticket dsnn-3qm.62). THE RUN CONTINUES: this is a plain
+    ``RuntimeError``, so it travels the generic measure-failure path -- the
+    order is refused, its plan record is written with
+    ``refused="raised:GradientOracleFailure"`` and a sentinel reward, and the
+    next plan is measured. Refusing is the point: every quality number of that
+    order would otherwise be measured against a wrong reference."""
 
 
 def grad_oracle() -> str:
@@ -4807,17 +4839,111 @@ def grad_oracle() -> str:
     return want
 
 
+def grad_oracle_tol() -> float:
+    """The relative L2 bar a checked order must meet. ``_GRAD_ORACLE_TOL``
+    (1e-3), overridable with ``ALPHAGRAD_GRAD_ORACLE_TOL``. ppo.py builds its
+    ``--grad-oracle`` help from this function, so the two cannot disagree."""
+    return float(os.environ.get(_GRAD_ORACLE_TOL_ENV, repr(_GRAD_ORACLE_TOL)))
+
+
+def _matmul_precision() -> str:
+    """The default matmul precision a ``dot_general`` traced RIGHT NOW would
+    carry. The oracle reads it on both sides and records what it read."""
+    return str(jax.config.jax_default_matmul_precision)
+
+
+def _grad_oracle_exact(config, order, args):
+    """The plan's exact vertex-elimination gradient, TRACED AND COMPILED HERE.
+
+    NOT the caller's ``compiled_exact``. Matmul precision is baked into the
+    HLO at TRACE time, so an already-compiled executable cannot be re-run at
+    another precision. ``compiled_exact`` is also the paired latency reference
+    and the quality reference, and its precision must not move -- so the
+    oracle builds its own copy of the SAME elimination (same order, same
+    argnums, same has_aux, same sparse representation, no approximation
+    kwargs) inside the precision context. That is the extra compile per
+    process and order the oracle now pays, and caching the reference pays for
+    most of it.
+
+    ``_compile_measure`` and not a plain ``.compile()``: outside that path the
+    XLA:GPU bitcast-hoisting pass fails a CHECK and dumps core on the
+    TransformerLM plans (dsnn-df8, jobs 66074/66075).
+    """
+    fn = jacve(config.target_fun, list(order), argnums=config.argnums,
+               has_aux=config.has_aux,
+               sparse_representation=bool(getattr(config, "sparse", False)))
+    exe = _compile_measure(jax.jit(fn, keep_unused=True).lower(*args))
+    out = exe(*args)
+    return _gradient_leaves(out[1] if config.has_aux else out)
+
+
+def _grad_oracle_reference(config, args, device, probe_seed):
+    """``jax.grad`` of the target on the probe batch, ONCE per process.
+
+    THE REFERENCE DOES NOT DEPEND ON THE ELIMINATION ORDER. Before this it was
+    recomputed for every order, which is where the budget for the extra
+    ``highest``-precision elimination compile comes from (dsnn-df8 section 7
+    item 4).
+
+    THE KEY is ``(target identity, argnums, has_aux, device, PROBE SEED, data
+    generator identity, arg shapes and dtypes)``. The probe seed is
+    ``_walk_seed(role, episode)``, exactly the number ``_probe_batch`` keys its
+    own cache on, so a NEW PROBE BATCH -- a new episode under
+    ``--walk-rotate``, a new probe seed, another role -- is a different key and
+    a miss. The target's weights are drawn once per process and never updated
+    (the policy searches elimination orders, not weights), so they are not in
+    the key; their shapes and dtypes are, so a changed argument still misses.
+    The cached entry holds the target and the data generator, which pins the
+    two ``id()`` values in the key against object reuse.
+    """
+    key = (id(config.target_fun),
+           getattr(config.target_fun, "__qualname__", ""),
+           tuple(int(i) for i in config.argnums),
+           bool(config.has_aux),
+           str(device),
+           int(probe_seed),
+           id(config.data_gen),
+           tuple((tuple(getattr(x, "shape", ())), str(getattr(x, "dtype", "")))
+                 for x in args))
+    hit = _GRAD_ORACLE_REF.get(key)
+    if hit is not None:
+        _GRAD_ORACLE_REF_STATS["hits"] += 1
+        return hit[2]
+    _GRAD_ORACLE_REF_STATS["misses"] += 1
+    ref = jax.grad(config.target_fun, argnums=config.argnums,
+                   has_aux=config.has_aux)(*args)
+    ref = ref[0] if config.has_aux else ref
+    leaves = jax.tree_util.tree_leaves(ref)
+    if len(_GRAD_ORACLE_REF) >= _GRAD_ORACLE_REF_MAX:
+        _GRAD_ORACLE_REF.clear()
+    _GRAD_ORACLE_REF[key] = (config.target_fun, config.data_gen, leaves)
+    return leaves
+
+
 def _grad_oracle_check(config, compiled_exact, base_args, device, order_key,
                        *, rel_tol: float | None = None):
-    """Oracle A: the SAME-ORDER exact gradient (the quality reference of this
-    callback) against ``jax.grad`` of the target on the real probe batch, once
-    per process and order. Densifying the exact output here is the oracle's
-    job, not the reward path's. Raises ``GradientOracleFailure`` when the
-    relative L2 distance exceeds ``rel_tol`` (float32 reduction order sits at
-    1e-7..1e-3 across different contraction topologies on GPU; a wrong
-    Jacobian sits at 1e-1..1)."""
+    """Oracle A: the SAME-ORDER exact gradient against ``jax.grad`` of the
+    target on the real probe batch, once per process and order.
+
+    BOTH SIDES RUN AT ``_GRAD_ORACLE_PRECISION`` ("highest"), under ONE
+    context manager. At the default float32 precision this hardware uses TF32
+    for the dots, and the oracle then asks whether two TF32 evaluations of one
+    quantity agree to better than one part in a thousand while a single TF32
+    evaluation is already one part in a thousand away from the truth
+    (dsnn-df8). The elimination side is therefore re-traced inside the
+    context; see :func:`_grad_oracle_exact` for why the caller's
+    ``compiled_exact`` cannot be reused. The reference side is cached across
+    orders; see :func:`_grad_oracle_reference` for the key.
+
+    Densifying the exact output here is the oracle's job, not the reward
+    path's. Raises ``GradientOracleFailure`` when the relative L2 distance
+    exceeds ``rel_tol`` (at "highest" an exact order sits at 1e-6 or below on
+    GPU and on CPU; a wrong Jacobian sits at 1e-1..1). A raise REFUSES AND
+    RECORDS that order and the run continues -- see
+    :class:`GradientOracleFailure`.
+    """
     if rel_tol is None:
-        rel_tol = float(os.environ.get(_GRAD_ORACLE_TOL_ENV, "1e-3"))
+        rel_tol = grad_oracle_tol()
     if grad_oracle() == "off" or compiled_exact is None:
         return
     key = (tuple(int(v) for v in order_key), str(device))
@@ -4828,20 +4954,24 @@ def _grad_oracle_check(config, compiled_exact, base_args, device, order_key,
     # anyway (the walk falls back to jac_cosine there).
     if config.target_fun is None or not getattr(config, "scalar_target", False):
         return
-    data = _probe_batch(config, base_args, role="train", index=0)
+    # THE EPISODE IS READ ONCE, not twice. `_probe_batch` would fold
+    # `walk_episode()` in itself, and the reference cache has to key on the
+    # SAME number the batch was drawn at. With `--walk-rotate` off this is the
+    # pre-change seed exactly, so nothing moves.
+    episode = int(walk_episode()) if walk_rotate_enabled() else 0
+    probe_seed = _walk_seed("train", episode)
+    data = _probe_batch(config, base_args, role="train", index=0,
+                        episode=episode)
     if data is None:
         return
     a = list(base_args)
-    if data is not None:
-        for slot in range(min(2, len(data))):
-            a[slot] = jax.device_put(jnp.asarray(data[slot]), device)
-    out = compiled_exact(*a)
-    jac_e = out[1] if config.has_aux else out
-    leaves = _gradient_leaves(jac_e)
-    ref = jax.grad(config.target_fun, argnums=config.argnums,
-                   has_aux=config.has_aux)(*a)
-    ref = ref[0] if config.has_aux else ref
-    ref_leaves = jax.tree_util.tree_leaves(ref)
+    for slot in range(min(2, len(data))):
+        a[slot] = jax.device_put(jnp.asarray(data[slot]), device)
+    with jax.default_matmul_precision(_GRAD_ORACLE_PRECISION):
+        _GRAD_ORACLE_LAST_PRECISION["plan"] = _matmul_precision()
+        leaves = _grad_oracle_exact(config, [int(v) for v in order_key], a)
+        _GRAD_ORACLE_LAST_PRECISION["reference"] = _matmul_precision()
+        ref_leaves = _grad_oracle_reference(config, a, device, probe_seed)
     if len(leaves) != len(ref_leaves):
         raise GradientOracleFailure(
             f"[grad-oracle] order {key[0][:6]}...: {len(leaves)} exact "
@@ -4865,12 +4995,16 @@ def _grad_oracle_check(config, compiled_exact, base_args, device, order_key,
     _GRAD_ORACLE_STATS["checks"] += 1
     _GRAD_ORACLE_STATS["rel_l2_max"] = max(_GRAD_ORACLE_STATS["rel_l2_max"], rel)
     print(f"[grad-oracle] order {key[0][:6]}... on {device}: exact gradient "
-          f"vs jax.grad rel_l2={rel:.3e} ({len(leaves)} leaves)", flush=True)
+          f"vs jax.grad rel_l2={rel:.3e} ({len(leaves)} leaves, both sides at "
+          f"matmul precision {_GRAD_ORACLE_PRECISION})", flush=True)
     if not (rel <= rel_tol):
         raise GradientOracleFailure(
             f"[grad-oracle] order {key[0][:6]}... on {device}: the exact "
-            f"gradient differs from jax.grad by rel_l2={rel:.3e} > {rel_tol}; "
-            f"the quality reference of this order is wrong -- abort")
+            f"gradient differs from jax.grad by rel_l2={rel:.3e} > {rel_tol} "
+            f"with both sides at matmul precision "
+            f"{_GRAD_ORACLE_PRECISION}; the quality reference of this order "
+            f"is wrong -- the order is REFUSED and recorded, the run "
+            f"continues")
     _GRAD_ORACLE_DONE.add(key)
 
 

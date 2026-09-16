@@ -195,8 +195,14 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument("--grad-oracle", choices=["reference", "off"],
                    default="reference",
                    help="Oracle A (ticket .62): the exact gradient of every "
-                        "order vs jax.grad once per process; a disagreement "
-                        "aborts. Same reader as ppo.py (ALPHAGRAD_GRAD_ORACLE).")
+                        "order vs jax.grad once per process, both sides at "
+                        "matmul precision highest (ticket dsnn-df8). A "
+                        "disagreement REFUSES that order and records it; the "
+                        "run continues. The bar is env.grad_oracle_tol() "
+                        "(ALPHAGRAD_GRAD_ORACLE_TOL). Same reader as ppo.py "
+                        "(ALPHAGRAD_GRAD_ORACLE). This help states no number "
+                        "because env is imported below, after the env-var "
+                        "setup, and the number must never be a second copy.")
     p.add_argument("--quality-metric", default="grad_cosine",
                    choices=["loss_drop", "grad_cosine", "jac_cosine",
                             "cosine", "none"],
