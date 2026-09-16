@@ -494,11 +494,13 @@ def build_env(args):
     key, args_key = jrand.split(key)
 
     from alphagrad.approx.common.snn_shd import SHD_TARGETS
+    from alphagrad.approx.common.rsnn_shd import is_rsnn
     dataset_arg = None if args.dataset == "none" else args.dataset
     use_dataset = dataset_arg is not None and (
         args.example.endswith("NeuralNetwork")
         or args.example.startswith("TransformerLM")
-        or args.example in SHD_TARGETS)
+        or args.example in SHD_TARGETS
+        or is_rsnn(args.example))
     dataset_for_call = dataset_arg if use_dataset else None
 
     target_fn = get_fn(args.example)

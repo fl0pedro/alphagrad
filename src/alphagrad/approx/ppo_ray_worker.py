@@ -518,10 +518,12 @@ class PPORayWorker:
         # and `valid_vertices` for the action mask.
         dataset_arg = None if self.args.dataset == "none" else self.args.dataset
         from alphagrad.approx.common.snn_shd import SHD_TARGETS
+        from alphagrad.approx.common.rsnn_shd import is_rsnn
         use_dataset = (
             dataset_arg is not None
             and (self.args.example.endswith("NeuralNetwork")
-                 or self.args.example in SHD_TARGETS)
+                 or self.args.example in SHD_TARGETS
+                 or is_rsnn(self.args.example))
         )
         dataset_for_call = dataset_arg if use_dataset else None
         from alphagrad.approx.common.examples import (

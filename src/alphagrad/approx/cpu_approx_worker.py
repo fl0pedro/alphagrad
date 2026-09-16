@@ -738,10 +738,12 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *, seed: int = 0)
 
     dataset_arg = None if args.dataset == "none" else args.dataset
     from alphagrad.approx.common.snn_shd import SHD_TARGETS
+    from alphagrad.approx.common.rsnn_shd import is_rsnn
     use_dataset = (
         dataset_arg is not None
         and (args.example.endswith("NeuralNetwork")
-             or args.example in SHD_TARGETS)
+             or args.example in SHD_TARGETS
+             or is_rsnn(args.example))
     )
     dataset_for_call = dataset_arg if use_dataset else None
     target_fn = get_fn(args.example)

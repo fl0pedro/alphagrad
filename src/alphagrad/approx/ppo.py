@@ -121,6 +121,7 @@ from alphagrad.approx.common.temporal_order import (
 from alphagrad.approx.common.snn_shd import SHD_TARGETS as _SHD_TARGETS
 from alphagrad.approx.common.rsnn_shd import (
     TEMPORAL_RULES as _TEMPORAL_RULES,
+    is_rsnn as _is_rsnn,
     last_step_position as _last_step_position,
     resolve_temporal_rule as _resolve_temporal_rule,
 )
@@ -7699,7 +7700,8 @@ def main():
     use_dataset = dataset_arg is not None and (
         args.example.endswith("NeuralNetwork")
         or args.example.startswith("TransformerLM")
-        or args.example in _SHD_TARGETS)
+        or args.example in _SHD_TARGETS
+        or _is_rsnn(args.example))
     dataset_for_call = dataset_arg if use_dataset else None
 
     from alphagrad.approx.common.examples import (
