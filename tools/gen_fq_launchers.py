@@ -2174,15 +2174,18 @@ THESIS_TIME = "24:00:00"
 # carry four, so the measurement fan-out is per node: one GPU for the trainer
 # and every other GPU a measure actor.
 #
-# THESIS_NODES is the subset RELEASED TO THIS AGENT.  On 2026-09-16 the owner
-# held `pgi15-gpu17` and `pgi15-gpu19` for other agents, so the block is
-# generated and submitted on the other four.  When the owner releases them,
-# set THESIS_NODES = THESIS_NODES_ALL and regenerate: the node is part of the
-# launcher, so this is a regeneration, never an edit in place.
+# THESIS_NODES is the subset RELEASED TO THIS AGENT.  It changed twice on
+# 2026-09-16.  In the morning the owner held `pgi15-gpu17` and `pgi15-gpu19`
+# for other agents.  In the evening the SNN agent finished and `pgi15-gpu19`
+# came back, while `pgi15-gpu17` stayed out because another agent may still
+# take it.  So the released set is five of the six.  When the owner releases
+# gpu17 as well, set THESIS_NODES = THESIS_NODES_ALL and regenerate: the node
+# is part of the launcher, so this is a regeneration, never an edit in place.
 # ---------------------------------------------------------------------------
 THESIS_NODES_ALL = ("pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu17",
                     "pgi15-gpu18", "pgi15-gpu19", "pgi15-gpu20")
-THESIS_NODES = ("pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu18", "pgi15-gpu20")
+THESIS_NODES = ("pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu18",
+                "pgi15-gpu19", "pgi15-gpu20")
 THESIS_NODE_GPUS = {"pgi15-gpu15": 4, "pgi15-gpu16": 4, "pgi15-gpu17": 4,
                     "pgi15-gpu18": 4, "pgi15-gpu19": 8, "pgi15-gpu20": 8}
 #: --ray-measure by node size: every GPU the trainer does not hold.
@@ -2493,9 +2496,10 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
     """One thesis run -> one `arm(...)`.  Returns the arm."""
     _require(node in THESIS_NODES,
              f"node {node!r} is not one of the released thesis nodes "
-             f"{THESIS_NODES} (the owner held gpu17 and gpu19 for other "
-             f"agents on 2026-09-16; THESIS_NODES_ALL is the matrix's own "
-             f"list and this is the released subset)")
+             f"{THESIS_NODES}. THESIS_NODES_ALL is the matrix's own list of "
+             f"six Blackwell nodes and THESIS_NODES is the subset released to "
+             f"this agent: on 2026-09-16 pgi15-gpu17 stayed out because "
+             f"another agent may still take it.")
     name = name or thesis_run_name(arm, target, seed)
     _require(arm in THESIS_ARM_SPEC, f"arm {arm!r} is not one of {THESIS_ARMS}")
     _require(target in THESIS_TARGET_CLI,

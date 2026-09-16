@@ -419,9 +419,10 @@ def test_the_nodes_and_the_actors_per_node_size(gen, matrix, smoke):
     assert gen.THESIS_NODES_ALL == (
         "pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu17", "pgi15-gpu18",
         "pgi15-gpu19", "pgi15-gpu20")
-    # the released subset: the owner held gpu17 and gpu19 on 2026-09-16
+    # the released subset: on 2026-09-16 gpu17 stayed out because another
+    # agent may still take it. gpu19 came back when the SNN agent finished.
     assert gen.THESIS_NODES == ("pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu18",
-                                "pgi15-gpu20")
+                                "pgi15-gpu19", "pgi15-gpu20")
     assert set(gen.THESIS_NODES) <= set(gen.THESIS_NODES_ALL)
     assert gen.THESIS_RAY_MEASURE == {4: "3", 8: "7"}
     used = {a["node"] for a in matrix}
@@ -439,14 +440,14 @@ def test_the_nodes_and_the_actors_per_node_size(gen, matrix, smoke):
         assert f"#SBATCH -c {gen.BLACKWELL_CPUS[gpus]}\n" in text, a["name"]
         assert f"#SBATCH --mem={gen.BLACKWELL_MEM[gpus]}\n" in text, a["name"]
         assert "#SBATCH -p pgi15\n" in text, a["name"]
-        # a held node must not appear anywhere in a generated launcher
-        for held_node in ("pgi15-gpu17", "pgi15-gpu19"):
+        # a HELD node must not appear anywhere in a generated launcher
+        for held_node in ("pgi15-gpu17",):
             assert held_node not in text, (a["name"], held_node)
 
 
 def test_the_first_block_spreads_over_every_released_node(gen):
     """The node is assigned round-robin over THESIS_NODES IN SUBMISSION
-    ORDER, so the authorised block occupies all four queues at once instead
+    ORDER, so the authorised block occupies all five queues at once instead
     of stacking behind one of them."""
     block = gen.thesis_block1_arms()
     order = {a["name"]: i for i, a in enumerate(block)}
@@ -456,8 +457,9 @@ def test_the_first_block_spreads_over_every_released_node(gen):
         counts[a["node"]] = counts.get(a["node"], 0) + 1
     assert set(counts) == set(gen.THESIS_NODES)
     assert max(counts.values()) - min(counts.values()) <= 1, counts
-    # the first four submissions go to four different nodes
-    assert len({a["node"] for a in block[:4]}) == 4
+    # the first submissions go to a different node each
+    n = len(gen.THESIS_NODES)
+    assert len({a["node"] for a in block[:n]}) == n
 
 
 def test_the_campaign_hardware_did_not_move(gen):
@@ -559,7 +561,7 @@ def test_thesis_arm_raises_on_a_row_outside_the_rulings(gen):
         ({"arm": "D"}, "is not one of"),
         ({"target": "snn"}, "is not one of"),
         ({"seed": "42"}, "is not one of"),
-        ({"node": "pgi15-gpu19"}, "released"),
+        ({"node": "pgi15-gpu17"}, "released"),
         ({"node": "pgi15-cpu1"}, "released"),
     ):
         with pytest.raises(gen.CampaignRowError) as e:
