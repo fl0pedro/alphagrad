@@ -295,9 +295,9 @@ def test_diag_on_the_carried_edge_is_that_block_diagonal(x64):
     from graphax.sparse.indexes import DenseIndex
     from graphax.sparse.tensor import SparseTensor
     st = SparseTensor(
-        out_dims=[DenseIndex(id=0, size=n, block_size=None, axis=0)],
-        primal_dims=[DenseIndex(id=1, size=n, block_size=None, axis=1),
-                     DenseIndex(id=2, size=n, block_size=None, axis=2)],
+        out_dims=[DenseIndex(id=0, size=n, axis=0)],
+        primal_dims=[DenseIndex(id=1, size=n, axis=1),
+                     DenseIndex(id=2, size=n, axis=2)],
         val=J)
     mask = diag_valid_mask(st, 8)
     assert mask[0, 1], "the (state, W row) pair must admit Diag"
