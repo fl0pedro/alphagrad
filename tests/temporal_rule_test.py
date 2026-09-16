@@ -899,3 +899,59 @@ def test_the_generator_draws_the_container_it_was_asked_for():
         for slot, d in zip(gen.data_slots, data):
             assert jnp.shape(d) == jnp.shape(xs[slot]), (cont, slot)
         assert gen.meta(jax.random.split(jax.random.PRNGKey(5), 5))["carry"] == cont
+
+
+def test_the_generator_publishes_an_exact_reference_draw_only_when_it_needs_one():
+    """Under ``exact`` the in-band rev-exact reference IS the truth, so there
+    is nothing to publish. Under ``eprop`` the drawn carry is approximated and
+    the reference has to come from the exact draw at the SAME step position,
+    or the quality channel would read 1.0 for a rule that accumulated real
+    error over the whole recording."""
+    plain = ex.data_gen("RSNN_SHD", dataset=None, key=jax.random.PRNGKey(1),
+                        temporal_rule="rtrl", carry_container="exact")
+    assert getattr(plain, "reference_draw", None) is None
+    approx = ex.data_gen("RSNN_SHD", dataset=None, key=jax.random.PRNGKey(1),
+                         temporal_rule="rtrl", carry_container="eprop")
+    ref = approx.reference_draw
+    keys = jax.random.split(jax.random.PRNGKey(5), 5)
+    a = approx(keys)
+    r = ref(keys)
+    assert len(a) == len(r) == len(approx.data_slots)
+    # the same step position and the same weights, a different carry
+    for i in range(10):
+        np.testing.assert_array_equal(np.asarray(a[i]), np.asarray(r[i]))
+    assert sum(int(np.asarray(x).nbytes) for x in r[10:]) > \
+        100 * sum(int(np.asarray(x).nbytes) for x in a[10:])
+
+
+def test_the_oracle_reference_makes_the_accumulated_error_visible():
+    """The number reward slot 6 holds under an approximated carry."""
+    import alphagrad.approx.env as envmod
+
+    fn = ex.get_fn("RSNN_SHD")
+    argnums = tuple(ex.infer_argnums("RSNN_SHD"))
+
+    class _C:
+        data_gen = ex.data_gen("RSNN_SHD", dataset=None,
+                               key=jax.random.PRNGKey(1),
+                               temporal_rule="rtrl", carry_container="eprop")
+        target_fun = staticmethod(fn)
+        scalar_target = True
+        has_aux = False
+    cfg = _C()
+    cfg.argnums = argnums
+    xs = ex.get_args("RSNN_SHD", jax.random.PRNGKey(1), dataset=None,
+                     temporal_rule="rtrl", carry_container="eprop")
+
+    def exact_plan(*a):
+        return list(jax.grad(fn, argnums=argnums)(*a))
+
+    envmod._PROBE_BATCH.clear()
+    got = envmod._grad_cosine_quality(cfg, exact_plan, exact_plan, list(xs),
+                                      None, 1)
+    envmod._PROBE_BATCH.clear()
+    assert got is not None
+    q, _frobs, _cos = got
+    # The plan is exact; what is left is the error the RULE accumulated over
+    # the recording. It is small at this firing rate, and it is not 1.0.
+    assert 0.9 < q < 1.0, q
