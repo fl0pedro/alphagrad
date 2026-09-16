@@ -4678,11 +4678,20 @@ def _dense_cosine(jac_exact, jac_approx):
             f"and the plan's gradient {len(leaves_a)}")
     dot = ee = aa = rr = 0.0
     for i, (e, a) in enumerate(zip(leaves_e, leaves_a)):
-        if a is None:
-            raise GradientStructureMismatch(
-                f"[grad_cosine] the plan's gradient leaf {i} is a dead path")
-        a_arr = a.dense() if _is_sparse_tensor(a) else a
         e_np = np.asarray(e, dtype=np.float64)
+        if a is None:
+            # A DEAD PATH IS A ZERO GRADIENT, not a broken pytree. A face
+            # SKIP can delete every path to one parameter, and then the
+            # plan's gradient for it IS zero: graphax's dense path returns
+            # zeros there and `_gradient_similarity` has always scored it as
+            # zero. This accumulator raised instead, so the first real policy
+            # plan that skipped its way to a dead parameter took the whole
+            # measurement down (job 66105, a one-episode run on the rtrl
+            # arm). Scored the same way here.
+            ee += float(np.sum(e_np ** 2))
+            rr += float(np.sum(e_np ** 2))
+            continue
+        a_arr = a.dense() if _is_sparse_tensor(a) else a
         a_np = np.asarray(a_arr, dtype=np.float64)
         if a_np.shape != e_np.shape and a_np.shape == e_np.shape[::-1]:
             a_np = a_np.T
