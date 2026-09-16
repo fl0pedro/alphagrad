@@ -169,6 +169,9 @@ from alphagrad.approx.common import var_probe as _vprobe
 from alphagrad.approx.common import gate_telemetry as _gate_telemetry
 from alphagrad.approx.common import episode_stream as _epstream
 from alphagrad.approx.common import rollout_shards as _shards
+# CHECKPOINT (1 of 8). --checkpoint-every / --resume. The whole mechanism
+# lives in that module; this file only marks the eight points it is used at.
+from alphagrad.approx.common import checkpoint as _ckpt
 
 # Same switch carry_stream reads, so one flag turns the whole fold on or
 # off rather than leaving half the consumers folded and half not.
@@ -4530,6 +4533,8 @@ def make_argparser() -> argparse.ArgumentParser:
              "Set to 'dll-streetview' to land in that team's project.",
     )
     p.add_argument("--episodes", type=int, default=50)
+    # CHECKPOINT (2 of 8). --checkpoint-every and --resume.
+    _ckpt.add_checkpoint_args(p)
     p.add_argument(
         "--grad-window", type=int, default=1,
         help="How many CONSECUTIVE step deltas the loss re-runs under the "
@@ -7000,6 +7005,26 @@ def _setup_jax_compile_cache() -> None:
 
 def main():
     args = make_argparser().parse_args()
+    # CHECKPOINT (3 of 8). THE ARGUMENT NAMESPACE, TAKEN HERE AND NOWHERE
+    # ELSE. main() normalises args as it goes (--per-face-masks below,
+    # --variant further down), so the only namespace two runs can be compared
+    # on without reproducing every normalisation is the one argparse just
+    # produced. A --resume is refused HERE, before a single array is built,
+    # when the command line is not the one the checkpoint was written with.
+    _CKPT_ARGS = _ckpt.args_to_json(args)
+    _CKPT_EVERY = int(getattr(args, "checkpoint_every", 0) or 0)
+    if _CKPT_EVERY < 0:
+        raise ValueError(
+            f"--checkpoint-every must be 0 (off) or positive, got "
+            f"{_CKPT_EVERY}.")
+    _RESUME_PATH = str(getattr(args, "resume", "") or "")
+    _RESUME_META = None
+    if _RESUME_PATH:
+        _RESUME_META = _ckpt.read_ppo_meta(_RESUME_PATH)
+        _ckpt.check_resume_args(_RESUME_META["args"], args)
+        print(f"[checkpoint] resuming {_RESUME_PATH} at episode "
+              f"{int(_RESUME_META['episode'])} of {int(args.episodes)}",
+              flush=True)
     # Per-face masks are not a choice: with the face head only the apply-time
     # (per-face, per-slot) mask decides, so it is always on; without the face
     # head there is no per-face action space and the per-vertex mask is all
@@ -12644,12 +12669,24 @@ def main():
     # the sparse flag, beside the repo SHAs _repo_commits put here.
     _wandb_config.update(_gate_telemetry.toolchain_fingerprint(
         sparse=getattr(getattr(env, "config", None), "sparse", None)))
+    # CHECKPOINT (4 of 8). A RESUME ATTACHES TO THE SAME WANDB RUN. The
+    # checkpoint carries the run id, and `resume="must"` refuses to create a
+    # new run: a resumed leg that quietly started its own run would split one
+    # training curve across two panels with no way to tell from the data.
+    # Empty when wandb is disabled, or when the checkpoint has no id.
+    _wandb_resume = {}
+    if _RESUME_META is not None and args.wandb != "disabled":
+        _rid = _RESUME_META.get("wandb_run_id")
+        if _rid:
+            _wandb_resume = {"id": str(_rid), "resume": "must"}
+            print(f"[checkpoint] attaching to wandb run {_rid}", flush=True)
     wandb.init(
         project=getattr(args, "wandb_project", None) or "dsnn-vertex",
         entity=getattr(args, "wandb_entity", None) or None,
         name=args.name,
         config=_wandb_config,
         mode="disabled" if args.wandb == "disabled" else args.wandb,
+        **_wandb_resume,
     )
     # Pareto front over the three objectives the spec plots: compute cost,
     # memory, accuracy. All are stored "higher is better", matching the
@@ -15176,7 +15213,188 @@ def main():
         )
         _finish_episode(_ctx)
 
-    for ep in range(args.episodes):
+    # ---- CHECKPOINT (5 of 8) --------------------------------------------
+    # THE DRAIN, THE SAVE AND THE RESTORE.
+    #
+    # WHERE A CHECKPOINT MAY BE TAKEN. The episode pipeline overlaps the
+    # terminal measurement of episode e with the rollout of e+1, so at almost
+    # every point of the loop there is a measurement ticket in flight and a
+    # trajectory whose PPO update has not run. Saving there would save a
+    # state no resume could reproduce: the tickets live in the measure
+    # actors' processes and the pending trajectory is an episode's worth of
+    # rollout. So the checkpoint is taken at the ONE quiescent point of the
+    # iteration -- after the previous episode's update and epilogue, before
+    # this episode's rollout -- and `_pipe_drain` is what puts the driver
+    # there. `pending_measure_tickets()` is asserted empty afterwards; it is
+    # the only proof that nothing is in flight.
+    #
+    # THE DRAIN IS PART OF THE SCHEDULE, NOT AN OBSERVATION OF IT, AND IT
+    # CHANGES ONE EPISODE. Pipelined, the rollout of episode e runs under
+    # parameters that have absorbed the update of e-2. Draining at e runs
+    # U_{e-1} first, so R_e runs one update fresher than it otherwise would.
+    # The schedule realigns immediately: episode e has no update in front of
+    # its own collect, so R_{e+1} again runs under the parameters of U_{e-1},
+    # exactly as it would have. So a checkpoint moves the checkpoint episode
+    # and nothing else, and two runs are comparable only at the SAME
+    # --checkpoint-every. That is why that flag is one of the arguments a
+    # resume must match. At --checkpoint-every 0 nothing here runs at all and
+    # the loop is the one this file had before; on the synchronous path
+    # (--measure-pipeline 0) there is never anything pending and the drain is
+    # a no-op, so the loop is unchanged there at any --checkpoint-every.
+    def _pipe_drain():
+        """Finish the pending pipelined episode, if there is one.
+
+        Returns True when it drained something. This is the tail the end of
+        the run always had; it is a function now so the end of the run and
+        every checkpoint use the same one.
+        """
+        _prev = _PIPE_PENDING[0]
+        if not (_MPIPE and _prev is not None):
+            return False
+        _PIPE_PENDING[0] = None
+        if _PIPE_DEEP:
+            # DEEP: this episode's measurement was started at the end of its
+            # own iteration and has no next rollout to hide behind. Wait for
+            # it, drain the actors that hold its plans, and put the rewards
+            # in the trajectory this update is about to read.
+            _t_wait0 = _prof_time.perf_counter()
+            _meas = _ep_env_mod.collect_measurement(_prev["ticket"])
+            _t_wait = _prof_time.perf_counter() - _t_wait0
+            print(f"[measure-pipeline] ep={int(_prev['ctx']['ep'])} "
+                  f"ticket={_prev['ticket']} collect_wait={_t_wait:.1f}s "
+                  f"overlapped=nothing (pipeline drained)", flush=True)
+            _pd = _drain_measure_telemetry(
+                _prev["ticket"], park=False, trainer=False)
+            _prev["park"]["pool_collapse"] = _pd["pool_collapse"]
+            _prev["park"]["pool_face"] = _pd["pool_face"]
+            _prev["park"]["pool_plan"] = _pd["pool_plan"]
+            if bool(np.any(_meas["sentinel"])):
+                print(f"[measure-pipeline] ep{int(_prev['ctx']['ep'])}: "
+                      f"{int(np.sum(_meas['sentinel']))} of "
+                      f"{_meas['rewards'].shape[0]} terminal plans came back "
+                      f"sentinelled", flush=True)
+            _prev["roll"] = _pipe_fill_rewards(
+                _prev["roll"], _meas["rewards"])
+            _prev["ctx"].update(
+                pool_drain=_prev["park"], collect_wait=_t_wait,
+                sentinelled=int(np.sum(_meas["sentinel"])))
+        _pipe_finish(_prev, _pipe_update_dispatch(_prev))
+        return True
+
+    def _ckpt_tree():
+        """THE ARITHMETIC HALF: everything the next episode's numbers read.
+
+        Read at call time, so this is always the live state. `_kl_ref_agent`
+        is deliberately absent -- it is the identity-initialised policy, it is
+        rebuilt from --seed on every start, and a checkpoint that carried it
+        could disagree with the run it continues about what the reference is.
+        """
+        return {
+            "agent": agent,
+            "opt_state": opt_state,
+            "probes": probes,
+            "probe_opt_state": probe_opt_state,
+            "vprobes": vprobes,
+            "vprobe_opt_state": vprobe_opt_state,
+            "popart_m1": popart_m1,
+            "popart_m2": popart_m2,
+            "popart_w": popart_w,
+            "global_step": global_step,
+            "key": key,
+            "lag_lambda": float(lag_lambda),
+            "kl_ref_coef": float(_kl_ref_coef),
+        }
+
+    def _ckpt_meta():
+        """THE BOOKKEEPING HALF: what a person reads, in JSON."""
+        try:
+            _rid = wandb.run.id if wandb.run is not None else ""
+        except Exception:
+            _rid = ""
+        return {
+            "args": _CKPT_ARGS,
+            "wandb_run_id": str(_rid or ""),
+            "pareto_archive": _ckpt.pareto_archive_to_json(pareto_archive),
+            "episode_bin": _ckpt.bin_policy_to_json(_EP_BIN),
+            "window_bin": _ckpt.bin_policy_to_json(_WIN_BIN),
+            "host_state": _ckpt.host_state_to_json(host_state),
+        }
+
+    _CKPT_DIR = (_ckpt.run_directory(args.wandb != "disabled")
+                 if _CKPT_EVERY > 0 else "")
+    _CKPT_LAST = [-1]
+
+    def _ckpt_write(done):
+        """Drain the pipeline and write ONE checkpoint. `done` = episodes run."""
+        if _CKPT_EVERY <= 0 or int(done) == _CKPT_LAST[0]:
+            return
+        _t0 = _prof_time.perf_counter()
+        _drained = _pipe_drain()
+        jax.block_until_ready(
+            [x for x in jax.tree_util.tree_leaves(_ckpt_tree())
+             if isinstance(x, jax.Array)])
+        _t_drain = _prof_time.perf_counter() - _t0
+        _in_flight = _ep_env_mod.pending_measure_tickets()
+        if _in_flight:
+            raise RuntimeError(
+                f"a checkpoint was asked for with measurement tickets "
+                f"{_in_flight} still in flight. The drain did not reach the "
+                f"quiescent point, and a checkpoint taken here could not be "
+                f"resumed exactly.")
+        _t1 = _prof_time.perf_counter()
+        _path = _ckpt.save_ppo_checkpoint(
+            _CKPT_DIR, episode=int(done), tree=_ckpt_tree(),
+            meta=_ckpt_meta(), keep=2)
+        _t_write = _prof_time.perf_counter() - _t1
+        _CKPT_LAST[0] = int(done)
+        print(f"[checkpoint] {int(done)} episodes -> {_path} "
+              f"(drain {_t_drain:.2f}s, "
+              f"{'one episode finished' if _drained else 'nothing pending'}; "
+              f"write {_t_write:.2f}s)", flush=True)
+
+    # ---- CHECKPOINT (6 of 8): THE RESTORE -------------------------------
+    # HERE and not earlier: `_kl_ref_agent` above is the identity-initialised
+    # policy and must stay that policy, and the Pareto archive, the two bin
+    # policies and `host_state` do not exist before this point. Everything
+    # restored is rebound in main()'s own scope, which is where the loop
+    # reads it from.
+    _ep_start = 0
+    if _RESUME_META is not None:
+        _ep_start = int(_RESUME_META["episode"])
+        _restored = _ckpt.load_ppo_tree(_RESUME_PATH, _ckpt_tree())
+        agent = _restored["agent"]
+        opt_state = _restored["opt_state"]
+        probes = _restored["probes"]
+        probe_opt_state = _restored["probe_opt_state"]
+        vprobes = _restored["vprobes"]
+        vprobe_opt_state = _restored["vprobe_opt_state"]
+        popart_m1 = _restored["popart_m1"]
+        popart_m2 = _restored["popart_m2"]
+        popart_w = _restored["popart_w"]
+        global_step = _restored["global_step"]
+        key = _restored["key"]
+        lag_lambda = float(_restored["lag_lambda"])
+        _kl_ref_coef = float(_restored["kl_ref_coef"])
+        _ckpt.pareto_archive_from_json(
+            pareto_archive, _RESUME_META["pareto_archive"])
+        _ckpt.bin_policy_from_json(_EP_BIN, _RESUME_META["episode_bin"])
+        _ckpt.bin_policy_from_json(_WIN_BIN, _RESUME_META["window_bin"])
+        _ckpt.host_state_from_json(host_state, _RESUME_META["host_state"])
+        _CKPT_LAST[0] = _ep_start
+        pbar.update(_ep_start)
+        print(f"[checkpoint] restored: episodes 0..{_ep_start - 1} are done, "
+              f"global_step={int(global_step)}, stream bin 2^{_EP_BIN.log2}, "
+              f"window bin 2^{_WIN_BIN.log2}, "
+              f"{len(pareto_archive.pts)} Pareto points, "
+              f"lambda={lag_lambda:g}, kl_ref_coef={_kl_ref_coef:g}",
+              flush=True)
+
+    for ep in range(_ep_start, args.episodes):
+        # CHECKPOINT (7 of 8). THE QUIESCENT POINT: after episode ep-1's
+        # update and epilogue, before episode ep's rollout. `_ckpt_write`
+        # drains the pipeline first, so `ep` episodes really are complete.
+        if _CKPT_EVERY > 0 and ep > 0 and ep % _CKPT_EVERY == 0:
+            _ckpt_write(ep)
         # (A3) Publish the episode index for the loss-drop probe rotation.
         # Inert unless --walk-rotate; one env-var write per episode.
         from alphagrad.approx.env import set_walk_episode as _set_walk_ep
@@ -15979,36 +16197,16 @@ def main():
     # iteration after its rollout, so the final one has nobody to ride behind:
     # it is dispatched and finished here. Without this the run would train on
     # `--episodes - 1` episodes and log one fewer.
-    if _MPIPE and _PIPE_PENDING[0] is not None:
-        _prev = _PIPE_PENDING[0]
-        _PIPE_PENDING[0] = None
-        if _PIPE_DEEP:
-            # DEEP: the last episode's measurement was started at the end of
-            # its own iteration and has no next rollout to hide behind. Wait
-            # for it, drain the actors that hold its plans, and put the
-            # rewards in the trajectory this update is about to read.
-            _t_wait0 = _prof_time.perf_counter()
-            _meas = _ep_env_mod.collect_measurement(_prev["ticket"])
-            _t_wait = _prof_time.perf_counter() - _t_wait0
-            print(f"[measure-pipeline] ep={int(_prev['ctx']['ep'])} "
-                  f"ticket={_prev['ticket']} collect_wait={_t_wait:.1f}s "
-                  f"overlapped=nothing (last episode)", flush=True)
-            _pd = _drain_measure_telemetry(
-                _prev["ticket"], park=False, trainer=False)
-            _prev["park"]["pool_collapse"] = _pd["pool_collapse"]
-            _prev["park"]["pool_face"] = _pd["pool_face"]
-            _prev["park"]["pool_plan"] = _pd["pool_plan"]
-            if bool(np.any(_meas["sentinel"])):
-                print(f"[measure-pipeline] ep{int(_prev['ctx']['ep'])}: "
-                      f"{int(np.sum(_meas['sentinel']))} of "
-                      f"{_meas['rewards'].shape[0]} terminal plans came back "
-                      f"sentinelled", flush=True)
-            _prev["roll"] = _pipe_fill_rewards(
-                _prev["roll"], _meas["rewards"])
-            _prev["ctx"].update(
-                pool_drain=_prev["park"], collect_wait=_t_wait,
-                sentinelled=int(np.sum(_meas["sentinel"])))
-        _pipe_finish(_prev, _pipe_update_dispatch(_prev))
+    # The body of this tail moved into `_pipe_drain` (checkpoint, 5 of 8), so
+    # the end of the run and a mid-run checkpoint reach the quiescent state by
+    # the same code rather than by two copies of it.
+    _pipe_drain()
+
+    # CHECKPOINT (8 of 8). THE FINAL CHECKPOINT, always written when
+    # checkpointing is on. `_ckpt_write` is a no-op if the last episode was
+    # itself a checkpoint episode, so a run whose length is a multiple of
+    # --checkpoint-every does not write the same state twice.
+    _ckpt_write(args.episodes)
 
     pbar.close()
 
