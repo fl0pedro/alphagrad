@@ -2074,6 +2074,565 @@ not a summary.""",
     )
 
 
+# ===========================  THE THESIS MATRIX  ============================
+# Epic `dsnn-dfw`, ticket `dsnn-dfw.4`.  The owner's rulings of 2026-09-15 and
+# 2026-09-16 (thesis-plan-2026-09-15.md, HANDOFF-2026-09-16.md and the epic's
+# comments).  THIS SECTION DOES NOT REPLACE THE PHASE 1-5 CAMPAIGN ABOVE: the
+# campaign answered "which class, which channel, which reward form" on ONE
+# seed and the static Markowitz order; the thesis matrix is the DATA
+# COLLECTION that follows from its answers, on the FREE order, five seeds and
+# a thousand episodes.
+#
+# THE MATRIX, verbatim from the owner:
+#
+#   arm        init bias   reward form                PopArt   conditioned
+#   A          0           fixed additive, NO floor   off      no
+#   B          4           fixed additive, NO floor   off      no
+#   C          0           Lagrangian dual, tau 0.90  off      no
+#   C_popart   0           Lagrangian dual, tau 0.90  ON       no
+#   condC      0           Lagrangian dual, tau 0.90  off      YES
+#
+#   target     example          dataset     target-shape env
+#   nn256      NeuralNetwork    mnist       ALPHAGRAD_NN_HIDDEN=256
+#   tlm        TransformerLM    wikitext2   the ALPHAGRAD_TLM_* triple
+#
+#   seeds      250197 250198 250199 250200 250201
+#   run name   <arm>_<target>_s<seed>, e.g. C_popart_tlm_s250197
+#
+# WHY A AND B CARRY NO QUALITY FLOOR (owner ruling 2026-09-16, night).  A and
+# B are the CONTROLS that make the Lagrangian arm readable: the fixed additive
+# form at lambda_q = 16 with raw quality is what finding 63 prices at contrast
+# -20.6, so A is PREDICTED to collapse to q = 0 and B, which starts at the
+# identity, is PREDICTED to stay there.  The prediction is the point.  They
+# are not tuned to succeed and the floor is not added to rescue them.
+#
+# WHY condC IS A COMPOSITION AND NOT A FORM.  `campaign_arm` ties
+# --preference-conditioned to the reward form (its P0/P1/L rows are all
+# conditioned), which is right for the campaign's phase-3 ladder and wrong
+# here: the owner's C is the Lagrangian dual WITHOUT conditioning and condC is
+# the same dual WITH it.  ppo.py has composed the two since 2026-09-04 (it
+# prints "[cfg] lagrangian + preference-conditioned: Dirichlet over (latency,
+# memory) only; the quality preference IS lambda") but NO run has ever used
+# the composition, which is why the smoke includes one condC run.
+# ---------------------------------------------------------------------------
+
+#: `thesis_arm(arm=...)` takes the ARM NAME in a parameter called `arm`, which
+#: shadows the module-level `arm(...)` registrar inside that function.  The
+#: alias is how the row still reaches ARMS.
+arm_ = arm
+
+THESIS_SEEDS = ("250197", "250198", "250199", "250200", "250201")
+THESIS_EPISODES = "1000"
+THESIS_CHECKPOINT_EVERY = "50"
+THESIS_PARETO_DUMP_EVERY = "10"
+THESIS_PLAN_LOG = "auto"
+#: Spatial order FREE in every thesis arm (owner: "order is free in every arm,
+#: spatial and temporal").  The campaign's Markowitz pin is a campaign answer.
+THESIS_ORDER = "free"
+#: Every approximation class is available; the thesis does not ablate classes.
+THESIS_PROFILE = "all"
+THESIS_LAMBDA_Q = LAMBDA_Q_MVP          # 16
+THESIS_TAU = QUALITY_FLOOR_TAU          # 0.90
+THESIS_TIME = "24:00:00"
+
+# ---------------------------------------------------------------------------
+# THE HARDWARE.  Six Blackwell nodes (owner: "all six Blackwell nodes with a
+# per-node singleton dependency").  Two of them carry eight GPUs and four
+# carry four, so the measurement fan-out is per node: one GPU for the trainer
+# and every other GPU a measure actor.
+#
+# THESIS_NODES is the subset RELEASED TO THIS AGENT.  On 2026-09-16 the owner
+# held `pgi15-gpu17` and `pgi15-gpu19` for other agents, so the block is
+# generated and submitted on the other four.  When the owner releases them,
+# set THESIS_NODES = THESIS_NODES_ALL and regenerate: the node is part of the
+# launcher, so this is a regeneration, never an edit in place.
+# ---------------------------------------------------------------------------
+THESIS_NODES_ALL = ("pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu17",
+                    "pgi15-gpu18", "pgi15-gpu19", "pgi15-gpu20")
+THESIS_NODES = ("pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu18", "pgi15-gpu20")
+THESIS_NODE_GPUS = {"pgi15-gpu15": 4, "pgi15-gpu16": 4, "pgi15-gpu17": 4,
+                    "pgi15-gpu18": 4, "pgi15-gpu19": 8, "pgi15-gpu20": 8}
+#: --ray-measure by node size: every GPU the trainer does not hold.
+THESIS_RAY_MEASURE = {4: "3", 8: "7"}
+#: -c and --mem by node size.  The 8-GPU values are the campaign's.
+BLACKWELL_CPUS = {4: 64, 8: CAMPAIGN_CPUS}
+BLACKWELL_MEM = {4: "400G", 8: CAMPAIGN_MEM}
+#: The node the smoke runs on (owner: "SMOKE on gpu16").
+THESIS_SMOKE_NODE = "pgi15-gpu16"
+
+
+def blackwell_gres(gpus: int) -> str:
+    """The Blackwell gres string for a node of ``gpus`` GPUs."""
+    if gpus not in THESIS_RAY_MEASURE:
+        raise CampaignRowError(
+            f"{gpus} is not a Blackwell node size on this cluster; the nodes "
+            f"carry {sorted(THESIS_RAY_MEASURE)} GPUs "
+            f"(sinfo, 2026-09-16).")
+    return ("gpu:nvidia_rtx_pro_6000_blackwell_max-q_workstation_edition"
+            f":{gpus}")
+
+
+assert blackwell_gres(CAMPAIGN_GPUS) == CAMPAIGN_GRES, (
+    "the campaign's 8-GPU gres string and the derived one must be the same "
+    "string; the campaign arms render from CAMPAIGN_GRES and the thesis arms "
+    "from blackwell_gres, and a drift would give two arms different hardware "
+    "under one name")
+
+
+def thesis_job_name(node: str) -> str:
+    """THE PER-NODE SINGLETON NAME (owner ruling 2026-09-16).
+
+    Every thesis job carries `--dependency=singleton` and a job NAME that is
+    the node it is pinned to, so Slurm runs exactly one of our jobs on that
+    node at a time and starts the next one the moment the node frees up.
+    This is the scheduling form of the project rule that two jobs of one user
+    on one pgi15 node kill each other: `/etc/slurm/epilog_reset_node.sh` kills
+    every process of the user when ANY of that user's jobs on the node ends
+    (memory note `pgi15-epilog-kills-sibling-jobs`; seven of eight sweep64
+    shards died that way on 2026-09-13).  A singleton queue cannot produce
+    that state, and it needs no babysitting.
+    """
+    if node not in THESIS_NODE_GPUS:
+        raise CampaignRowError(
+            f"node {node!r} is not a Blackwell node of this cluster "
+            f"({sorted(THESIS_NODE_GPUS)})")
+    return f"thesis-{node}"
+
+
+# ---------------------------------------------------------------------------
+# THE TARGETS.  The example and the dataset are ARGUMENTS; the target's SHAPE
+# is an environment variable on the NeuralNetwork side, because
+# common/examples.py reads ALPHAGRAD_NN_HIDDEN at IMPORT time (module-scope
+# `_EQ_NN_HIDDEN`), exactly as it reads the ALPHAGRAD_TLM_* triple.  There is
+# no --nn-hidden flag; this is the same "no flag exists" departure the
+# NO_FLAG_ENV block declares, and the thesis test pins that the only per-arm
+# export a thesis launcher carries is this one.
+#
+# ALPHAGRAD_MAX_FACES is NOT exported by either target.  It is an explicit
+# experiment override (env.py: `configure_max_faces` returns early when it is
+# set); the trainer derives the provable bound per graph and prints it
+# ("face width: derived bound N").  The campaign arms already run without it.
+# ---------------------------------------------------------------------------
+THESIS_TARGETS = ("nn256", "tlm")
+THESIS_TARGET_CLI = {
+    "nn256": {"--example": "NeuralNetwork", "--dataset": "mnist"},
+    "tlm": {"--example": "TransformerLM", "--dataset": "wikitext2"},
+}
+THESIS_TARGET_ENV = {
+    "nn256": {"ALPHAGRAD_NN_HIDDEN": "256"},
+    "tlm": {},          # the ALPHAGRAD_TLM_* triple is in CAMPAIGN_ENV
+}
+#: The ONLY per-arm exports a thesis launcher may carry.  `render` refuses
+#: any other key, exactly as it refuses every per-arm export on a campaign arm.
+THESIS_TARGET_ENV_ALLOWED = frozenset(
+    k for env in THESIS_TARGET_ENV.values() for k in env)
+#: Every `export NAME=` a THESIS launcher may contain: the campaign's allowed
+#: set plus the target-shape variables above.
+THESIS_ENV_ALLOWED = frozenset(CAMPAIGN_ENV_ALLOWED) | THESIS_TARGET_ENV_ALLOWED
+
+# ---------------------------------------------------------------------------
+# THE ARMS.  Each row is the DIFFERENCE from the shared thesis configuration:
+# the face-head init bias, the reward form, the advantage normalisation and
+# whether the preference conditioning is composed on top.
+# ---------------------------------------------------------------------------
+THESIS_ARMS = ("A", "B", "C", "C_popart", "condC")
+THESIS_ARM_SPEC = {
+    # arm: (face_none_bias, form, advantage_norm, conditioned)
+    "A": ("0", "fixed", "none", False),
+    "B": ("4", "fixed", "none", False),
+    "C": ("0", "L", "none", False),
+    "C_popart": ("0", "L", "popart", False),
+    "condC": ("0", "L", "none", True),
+}
+
+THESIS_FLAGS_FILES = REQUIRED_FLAGS_FILES + [
+    # --checkpoint-every and --resume live in common/checkpoint.py and
+    # --auto-stop in common/auto_stop.py; both install their arguments on
+    # ppo.py's own parser (`_ckpt.add_checkpoint_args`, `_auto.
+    # add_auto_stop_args`), so the pre-flight's grep must read them too or
+    # every thesis launcher would abort 64 naming a flag that is defined.
+    "src/alphagrad/approx/common/checkpoint.py",
+    "src/alphagrad/approx/common/auto_stop.py",
+]
+THESIS_REQUIRED_FLAGS = REQUIRED_FLAGS + [
+    "--example", "--dataset", "--episodes", "--seed", "--name",
+    "--checkpoint-every", "--resume", "--auto-stop",
+    "--lag-eta", "--lag-init", "--lag-min", "--lag-max",
+]
+
+THESIS_HEAD = f"""THE THESIS MATRIX (epic dsnn-dfw, ticket dsnn-dfw.4) under
+the owner's rulings of 2026-09-15 and 2026-09-16.  Data collection, not a
+comparison of reward designs: the campaign's phases 1-5 decided the class set,
+the channels and the reward form, and these runs collect the fronts the thesis
+reports.
+
+WHAT IS SHARED BY EVERY ARM.  Three trained channels -- paired log-difference
+latency, paired log-difference static temp memory (both against rev-exact
+measured back to back in the same actor; --cost-form paired-log, --mem-channel
+temp) and grad-cosine quality -- weighted --lambda-cmp 1 --lambda-mem 1.
+Terminal rewards only, gamma = GAE lambda = 1, classic init with the MVP face
+head (--scale-face-head {SCALE_FACE_HEAD_MVP}, --face-logit-clamp
+{FACE_LOGIT_CLAMP_MVP}), the face ADD --approx-add {APPROX_ADD}, the paired
+cost floor --paired-cost-floor {PAIRED_COST_FLOOR}, and THE SPATIAL ORDER FREE
+(--fixed-order {THESIS_ORDER}): the policy chooses the elimination order as
+well as the approximations.
+
+WHAT EACH RUN DOES.  --episodes {THESIS_EPISODES} with --auto-stop (the check
+points are after 250 and after 500 episodes; the run ends early only when the
+Pareto archive admitted nothing over the last 100 episodes AND the raw
+weighted mean return moved less than 2 percent AND the arm either collapsed or
+stopped changing its terminal plan), --checkpoint-every
+{THESIS_CHECKPOINT_EVERY} so an auto-stopped or killed run can be continued
+exactly, --pareto-dump-every {THESIS_PARETO_DUMP_EVERY} and --plan-log
+{THESIS_PLAN_LOG} so the front over exploration and every terminal plan are on
+disk while the run is alive.
+
+SCHEDULING.  One sbatch job per run, pinned to one Blackwell node, with
+`--dependency=singleton` on a job name that IS the node.  Slurm then runs one
+of our jobs per node at a time and starts the next as soon as the node frees
+up.  The measurement fan-out follows the node: --ray-measure
+{THESIS_RAY_MEASURE[8]} on the 8-GPU nodes and {THESIS_RAY_MEASURE[4]} on the
+4-GPU nodes, one actor per GPU the trainer does not hold.
+
+DATA.  /Scratch is NOT persistent.  The nightly copy job
+(thesis_nightly_copy.sbatch) mirrors the run directory, the plan log, the
+front dumps, the checkpoints and auto_stop.json to
+/Users/assmuth/thesis-runs/<run name>/ whenever the home export accepts
+writes, and marks a copy complete only after a checksum list verifies."""
+
+_THESIS_ARM_WHAT = {
+    "A": """CONTROL A: the fixed additive form at lambda_q """ + THESIS_LAMBDA_Q
+         + """ with RAW quality
+and NO floor, face-head init bias 0.  This is the reward finding 63 prices at
+contrast -20.6 on this channel set: the skip-everything absorber outscores
+every honest plan, so the arm is expected to allocate nothing.""",
+    "B": """CONTROL B: arm A with the face-head init bias at 4, which starts
+the face head AT THE IDENTITY (no approximation anywhere).  A and B together
+separate "the objective has no contrast" from "the initialisation cannot
+leave the identity".""",
+    "C": """THE ARM: the Lagrangian dual.  Quality is a CONSTRAINT at tau """
+         + THESIS_TAU + """ rather
+than a weighted channel; lambda is ascended once per episode on the measured
+mean violation, eta """ + DUAL_ETA + """, clipped to [""" + DUAL_LAMBDA_MIN
+         + ", " + DUAL_LAMBDA_MAX + """], started at """ + THESIS_LAMBDA_Q
+         + """.""",
+    "C_popart": """ARM C with PopArt: the same dual with per-channel
+debiased-EMA normalisation of the value targets and sigma-scaled advantages.
+--no-symlog AND --symlog-channels none ride with it (ppo.py checks the two
+sites agree): symlog and PopArt address the same dynamic range and stacking
+them shrinks the memory channel about 14x instead of normalising it.""",
+    "condC": """ARM C composed with the PREFERENCE CONDITIONING: the policy
+reads a Dirichlet preference over (latency, memory) -- the quality
+preference IS lambda -- so one run amortises a whole front instead of one
+point.  ppo.py has allowed the composition since 2026-09-04 and no run has
+used it; the smoke runs one.""",
+}
+
+_THESIS_ARM_PREDICTION = {
+    "A": """REGISTERED BEFORE THE RUN, NEVER EDITED AFTER (thesis plan
+2026-09-15): A COLLAPSES TO q = 0 -- the median terminal grad-cosine falls
+below 0.05 and stays there, and the front holds no point at q >= 0.9.""",
+    "B": """REGISTERED BEFORE THE RUN, NEVER EDITED AFTER: B STAYS AT q = 1 --
+the terminal plans stay at or next to the identity (approx_prob/none above
+0.99) for the whole run.""",
+    "C": """REGISTERED BEFORE THE RUN, NEVER EDITED AFTER: C is the arm that
+produces a FRONT -- at least one terminal plan with paired latency ratio
+<= 0.6 at quality >= tau by episode 250, and that plan still present in at
+least 20 percent of terminal plans 250 episodes later.""",
+    "C_popart": """REGISTERED BEFORE THE RUN, NEVER EDITED AFTER: the same
+front as C, reached no later, with a visibly smaller spread of the scalarized
+advantage across channels.""",
+    "condC": """REGISTERED BEFORE THE RUN, NEVER EDITED AFTER: one conditioned
+run covers the front that the unconditioned C seeds cover between them -- the
+readout at the final checkpoint over 40 preference points spans at least the
+latency range the five C seeds span.""",
+}
+
+_THESIS_FALSIFIER = """If the arm neither collapses nor produces a front but
+drifts (approx_prob/none > 0.99 with no plan outside the drift floor by
+episode 250), the result is reported as drift, on this reward, at this init.
+The arm is NOT retuned mid-matrix and no seed is dropped: the five seeds of an
+arm are reported together or not at all."""
+
+_THESIS_HELD = """The owner authorised the FIRST BLOCK only: C and C_popart on
+both targets at all five seeds, then condC on both targets at all five seeds,
+then A and B at seed """ + THESIS_SEEDS[0] + """ only.  The remaining A and B
+seeds are GENERATED so that the matrix is complete and reviewable, and they
+are HELD so that a stray `sbatch fq_*.sbatch` cannot start one.  Remove
+`held=` from the row in tools/gen_fq_launchers.py and regenerate when the
+owner releases them."""
+
+
+def thesis_run_name(arm: str, target: str, seed: str) -> str:
+    """`<arm>_<target>_s<seed>` (owner ruling 2026-09-16)."""
+    if arm not in THESIS_ARM_SPEC:
+        raise CampaignRowError(f"arm {arm!r} is not one of {THESIS_ARMS}")
+    if target not in THESIS_TARGET_CLI:
+        raise CampaignRowError(
+            f"target {target!r} is not one of {THESIS_TARGETS}")
+    if seed not in THESIS_SEEDS:
+        raise CampaignRowError(f"seed {seed!r} is not one of {THESIS_SEEDS}")
+    return f"{arm}_{target}_s{seed}"
+
+
+def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
+               episodes: str, checkpoint_every: str,
+               auto_stop: bool) -> dict:
+    """The `cli` override dict of one thesis run.
+
+    Everything the owner fixed is HERE, once, so the block and the smoke
+    cannot disagree about anything except the three arguments the smoke
+    changes on purpose (episodes, checkpoint interval, auto-stop).
+    """
+    bias, form, advantage_norm, conditioned = THESIS_ARM_SPEC[arm]
+    gpus = THESIS_NODE_GPUS[node]
+    cli: dict = {
+        "--name": name,
+        "--seed": seed,
+        # --- the target
+        **THESIS_TARGET_CLI[target],
+        # --- the search space
+        "--approx-profile": THESIS_PROFILE,
+        "--fixed-order": THESIS_ORDER,
+        "--approx-add": APPROX_ADD,
+        # --- the face head at init
+        "--face-none-bias": bias,
+        "--scale-face-head": SCALE_FACE_HEAD_MVP,
+        "--face-logit-clamp": FACE_LOGIT_CLAMP_MVP,
+        # --- the reward
+        "--rewards": "cmp mem acc",
+        "--lambda-cmp": "1",
+        "--lambda-mem": "1",
+        "--lambda-acc": THESIS_LAMBDA_Q,
+        "--paired-cost-floor": PAIRED_COST_FLOOR,
+        "--advantage-norm": advantage_norm,
+        # --- the measurement, sized by the node
+        "--ray-measure": THESIS_RAY_MEASURE[gpus],
+        "--ray-measure-timeout": CAMPAIGN_RAY_MEASURE_TIMEOUT,
+        "--measure-pipeline": CAMPAIGN_MEASURE_PIPELINE,
+        "--rollout-shards": CAMPAIGN_ROLLOUT_SHARDS,
+        "--tokenize-where": CAMPAIGN_TOKENIZE_WHERE,
+        "--face-wire-faces": CAMPAIGN_FACE_WIRE_FACES,
+        # --- the gate inputs (G1's table is resolved from --fixed-order)
+        "--gate-offline-contrast": GATE_OFFLINE_CONTRAST[THESIS_ORDER],
+        # --- the run
+        "--episodes": episodes,
+        "--checkpoint-every": checkpoint_every,
+        "--pareto-dump-every": THESIS_PARETO_DUMP_EVERY,
+        "--plan-log": THESIS_PLAN_LOG,
+    }
+    if auto_stop:
+        cli["--auto-stop"] = None
+    if form == "L":
+        # THE LAGRANGIAN DUAL.  --quality-floor IS --lag-tau in this mode
+        # (ppo.py: "under lagrangian it IS the constraint threshold"), and
+        # --lambda-acc is ignored: the quality slot's weight is lambda.
+        cli["--reward-mode"] = "lagrangian"
+        cli["--quality-floor"] = THESIS_TAU
+        cli["--lag-eta"] = DUAL_ETA
+        cli["--lag-min"] = DUAL_LAMBDA_MIN
+        cli["--lag-max"] = DUAL_LAMBDA_MAX
+        cli["--lag-init"] = THESIS_LAMBDA_Q
+    else:
+        # ARMS A AND B: the fixed additive form with RAW quality and NO
+        # floor (owner ruling 2026-09-16, night).  --quality-floor is not in
+        # SHARED_CLI, so "no floor" is the absence of the flag, and the
+        # thesis test asserts the absence rather than trusting it.
+        cli["--reward-mode"] = "additive"
+    if conditioned:
+        cli["--preference-conditioned"] = None
+    if advantage_norm == "popart":
+        # The recorded trap (ticket .53): --no-symlog must be set with PopArt
+        # and the three symlog sites must agree.  --symlog-channels none IS
+        # --no-symlog; both are passed and ppo.py checks they agree.
+        cli["--no-symlog"] = None
+        cli["--symlog-channels"] = "none"
+    return cli
+
+
+def thesis_arm(*, arm: str, target: str, seed: str, node: str,
+               name: str | None = None, episodes: str = THESIS_EPISODES,
+               checkpoint_every: str = THESIS_CHECKPOINT_EVERY,
+               auto_stop: bool = True, what: str | None = None,
+               prediction: str | None = None, held: str | None = None,
+               time: str = THESIS_TIME, extra_cli: dict | None = None) -> dict:
+    """One thesis run -> one `arm(...)`.  Returns the arm."""
+    _require(node in THESIS_NODES,
+             f"node {node!r} is not one of the released thesis nodes "
+             f"{THESIS_NODES} (the owner held gpu17 and gpu19 for other "
+             f"agents on 2026-09-16; THESIS_NODES_ALL is the matrix's own "
+             f"list and this is the released subset)")
+    name = name or thesis_run_name(arm, target, seed)
+    _require(arm in THESIS_ARM_SPEC, f"arm {arm!r} is not one of {THESIS_ARMS}")
+    _require(target in THESIS_TARGET_CLI,
+             f"target {target!r} is not one of {THESIS_TARGETS}")
+    # The seed is checked here as well as in `thesis_run_name`, because a row
+    # that passes its own `name` (the smoke rows do) never reaches that
+    # helper, and a run on an unruled seed is not part of the matrix.
+    _require(seed in THESIS_SEEDS,
+             f"seed {seed!r} is not one of {THESIS_SEEDS}")
+    cli = thesis_cli(arm=arm, target=target, seed=seed, node=node, name=name,
+                     episodes=episodes, checkpoint_every=checkpoint_every,
+                     auto_stop=auto_stop)
+    if extra_cli:
+        cli.update(extra_cli)
+    gpus = THESIS_NODE_GPUS[node]
+    a = dict(
+        name=name, job=thesis_job_name(node), kind="train", runtime="scratch",
+        node=node, time=time, gpus=gpus, singleton=True, thesis=True,
+        thesis_arm=arm, thesis_target=target, thesis_seed=seed,
+        env=dict(THESIS_TARGET_ENV[target]),
+        required_flags=THESIS_REQUIRED_FLAGS,
+        required_flags_file=" ".join(THESIS_FLAGS_FILES),
+        cli=cli,
+        purpose=THESIS_HEAD + f"\n\nARM {arm} ON {target.upper()}, SEED "
+                              f"{seed}: " + (what or _THESIS_ARM_WHAT[arm]),
+        prediction=prediction or _THESIS_ARM_PREDICTION[arm],
+        falsifier=_THESIS_FALSIFIER,
+    )
+    if held:
+        a["held"] = held
+    arm_(**a)
+    return a
+
+
+def thesis_submission_order() -> list[tuple[str, str, str]]:
+    """(arm, target, seed) in THE OWNER'S PRIORITY ORDER (2026-09-16).
+
+    1. C and C_popart, both targets, five seeds.
+    2. condC, both targets, five seeds.
+    3. A and B at seed 250197 only.
+    4. the remaining A and B seeds -- generated, HELD, not submitted.
+
+    The node of a run is assigned round-robin over THESIS_NODES IN THIS
+    ORDER, so the first block spreads over every released node instead of
+    queueing behind one of them.
+    """
+    order: list[tuple[str, str, str]] = []
+    for a in ("C", "C_popart"):
+        for t in ("tlm", "nn256"):
+            for s in THESIS_SEEDS:
+                order.append((a, t, s))
+    for t in ("tlm", "nn256"):
+        for s in THESIS_SEEDS:
+            order.append(("condC", t, s))
+    for a in ("A", "B"):
+        for t in ("tlm", "nn256"):
+            order.append((a, t, THESIS_SEEDS[0]))
+    for a in ("A", "B"):
+        for t in ("tlm", "nn256"):
+            for s in THESIS_SEEDS[1:]:
+                order.append((a, t, s))
+    return order
+
+
+#: How many entries of `thesis_submission_order` the owner authorised to
+#: start after the smoke: C and C_popart (20), condC (10), A and B at one
+#: seed (4).  The rest are held.
+THESIS_BLOCK1 = 20 + 10 + 4
+
+
+def thesis_arms() -> list[dict]:
+    return [a for a in ARMS if a.get("thesis")]
+
+
+def thesis_block1_arms() -> list[dict]:
+    return [a for a in thesis_arms()
+            if not a.get("held") and not a.get("smoke")]
+
+
+# --- the 50 runs of the matrix ----------------------------------------------
+for _i, (_arm, _target, _seed) in enumerate(thesis_submission_order()):
+    thesis_arm(
+        arm=_arm, target=_target, seed=_seed,
+        node=THESIS_NODES[_i % len(THESIS_NODES)],
+        held=None if _i < THESIS_BLOCK1 else _THESIS_HELD,
+    )
+del _i, _arm, _target, _seed
+
+
+# ---------------------------------------------------------------------------
+# THE SMOKE (owner ruling 2026-09-16).  Three short runs on gpu16 that prove
+# the block can start, BEFORE 50 jobs are queued:
+#
+#   1. arm C on TLM, 20 episodes, --checkpoint-every 10, --auto-stop OFF.
+#      Auto-stop is off because its first check point is after 250 episodes;
+#      on a 20-episode run it would only print that no check point is
+#      reachable, and the smoke is about the checkpoint, not about it.
+#   2. the same command line plus --resume <the episode-10 checkpoint>.  The
+#      resume refuses any command line that differs from the checkpoint's in
+#      anything but --episodes and --resume, so this arm MUST be byte-equal
+#      to arm 1 apart from that one flag -- which is why both are generated
+#      from one `thesis_cli` call instead of being written twice.  The
+#      checkpoint path is a shell placeholder the submitter exports.
+#   3. condC on NN256, 5 episodes: the ONE combination no run has ever
+#      executed (the Lagrangian dual composed with the preference
+#      conditioning) on the target whose shape comes from an env var.
+#
+# All three carry the per-node singleton name of gpu16, so they queue behind
+# each other and behind the block instead of sharing the node with it (the
+# epilog kills siblings).
+# ---------------------------------------------------------------------------
+THESIS_SMOKE_EPISODES = "20"
+THESIS_SMOKE_CHECKPOINT_EVERY = "10"
+THESIS_SMOKE_NN_EPISODES = "5"
+_THESIS_RESUME_PLACEHOLDER = (
+    "${THESIS_RESUME:?export THESIS_RESUME to the episode-10 checkpoint "
+    "directory of the smoke run, e.g. .../ppo_ckpt_ep000000010}")
+
+_SMOKE_WHAT = """THE SMOKE, not a result.  It proves that the thesis command
+line starts on this stack, that a checkpoint is written, that a resume
+continues the SAME run (the plan log appends and the front dumps keep
+coming), and that the Lagrangian dual composed with the preference
+conditioning runs at all.  No claim is made about learning in 20 episodes."""
+
+_SMOKE_PREDICTION = """REGISTERED BEFORE THE RUN: the run reaches episode 20,
+writes ppo_ckpt_ep000000010 and ppo_ckpt_ep000000020, appends to
+plan_log_<name>.jsonl every episode and dumps a front every 10 episodes; the
+resumed leg starts at episode 10, does not re-run episodes 0-9, and appends to
+the same plan log and front series."""
+
+_SMOKE_FALSIFIER = """If the resume raises, or the plan log or the front dumps
+restart instead of continuing, the block is NOT submitted and the failure is
+reported as it stands."""
+
+thesis_arm(
+    arm="C", target="tlm", seed=THESIS_SEEDS[0], node=THESIS_SMOKE_NODE,
+    name="smoke_C_tlm", episodes=THESIS_SMOKE_EPISODES,
+    checkpoint_every=THESIS_SMOKE_CHECKPOINT_EVERY, auto_stop=False,
+    time="04:00:00", what=_SMOKE_WHAT, prediction=_SMOKE_PREDICTION,
+)
+ARMS[-1]["smoke"] = True
+ARMS[-1]["falsifier"] = _SMOKE_FALSIFIER
+
+thesis_arm(
+    arm="C", target="tlm", seed=THESIS_SEEDS[0], node=THESIS_SMOKE_NODE,
+    name="smoke_C_tlm", episodes=THESIS_SMOKE_EPISODES,
+    checkpoint_every=THESIS_SMOKE_CHECKPOINT_EVERY, auto_stop=False,
+    time="04:00:00", what=_SMOKE_WHAT, prediction=_SMOKE_PREDICTION,
+    extra_cli={"--resume": _THESIS_RESUME_PLACEHOLDER},
+)
+ARMS[-1]["smoke"] = True
+ARMS[-1]["falsifier"] = _SMOKE_FALSIFIER
+# The FILE name differs (a launcher per file) while --name does NOT: a resume
+# whose --name differed from the checkpoint's is refused, and that refusal
+# already cost one agent a suite run (agent-ckpt-report section 9).
+ARMS[-1]["name"] = "smoke_C_tlm_resume"
+
+thesis_arm(
+    arm="condC", target="nn256", seed=THESIS_SEEDS[0], node=THESIS_SMOKE_NODE,
+    name="smoke_condC_nn256", episodes=THESIS_SMOKE_NN_EPISODES,
+    checkpoint_every=THESIS_SMOKE_CHECKPOINT_EVERY, auto_stop=False,
+    time="04:00:00", what=_SMOKE_WHAT, prediction=_SMOKE_PREDICTION,
+)
+ARMS[-1]["smoke"] = True
+ARMS[-1]["falsifier"] = _SMOKE_FALSIFIER
+
+
+def thesis_smoke_arms() -> list[dict]:
+    return [a for a in ARMS if a.get("smoke")]
+
+
 # ---------------------------------------------------------------------------
 # RENDERING
 # ---------------------------------------------------------------------------
@@ -2426,9 +2985,14 @@ def _stack_exists_check() -> list[str]:
     ]
 
 
-def _scratch_stack_block() -> list[str]:
+def _scratch_stack_block(target_env: dict | None = None) -> list[str]:
     """The environment of a campaign arm: the stack, the plumbing, the TLM
-    shape, the measurement vars, the no-flag knobs.  Nothing else."""
+    shape, the measurement vars, the no-flag knobs.  Nothing else.
+
+    ``target_env`` is the thesis matrix's one addition: the target-shape
+    variable a NeuralNetwork arm needs at import time (THESIS_TARGET_ENV).
+    Empty for every campaign arm, so their rendering does not move."""
+    target_env = dict(target_env or {})
     L = _stack_exists_check() + [
         f"export PYTHONPATH={CAMPAIGN_STACK}/graphax/src:{CAMPAIGN_STACK}/alphagrad/src",
         f"export DSNN_WIKITEXT_DIR={CAMPAIGN_CACHE}/dsnn_wikitext",
@@ -2451,6 +3015,14 @@ def _scratch_stack_block() -> list[str]:
     L.append("# in the header's TODO block with their evidence; promote and delete.")
     for k, v, _why in NO_FLAG_ENV:
         L.append(f"export {k}={v}")
+    if target_env:
+        L.append("")
+        L.append("# THE TARGET SHAPE (thesis matrix, ticket dsnn-dfw.4).  The")
+        L.append("# NeuralNetwork target's hidden width is read at IMPORT time by")
+        L.append("# common/examples.py (module-scope _EQ_NN_HIDDEN) exactly as the")
+        L.append("# ALPHAGRAD_TLM_* triple above is, and ppo.py has no flag for it.")
+        for k in sorted(target_env):
+            L.append(f"export {k}={target_env[k]}")
     L.append("")
     L.extend(_jax_cache_lines())
     return L
@@ -2471,9 +3043,13 @@ def render(a: dict) -> str:
     L.append(f"#SBATCH -w {a['node']}")
     if scratch:
         # THE CAMPAIGN HARDWARE: the whole Blackwell node, by its gres name.
-        L.append(f"#SBATCH --gres={CAMPAIGN_GRES}")
-        L.append(f"#SBATCH -c {CAMPAIGN_CPUS}")
-        L.append(f"#SBATCH --mem={CAMPAIGN_MEM}")
+        # Sized by the arm's own GPU count, because the thesis matrix runs on
+        # BOTH Blackwell sizes: gpu19 and gpu20 carry eight GPUs and 128 CPUs,
+        # gpu15-gpu18 carry four and 64 (sinfo, 2026-09-16).  A campaign arm
+        # is 8 GPUs and renders the identical three lines it always did.
+        L.append(f"#SBATCH --gres={blackwell_gres(gpus)}")
+        L.append(f"#SBATCH -c {BLACKWELL_CPUS[gpus]}")
+        L.append(f"#SBATCH --mem={BLACKWELL_MEM[gpus]}")
     elif gpus:
         L.append(f"#SBATCH --gres=gpu:{gpus}")
         L.append("#SBATCH -c 64")
@@ -2483,6 +3059,17 @@ def render(a: dict) -> str:
         L.append("#SBATCH --mem=64G")
     L.append(f"#SBATCH -t {a['time']}")
     L.append(f"#SBATCH -J {a['job']}")
+    if a.get("singleton"):
+        # THE PER-NODE SINGLETON QUEUE (owner ruling 2026-09-16, the thesis
+        # matrix).  `-J` is the NODE, not the run, and `--dependency=singleton`
+        # holds a job until every other job of this user with the same name
+        # has finished.  Slurm then runs one of our jobs per node at a time
+        # and starts the next as soon as that node frees up.  Two jobs of one
+        # user on one pgi15 node kill each other through the node epilog
+        # (memory note pgi15-epilog-kills-sibling-jobs), so this is a
+        # correctness guard, not a convenience.  The RUN's own name is
+        # --name / the -o log file, not -J.
+        L.append("#SBATCH --dependency=singleton")
     # -D and -o on /Scratch, for every arm (owner ruling 2026-09-14): a
     # launcher whose -o names the missing/stale home fails at launch with
     # ExitCode 0:53 (finding 57).  CAMPAIGN_RUNS must exist before sbatch
@@ -2560,11 +3147,16 @@ def render(a: dict) -> str:
 
     # --- the environment
     if scratch:
-        if a.get("env"):
+        allowed_env = THESIS_TARGET_ENV_ALLOWED if a.get("thesis") else set()
+        bad = sorted(set(a.get("env") or {}) - set(allowed_env))
+        if bad:
             raise CampaignRowError(
                 f"{a['name']}: a campaign arm carries no per-arm env "
-                f"(got {sorted(a['env'])}); every knob is an argument")
-        L.extend(_scratch_stack_block())
+                f"(got {bad}); every knob is an argument. A THESIS arm may "
+                f"carry only {sorted(THESIS_TARGET_ENV_ALLOWED)}, the target "
+                f"shape that common/examples.py reads at import time and for "
+                f"which ppo.py has no flag.")
+        L.extend(_scratch_stack_block(a.get("env") or {}))
     else:
         # A wave/cpu/tool arm (owner ruling 2026-09-14): the same stack, the
         # same node-local $HOME for wandb, and the same ABORT(66) check as a

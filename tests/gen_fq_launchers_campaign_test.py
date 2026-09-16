@@ -797,7 +797,13 @@ def test_the_wave_arms_keep_their_own_env_but_run_the_campaign_stack(gen):
     SHARED_ENV (not args-only: `is_scratch` -- and the full-node Blackwell
     hardware and env-purity check that comes with it -- stays False), and
     their own 4-GPU hardware request."""
-    waves = [a for a in gen.ARMS if a["kind"] == "train" and not a.get("phase")]
+    # The THESIS arms (ticket dsnn-dfw.4) are a third family: they run the
+    # /Scratch stack like a campaign arm (`is_scratch` True) and they carry no
+    # phase, so they are excluded by name here and pinned in
+    # tests/gen_fq_launchers_thesis_test.py instead.
+    waves = [a for a in gen.ARMS
+             if a["kind"] == "train" and not a.get("phase")
+             and not a.get("thesis")]
     assert waves
     for a in waves:
         assert not gen.is_scratch(a), a["name"]
