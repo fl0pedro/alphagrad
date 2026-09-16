@@ -1470,3 +1470,52 @@ def test_the_window_generator_fills_eleven_slots():
                      temporal_rule="window2")
     for slot, d in zip(gen.data_slots, data):
         assert jnp.shape(d) == jnp.shape(xs[slot]), slot
+
+
+# ---------------------------------------------------------------------------
+# 15. THE QUALITY FLOOR THAT WAS NOT A QUALITY (defect found 2026-09-16)
+#
+# `_quality_metrics` guarded its denominator with `max(||.||, sqrt(1e-7))`,
+# which is a FLOOR at a gradient norm of 3.16e-4. Below it the cosine of two
+# BIT-IDENTICAL Jacobians reads ||g||^2 / 1e-7 instead of 1.0, silently. One
+# step of a sparse spiking network lives in exactly that regime -- measured
+# 2.19e-4 on the two-copy window arm -- so the floor would have priced the
+# sampled step position instead of the plan on every SNN row.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("scale", [1.0, 1e-2, 1e-4, 1e-6])
+def test_two_identical_gradients_score_one_at_every_scale(scale):
+    import alphagrad.approx.env as envmod
+    g = tuple(jnp.asarray(np.random.RandomState(0).randn(*s), jnp.float32)
+              * scale for s in ((8, 5), (5, 5), (3, 5)))
+    cos, rel = envmod._quality_metrics(g, g)
+    assert abs(float(cos) - 1.0) < 1e-5, (scale, float(cos))
+    assert float(rel) < 1e-5
+
+
+def test_a_zero_reference_still_scores_zero_and_is_dropped():
+    """The cosine is UNDEFINED against a zero reference, and the channel drops
+    such a batch rather than counting it. The guard against zero stays; only
+    the guard against SMALL is gone."""
+    import alphagrad.approx.env as envmod
+    z = tuple(jnp.zeros(s, jnp.float32) for s in ((8, 5), (5, 5)))
+    a = tuple(jnp.ones(s, jnp.float32) for s in ((8, 5), (5, 5)))
+    cos, rel = envmod._quality_metrics(z, a)
+    assert float(cos) == 0.0
+    assert float(rel) == 1.0
+
+
+def test_a_small_gradient_scores_the_angle_and_not_its_size():
+    """Two gradients at a fixed angle score the same cosine whatever their
+    length. That is what a cosine means, and what the floor broke."""
+    import alphagrad.approx.env as envmod
+    rs = np.random.RandomState(1)
+    e0 = tuple(jnp.asarray(rs.randn(*s), jnp.float32) for s in ((8, 5), (5, 5)))
+    a0 = tuple(x + 0.25 * jnp.asarray(rs.randn(*x.shape), jnp.float32)
+               for x in e0)
+    ref = float(envmod._quality_metrics(e0, a0)[0])
+    for scale in (1e-3, 1e-5, 1e-7):
+        e = tuple(x * scale for x in e0)
+        a = tuple(x * scale for x in a0)
+        got = float(envmod._quality_metrics(e, a)[0])
+        assert abs(got - ref) < 1e-4, (scale, got, ref)
