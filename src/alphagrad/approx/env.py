@@ -2237,8 +2237,14 @@ def _record_plan(rec: dict) -> None:
     # be read back against another. The builder is the only place that knows
     # it; this is the one choke point every record passes through. Empty for
     # every other target, and then nothing is written.
+    # The PROBE BATCH's draw wins when there is one: under the default
+    # grad_cosine quality metric the batch is what the quality channel was
+    # actually scored on, it is redrawn per (environment, episode), and the
+    # builder's own tuple is only the run's starting point. Falls back to the
+    # builder for a run with no probe (quality metric `none`, or a target
+    # whose generator declares no `meta`).
     from alphagrad.approx.common.rsnn_shd import last_step_position
-    _pos = last_step_position()
+    _pos = probe_meta() or last_step_position()
     if _pos:
         rec["step_position"] = _pos
     _PLAN_RECORDS.append(rec)
@@ -5510,6 +5516,24 @@ def _walk_noise_std() -> float:
 _PROBE_BATCH: dict = {}
 _PROBE_BATCH_MAX = 4
 
+# WHAT THE LAST PROBE BATCH WAS DRAWN AT, for the plan record. A generator
+# that declares a ``meta`` callable answers "which draw is this?" -- on the
+# one-step recurrent SHD target that is the STEP POSITION, and a record that
+# does not say which step it measured cannot be read back against another
+# (owner ruling 2026-09-16). Empty for every generator that declares none.
+_PROBE_META: dict = {}
+
+# Strides folded into the probe seed when a generator asks to be redrawn per
+# (environment, episode). Large and coprime with `_WALK_EPISODE_STRIDE`, so no
+# two (env row, episode) pairs can land on one PRNGKey.
+_PROBE_ENV_STRIDE = 15485863
+_PROBE_EPISODE_STRIDE = 32452843
+
+
+def probe_meta() -> dict:
+    """What the last probe batch of this process was drawn at."""
+    return dict(_PROBE_META)
+
 
 def _probe_batch(config, base_args, role: str = "train",
                  episode: int | None = None, index: int = 0):
@@ -5542,17 +5566,35 @@ def _probe_batch(config, base_args, role: str = "train",
     # cosine. index=0 is bit-identical to the pre-index behaviour, so
     # the loss-drop walk's batch does not move.
     _seed = _walk_seed(role, episode) + 104729 * int(index)
+    # PER ENVIRONMENT AND PER EPISODE, when the generator asks for it (owner
+    # ruling 2026-09-16). `_walk_seed` rotates per episode only behind
+    # ALPHAGRAD_WALK_ROTATE, and never per environment, so a generator whose
+    # DRAW is the quantity under study -- the recurrent SHD step position --
+    # says so with `resample_per_env_episode` and gets both folded in here.
+    # Absent on every other generator, and then this is the identity and the
+    # batch is the one batch per process it has always been.
+    if getattr(config.data_gen, "resample_per_env_episode", False):
+        _ep = walk_episode() if episode is None else int(episode)
+        _seed += (_PROBE_EPISODE_STRIDE * int(_ep)
+                  + _PROBE_ENV_STRIDE * (current_env_slot() + 1))
     _key = (id(config.data_gen), _seed,
             tuple(getattr(a, "shape", ()) for a in base_args[:2]))
     hit = _PROBE_BATCH.get(_key)
     if hit is not None:
-        return hit
+        _PROBE_META.clear()
+        _PROBE_META.update(hit[1])
+        return hit[0]
     k = jrand.PRNGKey(_seed)
-    data = config.data_gen(jrand.split(k, 5))
+    keys = jrand.split(k, 5)
+    data = config.data_gen(keys)
     data = tuple(jax.device_get(d) for d in data)
+    _meta_fn = getattr(config.data_gen, "meta", None)
+    meta = dict(_meta_fn(keys)) if _meta_fn is not None else {}
     if len(_PROBE_BATCH) >= _PROBE_BATCH_MAX:
         _PROBE_BATCH.clear()
-    _PROBE_BATCH[_key] = data
+    _PROBE_BATCH[_key] = (data, meta)
+    _PROBE_META.clear()
+    _PROBE_META.update(meta)
     return data
 
 
@@ -5665,13 +5707,28 @@ def _grad_cosine_quality(config, compiled_approx, ref_ex, ref_key, base_args,
         return None
     cos_all: list[float] = []
     frob_all: list[float] = []
+    _degenerate = 0
     for k in range(max(1, int(k_batches))):
         data = _probe_batch(config, base_args, role="train", index=k)
         if data is None:
             return None
         a = list(base_args)
-        for slot in range(min(2, len(data))):
-            a[slot] = jax.device_put(jnp.asarray(data[slot]), device)
+        # WHICH SLOTS THE BATCH FILLS is the generator's statement
+        # (`data_slots`), not this function's guess. It used to be
+        # `range(min(2, len(data)))` -- true of every image / token generator,
+        # and identical to the line below for them, but false for a generator
+        # whose draw is a carried state and a block of given values further
+        # along the tuple.
+        _slots = getattr(config.data_gen, "data_slots", None)
+        _slots = (tuple(range(len(data))) if _slots is None
+                  else tuple(int(i) for i in _slots))
+        if len(_slots) != len(data):
+            raise ValueError(
+                f"the data generator declares {len(_slots)} slots and "
+                f"returned {len(data)} arrays; one of them would land in the "
+                f"wrong argument.")
+        for slot, d in zip(_slots, data):
+            a[slot] = jax.device_put(jnp.asarray(d), device)
         _seed = _walk_seed("train", None) + 104729 * int(k)
         try:
             out_a = compiled_approx(*a)
@@ -5681,10 +5738,34 @@ def _grad_cosine_quality(config, compiled_approx, ref_ex, ref_key, base_args,
         jac_a = out_a[1] if config.has_aux else out_a
         jac_e = out_e[1] if config.has_aux else out_e
         cos, rel = _quality_metrics(jac_e, jac_a)
-        cos_all.append(float(cos))
+        cos = float(cos)
+        if cos == 0.0:
+            # A ZERO REFERENCE IS NOT A BAD PLAN. The cosine is undefined when
+            # the EXACT gradient is identically zero, and the formula above
+            # then returns 0.0 -- the worst possible score, handed to a plan
+            # that reproduced the reference perfectly. It happens on a sparse
+            # spiking target: at a step where no hidden unit fired and the
+            # input frame is empty, every weight gradient is exactly zero.
+            # Drop that batch instead of scoring it.
+            _d, _ee, _aa, _rr, _tot = _gradient_similarity(
+                jac_e, jac_e, "grad_cosine")
+            if float(_ee) <= 0.0:
+                _degenerate += 1
+                out_a = out_e = jac_a = jac_e = None
+                continue
+        cos_all.append(cos)
         frob_all.append(float(rel))
         out_a = jac_a = jac_e = None
     if not cos_all:
+        if _degenerate and not _ZERO_REFERENCE_WARNED:
+            _ZERO_REFERENCE_WARNED.append(1)
+            print(
+                f"[measure] WARNING quality channel: the EXACT gradient is "
+                f"identically zero on all {_degenerate} probe batch(es), so "
+                f"the gradient cosine is undefined and the channel reads 0.0. "
+                f"On a spiking target this means the sampled step fired "
+                f"nothing; widen the probe (ALPHAGRAD_GRAD_COSINE_K) or raise "
+                f"the target's firing rate.", flush=True)
         return None
     return float(np.mean(cos_all)), frob_all, cos_all
 
@@ -5918,6 +5999,9 @@ _MEASURE_ACTOR = os.environ.get("ALPHAGRAD_MEASURE_ACTOR", "0") == "1"
 _MEM_FALLBACK_WARNED: list = []
 # One-shot warning flag for an undefinable loss-drop walk (see _callback).
 _WALK_UNDEFINED_WARNED: list = []
+
+# One-shot flag for the zero-exact-gradient case in `_grad_cosine_quality`.
+_ZERO_REFERENCE_WARNED: list = []
 # One-shot warning when the EXACT reference gradient cannot be built (see the
 # fail-soft branch of the fidelity block in `_callback`).
 _FID_REF_WARNED: list = []

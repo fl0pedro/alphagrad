@@ -35,6 +35,7 @@ from alphagrad.approx.common.rsnn_shd import (
     is_rsnn,
     resolve_temporal_rule,
     rsnn_args,
+    rsnn_data_gen,
 )
 
 # ALPHAGRAD_SNN_STEPS and ALPHAGRAD_SNN_TRUNC were the two environment
@@ -131,12 +132,41 @@ def _vision_base(fn_str):
     return base if base in _VISION_MODELS else None
 
 
-def data_gen(fn_str: str, dataset: str | None = None, dataset_size: int | None = -1):
+def data_gen(fn_str: str, dataset: str | None = None, dataset_size: int | None = -1,
+             key=None, temporal_rule: str | None = None):
     """Return a `keys -> data` jit-able function used to refresh dataset args.
 
     Returns `None` if the example does not have a data generator (most analytic
     examples like Helmholtz/Lighthouse/RoeFlux fall back to fixed args at startup).
+
+    A generator may declare WHICH argument slots it fills, as a ``data_slots``
+    attribute on the returned callable. Without it the slots are ``0`` to
+    ``len(data) - 1``, which is what every generator below but the recurrent
+    SHD one does.
     """
+    if is_rsnn(fn_str):
+        # THE STEP POSITION IS A DATA DRAW (owner ruling 2026-09-16). On the
+        # one-step recurrent target everything that changes with the step
+        # position -- the input frame, the carried state, and the rule's given
+        # values -- is data, so the refresher that samples a new step position
+        # IS the data generator. Without one the gradient cosine was undefined
+        # and reward slot 6 read 0.0 on every SHD plan.
+        #
+        # THE KEY IS NOT OPTIONAL HERE. The generator has to draw the SAME
+        # recording and the SAME weights `get_args` drew, or the reference
+        # weights it hands back stop matching slots 7 to 9 and the attached
+        # `W - W_ref` stops being zero -- which moves the forward value in
+        # silence. Pass the key `get_args` was given.
+        if key is None:
+            raise ValueError(
+                f"data_gen({fn_str!r}) needs the same `key` that was passed "
+                f"to get_args: the generator redraws the step position on a "
+                f"recording and a weight set that must be the run's own. "
+                f"Call data_gen(example, ..., key=args_key, "
+                f"temporal_rule=args.temporal_rule).")
+        return rsnn_data_gen(key, dataset=dataset, dataset_size=dataset_size,
+                             temporal_rule=resolve_temporal_rule(
+                                 fn_str, temporal_rule))
     if fn_str == "Helmholtz":
 
         @jax.jit

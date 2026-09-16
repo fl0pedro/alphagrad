@@ -192,58 +192,84 @@ def _step_loss(Uo, y):
     return jnp.sum(-y * jax.nn.log_softmax(Uo))
 
 
-def prefix_state(seq, t: int, weights, state0=None):
+def prefix_state(seq, t, weights, state0=None):
     """``s_(t-1)``: the state after steps ``0 .. t-1`` of ``seq``.
 
     Written as a function of the weights so the same code gives the VALUE and,
     under ``jax.jacrev``, the carried Jacobian. One ``lax.scan``, so the traced
     graph does not grow with ``t``.
+
+    ``t`` MAY BE A TRACED VALUE. The scan walks the WHOLE recording and step
+    ``u`` writes its result only while ``u < t``; the steps at and after ``t``
+    are computed and thrown away. That costs ``T`` cell evaluations instead of
+    ``t`` and buys the one property the per-episode step sampler needs: the
+    traced shape does not depend on ``t``, so ONE jit and ONE vmap serve every
+    step position, and the elimination graph is the same graph at every one of
+    them. The selected values are the values the ``seq[:t]`` scan produced,
+    entry for entry -- the cell sees the same inputs in the same order, and a
+    ``where`` selects, it does not compute.
     """
     cell = _cell()
     c = _consts()
     s0 = zero_state() if state0 is None else state0
+    T = int(seq.shape[0])
 
     def run(W, V, Wo):
-        def body(st, x):
-            return cell(x, *st, W, V, Wo, *c), None
-        st, _ = jax.lax.scan(body, s0, seq[:int(t)])
+        def body(st, inp):
+            u, x = inp
+            nxt = cell(x, *st, W, V, Wo, *c)
+            keep = u < t
+            return tuple(jnp.where(keep, a, b) for a, b in zip(nxt, st)), None
+        st, _ = jax.lax.scan(body, s0, (jnp.arange(T), seq))
         return st
     return run
 
 
-def suffix_adjoint(seq, t: int, weights, state_t):
+def suffix_adjoint(seq, t, weights, state_t):
     """``lambda_(t+1) = d (sum_(u>t) L_u) / d s_t``, by reverse mode.
 
     The suffix runs steps ``t+1 .. T-1`` from ``s_t`` and sums their losses.
     The gradient with respect to ``s_t`` is the adjoint the ``bptt`` rule
     attaches. An empty suffix gives five zero vectors, which is the right
     answer at the last step.
+
+    ``t`` MAY BE A TRACED VALUE, by the same construction
+    :func:`prefix_state` uses: the scan walks the whole recording, the state
+    handed in is INJECTED at ``u == t + 1``, and only the losses of the steps
+    after ``t`` are summed. Every earlier step reaches the injection through
+    the carry and contributes nothing to the gradient, because ``where``
+    selects the injected value there.
     """
     cell = _cell()
     c = _consts()
     W, V, Wo = weights
     T = int(seq.shape[0])
-    y_free = seq  # unused, kept for the closure's clarity
 
     def tail_loss(st, y):
-        def body(carry, x):
-            st = cell(x, *carry, W, V, Wo, *c)
-            return st, _step_loss(st[4], y)
-        st_end, losses = jax.lax.scan(body, st, seq[int(t) + 1:T])
+        def body(carry, inp):
+            u, x = inp
+            inject = u == t + 1
+            st_u = tuple(jnp.where(inject, a, b) for a, b in zip(st, carry))
+            nxt = cell(x, *st_u, W, V, Wo, *c)
+            return nxt, jnp.where(u > t, _step_loss(nxt[4], y), 0.0)
+        _, losses = jax.lax.scan(
+            body, zero_state(), (jnp.arange(T), seq))
         return jnp.sum(losses)
     return tail_loss
 
 
-def step_target_loss(seq, y, t: int, weights, state_prev):
-    """``L_t``: what the traced step returns under ``tbptt``."""
+def step_target_loss(seq, y, t, weights, state_prev):
+    """``L_t``: what the traced step returns under ``tbptt``.
+
+    ``t`` may be traced: ``seq[t]`` is a gather, not a slice."""
     cell = _cell()
     c = _consts()
     W, V, Wo = weights
-    nxt = cell(seq[int(t)], *state_prev, W, V, Wo, *c)
+    nxt = cell(seq[t], *state_prev, W, V, Wo, *c)
     return _step_loss(nxt[4], y), nxt
 
 
-def carried_jacobians(seq, t: int, weights, *, check_zeros: bool = True):
+def carried_jacobians(seq, t, weights, *, check_zeros: bool = True):
     """The RTRL attachment tuple: three reference weights, then ELEVEN blocks.
 
     Block ``(s, w)`` is ``d s_(t-1)^s / d W_w``, taken by reverse-mode
@@ -373,7 +399,7 @@ def eprop_traces(seq, t: int, weights):
             + tuple(sg(blocks[b]) for b in RSNN_CARRY_BLOCKS))
 
 
-def future_adjoints(seq, y, t: int, weights, state_prev):
+def future_adjoints(seq, y, t, weights, state_prev):
     """The BPTT attachment: five adjoints ``lambda_(t+1) = dL_(>t)/ds_t``."""
     _, state_t = step_target_loss(seq, y, t, weights, state_prev)
     tail = suffix_adjoint(seq, t, weights, state_t)
@@ -393,14 +419,133 @@ def last_step_position() -> dict:
     return dict(_LAST_STEP_POSITION)
 
 
-def sample_step_position(key, T: int) -> int:
-    """A uniform step position with a non-empty prefix.
+def sampled_step_position(key, T: int):
+    """The drawn step position, as an ARRAY. Traceable and vmappable.
 
-    ``t`` is drawn from ``1 .. T-1``. ``t = 0`` is excluded because its carried
-    state is the zero state and every given quantity is zero there, which makes
-    the three rules identical and hides what the run is measuring.
+    ``t`` is drawn uniformly from ``1 .. T-1``. ``t = 0`` is excluded because
+    its carried state is the zero state and every given quantity is zero
+    there, which makes the three rules identical and hides what the run is
+    measuring.
     """
-    return int(jax.random.randint(key, (), 1, int(T)))
+    return jax.random.randint(key, (), 1, int(T))
+
+
+def sample_step_position(key, T: int) -> int:
+    """:func:`sampled_step_position` as a Python int, for the host paths."""
+    return int(sampled_step_position(key, T))
+
+
+#: The argument slots the DATA GENERATOR fills, by rule. Slots 0 and 1 are the
+#: input frame and the label, 2 to 6 the carried state, 7 to 9 the weights and
+#: 10 to 15 the constants; the rule's given values follow at 16.
+RSNN_HEAD_SLOTS = 16
+
+
+def rsnn_data_slots(rule: str) -> tuple[int, ...]:
+    """The slots :func:`rsnn_data_gen` returns, in order.
+
+    THE WEIGHTS ARE AMONG THEM, and that is deliberate. The ``rtrl`` given
+    values LEAD with three REFERENCE WEIGHTS whose whole job is to be bit-for-
+    bit equal to the weights in slots 7 to 9, so that the attached
+    ``W - W_ref`` is exactly zero and no forward value moves. A refresher that
+    replaced the weights and not the reference weights (which is what
+    ``generate_eval_samples`` does to every slot a generator does not cover)
+    would break that equality in silence. So the generator owns the weights
+    too, and hands back the run's initial ones -- which is also the point at
+    which this target is defined (see WEIGHT_SCALE).
+    """
+    from graphax.examples.neuromorphic import RSNN_GIVEN_LENGTHS
+    n_given = {v: n for n, v in RSNN_GIVEN_LENGTHS.items()}[str(rule)]
+    return (tuple(range(0, 10))
+            + tuple(range(RSNN_HEAD_SLOTS, RSNN_HEAD_SLOTS + n_given)))
+
+
+def rsnn_data_gen(key=None, *, dataset: str | None = None,
+                  dataset_size: int | None = -1,
+                  temporal_rule: str | None = None):
+    """``keys -> the data-dependent argument slots``, at a SAMPLED ``t``.
+
+    OWNER RULING, 2026-09-16: the step position is sampled uniformly over the
+    recording PER ENVIRONMENT AND PER EPISODE. This is the object that does
+    it. Everything that changes with ``t`` is here -- the input frame, the
+    carried state, and the rule's given values (the carried Jacobian under
+    ``rtrl``, the future adjoints under ``bptt``, nothing under ``tbptt``) --
+    and everything that does not (the weights, the six decay constants) either
+    rides along unchanged or is left alone.
+
+    THE RECORDING IS FIXED, THE STEP POSITION IS NOT. The ruling asks for
+    ``t`` uniform OVER THE RECORDING, so one recording is drawn from the run's
+    key and every draw walks it. Holding the recording still also keeps this
+    function jittable and vmappable with a 280 kB closure instead of the
+    571 MB the whole binned split would cost on the device.
+
+    THE GRAPH SHAPE DOES NOT MOVE WITH ``t``. The prefix and the suffix are
+    masked scans over the whole recording (see :func:`prefix_state`), so the
+    traced step body, its vertex count and its face count are the same at
+    every step position. ``tests/temporal_rule_test.py`` asserts that.
+
+    WHAT ONE DRAW COSTS. One prefix pass of ``T`` cell evaluations plus, under
+    ``rtrl``, one reverse-mode Jacobian of that pass (``4 * hidden + classes``
+    = 532 cotangent sweeps) or, under ``bptt``, one suffix pass and one
+    reverse sweep. It is drawn once per (environment, episode), not once per
+    measured plan: the probe-batch cache in ``env._probe_batch`` is keyed by
+    the environment row and the episode.
+    """
+    rule = "tbptt" if temporal_rule is None else str(temporal_rule)
+    if rule not in TEMPORAL_RULES:
+        raise ValueError(f"temporal rule {rule!r} is not one of "
+                         f"{list(TEMPORAL_RULES)}")
+    key = jax.random.PRNGKey(1) if key is None else key
+    k = jax.random.split(key, 3)
+    seq, y, rec = _draw_recording(k[0], dataset, dataset_size)
+    weights = rsnn_weights(k[1])
+    T = int(seq.shape[0])
+    slots = rsnn_data_slots(rule)
+
+    def _t(keys):
+        return sampled_step_position(keys[0], T)
+
+    @jax.jit
+    def _draw(keys):
+        t = _t(keys)
+        sg = jax.lax.stop_gradient
+        state_prev = tuple(
+            sg(x) for x in prefix_state(seq, t, weights)(*weights))
+        head = (seq[t], y) + state_prev + weights
+        if rule == "tbptt":
+            given = ()
+        elif rule == "rtrl":
+            given = carried_jacobians(seq, t, weights, check_zeros=False)
+        else:
+            given = future_adjoints(seq, y, t, weights, state_prev)
+        out = head + tuple(given)
+        if len(out) != len(slots):
+            raise ValueError(
+                f"the {rule} generator built {len(out)} arrays for "
+                f"{len(slots)} declared slots {slots}")
+        return out
+
+    # A PLAIN PYTHON WRAPPER around the jitted draw: the attributes below are
+    # the generator's contract with the env, and a `PjitFunction` is a C type
+    # that does not take them.
+    def fn(keys):
+        return _draw(keys)
+
+    def meta(keys):
+        """``{t, T, recording, rule}`` of the draw ``keys`` produces."""
+        return {"t": int(_t(keys)), "T": T, "recording": int(rec),
+                "rule": rule}
+
+    # THE CONTRACT WITH env._probe_batch AND generate_eval_samples. Both used
+    # to assume a generator fills the first one or two argument slots; this
+    # one fills ten of them and then a block at 16. `data_slots` is how a
+    # generator says so, and a generator without the attribute keeps the old
+    # contiguous-from-zero behaviour exactly.
+    fn.data_slots = slots
+    #: Redraw per (environment, episode) rather than once per process.
+    fn.resample_per_env_episode = True
+    fn.meta = meta
+    return fn
 
 
 def rsnn_args(key=None, *, dataset: str | None = None,

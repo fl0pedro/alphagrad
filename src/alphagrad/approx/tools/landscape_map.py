@@ -386,10 +386,24 @@ _APPROX_ADD_CHOICES = ("lossy", "lossless")
 _APPROX_ADD_DEFAULT = "lossless"
 
 
-if __name__ == "__main__":
-    ARGS = make_argparser().parse_args()
-else:
-    ARGS = make_argparser().parse_args([])
+# THE IMPORT-TIME ARGUMENTS. Everything in the block below is a PROCESS-WIDE
+# env knob that has to be set before `alphagrad.approx.env` reads it, so it is
+# decided here, at import. A probe that sets `sys.argv` and then IMPORTS this
+# module is a supported way to drive the tool (it is how every measurement
+# script of 2026-09-16 is written), and it used to be served the DEFAULTS:
+# `parse_args([])` threw the argv away, so `--quality-metric jac_cosine`
+# silently ran `grad_cosine` and `--exec-on-gpu` only worked because its line
+# below reads `sys.argv` by hand. Read argv whenever argv NAMES this tool --
+# the same test, applied to every flag instead of one.
+def _import_time_argv() -> list:
+    if __name__ == "__main__":
+        return sys.argv[1:]
+    if os.path.basename(str(sys.argv[0] or "")).startswith("landscape_map"):
+        return sys.argv[1:]
+    return []
+
+
+ARGS = make_argparser().parse_args(_import_time_argv())
 
 # --- IMPORT-TIME env knobs -------------------------------------------------
 # `_MEASURE_ACTOR` is read at import of alphagrad.approx.env. Setting it here
@@ -510,7 +524,8 @@ def build_env(args):
                   temporal_rule=getattr(args, "temporal_rule", None),
                   step_position=getattr(args, "step_position", None))
     gen = data_gen(args.example, dataset=dataset_for_call,
-                   dataset_size=args.dataset_size)
+                   dataset_size=args.dataset_size, key=args_key,
+                   temporal_rule=getattr(args, "temporal_rule", None))
     target_fn, xs, argnums = grad_target_setup(args, target_fn, xs, args.example)
     closed_jaxpr = _traced_inlined(target_fn, xs)
 

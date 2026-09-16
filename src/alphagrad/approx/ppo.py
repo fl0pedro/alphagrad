@@ -7760,7 +7760,8 @@ def main():
               f"of T={_pos.get('T')}, recording {_pos.get('recording')}",
               flush=True)
     gen = data_gen(
-        args.example, dataset=dataset_for_call, dataset_size=args.dataset_size
+        args.example, dataset=dataset_for_call, dataset_size=args.dataset_size,
+        key=args_key, temporal_rule=args.temporal_rule,
     )
     # TARGET SETUP -- routed through the shared builder so the trainer and
     # every measure-actor construct the IDENTICAL graph (jaxpr / vertex+action

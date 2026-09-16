@@ -13,21 +13,44 @@ def generate_eval_samples(env_obj, key, num_samples: int = 10):
     refreshed via `config.data_gen`, and any `argnums` slots that aren't covered
     by the data generator get a fresh `jrand.normal` draw with the same shape
     and dtype as the existing arg.
+
+    WHICH SLOTS THE GENERATOR COVERS is the generator's own statement, read off
+    its ``data_slots`` attribute. Without one the slots are ``0`` to
+    ``len(data) - 1``, which is what every image / token generator does and is
+    byte-identical to the positional loop this replaces. The recurrent SHD
+    generator fills ten slots and then a block further along, so the
+    positional assumption would have scattered its carried state over the
+    weights.
     """
     config = env_obj.config
     args = env_obj.args
 
+    def _slots_of(data):
+        slots = getattr(config.data_gen, "data_slots", None)
+        if slots is None:
+            return tuple(range(len(data)))
+        slots = tuple(int(i) for i in slots)
+        if len(slots) != len(data):
+            raise ValueError(
+                f"the data generator declares {len(slots)} slots {slots} and "
+                f"returned {len(data)} arrays. A generator's `data_slots` is "
+                f"the contract every refresher reads; a mismatch would put "
+                f"one of its arrays in the wrong argument.")
+        return slots
+
     def get_one_sample(k):
         dk, wk = jrand.split(k)
         e_args = list(args)
+        covered: tuple = ()
         if config.data_gen is not None:
             data = config.data_gen(jrand.split(dk, 5))
-            for i, d in enumerate(data):
+            covered = _slots_of(data)
+            for i, d in zip(covered, data):
                 e_args[i] = d
         if config.argnums:
             w_keys = jrand.split(wk, len(config.argnums))
             for i, arg_idx in enumerate(config.argnums):
-                if config.data_gen is not None and arg_idx < len(data):
+                if config.data_gen is not None and arg_idx in covered:
                     continue
                 curr_val = e_args[arg_idx]
                 # Seed-vertex tangent seed (a 0-d scalar appended as the last
