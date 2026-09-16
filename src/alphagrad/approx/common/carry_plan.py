@@ -526,7 +526,22 @@ def transport_wires(o_list, variant, rule_specs, face_specs, face_skips,
         j = vmap.get(int(v))
         if j is None:
             continue                       # a carry vertex: nothing travels
-        k2 = pos[j]
+        k2 = pos.get(j)
+        if k2 is None:
+            # A STEP-BODY VERTEX THE VARIANT DOES NOT ELIMINATE. The
+            # eliminable set is a property of the GRAPH, not of the equation
+            # alone: `_build_graph` decides it from the arguments too, and
+            # the containers carry different ones. An all-exact row has
+            # nothing to carry and is dropped; a row that carries a decision
+            # would have it vanish, so it raises.
+            if (int(fs[k][..., 0].max()) != -1 or int(sk[k].max()) != 0
+                    or int(rs[k][:, 0].max()) != -1):
+                raise ValueError(
+                    f"vertex {int(v)} of the policy's graph carries an "
+                    f"approximation and its image {j} is not eliminable on "
+                    f"the measured graph, so the decision would be dropped "
+                    f"in silence.")
+            continue
         rs2[k2] = rs[k]
         fs2[k2] = fs[k]
         sk2[k2] = sk[k]
