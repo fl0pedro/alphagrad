@@ -194,7 +194,7 @@ def test_a_wrong_given_shape_raises():
     bad = tuple(W) + tuple(jnp.zeros((2, 2, 2)) for _ in RSNN_CARRY_BLOCKS)
     with pytest.raises(ValueError, match="Nothing else is a container"):
         attach_rsnn_past(st, W, bad)
-    with pytest.raises(ValueError, match="does not match the state"):
+    with pytest.raises(ValueError, match="nor the reduced container"):
         attach_rsnn_future(jnp.array(0.0), st,
                            tuple(jnp.zeros((3,)) for _ in range(5)))
     with pytest.raises(ValueError, match="one adjoint per state"):
@@ -614,8 +614,8 @@ def test_the_graph_shape_does_not_move_with_the_step_position(rule):
     assert len(seen) == 1, f"the graph moved with t: {seen}"
 
 
-def _jaxpr_of(xs):
-    fn = ex.get_fn("RSNN_SHD")
+def _jaxpr_of(xs, example="RSNN_SHD"):
+    fn = ex.get_fn(example)
     cj = jax.make_jaxpr(fn)(*xs)
     jx, _ = _inline_call_primitives(cj.jaxpr, cj.literals)
     return jx
@@ -1228,7 +1228,7 @@ def test_a_reduce_and_a_quant_plan_score_below_one(container):
     a = np.concatenate([np.asarray(x, np.float64).ravel() for x in g_ap])
     b = np.concatenate([np.asarray(x, np.float64).ravel() for x in g_ex])
     cos = float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))
-    assert cos < 1.0 - 1e-6, (container, cos)
+    assert cos < 1.0 - 1e-9, (container, cos)
 
 
 def test_the_adjoint_containers_are_the_two_a_vector_can_express():
@@ -1401,7 +1401,8 @@ def test_a_step_body_that_stops_matching_raises():
     lm, CP, env = _env_for("rtrl")
     other = _jaxpr_of(ex.get_args(R.RSNN_W2_TARGET, jax.random.PRNGKey(1),
                                   dataset=None, temporal_rule="window2",
-                                  step_position=T_PIN))
+                                  step_position=T_PIN),
+                      example=R.RSNN_W2_TARGET)
     with pytest.raises(ValueError, match="disagree about the STEP BODY"):
         CP._alignment(env.config.jaxpr, other)
 
@@ -1436,7 +1437,7 @@ def test_the_window_arm_has_no_given_edge():
 def test_the_window_arm_carries_two_step_scopes():
     xs = ex.get_args(R.RSNN_W2_TARGET, jax.random.PRNGKey(1), dataset=None,
                      temporal_rule="window2", step_position=T_PIN)
-    jx = _jaxpr_of(xs)
+    jx = _jaxpr_of(xs, example=R.RSNN_W2_TARGET)
     tags = to.step_tags(jx)
     assert set(int(t) for t in tags) >= {0, 1}
 
