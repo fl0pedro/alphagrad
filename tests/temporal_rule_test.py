@@ -160,7 +160,11 @@ def test_carried_block_shapes_and_bytes():
     # the three reference weights lead the tuple
     for ref, w in zip(xs[16:19], xs[7:10]):
         assert np.array_equal(np.asarray(ref), np.asarray(w))
-    assert total * 4 == 225_742_848
+    # 226 MB: four hidden components against W and V, plus the readout row
+    want_total = (4 * (h * h * n_in) + 4 * (h * h * h)
+                  + n_out * h * n_in + n_out * h * h + n_out * n_out * h)
+    assert total == want_total == 56_434_688
+    assert total * 4 == 225_738_752
 
 
 def test_the_structurally_zero_blocks_really_are_zero():
