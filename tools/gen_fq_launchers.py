@@ -2328,9 +2328,10 @@ up.  The measurement fan-out follows the node: --ray-measure
 4-GPU nodes, one actor per GPU the trainer does not hold.
 
 DATA.  /Scratch is NOT persistent.  The nightly copy job
-(thesis_nightly_copy.sbatch) mirrors the run directory, the plan log, the
-front dumps, the checkpoints and auto_stop.json to
-/Users/assmuth/thesis-runs/<run name>/ whenever the home export accepts
+(tools/thesis_nightly_copy.sh, run by a cron entry on the login host at 02:23)
+mirrors the run directory -- which is where the plan log, the front dumps, the
+checkpoints and auto_stop.json all land, by common/checkpoint.run_directory --
+to the home export's thesis-runs directory whenever that export accepts
 writes, and marks a copy complete only after a checksum list verifies."""
 
 _THESIS_ARM_WHAT = {
