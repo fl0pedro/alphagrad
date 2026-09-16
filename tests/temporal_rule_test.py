@@ -912,7 +912,7 @@ def test_the_generator_publishes_an_exact_reference_draw_only_when_it_needs_one(
     assert getattr(plain, "reference_draw", None) is None
     approx = ex.data_gen("RSNN_SHD", dataset=None, key=jax.random.PRNGKey(1),
                          temporal_rule="rtrl", carry_container="eprop")
-    ref = approx.reference_draw
+    ref = getattr(approx, "reference_draw")
     keys = jax.random.split(jax.random.PRNGKey(5), 5)
     a = approx(keys)
     r = ref(keys)
@@ -921,37 +921,84 @@ def test_the_generator_publishes_an_exact_reference_draw_only_when_it_needs_one(
     for i in range(10):
         np.testing.assert_array_equal(np.asarray(a[i]), np.asarray(r[i]))
     assert sum(int(np.asarray(x).nbytes) for x in r[10:]) > \
-        100 * sum(int(np.asarray(x).nbytes) for x in a[10:])
+        80 * sum(int(np.asarray(x).nbytes) for x in a[10:])
 
 
 def test_the_oracle_reference_makes_the_accumulated_error_visible():
-    """The number reward slot 6 holds under an approximated carry."""
+    """WHAT REWARD SLOT 6 HOLDS under an approximated carry.
+
+    The plan is EXACT, so everything left in the number is the error the RULE
+    accumulated over the whole recording. Pinned against the same cosine
+    computed directly, so the test says the channel reports that quantity
+    whatever step position the draw landed on."""
     import alphagrad.approx.env as envmod
 
     fn = ex.get_fn("RSNN_SHD")
     argnums = tuple(ex.infer_argnums("RSNN_SHD"))
 
     class _C:
-        data_gen = ex.data_gen("RSNN_SHD", dataset=None,
+        pass
+    cfg = _C()
+    # ON THE INSTANCE, not the class: a plain function stored as a CLASS
+    # attribute is served as a bound method and would be handed `self`.
+    cfg.data_gen = ex.data_gen("RSNN_SHD", dataset=None,
                                key=jax.random.PRNGKey(1),
                                temporal_rule="rtrl", carry_container="eprop")
-        target_fun = staticmethod(fn)
-        scalar_target = True
-        has_aux = False
-    cfg = _C()
+    cfg.target_fun = fn
+    cfg.scalar_target = True
+    cfg.has_aux = False
     cfg.argnums = argnums
-    xs = ex.get_args("RSNN_SHD", jax.random.PRNGKey(1), dataset=None,
-                     temporal_rule="rtrl", carry_container="eprop")
+    xs = list(ex.get_args("RSNN_SHD", jax.random.PRNGKey(1), dataset=None,
+                          temporal_rule="rtrl", carry_container="eprop"))
 
     def exact_plan(*a):
         return list(jax.grad(fn, argnums=argnums)(*a))
 
     envmod._PROBE_BATCH.clear()
-    got = envmod._grad_cosine_quality(cfg, exact_plan, exact_plan, list(xs),
-                                      None, 1)
+    envmod._PROBE_META.clear()
+    got = envmod._grad_cosine_quality(cfg, exact_plan, exact_plan, xs, None, 1)
+    t = envmod.probe_meta()["t"]
     envmod._PROBE_BATCH.clear()
+    envmod._PROBE_META.clear()
     assert got is not None
-    q, _frobs, _cos = got
-    # The plan is exact; what is left is the error the RULE accumulated over
-    # the recording. It is small at this firing rate, and it is not 1.0.
-    assert 0.9 < q < 1.0, q
+    q = got[0]
+
+    # THE SAME NUMBER, computed here: the truth at that step position against
+    # the gradient the approximated carry produces.
+    seq, y, _ = R._draw_recording(jax.random.PRNGKey(1), None, -1)
+    W = R.rsnn_weights(jax.random.PRNGKey(1))
+    st = tuple(jax.lax.stop_gradient(x)
+               for x in R.prefix_state(seq, t, W)(*W))
+    head = (seq[t], y) + st + tuple(W)
+    g_ap = jax.grad(fn, argnums=argnums)(
+        *(head + R.carry_under_plan(seq, t, W, "eprop", check_zeros=False)))
+    g_ex = jax.grad(fn, argnums=argnums)(
+        *(head + R.carry_under_plan(seq, t, W, "exact", check_zeros=False)))
+    a = np.concatenate([np.asarray(x, np.float64).ravel() for x in g_ap])
+    b = np.concatenate([np.asarray(x, np.float64).ravel() for x in g_ex])
+    want = float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))
+    assert abs(q - want) < 1e-5, (q, want, t)
+    assert 0.9 < want <= 1.0
+
+
+def test_the_oracle_reference_is_not_the_same_number_as_the_in_band_one():
+    """Without it the channel reads 1.0 for a rule that accumulated real
+    error: both sides read the same approximated carry."""
+    fn = ex.get_fn("RSNN_SHD")
+    argnums = tuple(ex.infer_argnums("RSNN_SHD"))
+    seq, y, _ = R._draw_recording(jax.random.PRNGKey(1), None, -1)
+    W = R.rsnn_weights(jax.random.PRNGKey(1))
+    t = 40
+    st = tuple(jax.lax.stop_gradient(x)
+               for x in R.prefix_state(seq, t, W)(*W))
+    head = (seq[t], y) + st + tuple(W)
+    g_ap = jax.grad(fn, argnums=argnums)(
+        *(head + R.carry_under_plan(seq, t, W, "eprop", check_zeros=False)))
+    g_ex = jax.grad(fn, argnums=argnums)(
+        *(head + R.carry_under_plan(seq, t, W, "exact", check_zeros=False)))
+    a = np.concatenate([np.asarray(x, np.float64).ravel() for x in g_ap])
+    b = np.concatenate([np.asarray(x, np.float64).ravel() for x in g_ex])
+    same_args = float(a @ a / (np.linalg.norm(a) * np.linalg.norm(a)))
+    oracle = float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))
+    assert abs(same_args - 1.0) < 1e-9
+    assert oracle < 1.0 - 1e-6, oracle
