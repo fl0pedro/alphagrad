@@ -35,7 +35,9 @@ THE TIME STEP is the SHD loader's 10 ms bin, unchanged. Zenke runs 1 ms, so
 the decay constants here are his time constants doubled, which is the setting
 the learning gate of 2026-09-16 selected (job 65986: 77.8 percent test accuracy
 on SHD after thirty epochs of full backpropagation through time, against a 5
-percent chance level).
+percent chance level; job 65992 gives 77.8 to 80.7 percent across the init
+scales, and this module takes the one that also FIRES at its initial
+weights).
 """
 
 from __future__ import annotations
@@ -79,19 +81,31 @@ RSNN_ARGNUMS: tuple[int, int, int] = (7, 8, 9)
 #: ``beta_a 1.0`` is the adaptation strength, and the gate shows it is worth
 #: 14 accuracy points (0.778 with it, 0.634 without).
 #:
-#: MEASURED, job 65986, thirty epochs of full backpropagation through time on
-#: the real SHD splits, test accuracy against a 0.05 chance level:
+#: MEASURED, jobs 65986 and 65992, thirty epochs of full backpropagation
+#: through time on the real SHD splits. ``acc`` is test accuracy against a 0.05
+#: chance level; ``rate`` is the mean hidden spike rate per unit per step at
+#: the INITIAL weights (job 65991).
 #:
-#:   tau 5/10 ms, scale 0.2 (Zenke's literal constants)   0.729
-#:   tau 10/20 ms, scale 0.2 (THIS SETTING)               0.778
-#:   tau 20/50 ms, scale 0.2                              0.793
-#:   tau 10/20 ms, scale 1.0                              0.807
-#:   tau 20/50 ms, scale 1.0                              0.819
-#:   tau 10/20 ms, scale 0.2, beta_a 0 (no adaptation)    0.634
+#:   tau ms   scale   acc     rate at init
+#:   5/10     0.2     0.729   0.00000
+#:   10/20    0.2     0.778   0.00000
+#:   20/50    0.2     0.793   0.00000
+#:   10/20    1.0     0.807   0.00492
+#:   20/50    1.0     0.819   0.00578
+#:   10/20    2.0     0.795   0.01352   <- THIS SETTING
+#:   10/20    4.0     0.689   0.03391
+#:   10/20    8.0     0.505   0.06...
+#:   10/20    0.2, beta_a 0 (no adaptation)  0.634
 #:
-#: This row is the one that keeps Zenke's own init scale and changes only what
-#: the ten times longer step forces. Change these six numbers to move to
-#: another row; nothing else reads them.
+#: THE INIT SCALE IS NOT ZENKE'S 0.2, AND THE REASON IS THE TARGET, NOT THE
+#: TRAINING. At 0.2 the network is SILENT at its initial weights: the membrane
+#: never reaches the threshold, so no hidden unit spikes, ``V S`` is zero, and
+#: every carried Jacobian block with respect to ``V`` is EXACTLY ZERO. A PPO
+#: target is built at the initial weights, so at 0.2 the recurrent coupling the
+#: whole design is about would be invisible. 2.0 fires 1.35 percent of units
+#: per step (about 173 hidden spikes per recording), which is a working sparse
+#: rate, and costs 1.2 accuracy points against the best row. Change these seven
+#: numbers to move to another row; nothing else reads them.
 DT_MS = 10.0
 TAU_SYN_MS = 10.0
 TAU_MEM_MS = 20.0
@@ -100,8 +114,9 @@ TAU_A_MS = 200.0
 BETA_A = 1.0
 THRESH = 1.0
 
-#: Zenke's ``weight_scale`` (SpyTorch tutorial 4): ``std = scale / sqrt(fan_in)``.
-WEIGHT_SCALE = 0.2
+#: The init scale, in Zenke's form ``std = scale / sqrt(fan_in)`` (SpyTorch
+#: tutorial 4, where it is 0.2). See the table above for why it is not 0.2.
+WEIGHT_SCALE = 2.0
 
 
 def decay_constants() -> tuple[float, float, float, float]:
