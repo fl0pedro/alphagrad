@@ -34,6 +34,7 @@ from alphagrad.approx.common.rsnn_shd import (
     RSNN_ARGNUMS,
     RSNN_TARGET,
     is_rsnn,
+    resolve_carry_container,
     resolve_temporal_rule,
     rsnn_args,
     rsnn_data_gen,
@@ -135,7 +136,8 @@ def _vision_base(fn_str):
 
 def data_gen(fn_str: str, dataset: str | None = None, dataset_size: int | None = -1,
              key=None, temporal_rule: str | None = None,
-             grad_window: int | None = None):
+             grad_window: int | None = None,
+             carry_container: str | None = None):
     """Return a `keys -> data` jit-able function used to refresh dataset args.
 
     Returns `None` if the example does not have a data generator (most analytic
@@ -168,7 +170,8 @@ def data_gen(fn_str: str, dataset: str | None = None, dataset_size: int | None =
                 f"temporal_rule=args.temporal_rule).")
         return rsnn_data_gen(key, dataset=dataset, dataset_size=dataset_size,
                              temporal_rule=resolve_temporal_rule(
-                                 fn_str, temporal_rule))
+                                 fn_str, temporal_rule),
+                             carry_container=carry_container)
     if fn_str in SHD_TARGETS:
         # THE SAME DEFECT, THE SAME FIX, on the two multi-copy SHD targets.
         # They have no temporal rule and no step position; what moves in a
@@ -380,7 +383,8 @@ _BASIC_ARGS = {
 
 def get_args(fn_str: str, key, dataset: str | None = None,
              grad_window: int | None = None, dataset_size: int | None = -1,
-             temporal_rule: str | None = None, step_position: int | None = None):
+             temporal_rule: str | None = None, step_position: int | None = None,
+             carry_container: str | None = None):
     """Build the initial argument tuple for the example function `fn_str`.
 
     ``grad_window`` is the TARGET's gradient window (``--target-grad-window``,
@@ -391,6 +395,7 @@ def get_args(fn_str: str, key, dataset: str | None = None,
     one step on a temporal target.
     """
     rule = resolve_temporal_rule(fn_str, temporal_rule)
+    resolve_carry_container(fn_str, carry_container)
     if is_rsnn(fn_str):
         # THE ONE-STEP RECURRENT TARGET (owner ruling 2026-09-16). It has NO
         # gradient window: the graph is always one recurrent step and the
@@ -399,7 +404,8 @@ def get_args(fn_str: str, key, dataset: str | None = None,
         # through the same resolver every other non-temporal target uses.
         resolve_grad_window(fn_str, grad_window)
         return rsnn_args(key, dataset=dataset, dataset_size=dataset_size,
-                         temporal_rule=rule, step_position=step_position)
+                         temporal_rule=rule, step_position=step_position,
+                         carry_container=carry_container)
     if fn_str in TEMPORAL_TARGETS:
         n = resolve_grad_window(fn_str, grad_window)
         if fn_str in SHD_TARGETS:

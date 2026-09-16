@@ -773,11 +773,13 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *, seed: int = 0)
                   grad_window=getattr(args, "target_grad_window", None),
                   dataset_size=args.dataset_size,
                   temporal_rule=getattr(args, "temporal_rule", None),
-                  step_position=getattr(args, "step_position", None))
+                  step_position=getattr(args, "step_position", None),
+                  carry_container=getattr(args, "carry_container", None))
     gen = data_gen(
         args.example, dataset=dataset_for_call, dataset_size=args.dataset_size,
         key=args_key, temporal_rule=getattr(args, "temporal_rule", None),
         grad_window=getattr(args, "target_grad_window", None),
+        carry_container=getattr(args, "carry_container", None),
     )
     # Gradient mode: THIS env (inside the CpuApproximationActor) does the actual
     # pooled measurement, so the grad-mode wrapping + jaxpr + argnums must mirror

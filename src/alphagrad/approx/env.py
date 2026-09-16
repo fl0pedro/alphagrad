@@ -2247,6 +2247,12 @@ def _record_plan(rec: dict) -> None:
     _pos = probe_meta() or last_step_position()
     if _pos:
         rec["step_position"] = _pos
+        # WHICH CONTAINER THE CARRY ARRIVED IN (owner ruling 2026-09-16). The
+        # given temporal value is the RULE run over the recording, and the
+        # container it is stored in is what the memory channel sees, so a
+        # record that does not name it cannot be read against another.
+        if _pos.get("carry") is not None:
+            rec["carry_container"] = str(_pos["carry"])
     _PLAN_RECORDS.append(rec)
 
 

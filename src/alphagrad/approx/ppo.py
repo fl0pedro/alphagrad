@@ -123,6 +123,8 @@ from alphagrad.approx.common.rsnn_shd import (
     TEMPORAL_RULES as _TEMPORAL_RULES,
     is_rsnn as _is_rsnn,
     last_step_position as _last_step_position,
+    CARRY_CONTAINERS as _CARRY_CONTAINERS,
+    resolve_carry_container as _resolve_carry_container,
     resolve_temporal_rule as _resolve_temporal_rule,
 )
 from alphagrad.approx.common.schedules import cosine_warmup_exp_decay_lr
@@ -5540,6 +5542,9 @@ def make_argparser() -> argparse.ArgumentParser:
              "where an e-prop-like approximation (Zenke and Neftci 2020) "
              "lives. RAISES on any target without time steps.")
     p.add_argument(
+        "--carry-container", choices=list(_CARRY_CONTAINERS), default=None,
+        help='WHICH CONTAINER THE GIVEN TEMPORAL VALUE ARRIVES IN, and which rule produced it (--example RSNN_SHD; owner ruling 2026-09-16). The given edge is not a snapshot of the exact carry any more: it is the RULE run over the whole prefix (rtrl) or suffix (bptt), so the value arriving at step t carries the error that rule accumulated over the recording, not the error of one approximated step. exact (default): the influence matrix from a detached reverse-mode pass, dense, 225.74 MB over the eleven carried blocks; for bptt, plain backpropagation through time. eprop: the block diagonal of Zenke and Neftci applied at EVERY step. For rtrl that is one eligibility trace per synapse and the container shrinks with it -- 2.12 MB, a factor of 106, which is the whole point of the approximation and the only way the memory channel can see it. For bptt the state-to-state Jacobian is block-diagonalised at every suffix step; the adjoint is 532 numbers either way, so only its value moves. RAISES on any target that carries no temporal edge.')
+    p.add_argument(
         "--step-position", type=int, default=None, metavar="T",
         help="Pin the step position t of the recurrent target instead of "
              "drawing it uniformly from the run's key. Debugging and tests "
@@ -7512,6 +7517,8 @@ def main():
     # every actor and the run record carry the SAME rule. An actor that read a
     # different rule would measure a different graph than the search acts on.
     args.temporal_rule = _resolve_temporal_rule(args.example, args.temporal_rule)
+    args.carry_container = _resolve_carry_container(
+        args.example, args.carry_container)
     # Knobs that became flags (dsnn-3qm.44) are REFUSED if a launcher still
     # exports them, never read: an ignored export would run the knob OFF.
     from alphagrad.approx.common.agent_factory import refuse_removed_env_knobs
@@ -7753,16 +7760,19 @@ def main():
                   grad_window=args.target_grad_window,
                   dataset_size=args.dataset_size,
                   temporal_rule=args.temporal_rule,
-                  step_position=args.step_position)
+                  step_position=args.step_position,
+                  carry_container=args.carry_container)
     if args.temporal_rule is not None:
         _pos = _last_step_position()
         print(f"[cfg] --temporal-rule {args.temporal_rule}: step t={_pos.get('t')} "
-              f"of T={_pos.get('T')}, recording {_pos.get('recording')}",
+              f"of T={_pos.get('T')}, recording {_pos.get('recording')}, "
+              f"carry {_pos.get('carry')}",
               flush=True)
     gen = data_gen(
         args.example, dataset=dataset_for_call, dataset_size=args.dataset_size,
         key=args_key, temporal_rule=args.temporal_rule,
         grad_window=args.target_grad_window,
+        carry_container=args.carry_container,
     )
     # TARGET SETUP -- routed through the shared builder so the trainer and
     # every measure-actor construct the IDENTICAL graph (jaxpr / vertex+action

@@ -141,6 +141,8 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument("--temporal-rule", choices=["tbptt", "bptt", "rtrl"],
                    default=None)
     p.add_argument("--step-position", type=int, default=None, metavar="T")
+    p.add_argument("--carry-container", choices=["exact", "eprop"],
+                   default=None)
     p.add_argument("--hidden-dim", type=int, default=256)
     p.add_argument("--vocab-size", type=int, default=512)
     p.add_argument("--embd-dim", type=int, default=128)
@@ -522,11 +524,13 @@ def build_env(args):
                   grad_window=getattr(args, "target_grad_window", None),
                   dataset_size=args.dataset_size,
                   temporal_rule=getattr(args, "temporal_rule", None),
-                  step_position=getattr(args, "step_position", None))
+                  step_position=getattr(args, "step_position", None),
+                  carry_container=getattr(args, "carry_container", None))
     gen = data_gen(args.example, dataset=dataset_for_call,
                    dataset_size=args.dataset_size, key=args_key,
                    temporal_rule=getattr(args, "temporal_rule", None),
-                   grad_window=getattr(args, "target_grad_window", None))
+                   grad_window=getattr(args, "target_grad_window", None),
+                   carry_container=getattr(args, "carry_container", None))
     target_fn, xs, argnums = grad_target_setup(args, target_fn, xs, args.example)
     closed_jaxpr = _traced_inlined(target_fn, xs)
 

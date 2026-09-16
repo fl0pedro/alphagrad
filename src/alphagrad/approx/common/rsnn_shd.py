@@ -225,7 +225,7 @@ def prefix_state(seq, t, weights, state0=None):
     return run
 
 
-def suffix_adjoint(seq, t, weights, state_t):
+def suffix_adjoint(seq, t, weights, state_t, container: str = "exact"):
     """``lambda_(t+1) = d (sum_(u>t) L_u) / d s_t``, by reverse mode.
 
     The suffix runs steps ``t+1 .. T-1`` from ``s_t`` and sums their losses.
@@ -239,8 +239,17 @@ def suffix_adjoint(seq, t, weights, state_t):
     after ``t`` are summed. Every earlier step reaches the injection through
     the carry and contributes nothing to the gradient, because ``where``
     selects the injected value there.
+
+    ``container`` says WHICH RULE the suffix runs (owner ruling 2026-09-16).
+    ``exact`` is backpropagation through time. ``eprop`` replaces the
+    state-to-state Jacobian by its block diagonal at EVERY step of the suffix,
+    so the adjoint that arrives at ``t`` is the one the approximated rule
+    would actually carry, with the error it accumulated over the whole
+    suffix. The CONTAINER does not move here and there is nothing for it to
+    shrink: an adjoint is one number per state component either way, 532 of
+    them, 2.1 kB. Only the value moves.
     """
-    cell = _cell()
+    cell = _cell() if container == "exact" else _blockdiag_cell(container)
     c = _consts()
     W, V, Wo = weights
     T = int(seq.shape[0])
@@ -304,17 +313,75 @@ def carried_jacobians(seq, t, weights, *, check_zeros: bool = True):
             + tuple(sg(jac[s_i][w_i]) for s_i, w_i in RSNN_CARRY_BLOCKS))
 
 
-def eprop_traces(seq, t: int, weights):
-    """THE E-PROP INFLUENCE MATRIX: the same eleven blocks, block diagonal.
+#: The carry containers a run can ask for.
+#:
+#: ``exact``  the exact influence matrix, dense, 225.74 MB. The carry the
+#:            detached reverse-mode prefix produces.
+#: ``eprop``  THE PLAN, RUN OVER THE PREFIX. The block-diagonal recursion of
+#:            Zenke and Neftci applied at EVERY step, stored in the container
+#:            it implies: 2.12 MB of eligibility traces.
+CARRY_CONTAINERS: tuple[str, ...] = ("exact", "eprop")
+
+
+def resolve_carry_container(example: str | None, container,
+                            *, flag: str = "--carry-container") -> str:
+    """The carry container for ``example``, or raise."""
+    if not is_rsnn(example):
+        if container is not None and str(container) != "exact":
+            raise ValueError(
+                f"{flag} {container} was passed with --example {example}, "
+                f"which carries no temporal edge. The container names how the "
+                f"given temporal value is stored; it is defined only on "
+                f"{sorted(TEMPORAL_RULE_TARGETS)}.")
+        return "exact"
+    if container is None:
+        return "exact"
+    c = str(container)
+    if c not in CARRY_CONTAINERS:
+        raise ValueError(f"{flag} {c!r} is not one of {list(CARRY_CONTAINERS)}")
+    return c
+
+
+def _blockdiag_cell(container: str):
+    """``rsnn_cell``, with the recurrent coupling the container drops.
+
+    Under ``eprop`` the BACKWARD sees ``diag(V)`` where the forward sees
+    ``V``, which is exactly Zenke and Neftci's replacement of the
+    state-to-state Jacobian by its block diagonal: the forward states of the
+    prefix and the suffix do not move at all, and the credit that flows
+    through them does. Written as a straight-through substitution so there is
+    one cell and one forward value, not two.
+    """
+    cell = _cell()
+    if container == "exact":
+        return cell
+
+    def bd_cell(x, S, I, U, a, Uo, W, V, Wo, *c):
+        vd = jnp.diag(V)
+        rec = jax.lax.stop_gradient(V @ S - vd * S) + vd * S
+        # The recurrent term enters only through ``I``; rebuild the step with
+        # it replaced, so nothing else about the cell changes.
+        a_syn, a_mem, a_out, rho, beta_a, thresh = c
+        I_n = a_syn * I + W @ x + rec
+        U_n = a_mem * U + (1.0 - a_mem) * I_n - thresh * S
+        from graphax.examples.neuromorphic import rsnn_surrogate
+        S_n = rsnn_surrogate(U_n - (thresh + beta_a * a))
+        a_n = rho * a + S_n
+        Uo_n = a_out * Uo + (1.0 - a_out) * (Wo @ S_n)
+        return S_n, I_n, U_n, a_n, Uo_n
+    return bd_cell
+
+
+def carry_traces(seq, t, weights):
+    """THE PLAN, RUN OVER THE PREFIX: the eleven blocks in COMPACT form.
 
     Zenke and Neftci (arXiv 2010.11931) approximate real-time recurrent
     learning by replacing the state-to-state Jacobian ``A_t`` with its BLOCK
     DIAGONAL, one block per neuron: a neuron's own synaptic current, membrane
     and adaptation survive and the coupling through OTHER neurons' spikes is
-    dropped. Running ``G_t = blockdiag(A_t) G_(t-1) + F_t`` over the prefix
-    leaves ONE ELIGIBILITY TRACE PER SYNAPSE. For
-    :func:`graphax.examples.neuromorphic.rsnn_cell` the traces are, per
-    postsynaptic unit ``j`` and presynaptic index ``i``:
+    dropped. Running ``G_u = blockdiag(A_u) G_(u-1) + F_u`` over the whole
+    prefix leaves ONE ELIGIBILITY TRACE PER SYNAPSE. Per postsynaptic unit
+    ``j`` and presynaptic index ``i``:
 
         psi[j]     = 1 / (scale * |U[j] - thresh - beta_a * a_prev[j]| + 1)^2
         eI[j,i]   <- a_syn * eI[j,i] + V[j,j] * eS[j,i] + direct[j,i]
@@ -323,26 +390,38 @@ def eprop_traces(seq, t: int, weights):
         ea[j,i]   <- rho * ea[j,i] + eS[j,i]
 
     with ``direct = x[i]`` for the input weight and ``direct = S_prev[i]`` for
-    the recurrent weight, and every trace zero at the start of the recording.
-    THE ONE TERM THE EXACT RECURSION HAS AND THIS DOES NOT is
-    ``V[j,k] * eS[k,i]`` for ``k != j``: the recurrent coupling. Set ``V`` to a
-    diagonal matrix and the two agree exactly; that is the test.
+    the recurrent weight, every trace zero at the start of the recording. THE
+    ONE TERM THE EXACT RECURSION HAS AND THIS DOES NOT is ``V[j,k] * eS[k,i]``
+    for ``k != j``. Set ``V`` diagonal and the two agree exactly; that is the
+    test.
 
-    The readout blocks stay EXACT and are a plain leaky filter of the hidden
-    traces, because the readout feeds nothing back:
+    WHY PROJECTING THE PRODUCT IS THE SAME AS BLOCK-DIAGONALISING ``A``. If
+    ``G`` is already block diagonal, ``(A G)[j, j, i] = sum_k A[j,k] G[k,j,i]``
+    has only the ``k = j`` term left, which is ``blockdiag(A) G``. The traces
+    start at zero, which is block diagonal, so applying the projection at
+    every step and replacing ``A`` by its block diagonal at every step are the
+    same recursion. That is why "the plan applied at every step" IS e-prop
+    here, and not merely something like it.
 
-        eUo[m,j,i] <- a_out * eUo[m,j,i] + (1 - a_out) * Wo[m,j] * eS[j,i]
+    THE THREE READOUT BLOCKS ARE EXACT AND STILL COMPACT. The readout feeds
+    nothing back, so it is a leaky filter of the hidden traces through a
+    CONSTANT ``Wo``, and the exact block factorises:
 
-    The returned tuple has the SAME SHAPE as :func:`carried_jacobians`, so the
-    two are interchangeable as the ``rtrl`` given values and the difference
-    between the gradients they produce IS the e-prop approximation.
+        (Uo, W)[m,j,i]  = Wo[m,j] * f_W[j,i],   f_W  <- a_out f_W + (1-a_out) eS_W
+        (Uo, V)[m,j,i]  = Wo[m,j] * f_V[j,i]
+        (Uo, Wo)[m,k,j] = delta(m,k) * g[j],    g    <- a_out g + (1-a_out) S
 
-    THE STORE IS THE POINT. The exact influence matrix is 226 MB of dense
-    blocks; these traces are ``4 * (h * n_in + h * h)`` numbers, 1.7 MB, plus
-    whatever the readout filter is expanded to for the drop-in shape.
+    so the compact container carries ``f_W``, ``f_V`` and ``g`` and
+    :func:`graphax.examples.attach_rsnn_past` restores the constant factor
+    from the REFERENCE weight, which is outside ``argnums`` and therefore adds
+    no edge.
+
+    ``t`` may be TRACED: the recursion is a masked scan over the whole
+    recording, like :func:`prefix_state`.
+
+    THE STORE IS THE POINT. 2.12 MB against 225.74 MB dense, a factor of 106.
     """
-    from graphax.examples.neuromorphic import (
-        RSNN_CARRY_BLOCKS, RSNN_SURROGATE_SCALE)
+    from graphax.examples.neuromorphic import RSNN_CARRY_BLOCKS, RSNN_SURROGATE_SCALE
 
     cell = _cell()
     a_syn, a_mem, a_out, rho = decay_constants()
@@ -350,59 +429,121 @@ def eprop_traces(seq, t: int, weights):
     W, V, Wo = weights
     h, n_in, n_out = RSNN_HIDDEN, SHD_CHANNELS, SHD_CLASSES
     vd = jnp.diag(V)[:, None]
+    T = int(seq.shape[0])
 
-    st = zero_state()
     zW = jnp.zeros((h, n_in))
     zV = jnp.zeros((h, h))
-    tr = {"W": [zW, zW, zW, zW], "V": [zV, zV, zV, zV]}   # eS, eI, eU, ea
-    oW = jnp.zeros((n_out, h, n_in))
-    oV = jnp.zeros((n_out, h, h))
-    oWo = jnp.zeros((n_out, n_out, h))
+    init = (zero_state(),
+            (zW, zW, zW, zW),          # eS, eI, eU, ea  for W
+            (zV, zV, zV, zV),          # eS, eI, eU, ea  for V
+            zW, zV, jnp.zeros((h,)))   # f_W, f_V, g
 
-    for u in range(int(t)):
+    def body(carry, inp):
+        u, x = inp
+        st, trW, trV, fW, fV, g = carry
         S_prev, I_prev, U_prev, a_prev, Uo_prev = st
-        x = seq[u]
         nxt = cell(x, *st, W, V, Wo, *c)
         S, I, U, a, Uo = nxt
         psi = 1.0 / (RSNN_SURROGATE_SCALE
                      * jnp.abs(U - (THRESH + BETA_A * a_prev)) + 1.0) ** 2
         psi = psi[:, None]
-        for name, direct in (("W", jnp.broadcast_to(x[None, :], (h, n_in))),
-                             ("V", jnp.broadcast_to(S_prev[None, :], (h, h)))):
-            eS, eI, eU, ea = tr[name]
+
+        def step(tr, direct):
+            eS, eI, eU, ea = tr
             nI = a_syn * eI + vd * eS + direct
             nU = a_mem * eU + (1.0 - a_mem) * nI - THRESH * eS
             nS = psi * (nU - BETA_A * ea)
             na = rho * ea + nS
-            tr[name] = [nS, nI, nU, na]
-        # the readout, exact, filtering the hidden traces
-        oW = a_out * oW + (1.0 - a_out) * (Wo[:, :, None] * tr["W"][0][None])
-        oV = a_out * oV + (1.0 - a_out) * (Wo[:, :, None] * tr["V"][0][None])
-        # d Uo[m] / d Wo[m, k] = (1 - a_out) * S[k], filtered
-        oWo = a_out * oWo + (1.0 - a_out) * (
-            jnp.eye(n_out)[:, :, None] * S[None, None, :])
-        st = nxt
+            return (nS, nI, nU, na)
 
-    def expand(mat):
-        """``(h, n)`` trace -> the full ``(h, h, n)`` block, diagonal in (j, j)."""
-        return jnp.eye(mat.shape[0])[:, :, None] * mat[:, None, :]
+        nW = step(trW, jnp.broadcast_to(x[None, :], (h, n_in)))
+        nV = step(trV, jnp.broadcast_to(S_prev[None, :], (h, h)))
+        nfW = a_out * fW + (1.0 - a_out) * nW[0]
+        nfV = a_out * fV + (1.0 - a_out) * nV[0]
+        ng = a_out * g + (1.0 - a_out) * S
+        keep = u < t
+        new = (nxt, nW, nV, nfW, nfV, ng)
+        return jax.tree_util.tree_map(
+            lambda p, q: jnp.where(keep, p, q), new, carry), None
+
+    (st, trW, trV, fW, fV, g), _ = jax.lax.scan(
+        body, init, (jnp.arange(T), seq))
 
     blocks = {
-        (0, 0): expand(tr["W"][0]), (0, 1): expand(tr["V"][0]),
-        (1, 0): expand(tr["W"][1]), (1, 1): expand(tr["V"][1]),
-        (2, 0): expand(tr["W"][2]), (2, 1): expand(tr["V"][2]),
-        (3, 0): expand(tr["W"][3]), (3, 1): expand(tr["V"][3]),
-        (4, 0): oW, (4, 1): oV, (4, 2): oWo,
+        (0, 0): trW[0], (0, 1): trV[0],
+        (1, 0): trW[1], (1, 1): trV[1],
+        (2, 0): trW[2], (2, 1): trV[2],
+        (3, 0): trW[3], (3, 1): trV[3],
+        # The readout blocks, exact, in the weight's own shape.
+        (4, 0): fW, (4, 1): fV,
+        # (Uo, Wo)[m, k, j] = delta(m, k) * g[j]: every row of the compact
+        # (n_out, h) form is the same filter, which is what the block diagonal
+        # of a delta is.
+        (4, 2): jnp.broadcast_to(g[None, :], (n_out, h)),
     }
     sg = jax.lax.stop_gradient
-    return (tuple(sg(x) for x in weights)
-            + tuple(sg(blocks[b]) for b in RSNN_CARRY_BLOCKS))
+    return tuple(sg(blocks[b]) for b in RSNN_CARRY_BLOCKS)
 
 
-def future_adjoints(seq, y, t, weights, state_prev):
-    """The BPTT attachment: five adjoints ``lambda_(t+1) = dL_(>t)/ds_t``."""
+def eprop_traces(seq, t, weights):
+    """:func:`carry_traces`, EXPANDED to the dense block shapes.
+
+    The same recursion and the same numbers, written into the container
+    :func:`carried_jacobians` uses, so the two are directly comparable block
+    for block. This is the form the earlier probes and tests compare against;
+    :func:`carry_traces` is what a run actually carries.
+    """
+    from graphax.examples.neuromorphic import RSNN_CARRY_BLOCKS
+
+    W, V, Wo = weights
+    n_out = SHD_CLASSES
+    compact = carry_traces(seq, t, weights)
+    out = []
+    for (s, w), m in zip(RSNN_CARRY_BLOCKS, compact):
+        if s == 4 and w != 2:
+            # (Uo, W) / (Uo, V): restore the constant readout factor.
+            out.append(Wo[:, :, None] * m[None])
+        elif s == 4:
+            # (Uo, Wo): delta(m, k) * g[j]
+            out.append(jnp.eye(n_out)[:, :, None] * m[0][None, None, :])
+        else:
+            out.append(jnp.eye(m.shape[0])[:, :, None] * m[:, None, :])
+    sg = jax.lax.stop_gradient
+    return tuple(sg(x) for x in out)
+
+
+def carry_under_plan(seq, t, weights, container: str = "exact", *,
+                     check_zeros: bool = True):
+    """The ``rtrl`` given tuple the PLAN implies (owner ruling 2026-09-16).
+
+    ``exact``  the dense influence matrix, from a detached reverse-mode pass
+               over the prefix. 225.74 MB.
+    ``eprop``  the plan run over the whole prefix: the block diagonal applied
+               at EVERY step, in the container that implies. 2.12 MB.
+
+    Both return three reference weights and eleven blocks, so the varargs
+    COUNT that selects the temporal rule is the same either way and only the
+    SHAPES move.
+    """
+    if container not in CARRY_CONTAINERS:
+        raise ValueError(f"carry container {container!r} is not one of "
+                         f"{list(CARRY_CONTAINERS)}")
+    if container == "exact":
+        return carried_jacobians(seq, t, weights, check_zeros=check_zeros)
+    sg = jax.lax.stop_gradient
+    return (tuple(sg(W) for W in weights) + carry_traces(seq, t, weights))
+
+
+def future_adjoints(seq, y, t, weights, state_prev, container: str = "exact"):
+    """The BPTT attachment: five adjoints ``lambda_(t+1) = dL_(>t)/ds_t``.
+
+    ``container`` selects which rule the suffix runs; see
+    :func:`suffix_adjoint`."""
+    if container not in CARRY_CONTAINERS:
+        raise ValueError(f"carry container {container!r} is not one of "
+                         f"{list(CARRY_CONTAINERS)}")
     _, state_t = step_target_loss(seq, y, t, weights, state_prev)
-    tail = suffix_adjoint(seq, t, weights, state_t)
+    tail = suffix_adjoint(seq, t, weights, state_t, container)
     lam = jax.grad(lambda st: tail(st, y))(tuple(state_t))
     sg = jax.lax.stop_gradient
     return tuple(sg(x) for x in lam)
@@ -462,7 +603,8 @@ def rsnn_data_slots(rule: str) -> tuple[int, ...]:
 
 def rsnn_data_gen(key=None, *, dataset: str | None = None,
                   dataset_size: int | None = -1,
-                  temporal_rule: str | None = None):
+                  temporal_rule: str | None = None,
+                  carry_container: str | None = None):
     """``keys -> the data-dependent argument slots``, at a SAMPLED ``t``.
 
     OWNER RULING, 2026-09-16: the step position is sampled uniformly over the
@@ -495,6 +637,7 @@ def rsnn_data_gen(key=None, *, dataset: str | None = None,
     if rule not in TEMPORAL_RULES:
         raise ValueError(f"temporal rule {rule!r} is not one of "
                          f"{list(TEMPORAL_RULES)}")
+    cont = resolve_carry_container(RSNN_TARGET, carry_container)
     key = jax.random.PRNGKey(1) if key is None else key
     k = jax.random.split(key, 3)
     seq, y, rec = _draw_recording(k[0], dataset, dataset_size)
@@ -515,9 +658,9 @@ def rsnn_data_gen(key=None, *, dataset: str | None = None,
         if rule == "tbptt":
             given = ()
         elif rule == "rtrl":
-            given = carried_jacobians(seq, t, weights, check_zeros=False)
+            given = carry_under_plan(seq, t, weights, cont, check_zeros=False)
         else:
-            given = future_adjoints(seq, y, t, weights, state_prev)
+            given = future_adjoints(seq, y, t, weights, state_prev, cont)
         out = head + tuple(given)
         if len(out) != len(slots):
             raise ValueError(
@@ -534,7 +677,7 @@ def rsnn_data_gen(key=None, *, dataset: str | None = None,
     def meta(keys):
         """``{t, T, recording, rule}`` of the draw ``keys`` produces."""
         return {"t": int(_t(keys)), "T": T, "recording": int(rec),
-                "rule": rule}
+                "rule": rule, "carry": cont}
 
     # THE CONTRACT WITH env._probe_batch AND generate_eval_samples. Both used
     # to assume a generator fills the first one or two argument slots; this
@@ -550,7 +693,8 @@ def rsnn_data_gen(key=None, *, dataset: str | None = None,
 
 def rsnn_args(key=None, *, dataset: str | None = None,
               dataset_size: int | None = -1, temporal_rule: str | None = None,
-              step_position: int | None = None):
+              step_position: int | None = None,
+              carry_container: str | None = None):
     """The argument tuple of ``graphax.examples.neuromorphic.RSNN_SHD``.
 
     Slots: ``x_t`` 0, ``y`` 1, the five carried state components 2 to 6, the
@@ -567,6 +711,7 @@ def rsnn_args(key=None, *, dataset: str | None = None,
     if rule not in TEMPORAL_RULES:
         raise ValueError(f"temporal rule {rule!r} is not one of "
                          f"{list(TEMPORAL_RULES)}")
+    cont = resolve_carry_container(RSNN_TARGET, carry_container)
     key = jax.random.PRNGKey(1) if key is None else key
     k = jax.random.split(key, 3)
     seq, y, rec = _draw_recording(k[0], dataset, dataset_size)
@@ -578,7 +723,7 @@ def rsnn_args(key=None, *, dataset: str | None = None,
         raise ValueError(f"step position {t} is outside 0 .. {T - 1}")
     _LAST_STEP_POSITION.clear()
     _LAST_STEP_POSITION.update({"t": t, "T": T, "recording": rec,
-                                "rule": rule})
+                                "rule": rule, "carry": cont})
 
     sg = jax.lax.stop_gradient
     state_prev = tuple(sg(x) for x in prefix_state(seq, t, weights)(*weights))
@@ -587,9 +732,9 @@ def rsnn_args(key=None, *, dataset: str | None = None,
     if rule == "tbptt":
         given = ()
     elif rule == "rtrl":
-        given = carried_jacobians(seq, t, weights)
+        given = carry_under_plan(seq, t, weights, cont)
     else:
-        given = future_adjoints(seq, y, t, weights, state_prev)
+        given = future_adjoints(seq, y, t, weights, state_prev, cont)
     want = {v: n for n, v in RSNN_GIVEN_LENGTHS.items()}[rule]
     if len(given) != want:
         raise ValueError(
