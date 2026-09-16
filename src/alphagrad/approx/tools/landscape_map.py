@@ -136,6 +136,13 @@ def make_argparser() -> argparse.ArgumentParser:
     # blocks. Without it this tool would silently map a one-step graph against
     # a run that trained on a hundred.
     p.add_argument("--target-grad-window", type=int, default=None, metavar="N")
+    # A replay must rebuild the SAME graph the run trained on, so the two
+    # flags that change the graph's shape are accepted here as well: without
+    # them a replay of an RTRL arm would map a truncated graph against a run
+    # that carried the influence matrix, and a replay of a 100 ms arm would
+    # map a 100-step graph against a 10-step run.
+    p.add_argument("--temporal-rule", choices=["bptt", "rtrl"], default=None)
+    p.add_argument("--shd-bin-ms", type=int, default=None, metavar="MS")
     p.add_argument("--hidden-dim", type=int, default=256)
     p.add_argument("--vocab-size", type=int, default=512)
     p.add_argument("--embd-dim", type=int, default=128)
@@ -499,7 +506,9 @@ def build_env(args):
     target_fn = get_fn(args.example)
     xs = get_args(args.example, args_key, dataset=dataset_for_call,
                   grad_window=getattr(args, "target_grad_window", None),
-                  dataset_size=args.dataset_size)
+                  dataset_size=args.dataset_size,
+                  bin_ms=getattr(args, "shd_bin_ms", None),
+                  temporal_rule=getattr(args, "temporal_rule", None))
     gen = data_gen(args.example, dataset=dataset_for_call,
                    dataset_size=args.dataset_size)
     target_fn, xs, argnums = grad_target_setup(args, target_fn, xs, args.example)

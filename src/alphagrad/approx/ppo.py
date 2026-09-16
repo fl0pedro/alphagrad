@@ -118,7 +118,12 @@ from alphagrad.approx.common.temporal_order import (
     build_order_constraint as _build_order_constraint,
     describe as _describe_order,
 )
-from alphagrad.approx.common.snn_shd import SHD_TARGETS as _SHD_TARGETS
+from alphagrad.approx.common.snn_shd import (
+    SHD_TARGETS as _SHD_TARGETS,
+    TEMPORAL_RULES as _TEMPORAL_RULES,
+    resolve_fixed_temporal_order as _resolve_fixed_temporal_order,
+    resolve_temporal_rule as _resolve_temporal_rule,
+)
 from alphagrad.approx.common.schedules import cosine_warmup_exp_decay_lr
 from alphagrad.approx.env import (
     quality_metric as _env_quality_metric,
@@ -5513,6 +5518,34 @@ def make_argparser() -> argparse.ArgumentParser:
              "is the ENCODER's replay window over elimination steps and is a "
              "different quantity entirely.")
     p.add_argument(
+        "--temporal-rule", choices=list(_TEMPORAL_RULES), default=None,
+        metavar="{bptt,rtrl}",
+        help="HOW THE STATE CARRIED INTO THE GRADIENT WINDOW ENTERS THE "
+             "GRADIENT, on a recurrent target. bptt (backpropagation through "
+             "time): the carry enters as a CONSTANT and the gradient is the "
+             "truncated one -- at --target-grad-window 1 the credit is purely "
+             "spatial. rtrl (real-time recurrent learning): the carried "
+             "influence matrix d state / d W, computed by the detached "
+             "prefix, enters as a GIVEN EDGE from the weights to the carried "
+             "state, so eliminating that vertex multiplies it by the step's "
+             "state-to-state Jacobian -- one RTRL step -- and the gradient is "
+             "EXACT through the whole prefix. That face is where an e-prop-like "
+             "approximation lives (Zenke and Neftci 2020): their rule is this "
+             "face with the state-to-state coupling reduced to its block "
+             "diagonal. The rule also FORCES --fixed-temporal-order (reverse "
+             "for bptt, forward for rtrl) and raises if that flag says the "
+             "opposite. Unset (default) keeps the truncated graph and forces "
+             "no order. RAISES on a target without time steps.")
+    p.add_argument(
+        "--shd-bin-ms", type=int, default=None, metavar="MS",
+        help="The SHD bin width in milliseconds (default 10). The frame is "
+             "the first second of a recording, so T = 1000 / MS time steps: "
+             "10 gives T = 100, 100 gives T = 10. MS must divide 1000, "
+             "because a ragged last bin is a silent change of what the last "
+             "time step means. The binned split is cached PER WIDTH, on disk "
+             "and in memory, so the two widths can never be confused. RAISES "
+             "on a target that reads no SHD recording.")
+    p.add_argument(
         "--approx-profile", choices=["all", "skip", "reduce", "quant", "diag", "none"],
         default=None,
         help="Approximation-profile mask restricting the approximation head to a subset of classes: "
@@ -7475,6 +7508,22 @@ def main():
             "--per-face-masks needs --face-actions: it masks the per-FACE "
             "action space, and without the face head there is none.")
     args.per_face_masks = bool(args.face_actions)
+    # --temporal-rule IS an order across the step copies, so it FILLS IN
+    # --fixed-temporal-order (reverse for bptt, forward for rtrl) and raises on
+    # a contradiction. Resolved HERE, before `dict(vars(args))` reaches the
+    # measure actors and before the wandb config is written, so the trainer,
+    # every actor and the run record all carry the SAME order -- an actor that
+    # read "free" while the trainer ran "forward" would measure a plan the
+    # search can never emit.
+    args.temporal_rule = _resolve_temporal_rule(args.example, args.temporal_rule)
+    args.fixed_temporal_order = _resolve_fixed_temporal_order(
+        args.temporal_rule, args.fixed_temporal_order)
+    if args.temporal_rule is not None:
+        print(f"[cfg] --temporal-rule {args.temporal_rule}: "
+              f"--fixed-temporal-order {args.fixed_temporal_order}, carried "
+              f"Jacobian "
+              f"{'attached' if args.temporal_rule == 'rtrl' else 'not attached'}",
+              flush=True)
     # Knobs that became flags (dsnn-3qm.44) are REFUSED if a launcher still
     # exports them, never read: an ignored export would run the knob OFF.
     from alphagrad.approx.common.agent_factory import refuse_removed_env_knobs
@@ -7713,7 +7762,9 @@ def main():
     target_fn = get_fn(args.example)
     xs = get_args(args.example, args_key, dataset=dataset_for_call,
                   grad_window=args.target_grad_window,
-                  dataset_size=args.dataset_size)
+                  dataset_size=args.dataset_size,
+                  bin_ms=args.shd_bin_ms,
+                  temporal_rule=args.temporal_rule)
     gen = data_gen(
         args.example, dataset=dataset_for_call, dataset_size=args.dataset_size
     )

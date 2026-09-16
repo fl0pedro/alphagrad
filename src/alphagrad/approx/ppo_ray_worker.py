@@ -529,7 +529,9 @@ class PPORayWorker:
         target_fn = get_fn(self.args.example)
         xs = get_args(self.args.example, args_key, dataset=dataset_for_call,
                       grad_window=getattr(self.args, "target_grad_window", None),
-                      dataset_size=self.args.dataset_size)
+                      dataset_size=self.args.dataset_size,
+                      bin_ms=getattr(self.args, "shd_bin_ms", None),
+                      temporal_rule=getattr(self.args, "temporal_rule", None))
         gen = data_gen(
             self.args.example,
             dataset=dataset_for_call,

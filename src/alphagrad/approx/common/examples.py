@@ -26,7 +26,9 @@ from alphagrad.approx.common.snn_shd import (
     SHD_TARGETS,
     TEMPORAL_TARGETS,
     refuse_legacy_snn_env,
+    resolve_bin_ms,
     resolve_grad_window,
+    resolve_temporal_rule,
     shd_args,
 )
 
@@ -326,7 +328,8 @@ _BASIC_ARGS = {
 
 
 def get_args(fn_str: str, key, dataset: str | None = None,
-             grad_window: int | None = None, dataset_size: int | None = -1):
+             grad_window: int | None = None, dataset_size: int | None = -1,
+             bin_ms: int | None = None, temporal_rule: str | None = None):
     """Build the initial argument tuple for the example function `fn_str`.
 
     ``grad_window`` is the TARGET's gradient window (``--target-grad-window``,
@@ -336,13 +339,18 @@ def get_args(fn_str: str, key, dataset: str | None = None,
     never claim a window it did not run. ``None`` is "not asked for" and means
     one step on a temporal target.
     """
+    rule = resolve_temporal_rule(fn_str, temporal_rule)
     if fn_str in TEMPORAL_TARGETS:
-        n = resolve_grad_window(fn_str, grad_window)
+        n = resolve_grad_window(fn_str, grad_window, bin_ms=bin_ms)
         if fn_str in SHD_TARGETS:
             return shd_args(fn_str, n, key=key, dataset=dataset,
-                            dataset_size=dataset_size)
+                            dataset_size=dataset_size, bin_ms=bin_ms,
+                            temporal_rule=rule)
+        resolve_bin_ms(fn_str, bin_ms)  # refuses the flag off an SHD target
         return _adalif_seq_args(n)
-    resolve_grad_window(fn_str, grad_window)    # refuses the flag off a temporal target
+    # Refuse both flags off a temporal target rather than ignoring them.
+    resolve_grad_window(fn_str, grad_window)
+    resolve_bin_ms(fn_str, bin_ms)
     if fn_str.endswith("NeuralNetwork"):
         if dataset is not None:
             in_dim, out_dim = dataset_dims(dataset)
