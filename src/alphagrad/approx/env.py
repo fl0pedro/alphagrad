@@ -4616,13 +4616,30 @@ def _quality_metrics(jac_exact, jac_approx, *, align: bool = False,
         return jnp.array(0.0, dtype=jnp.float32), jnp.array(1.0, dtype=jnp.float32)
     exact_norm = jnp.sqrt(ee)
     approx_norm = jnp.sqrt(aa)
-    cos = dot / (jnp.maximum(exact_norm, jnp.sqrt(1e-7))
-                 * jnp.maximum(approx_norm, jnp.sqrt(1e-7)))
+    # THE DENOMINATOR IS GUARDED AGAINST ZERO, NOT AGAINST SMALL (defect found
+    # 2026-09-16 on the recurrent SHD family). It used to be
+    # ``max(||.||, sqrt(1e-7))`` on both factors, which is a FLOOR at a
+    # gradient norm of 3.16e-4: below it the cosine of a plan that reproduced
+    # the reference EXACTLY reads ``||g||^2 / 1e-7`` instead of 1.0, and it
+    # reads it silently. Measured on the two-copy window arm at a sampled step
+    # whose gradient norm is 2.19e-4: two bit-identical Jacobians scored
+    # 0.3247. One step of a sparse spiking network is exactly the regime where
+    # that happens, so the floor would have priced the step position instead
+    # of the plan on every SNN row of the matrix.
+    #
+    # A norm of EXACTLY zero is a different case and is still scored 0.0 here:
+    # the cosine is undefined there, and `_grad_cosine_quality` DROPS such a
+    # batch rather than counting it (the zero-reference guard of 2026-09-16).
+    _denom = exact_norm * approx_norm
+    _safe = jnp.where(_denom > 0, _denom, 1.0)
+    cos = jnp.where(_denom > 0, dot / _safe, 0.0)
     # Certain quant/compress combos yield complex-valued Jacobian leaves,
     # making the accumulated dot complex. Use the real part — matches the
     # reward path's existing real cast.
     cos = jnp.real(cos)
-    rel_frob = jnp.sqrt(jnp.maximum(rr, 0.0)) / jnp.maximum(exact_norm, jnp.sqrt(1e-7))
+    _en = jnp.where(exact_norm > 0, exact_norm, 1.0)
+    rel_frob = jnp.where(
+        exact_norm > 0, jnp.sqrt(jnp.maximum(rr, 0.0)) / _en, 1.0)
 
     if os.environ.get("ALPHAGRAD_DEBUG_QUALITY", "0") == "1":
         print(
