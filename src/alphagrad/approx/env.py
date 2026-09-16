@@ -2231,6 +2231,16 @@ def _record_plan(rec: dict) -> None:
         _PLAN_LOG_DROPPED[0] += 1
         return
     rec["attempt"] = int(_PLAN_LOG_ATTEMPT[0])
+    # THE STEP POSITION (owner ruling 2026-09-16). On the one-step recurrent
+    # target the graph is the same at every step position and only the GIVEN
+    # VALUES move, so a record that does not say which step it measured cannot
+    # be read back against another. The builder is the only place that knows
+    # it; this is the one choke point every record passes through. Empty for
+    # every other target, and then nothing is written.
+    from alphagrad.approx.common.rsnn_shd import last_step_position
+    _pos = last_step_position()
+    if _pos:
+        rec["step_position"] = _pos
     _PLAN_RECORDS.append(rec)
 
 

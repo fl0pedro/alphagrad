@@ -26,10 +26,15 @@ from alphagrad.approx.common.snn_shd import (
     SHD_TARGETS,
     TEMPORAL_TARGETS,
     refuse_legacy_snn_env,
-    resolve_bin_ms,
     resolve_grad_window,
-    resolve_temporal_rule,
     shd_args,
+)
+from alphagrad.approx.common.rsnn_shd import (
+    RSNN_ARGNUMS,
+    RSNN_TARGET,
+    is_rsnn,
+    resolve_temporal_rule,
+    rsnn_args,
 )
 
 # ALPHAGRAD_SNN_STEPS and ALPHAGRAD_SNN_TRUNC were the two environment
@@ -329,7 +334,7 @@ _BASIC_ARGS = {
 
 def get_args(fn_str: str, key, dataset: str | None = None,
              grad_window: int | None = None, dataset_size: int | None = -1,
-             bin_ms: int | None = None, temporal_rule: str | None = None):
+             temporal_rule: str | None = None, step_position: int | None = None):
     """Build the initial argument tuple for the example function `fn_str`.
 
     ``grad_window`` is the TARGET's gradient window (``--target-grad-window``,
@@ -340,17 +345,22 @@ def get_args(fn_str: str, key, dataset: str | None = None,
     one step on a temporal target.
     """
     rule = resolve_temporal_rule(fn_str, temporal_rule)
+    if is_rsnn(fn_str):
+        # THE ONE-STEP RECURRENT TARGET (owner ruling 2026-09-16). It has NO
+        # gradient window: the graph is always one recurrent step and the
+        # temporal credit arrives as the VALUES of given edges, so a window
+        # would size nothing. --target-grad-window therefore raises on it,
+        # through the same resolver every other non-temporal target uses.
+        resolve_grad_window(fn_str, grad_window)
+        return rsnn_args(key, dataset=dataset, dataset_size=dataset_size,
+                         temporal_rule=rule, step_position=step_position)
     if fn_str in TEMPORAL_TARGETS:
-        n = resolve_grad_window(fn_str, grad_window, bin_ms=bin_ms)
+        n = resolve_grad_window(fn_str, grad_window)
         if fn_str in SHD_TARGETS:
             return shd_args(fn_str, n, key=key, dataset=dataset,
-                            dataset_size=dataset_size, bin_ms=bin_ms,
-                            temporal_rule=rule)
-        resolve_bin_ms(fn_str, bin_ms)  # refuses the flag off an SHD target
+                            dataset_size=dataset_size)
         return _adalif_seq_args(n)
-    # Refuse both flags off a temporal target rather than ignoring them.
-    resolve_grad_window(fn_str, grad_window)
-    resolve_bin_ms(fn_str, bin_ms)
+    resolve_grad_window(fn_str, grad_window)    # refuses the flag off a temporal target
     if fn_str.endswith("NeuralNetwork"):
         if dataset is not None:
             in_dim, out_dim = dataset_dims(dataset)
@@ -593,7 +603,8 @@ def get_fn(fn_str: str):
 
     # ALREADY THE LOSS. ``LIF_SNN_SHD`` / ``ADALIF_SNN_SEQ`` reduce inside the
     # model and return 0-d. Nothing is added: the model IS the target.
-    if base in ("LIF_SNN_SHD", "ADALIF_SNN_SHD", "ADALIF_SNN_SEQ"):
+    if base in ("LIF_SNN_SHD", "ADALIF_SNN_SHD", "ADALIF_SNN_SEQ",
+                RSNN_TARGET):
         return raw
 
     # NO TRAINING LOSS -- exempt, deliberately. See the block comment.
@@ -872,6 +883,12 @@ def infer_argnums(fn_str: str) -> tuple[int, ...]:
     if fn_str in ("LIF_SNN", "LIF_SNN_SHD", "ADALIF_SNN", "ADALIF_SNN_SHD",
                   "ADALIF_SNN_SEQ"):
         return (8, 9, 10)
+    # THE RECURRENT STEP keeps its three weights at 7, 8 and 9, and the
+    # RECURRENT matrix V is one of them. Without V among the differentiated
+    # weights the state-to-state Jacobian would be block diagonal and e-prop
+    # would be exact rather than an approximation.
+    if fn_str == RSNN_TARGET:
+        return RSNN_ARGNUMS
     if "Encoder" in fn_str or "Decoder" in fn_str:
         # (x, y, *weights) -> every weight arg, matching the vision models.
         # Resolve the BASE name: ``graphax.examples`` has ``Encoder``, never

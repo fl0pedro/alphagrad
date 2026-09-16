@@ -117,24 +117,17 @@ def dataset_dims(name: str) -> tuple[int, int]:
     raise ValueError(f"Unknown dataset '{name}'")
 
 
-def load_dataset(name: str, dataset_size: int | None, subset: str = "train",
-                 bin_ms: int | None = None):
+def load_dataset(name: str, dataset_size: int | None, subset: str = "train"):
     """Load a dataset (cached) and return a `(x, y)` tuple of jnp arrays.
 
     `dataset_size` truncates the cached arrays when > 0; `None` or `<= 0` keeps
     the full set. `subset` selects the MNIST split (``"train"`` or ``"test"``).
     Other datasets currently ignore ``subset`` (only ``"train"`` is supported).
     """
-    cache_key = (name, dataset_size, subset,
-                 None if name != "shd" else resolve_shd_bin_ms(bin_ms))
+    cache_key = (name, dataset_size, subset)
     if cache_key in _DATASET_CACHE:
         return _DATASET_CACHE[cache_key]
 
-    if name != "shd" and bin_ms is not None:
-        raise ValueError(
-            f"--shd-bin-ms {bin_ms} was passed with --dataset {name}: the bin "
-            f"width is a property of the SHD recordings and sizes nothing "
-            f"here. Drop the flag or change the dataset.")
     if name == "mnist":
         x_np, y_np = _load_mnist_native(subset=subset)
         x_np = x_np.reshape(x_np.shape[0], -1).astype(np.float32) / 255.0
@@ -172,7 +165,7 @@ def load_dataset(name: str, dataset_size: int | None, subset: str = "train",
         # The binned Spiking Heidelberg Digits. Its x carries a TIME axis
         # (N, 100, 700) where MNIST's carries none, so it has its own loader;
         # this branch is the one door every caller can knock on.
-        result = load_shd(dataset_size, subset=subset, bin_ms=bin_ms)
+        result = load_shd(dataset_size, subset=subset)
     else:
         if subset != "train":
             raise ValueError(
@@ -246,48 +239,12 @@ def load_wikitext2(vocab_size: int, subset: str = "train") -> np.ndarray:
 _SHD_MIRROR = "https://zenkelab.org/datasets"
 _SHD_FILES = {"train": "shd_train.h5", "test": "shd_test.h5"}
 
-#: The binned shape. n_in = 700 input channels, n_out = 20 classes. The TIME
-#: axis is set by the bin width: the frame is the FIRST SECOND of a recording,
-#: so ``T = 1000 / bin_ms``. LIF_SNN_SHD / ADALIF_SNN_SHD are built to it.
+#: The binned shape. n_in = 700 input channels, T = 100 bins, 10 ms each,
+#: n_out = 20 classes. LIF_SNN_SHD / ADALIF_SNN_SHD are built to it.
 SHD_CHANNELS = 700
+SHD_TIME_BINS = 100
+SHD_BIN_SECONDS = 0.01
 SHD_CLASSES = 20
-
-#: The frame every recording is cut to, in milliseconds. A spike later than
-#: this is dropped, not folded into the last bin.
-SHD_FRAME_MS = 1000
-
-#: The default bin width (``--shd-bin-ms``), in milliseconds.
-SHD_DEFAULT_BIN_MS = 10
-
-#: ``T`` at the default bin width. Kept as a name because the shipped shape of
-#: both SHD targets is the 10 ms one and every archived result carries it.
-SHD_TIME_BINS = SHD_FRAME_MS // SHD_DEFAULT_BIN_MS
-SHD_BIN_SECONDS = SHD_DEFAULT_BIN_MS / 1000.0
-
-
-def resolve_shd_bin_ms(bin_ms: int | None) -> int:
-    """The bin width in milliseconds, or raise.
-
-    It must DIVIDE the one-second frame: a width that does not gives a ragged
-    last bin, and a ragged last bin is a silent change of what the last time
-    step of a recording means.
-    """
-    if bin_ms is None:
-        return SHD_DEFAULT_BIN_MS
-    b = int(bin_ms)
-    if b < 1:
-        raise ValueError(f"--shd-bin-ms must be >= 1 ms, got {b}")
-    if SHD_FRAME_MS % b:
-        raise ValueError(
-            f"--shd-bin-ms {b} does not divide the {SHD_FRAME_MS} ms SHD "
-            f"frame, so the last bin would be ragged. Pick a divisor of "
-            f"{SHD_FRAME_MS} (10 gives T = 100, 100 gives T = 10).")
-    return b
-
-
-def shd_time_bins(bin_ms: int | None = None) -> int:
-    """``T`` at that bin width: how many time steps a recording has."""
-    return SHD_FRAME_MS // resolve_shd_bin_ms(bin_ms)
 
 
 def _shd_cache_dir() -> Path:
@@ -336,38 +293,31 @@ def _download_shd(cache: Path, subset: str) -> Path:
 _SHD_COUNT_DTYPE = np.uint8
 
 
-def _bin_shd(path: Path, bin_ms: int) -> tuple[np.ndarray, np.ndarray]:
-    """Bin one raw SHD file to ``(x [N, T, 700] uint8, y [N] uint8)``.
-
-    ``bin_ms`` is the bin width in milliseconds and ``T = 1000 / bin_ms``. A
-    WIDER bin holds MORE spikes, so the uint8 ceiling is checked per sample
-    and says which width overflowed it.
-    """
+def _bin_shd(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Bin one raw SHD file to ``(x [N, T, 700] uint8, y [N] uint8)``."""
     import h5py
 
-    n_bins = SHD_FRAME_MS // int(bin_ms)
-    bin_secs = int(bin_ms) / 1000.0
     with h5py.File(path, "r") as fh:
         times = fh["spikes"]["times"]
         units = fh["spikes"]["units"]
         labels = np.asarray(fh["labels"][:], dtype=np.uint8)
         n = int(labels.shape[0])
-        x = np.zeros((n, n_bins, SHD_CHANNELS), dtype=_SHD_COUNT_DTYPE)
+        x = np.zeros((n, SHD_TIME_BINS, SHD_CHANNELS), dtype=_SHD_COUNT_DTYPE)
         for i in range(n):
             t = np.asarray(times[i], dtype=np.float64)
             u = np.asarray(units[i], dtype=np.int64)
-            keep = (t >= 0.0) & (t < n_bins * bin_secs)
-            b = (t[keep] / bin_secs).astype(np.int64)
+            keep = (t >= 0.0) & (t < SHD_TIME_BINS * SHD_BIN_SECONDS)
+            b = (t[keep] / SHD_BIN_SECONDS).astype(np.int64)
             c = u[keep]
             if c.size and (c.min() < 0 or c.max() >= SHD_CHANNELS):
                 raise ValueError(
                     f"{path.name} sample {i}: channel index out of range "
                     f"[0, {SHD_CHANNELS}): min {c.min()}, max {c.max()}")
-            cell = np.zeros((n_bins, SHD_CHANNELS), dtype=np.int32)
+            cell = np.zeros((SHD_TIME_BINS, SHD_CHANNELS), dtype=np.int32)
             np.add.at(cell, (b, c), 1)
             if cell.max() > np.iinfo(_SHD_COUNT_DTYPE).max:
                 raise ValueError(
-                    f"{path.name} sample {i}: a {int(bin_ms)} ms bin holds "
+                    f"{path.name} sample {i}: a 10 ms bin holds "
                     f"{cell.max()} spikes, more than "
                     f"{_SHD_COUNT_DTYPE.__name__} can store; widen "
                     f"_SHD_COUNT_DTYPE rather than clipping the count")
@@ -382,24 +332,17 @@ def _bin_shd(path: Path, bin_ms: int) -> tuple[np.ndarray, np.ndarray]:
 _SHD_BINNED: dict = {}
 
 
-def _shd_binned(subset: str, bin_ms: int | None = None
-                ) -> tuple[np.ndarray, np.ndarray]:
+def _shd_binned(subset: str) -> tuple[np.ndarray, np.ndarray]:
     """The binned split ``(x uint8, y uint8 labels)``, on the HOST.
 
     From the ``.npz`` cache beside the MNIST cache, or binned from the raw
     ``.h5`` and cached once. Held per process in ``_SHD_BINNED`` so a second
     ``--dataset-size`` does not re-read 570 MB.
-
-    ONE CACHE PER BIN WIDTH, in memory and on disk. The width is part of the
-    key and part of the file name, so a run at 100 ms bins can never be handed
-    the 10 ms array and a rebuild is what a new width costs -- once.
     """
     if subset not in _SHD_FILES:
         raise ValueError(
             f"SHD subset must be one of {sorted(_SHD_FILES)}, got {subset!r}")
-    bin_ms = resolve_shd_bin_ms(bin_ms)
-    key = (subset, bin_ms)
-    hit = _SHD_BINNED.get(key)
+    hit = _SHD_BINNED.get(subset)
     if hit is not None:
         return hit
     cache = _shd_cache_dir()
@@ -408,15 +351,14 @@ def _shd_binned(subset: str, bin_ms: int | None = None
     # only way to make that impossible is to let the file name say what is in
     # it -- a stale file is then simply not found and is rebuilt.
     npz = cache / (f"shd_{subset}_binned_"
-                   f"{SHD_FRAME_MS // bin_ms}x{SHD_CHANNELS}_"
-                   f"{bin_ms}ms_"
+                   f"{SHD_TIME_BINS}x{SHD_CHANNELS}_"
                    f"{np.dtype(_SHD_COUNT_DTYPE).name}.npz")
     if npz.exists():
         with np.load(npz) as z:
             out = (z["x"], z["y"])
     else:
         raw = _download_shd(cache, subset)
-        out = _bin_shd(raw, bin_ms)
+        out = _bin_shd(raw)
         # Written through an OPEN HANDLE, then renamed: np.savez appends ".npz"
         # to a path that does not already end in it, so passing a ".part" NAME
         # wrote "<...>.npz.part.npz" and the rename then failed on a file that
@@ -426,28 +368,27 @@ def _shd_binned(subset: str, bin_ms: int | None = None
         with open(tmp, "wb") as fh:
             np.savez(fh, x=out[0], y=out[1])
         tmp.replace(npz)
-    _SHD_BINNED[key] = out
+    _SHD_BINNED[subset] = out
     return out
 
 
-def shd_split_size(dataset_size: int | None = -1, subset: str = "train",
-                   bin_ms: int | None = None) -> int:
+def shd_split_size(dataset_size: int | None = -1, subset: str = "train") -> int:
     """How many recordings ``--dataset-size`` leaves in ``subset``."""
-    x, _ = _shd_binned(subset, bin_ms)
+    x, _ = _shd_binned(subset)
     n = int(x.shape[0])
     if dataset_size is not None and dataset_size > 0:
         n = min(n, int(dataset_size))
     return n
 
 
-def shd_sample(index: int, subset: str = "train", bin_ms: int | None = None):
-    """ONE recording as ``(x [T, 700] float32, y [20] float32 one-hot)``.
+def shd_sample(index: int, subset: str = "train"):
+    """ONE recording as ``(x [100, 700] float32, y [20] float32 one-hot)``.
 
-    ``T = 1000 / bin_ms``. This is what a target's argument builder draws. It
-    widens exactly one recording, so the full split never leaves the host and
-    never becomes float32.
+    This is what a target's argument builder draws. It widens exactly one
+    recording, so the full split never leaves the host and never becomes
+    float32.
     """
-    x, y = _shd_binned(subset, bin_ms)
+    x, y = _shd_binned(subset)
     i = int(index)
     if not 0 <= i < int(x.shape[0]):
         raise IndexError(
@@ -458,7 +399,7 @@ def shd_sample(index: int, subset: str = "train", bin_ms: int | None = None):
 
 
 def load_shd(dataset_size: int | None = -1, subset: str = "train",
-             device: bool = True, bin_ms: int | None = None):
+             device: bool = True):
     """THE WHOLE SPLIT as ``(x [N, 100, 700] float32, y [N, 20] one-hot)``.
 
     ``dataset_size > 0`` keeps the FIRST ``dataset_size`` recordings -- the
@@ -473,11 +414,11 @@ def load_shd(dataset_size: int | None = -1, subset: str = "train",
     through :func:`shd_sample`.
     """
     ck = ("shd", int(dataset_size) if dataset_size is not None else None,
-          subset, bool(device), resolve_shd_bin_ms(bin_ms))
+          subset, bool(device))
     if ck in _DATASET_CACHE:
         return _DATASET_CACHE[ck]
-    x_np, y_np = _shd_binned(subset, bin_ms)
-    n = shd_split_size(dataset_size, subset, bin_ms)
+    x_np, y_np = _shd_binned(subset)
+    n = shd_split_size(dataset_size, subset)
     x_np = x_np[:n].astype(np.float32)
     y_np = np.eye(SHD_CLASSES, dtype=np.float32)[y_np[:n]]
     result = ((jnp.asarray(x_np), jnp.asarray(y_np)) if device

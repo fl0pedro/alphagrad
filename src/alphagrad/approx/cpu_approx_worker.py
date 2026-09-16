@@ -748,8 +748,8 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *, seed: int = 0)
     xs = get_args(args.example, args_key, dataset=dataset_for_call,
                   grad_window=getattr(args, "target_grad_window", None),
                   dataset_size=args.dataset_size,
-                  bin_ms=getattr(args, "shd_bin_ms", None),
-                  temporal_rule=getattr(args, "temporal_rule", None))
+                  temporal_rule=getattr(args, "temporal_rule", None),
+                  step_position=getattr(args, "step_position", None))
     gen = data_gen(
         args.example, dataset=dataset_for_call, dataset_size=args.dataset_size
     )

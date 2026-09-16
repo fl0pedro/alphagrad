@@ -118,10 +118,10 @@ from alphagrad.approx.common.temporal_order import (
     build_order_constraint as _build_order_constraint,
     describe as _describe_order,
 )
-from alphagrad.approx.common.snn_shd import (
-    SHD_TARGETS as _SHD_TARGETS,
+from alphagrad.approx.common.snn_shd import SHD_TARGETS as _SHD_TARGETS
+from alphagrad.approx.common.rsnn_shd import (
     TEMPORAL_RULES as _TEMPORAL_RULES,
-    resolve_fixed_temporal_order as _resolve_fixed_temporal_order,
+    last_step_position as _last_step_position,
     resolve_temporal_rule as _resolve_temporal_rule,
 )
 from alphagrad.approx.common.schedules import cosine_warmup_exp_decay_lr
@@ -5519,32 +5519,30 @@ def make_argparser() -> argparse.ArgumentParser:
              "different quantity entirely.")
     p.add_argument(
         "--temporal-rule", choices=list(_TEMPORAL_RULES), default=None,
-        metavar="{bptt,rtrl}",
-        help="HOW THE STATE CARRIED INTO THE GRADIENT WINDOW ENTERS THE "
-             "GRADIENT, on a recurrent target. bptt (backpropagation through "
-             "time): the carry enters as a CONSTANT and the gradient is the "
-             "truncated one -- at --target-grad-window 1 the credit is purely "
-             "spatial. rtrl (real-time recurrent learning): the carried "
-             "influence matrix d state / d W, computed by the detached "
-             "prefix, enters as a GIVEN EDGE from the weights to the carried "
-             "state, so eliminating that vertex multiplies it by the step's "
-             "state-to-state Jacobian -- one RTRL step -- and the gradient is "
-             "EXACT through the whole prefix. That face is where an e-prop-like "
-             "approximation lives (Zenke and Neftci 2020): their rule is this "
-             "face with the state-to-state coupling reduced to its block "
-             "diagonal. The rule also FORCES --fixed-temporal-order (reverse "
-             "for bptt, forward for rtrl) and raises if that flag says the "
-             "opposite. Unset (default) keeps the truncated graph and forces "
-             "no order. RAISES on a target without time steps.")
+        help="HOW TEMPORAL CREDIT ENTERS THE ONE-STEP RECURRENT GRAPH "
+             "(--example RSNN_SHD; owner ruling 2026-09-16). The graph is "
+             "always ONE recurrent step -- inputs the weights, the carried "
+             "state and the input frame, outputs the next state and the step "
+             "loss -- and the rule says which given quantity meets it. "
+             "tbptt (default): no temporal edge, the carried state is a "
+             "constant, truncated and spatial only; the baseline. "
+             "bptt: the FUTURE feeds in. An edge from the next state to the "
+             "loss carries the adjoint dL(>t)/ds_t from a detached backward "
+             "pass over the suffix, so the gradient is exactly the "
+             "contribution step t makes to full backpropagation through time. "
+             "rtrl: the PAST feeds in. An edge from the weights to the "
+             "carried state carries the influence matrix ds(t-1)/dW from a "
+             "detached pass over the prefix, so eliminating that vertex is "
+             "one real-time-recurrent-learning step and the gradient is "
+             "exactly dL_t/dW through the whole prefix. bptt and rtrl are "
+             "both EXACT; the face where the given quantity meets the step is "
+             "where an e-prop-like approximation (Zenke and Neftci 2020) "
+             "lives. RAISES on any target without time steps.")
     p.add_argument(
-        "--shd-bin-ms", type=int, default=None, metavar="MS",
-        help="The SHD bin width in milliseconds (default 10). The frame is "
-             "the first second of a recording, so T = 1000 / MS time steps: "
-             "10 gives T = 100, 100 gives T = 10. MS must divide 1000, "
-             "because a ragged last bin is a silent change of what the last "
-             "time step means. The binned split is cached PER WIDTH, on disk "
-             "and in memory, so the two widths can never be confused. RAISES "
-             "on a target that reads no SHD recording.")
+        "--step-position", type=int, default=None, metavar="T",
+        help="Pin the step position t of the recurrent target instead of "
+             "drawing it uniformly from the run's key. Debugging and tests "
+             "only: a pinned t measures one step of one recording forever.")
     p.add_argument(
         "--approx-profile", choices=["all", "skip", "reduce", "quant", "diag", "none"],
         default=None,
@@ -7508,22 +7506,11 @@ def main():
             "--per-face-masks needs --face-actions: it masks the per-FACE "
             "action space, and without the face head there is none.")
     args.per_face_masks = bool(args.face_actions)
-    # --temporal-rule IS an order across the step copies, so it FILLS IN
-    # --fixed-temporal-order (reverse for bptt, forward for rtrl) and raises on
-    # a contradiction. Resolved HERE, before `dict(vars(args))` reaches the
+    # --temporal-rule is resolved HERE, before `dict(vars(args))` reaches the
     # measure actors and before the wandb config is written, so the trainer,
-    # every actor and the run record all carry the SAME order -- an actor that
-    # read "free" while the trainer ran "forward" would measure a plan the
-    # search can never emit.
+    # every actor and the run record carry the SAME rule. An actor that read a
+    # different rule would measure a different graph than the search acts on.
     args.temporal_rule = _resolve_temporal_rule(args.example, args.temporal_rule)
-    args.fixed_temporal_order = _resolve_fixed_temporal_order(
-        args.temporal_rule, args.fixed_temporal_order)
-    if args.temporal_rule is not None:
-        print(f"[cfg] --temporal-rule {args.temporal_rule}: "
-              f"--fixed-temporal-order {args.fixed_temporal_order}, carried "
-              f"Jacobian "
-              f"{'attached' if args.temporal_rule == 'rtrl' else 'not attached'}",
-              flush=True)
     # Knobs that became flags (dsnn-3qm.44) are REFUSED if a launcher still
     # exports them, never read: an ignored export would run the knob OFF.
     from alphagrad.approx.common.agent_factory import refuse_removed_env_knobs
@@ -7763,8 +7750,13 @@ def main():
     xs = get_args(args.example, args_key, dataset=dataset_for_call,
                   grad_window=args.target_grad_window,
                   dataset_size=args.dataset_size,
-                  bin_ms=args.shd_bin_ms,
-                  temporal_rule=args.temporal_rule)
+                  temporal_rule=args.temporal_rule,
+                  step_position=args.step_position)
+    if args.temporal_rule is not None:
+        _pos = _last_step_position()
+        print(f"[cfg] --temporal-rule {args.temporal_rule}: step t={_pos.get('t')} "
+              f"of T={_pos.get('T')}, recording {_pos.get('recording')}",
+              flush=True)
     gen = data_gen(
         args.example, dataset=dataset_for_call, dataset_size=args.dataset_size
     )
