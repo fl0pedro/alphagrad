@@ -714,6 +714,7 @@ def test_the_temporal_rule_helper_reads_the_rule_off_the_target(gen):
 # --------------------------------------------------------- 8. ppo's argparse
 
 def test_ppo_argparse_accepts_every_thesis_command_line(gen, matrix, smoke):
+    from alphagrad.approx.ppo import make_argparser
     for a in matrix + smoke:
         toks = [_PLACEHOLDER.sub("/tmp/ckpt", t) for t in gen.cli_tokens(a)]
         try:
