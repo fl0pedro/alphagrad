@@ -172,6 +172,10 @@ from alphagrad.approx.common import rollout_shards as _shards
 # CHECKPOINT (1 of 8). --checkpoint-every / --resume. The whole mechanism
 # lives in that module; this file only marks the eight points it is used at.
 from alphagrad.approx.common import checkpoint as _ckpt
+# AUTO-STOP (1 of 8). --auto-stop. The decision, the window bookkeeping and
+# the three conditions live in that module; this file only marks the eight
+# points it is used at. Ticket dsnn-dfw.6.
+from alphagrad.approx.common import auto_stop as _auto
 
 # Same switch carry_stream reads, so one flag turns the whole fold on or
 # off rather than leaving half the consumers folded and half not.
@@ -4535,6 +4539,9 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument("--episodes", type=int, default=50)
     # CHECKPOINT (2 of 8). --checkpoint-every and --resume.
     _ckpt.add_checkpoint_args(p)
+    # AUTO-STOP (2 of 8). --auto-stop, and the two SUPPRESSed test-only knobs
+    # that move the check points and the window size off their ruled values.
+    _auto.add_auto_stop_args(p)
     p.add_argument(
         "--grad-window", type=int, default=1,
         help="How many CONSECUTIVE step deltas the loss re-runs under the "
@@ -7025,6 +7032,26 @@ def main():
         print(f"[checkpoint] resuming {_RESUME_PATH} at episode "
               f"{int(_RESUME_META['episode'])} of {int(args.episodes)}",
               flush=True)
+    # AUTO-STOP (3 of 8). THE REFUSAL, AND THE MONITOR. The refusal is made
+    # here, beside the checkpoint's own, so a command line that cannot stop
+    # correctly never builds an array. The monitor holds one row per episode
+    # and nothing else; the three conditions it decides are in the module.
+    _AUTO_ON = bool(getattr(args, "auto_stop", False))
+    _auto.check_auto_stop_args(args)
+    _AUTO_STOP = (_auto.AutoStopMonitor(window=_auto.window_size(args),
+                                        points=_auto.check_points(args))
+                  if _AUTO_ON else None)
+    # HOW MANY EPISODES THE RUN ACTUALLY RAN. `args.episodes` until an
+    # auto-stop moves it, and the number the end-of-run checkpoint and the
+    # final front dump are labelled with. Without it a stopped run would write
+    # a checkpoint claiming --episodes episodes were done and a resume from it
+    # would start after the end.
+    _EPISODES_DONE = [int(args.episodes)]
+    if _AUTO_ON:
+        print(f"[auto-stop] ON: check points "
+              f"{list(_AUTO_STOP.points)} episodes, window "
+              f"{_AUTO_STOP.window} episodes, return tolerance "
+              f"{100.0 * _AUTO_STOP.return_tolerance:.1f} percent", flush=True)
     # Per-face masks are not a choice: with the face head only the apply-time
     # (per-face, per-slot) mask decides, so it is always on; without the face
     # head there is no per-face action space and the per-vertex mask is all
@@ -13975,11 +14002,16 @@ def main():
         # ---- Pareto front + hypervolume (spec P2) ---------------------------
         # Objectives are logged in "higher is better" form, so the archive's
         # maximisation convention applies directly.
+        # AUTO-STOP: `add_many` returns HOW MANY of this episode's plans were
+        # non-dominated on arrival. That number is condition 1 of the stop
+        # rule and nothing else in the loop had it, so it is kept here rather
+        # than discarded. 0 when no environment was eligible at all.
+        _AS_ADMITTED = 0
         if pareto_archive is not None and elig_rets.shape[0]:
             elig_idx = [i for i in range(all_rets.shape[0]) if eligible[i]]
-            pareto_archive.add_many(
+            _AS_ADMITTED = int(pareto_archive.add_many(
                 ((all_rets[i], _decode_arch(i)) for i in elig_idx), ep
-            )
+            ))
             # CROSS-ARM CAVEAT (audited 2026-08-07). `pareto/archive_size`
             # is the live front's cardinality and means the same thing on
             # az_gumbel. `pareto/hypervolume` uses the same ParetoArchive and
@@ -14019,6 +14051,95 @@ def main():
                         _e = int(_peps[_i]) if _i < len(_peps) else int(ep)
                         tbl.add_data(float(row[a]), float(row[b]), _e)
                     log_dict[key] = tbl
+
+        # ---- AUTO-STOP (4 of 8): THIS EPISODE'S OBSERVATION ----------------
+        # One row per episode, taken HERE because this is the one place that
+        # holds all four quantities at once: the archive's admission count for
+        # this episode, the episode's true scalar return, the terminal
+        # qualities of the LIVE environments and the decoded terminal plans.
+        # Nothing here measures anything -- every number is already on the
+        # host -- and the row is a dozen scalars, so the cost is one dict
+        # build per episode and only when --auto-stop is on.
+        #
+        # THE RETURN IS THE TRUE ONE. `true_return` is the scalar return
+        # before PopArt normalisation. The normalised one moves whenever the
+        # normaliser moves, so a run whose scale is still settling would read
+        # as a run whose result is still moving, and the reverse.
+        #
+        # THE PLAN COUNTS. `n_approx` is how many approximations the terminal
+        # plan ASKS FOR: the micro-action calls the decoder emits per vertex,
+        # plus the live rows of the face wire. Applied is at most requested,
+        # so requested == 0 is applied == 0 exactly, which is what arm B's
+        # collapse ("stays at the identity") needs. The batch-wide
+        # `plan/NN/approx_applied_est` above is an ESTIMATE and the comment
+        # over it forbids reading it as a count, so it is not used here.
+        # Skips are counted separately and reported, never folded into the
+        # approximation count: a skip is a distinct action class.
+        if _AUTO_STOP is not None:
+            # THE CHANNEL IS "quality", not `_QUALITY_METRIC`. The latter names
+            # the MEASURE (jac_cosine, grad cosine); the reward slot it lands
+            # in is called "quality" on every arm. The plan panels above read
+            # the same literal for the same reason.
+            _as_qi = REWARD_INDEX.get("quality")
+            if (_as_qi is None or all_rets.ndim != 2
+                    or all_rets.shape[1] <= int(_as_qi)):
+                raise RuntimeError(
+                    f"--auto-stop needs the quality channel of the terminal "
+                    f"reward vector (the measure is {_QUALITY_METRIC!r}) to "
+                    f"run its collapse detector, and this episode's reward "
+                    f"vectors have shape {all_rets.shape}.")
+            # THE RETURN IS THE RAW WEIGHTED ONE, NOT `scalarized_return`.
+            # `weighted_sums` is this episode's per-environment scalar return
+            # in REWARD UNITS -- the same sum `mean_return` is logged from --
+            # and the mean is taken over the LIVE environments, because a
+            # sentinelled one carries -1e10 on every cost slot.
+            #
+            # `true_return` (`scalarized_return`) is the PopArt-z of the same
+            # quantity: the exact scalar the update maximises. It is the wrong
+            # input for a "has the result stopped moving" test, because a
+            # settled arm drives its own normaliser onto its own returns and
+            # the z-score then walks towards zero. MEASURED on job 65941, on
+            # an arm whose terminal plan was the same plan in every episode:
+            # `scalarized_return` read -5.97e-07 over one window and -4.59e-10
+            # over the next, a relative move of 99.9 percent on a run that had
+            # not changed at all, while the raw return was a steady 2.0. It is
+            # recorded beside the raw one so a reader of auto_stop.json can
+            # see both.
+            _as_ret = None
+            if _any_live:
+                _as_ret = float(np.mean(
+                    np.asarray(weighted_sums, dtype=np.float64)[_live_env]))
+            _as_q = np.asarray(
+                all_rets[_live_env, int(_as_qi)], dtype=np.float64)
+            _as_hashes, _as_napprox, _as_nskip = [], [], []
+            for _as_i in range(all_rets.shape[0]):
+                _as_plan = _decode_arch(_as_i)
+                _as_hashes.append(_auto.plan_hash(_as_plan))
+                _as_seq = (_as_plan["seq"] if isinstance(_as_plan, dict)
+                           else _as_plan)
+                _as_n = int(sum(len(_as_calls) for _as_v, _as_calls in _as_seq))
+                if face_specs_arr is not None:
+                    _as_n += int(np.sum(
+                        np.asarray(face_specs_arr[_as_i])[..., 0] != -1))
+                _as_napprox.append(_as_n)
+                _as_nskip.append(
+                    0 if face_skips_arr is None
+                    else int(np.sum(np.asarray(face_skips_arr[_as_i]) == 1)))
+            _as_row = _AUTO_STOP.record(
+                episode=ep, admitted=int(_AS_ADMITTED),
+                scalar_return=_as_ret, qualities=_as_q,
+                plan_hashes=_as_hashes, n_approx=_as_napprox,
+                n_skip=_as_nskip,
+                scalar_return_z=(None if true_return is None
+                                 else float(true_return)))
+            log_dict["auto_stop/admitted"] = int(_as_row["admitted"])
+            log_dict["auto_stop/distinct_terminal_plans"] = int(
+                _as_row["n_distinct"])
+            log_dict["auto_stop/approximations_max"] = int(
+                _as_row["approx_max"])
+            if _as_row["q_median"] is not None:
+                log_dict["auto_stop/quality_median"] = float(
+                    _as_row["q_median"])
 
         # Stage D/E/F marginals — pair-index distribution (axis-pair head),
         # factor-index distribution (Stage E ρ-collapse early-warning), and
@@ -15318,6 +15439,16 @@ def main():
             "episode_bin": _ckpt.bin_policy_to_json(_EP_BIN),
             "window_bin": _ckpt.bin_policy_to_json(_WIN_BIN),
             "host_state": _ckpt.host_state_to_json(host_state),
+            # AUTO-STOP (5 of 8). THE HISTORY RIDES IN THE CHECKPOINT. The
+            # window at check point 500 reaches back to episode 300, so a run
+            # resumed from the checkpoint at 350 has observed nothing the
+            # decision needs and could not decide at all. One row per episode,
+            # capped at two windows. `null` when --auto-stop is off, which is
+            # the state a resume then checks against: --auto-stop is part of
+            # the argument namespace, so the two legs of one run always agree
+            # about whether it is on.
+            "auto_stop": (None if _AUTO_STOP is None
+                          else _AUTO_STOP.to_json()),
         }
 
     _CKPT_DIR = (_ckpt.run_directory(args.wandb != "disabled")
@@ -15352,6 +15483,45 @@ def main():
               f"{'one episode finished' if _drained else 'nothing pending'}; "
               f"write {_t_write:.2f}s)", flush=True)
 
+    def _auto_stop_now(done, reason):
+        """End the run at `done` complete episodes, for `reason`.
+
+        Called at the quiescent point, with the pipeline already drained, so
+        every artefact below describes a state that a resume reproduces.
+        The order matters. The CHECKPOINT goes first, because it is the only
+        one of the four that a later failure cannot be recovered from; the
+        three records then describe a checkpoint that already exists.
+
+        This does NOT exit the process. It records the stop and the caller
+        leaves the loop, so the end-of-run path -- the final front dump, the
+        top-N tables and the elimination-order table -- runs exactly as it
+        would on a run that had been given `done` episodes in the first place,
+        and the process returns 0. An early `sys.exit` would leave the front
+        of an auto-stopped arm unwritten, which is the one artefact the
+        readout of that arm is made from.
+        """
+        done = int(done)
+        _ckpt_write(done)
+        _as_path = _auto.write_auto_stop_json(_CKPT_DIR, reason)
+        _as_fields = _auto.summary_fields(reason)
+        if wandb.run is not None:
+            wandb.run.summary.update(_as_fields)
+        if _PLAN_LOG_PATH is not None:
+            from alphagrad.approx.common.plan_log import (
+                append_records as _as_plog_append)
+            _as_plog_append(_resolve_plan_log_path(args),
+                            [_auto.plan_log_record(reason)])
+        _EPISODES_DONE[0] = done
+        print(f"[auto-stop] STOPPING after {done} episodes of "
+              f"{int(args.episodes)}. The reason is in {_as_path}, in the "
+              f"wandb summary under auto_stop/, and in the plan log."
+              + ("" if _PLAN_LOG_PATH is not None else " (no plan log)"),
+              flush=True)
+        print(f"[auto-stop] {reason['message']}", flush=True)
+        print(f"[auto-stop] to continue this run, resume the checkpoint at "
+              f"{done} episodes with --episodes above {done}; the next check "
+              f"point is re-evaluated there.", flush=True)
+
     # ---- CHECKPOINT (6 of 8): THE RESTORE -------------------------------
     # HERE and not earlier: `_kl_ref_agent` above is the identity-initialised
     # policy and must stay that policy, and the Pareto archive, the two bin
@@ -15380,6 +15550,13 @@ def main():
         _ckpt.bin_policy_from_json(_EP_BIN, _RESUME_META["episode_bin"])
         _ckpt.bin_policy_from_json(_WIN_BIN, _RESUME_META["window_bin"])
         _ckpt.host_state_from_json(host_state, _RESUME_META["host_state"])
+        # AUTO-STOP (6 of 8). THE HISTORY COMES BACK. Without it the first
+        # check point of a resumed leg would compare windows it never saw.
+        # `load_json` raises when the key is absent or when the window or the
+        # check points differ from this run's, because a history taken under
+        # another window is a history of other numbers.
+        if _AUTO_STOP is not None:
+            _AUTO_STOP.load_json(_RESUME_META.get("auto_stop"))
         _CKPT_LAST[0] = _ep_start
         pbar.update(_ep_start)
         print(f"[checkpoint] restored: episodes 0..{_ep_start - 1} are done, "
@@ -15395,6 +15572,35 @@ def main():
         # drains the pipeline first, so `ep` episodes really are complete.
         if _CKPT_EVERY > 0 and ep > 0 and ep % _CKPT_EVERY == 0:
             _ckpt_write(ep)
+        # ---- AUTO-STOP (7 of 8): THE CHECK POINT ---------------------------
+        # SAME PLACE AS THE CHECKPOINT, AND FOR THE SAME REASON. The decision
+        # reads episode ep-1's observation, and under --measure-pipeline 1
+        # that episode's `host_log` has not run yet at the top of this
+        # iteration: its update is still pending. `_pipe_drain` is what runs
+        # it. So the check happens at the quiescent point, after the drain,
+        # where episodes 0..ep-1 really are complete and observed.
+        #
+        # THE DRAIN IS PART OF THE SCHEDULE (see the checkpoint's note above),
+        # so a check point that is not also a checkpoint episode moves that
+        # one episode the way a checkpoint would. At the ruled configuration
+        # -- check points 250 and 500, --checkpoint-every 50 -- both check
+        # points ARE checkpoint episodes, `_ckpt_write` above has already
+        # drained, and this call finds nothing pending. --auto-stop then
+        # changes no episode of the run it does not stop.
+        #
+        # `ep > _ep_start` is what makes a resume work. A run that stopped at
+        # 250 and is resumed from its checkpoint starts the loop AT 250;
+        # without this it would decide again on the same window and stop
+        # again at once. The next check point is the one that is re-evaluated,
+        # which is what the ruling asks for.
+        if (_AUTO_STOP is not None and ep > _ep_start
+                and _AUTO_STOP.is_check_point(ep)):
+            _pipe_drain()
+            _as_decision = _AUTO_STOP.decide(ep)
+            print(f"[auto-stop] {_as_decision['message']}", flush=True)
+            if _as_decision["stop"]:
+                _auto_stop_now(ep, _as_decision["reason"])
+                break
         # (A3) Publish the episode index for the loss-drop probe rotation.
         # Inert unless --walk-rotate; one env-var write per episode.
         from alphagrad.approx.env import set_walk_episode as _set_walk_ep
@@ -16206,7 +16412,14 @@ def main():
     # checkpointing is on. `_ckpt_write` is a no-op if the last episode was
     # itself a checkpoint episode, so a run whose length is a multiple of
     # --checkpoint-every does not write the same state twice.
-    _ckpt_write(args.episodes)
+    # AUTO-STOP (8 of 8). THE END OF THE RUN IS LABELLED WITH THE EPISODES
+    # THE RUN ACTUALLY RAN. `_EPISODES_DONE[0]` is `--episodes` unless an
+    # auto-stop moved it. A stopped run has already written its checkpoint at
+    # that episode, so this call is the no-op `_ckpt_write` makes of a repeat;
+    # without the change it would write a SECOND checkpoint claiming
+    # `--episodes` episodes were complete, and a resume from that one would
+    # start after the end of the run.
+    _ckpt_write(_EPISODES_DONE[0])
 
     pbar.close()
 
@@ -16222,7 +16435,7 @@ def main():
             file=sys.stderr,
         )
 
-    _dump_pareto(pareto_archive, args, args.episodes, final=True)
+    _dump_pareto(pareto_archive, args, _EPISODES_DONE[0], final=True)
     print_top_n("Total Reward", host_state["top_n_total"])
     print_top_n(f"CMP (Lowest {args.cmp_type})", host_state["top_n_cmp"])
     print_top_n(f"Memory (Lowest {args.mem_type})", host_state["top_n_mem"])
