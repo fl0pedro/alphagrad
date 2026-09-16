@@ -120,6 +120,7 @@ from alphagrad.approx.env import (
 from alphagrad.approx.common.token_vocab import incr_token_vocab
 from alphagrad.approx.common import carry_stream as _carry_stream
 from alphagrad.approx.common.face_driver import (
+    bind_decide_callback,
     bind_sizes_callback,
     bind_step_callbacks,
     build_live_face_stream,
@@ -167,6 +168,7 @@ from alphagrad.approx.common import feature_probe as _fprobe
 from alphagrad.approx.common import var_probe as _vprobe
 from alphagrad.approx.common import gate_telemetry as _gate_telemetry
 from alphagrad.approx.common import episode_stream as _epstream
+from alphagrad.approx.common import rollout_shards as _shards
 # CHECKPOINT (1 of 8). --checkpoint-every / --resume. The whole mechanism
 # lives in that module; this file only marks the eight points it is used at.
 from alphagrad.approx.common import checkpoint as _ckpt
@@ -332,7 +334,7 @@ def _pp_mark(key, x):
         acc = acc + jnp.sum(jnp.asarray(leaf).astype(jnp.float32))
     from jax.experimental import io_callback as _io_callback
     tok = _io_callback(
-        partial(_pp_mark_host, key),
+        _shards.host_serial(partial(_pp_mark_host, key)),
         jax.ShapeDtypeStruct((), jnp.float32),
         acc,
     )
@@ -2975,80 +2977,42 @@ class Agent(eqx.Module):
 
             if budget is not None:
                 # DIFFERENTIABLE dynamic trip count. `nb` here is a batch-wide
-                # bound, so the predicate `i < nb` is UNBATCHED under the
-                # loss's vmap -- vmap then keeps a real `cond` instead of
-                # lowering it to `select_n` over both branches, which is the
-                # whole point (a per-sample predicate would compute the
-                # skipped chunk anyway and save nothing).
+                # bound, so it is UNBATCHED under the loss's vmap. That is the
+                # contract `count_loop` needs: a batched loop bound makes
+                # `lax.while_loop` run to the batch-wide maximum with a select
+                # on every lane, which would compute the skipped chunks anyway
+                # and save nothing.
                 #
-                # Bit-identical for the same reason the while_loop is: `_step`
-                # freezes the entire carry and emits a zero row on an invalid
-                # step, so a skipped chunk is the identity map -- and its
-                # gradient is exactly zero, because every param path out of a
-                # padded step goes through `jnp.where(ok, ., <carry>)` /
-                # `jnp.where(ok, x, 0)` whose cotangent on the frozen side is
-                # zero. The zero rows are still materialised at full width, so
-                # every downstream reduction sees the identical array.
+                # COUNT-PROPORTIONAL BACKWARD, AND THE ONLY LOOP HERE (owner
+                # ruling 2026-09-15). A `lax.scan` would be nb_max = ceil(W/C)
+                # iterations long whatever `nb` is, because reverse-mode AD
+                # cannot transpose a `while_loop`. Inside a `custom_vjp` it
+                # never has to: the forward runs `nb` chunks with a
+                # `while_loop` and saves each chunk's boundary carry, and the
+                # hand-written backward sweeps the same `nb` chunks in
+                # reverse. Same residual (the checkpointed scan stacked
+                # exactly those boundary carries), and the forward is
+                # bit-identical -- see common/count_vjp.py. The old
+                # scan-and-cond body survives in exactly one place,
+                # tests/count_vjp_oracle.py, as the gradient oracle.
+                #
+                # `ALPHAGRAD_LOSS_EXTEND_REMAT` is gone with that scan. It
+                # chose between the scan's stored-residual and recomputed
+                # forms, and `count_loop`'s backward always recomputes the
+                # chunk, so there is no form left to choose.
                 b_toks = toks_p.reshape(nb_max, C)
                 b_valid = valid_p.reshape(nb_max, C)
-                _remat_on = os.environ.get(
-                    "ALPHAGRAD_LOSS_EXTEND_REMAT", "1") != "0"
 
-                # COUNT-PROPORTIONAL BACKWARD (owner ruling 2026-09-14). The
-                # scan below is nb_max = ceil(W/C) iterations long whatever
-                # `nb` is, because reverse-mode AD cannot transpose a
-                # `while_loop`. Inside a `custom_vjp` it never has to: the
-                # forward runs `nb` chunks with a `while_loop` and saves each
-                # chunk's boundary carry, and the hand-written backward sweeps
-                # the same `nb` chunks in reverse. Same residual (the
-                # checkpointed scan already stacks exactly those boundary
-                # carries), same numbers -- see common/count_vjp.py.
-                #
-                # Gated on remat for the same reason the fold is:
-                # ALPHAGRAD_LOSS_EXTEND_REMAT=0 asks for the stored-residual
-                # form, which a recompute-in-the-backward custom_vjp cannot
-                # give.
-                if _remat_on and _count_vjp.enabled():
-                    def _cv_chunk(i, c):
-                        return _walk(c, b_toks[i], b_valid[i])
+                def _cv_chunk(i, c):
+                    return _walk(c, b_toks[i], b_valid[i])
 
-                    (M2, I2), rows_b = _count_vjp.count_loop(
-                        _cv_chunk, c0, nb=nb_max, nb_live=nb,
-                        y_struct=jax.ShapeDtypeStruct(
-                            (C, self.embd_dim), jnp.float32))
-                    rows = rows_b.reshape(nb_max * C, -1)[:W]
-                    new_carry = EncCarry(M=M2, I=I2, pos=carry.pos + count)
-                    return new_carry, rows, valid
-
-                def _chunk_d(c, xs):
-                    i, bt, bv = xs
-
-                    def _run(c):
-                        return _walk(c, bt, bv)
-
-                    def _skip(c):
-                        return c, jnp.zeros((C, self.embd_dim), jnp.float32)
-
-                    return lax.cond(i < nb, _run, _skip, c)
-
-                # REMAT the chunk body. Without it the scan stores every
-                # step's per-layer activations for the backward -- and the
-                # SKIPPED chunks store a zero block of exactly the same
-                # shape, because `cond`'s partial-eval joins both branches'
-                # residuals. That residual traffic is O(window) no matter how
-                # few chunks actually run, which is why shrinking the chunk
-                # count alone left a floor. With remat each chunk stores only
-                # its boundary carry and recomputes its forward, so a skipped
-                # chunk costs a predicate.
-                # ON by default: measured 4.8s -> 2.1s of prof/update on the
-                # TLM flagship and 4.1s -> 3.2s on CPU, with a bitwise
-                # identical forward. ALPHAGRAD_LOSS_EXTEND_REMAT=0 restores
-                # the stored-residual form.
-                _body = (jax.checkpoint(_chunk_d)
-                         if _remat_on else _chunk_d)
-                (M2, I2), rows_b = lax.scan(
-                    _body, c0,
-                    (jnp.arange(nb_max, dtype=jnp.int32), b_toks, b_valid))
+                (M2, I2), rows_b = _count_vjp.count_loop(
+                    _cv_chunk, c0, nb=nb_max, nb_live=nb,
+                    y_struct=jax.ShapeDtypeStruct(
+                        (C, self.embd_dim), jnp.float32))
+                # The untaken slots stay zero, which is what the cond form's
+                # skip branch wrote there, so every downstream reduction sees
+                # the identical array.
                 rows = rows_b.reshape(nb_max * C, -1)[:W]
                 new_carry = EncCarry(M=M2, I=I2, pos=carry.pos + count)
                 return new_carry, rows, valid
@@ -3340,8 +3304,6 @@ class Agent(eqx.Module):
                 f_pair = jnp.broadcast_to(
                     _pair, (_F,) + _pair.shape)
                 f_comp = jnp.broadcast_to(_av, (_F,) + _av.shape)
-                _n_faces = face_count_fn(vertex_idx)
-                f_valid = (jnp.arange(_F) < _n_faces).astype(jnp.float32)
                 # --per-face-masks, SIZES half (workstream A1b). The
                 # masks above are static BY DESIGN on this path (per-face
                 # legality is enforced at APPLICATION), but the head's
@@ -3357,8 +3319,26 @@ class Agent(eqx.Module):
                 # the oracle path supplies, so everything downstream --
                 # `_face_loop`, the stored trajectory leaf, `_face_replay`
                 # -- is untouched.
+                #
+                # ONE ROUND TRIP FOR THE COUNT AND THE MASKS (owner ruling
+                # 2026-09-15, item 1). This call and the face count used to
+                # be two `pure_callback`s fired back to back with BYTE-
+                # IDENTICAL operands (the same prefix, the same history
+                # wires, the same vertex) and no dependence either way. The
+                # slot-legality callback now carries the count as its sixth
+                # output (`face_driver.make_face_slot_legality_callback`,
+                # `with_count`) and `face_count_fn` is not called on this
+                # path at all. The count is still `LiveFaceStream.n_faces`,
+                # so the narrow-wire guard and the value are unchanged.
+                _fsz = None
                 if face_sizes_fn is not None:
                     _fsz = face_sizes_fn(vertex_idx)
+                if _fsz is not None and len(_fsz) > 5:
+                    _n_faces = _fsz[5]
+                else:
+                    _n_faces = face_count_fn(vertex_idx)
+                f_valid = (jnp.arange(_F) < _n_faces).astype(jnp.float32)
+                if _fsz is not None:
                     f_sizes, f_quant = _fsz[0], _fsz[1]
                     if len(_fsz) > 2:
                         # --face-slot-frames (ticket .18): the per-SLOT
@@ -5727,7 +5707,36 @@ def make_argparser() -> argparse.ArgumentParser:
         "--num-envs",
         type=int,
         default=-1,
-        help="Parallel rollout envs. -1 = os.cpu_count() (or 16 for Vmapped examples).",
+        help="Parallel rollout envs PER SHARD (see --rollout-shards). "
+             "-1 = os.cpu_count() (or 16 for Vmapped examples).",
+    )
+    p.add_argument(
+        "--rollout-shards",
+        type=int,
+        default=1,
+        metavar="N",
+        help="DATA PARALLELISM OVER ENVIRONMENTS. Roll out N shards of "
+             "--num-envs environments each, one shard per GPU, so an episode "
+             "holds N * --num-envs environments and the PPO update runs on "
+             "all of them concatenated. 1 (the default) is the single-device "
+             "rollout, unchanged down to the trace. The shards are dispatched "
+             "one Python thread each, because a host callback runs on the "
+             "thread that dispatched its program; their per-step measurement "
+             "callbacks rendezvous into ONE batched pool call over all the "
+             "rows, because concurrent calls would starve each other of "
+             "actors. See common/rollout_shards.py.",
+    )
+    p.add_argument(
+        "--rollout-shard-devices",
+        type=str,
+        default="",
+        metavar="I,J,...",
+        help="WHICH DEVICE EACH ROLLOUT SHARD RUNS ON, as device indices, one "
+             "per shard. Empty (the default) is one shard per device in "
+             "order. Naming one device twice puts two shards ON IT, which is "
+             "how two half-batch shards are interleaved on a single GPU so "
+             "that the device work of one half runs while the other half is "
+             "on the host.",
     )
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument(
@@ -7911,7 +7920,7 @@ def main():
     def _oracle_masks(order, spec_hist, step_count):
         """(pair (total_v+1, N, N), comp (total_v+1, N)) for the current graph."""
         return jax.pure_callback(
-            _oracle_masks_host,
+            _shards.host_serial(_oracle_masks_host),
             (jax.ShapeDtypeStruct((_oracle_total_v + 1, _oracle_N, _oracle_N),
                                   jnp.float32),
              jax.ShapeDtypeStruct((_oracle_total_v + 1, _oracle_N), jnp.float32)),
@@ -8017,7 +8026,7 @@ def main():
                 jax.ShapeDtypeStruct((V + 1, F, N), jnp.int32),
                 jax.ShapeDtypeStruct((V + 1, F), jnp.float32))
         return jax.pure_callback(
-            _oracle_face_masks_host, _shapes,
+            _shards.host_serial(_oracle_face_masks_host), _shapes,
             order, spec_hist, step_count, vmap_method="sequential",
         )
 
@@ -8141,7 +8150,7 @@ def main():
                 jax.ShapeDtypeStruct((F, N), jnp.int32),
                 jax.ShapeDtypeStruct((F,), jnp.float32))
         return jax.pure_callback(
-            _oracle_one_host, _shapes,
+            _shards.host_serial(_oracle_one_host), _shapes,
             order, spec_hist, step_count, vertex_idx,
             vmap_method="sequential",
         )
@@ -8261,7 +8270,7 @@ def main():
         def _probe_targets(order, spec_hist, step_count, vertex_idx, ends):
             P, N = _PROBE_FACES, _oracle_N
             return jax.pure_callback(
-                _probe_targets_host,
+                _shards.host_serial(_probe_targets_host),
                 (jax.ShapeDtypeStruct((P, _fprobe.NFT), jnp.float32),
                  jax.ShapeDtypeStruct((P, N), jnp.float32),
                  jax.ShapeDtypeStruct((P,), jnp.float32)),
@@ -8455,7 +8464,7 @@ def main():
                         face_hist, skip_hist):
             P = _PROBE_FACES
             return jax.pure_callback(
-                _vp_targets_host,
+                _shards.host_serial(_vp_targets_host),
                 (jax.ShapeDtypeStruct(
                     (P, _vprobe.N_SLOTS, _vprobe.TGT_COLS), jnp.float32),
                  jax.ShapeDtypeStruct((P, _vprobe.N_SLOTS), jnp.float32)),
@@ -8500,8 +8509,11 @@ def main():
             # env count would turn every substep into a cold replay.
             # (AZ, with no envs, passes its own capacity;
             # ALPHAGRAD_FACE_PREFIX_CACHE still overrides.)
-            cache=max(64, 4 * _resolve_num_envs(
-                args.num_envs, args.example)),
+            # --rollout-shards: the shards' face callbacks are concurrent,
+            # so the live set is one prefix per environment of the WHOLE
+            # episode, N times what one shard holds.
+            cache=max(64, 4 * int(getattr(args, "rollout_shards", 1) or 1)
+                      * _resolve_num_envs(args.num_envs, args.example)),
         )
         # The `pure_callback` wrappers themselves now live in
         # common/face_driver.py so AZ drives the SAME stream, not a copy.
@@ -8538,9 +8550,15 @@ def main():
         # flag-off trace has no extra callback and no extra host work.
         # Per-SLOT, always (ticket .18): the per-face probe recorded the
         # RESULT tensor only and broadcast it to lhs / rhs / new.
+        # `with_count`: the face COUNT rides out of this same call, so the
+        # rollout step makes ONE host round trip for the count and the masks
+        # instead of two with identical operands (owner ruling 2026-09-15,
+        # item 1). `Agent.sample_action_dynamic` reads the sixth output and
+        # never calls `face_count_fn` on this path.
         _live_face_sizes = make_face_slot_legality_callback(
             _LIVE_FACES, max_faces=_F_FACES,
-            max_axes=MAX_AXES_PER_VERTEX, prof_sink=_env_prof_add)
+            max_axes=MAX_AXES_PER_VERTEX, prof_sink=_env_prof_add,
+            with_count=True)
         # The exact slot-2 masks (ticket .59 fault 2): the two-stage pass,
         # driven with the rollout's own stage-1 rows for slots 0 and 1 and
         # drawing nothing for slot 2, so what comes back is the legality of
@@ -8571,7 +8589,8 @@ def main():
     if not os.environ.get("ALPHAGRAD_FACE_LIVE_CHAINS"):
         from alphagrad.approx import env as _env_chain_mod
         _env_chain_mod._LIVE_CHAIN_CAP = max(
-            8, 4 * _resolve_num_envs(args.num_envs, args.example))
+            8, 4 * int(getattr(args, "rollout_shards", 1) or 1)
+            * _resolve_num_envs(args.num_envs, args.example))
 
     _ORACLE_ONE_VERTEX = os.environ.get(
         "ALPHAGRAD_ORACLE_ONE_VERTEX", "1") == "1"
@@ -8713,7 +8732,56 @@ def main():
             f"Stage D: pinning factor to {args.pin_factor} (index {pin_factor_idx} "
             f"in factor_table). Axis head trains; factor head deterministic."
         )
-    num_envs = _resolve_num_envs(args.num_envs, args.example)
+    # --rollout-shards: DATA PARALLELISM OVER ENVIRONMENTS.
+    #
+    # `envs_per_shard` is what --num-envs asks for and what one GPU rolls out.
+    # `num_envs` is the TOTAL the episode holds, and everything downstream of
+    # the rollout -- the minibatching, the loss, the episode streams' row
+    # count, the trajectory -- reads that one, because the update runs on the
+    # shards concatenated and is the same program a single device would run
+    # for that many environments. At one shard the two are the same number and
+    # nothing below this line can tell the difference.
+    envs_per_shard = _resolve_num_envs(args.num_envs, args.example)
+    _SHARDS = int(getattr(args, "rollout_shards", 1) or 1)
+    if _SHARDS < 1:
+        raise ValueError(
+            f"--rollout-shards must be at least 1, got {_SHARDS}.")
+    _SHARD_MAP = _shards.parse_shard_devices(
+        getattr(args, "rollout_shard_devices", "") or "", _SHARDS)
+    _SHARD_DEVS = _shards.resolve_devices(_SHARDS, mapping=_SHARD_MAP)
+    num_envs = envs_per_shard * _SHARDS
+    if _SHARDS > 1:
+        if os.environ.get("ALPHAGRAD_BATCHED_CALLBACK", "0") != "1":
+            # Only the BATCHED step callback is wrapped by the rendezvous.
+            # Per-environment callbacks would each make their own pool call,
+            # and `CpuApproxPool._pick()` sentinels every slot it cannot get
+            # an actor for, so most of the environments would come back with
+            # a -1e10 reward they never earned.
+            raise ValueError(
+                "--rollout-shards > 1 needs ALPHAGRAD_BATCHED_CALLBACK=1: the "
+                "shards' measurement rendezvous wraps the batched step "
+                "callback, and the per-environment one has nothing to gather.")
+        print(f"[rollout-shards] {_SHARDS} shards x {envs_per_shard} "
+              f"environments = {num_envs} environments per episode, on "
+              f"devices {[str(d) for d in _SHARD_DEVS]}; the PPO update runs "
+              f"on all of them concatenated on {_SHARD_DEVS[0]}", flush=True)
+        # THE UPDATE'S MINIBATCH GROWS WITH THE SHARDS, and it is the thing
+        # that runs out of memory first: every shard's trajectory is moved to
+        # the trainer's device and the minibatch is `num_envs / minibatches`
+        # TRAJECTORIES under --grad-window 0. Measured: 8 shards x 16
+        # environments with --minibatches 4 asks for 32 trajectories in one
+        # minibatch and dies asking for 37.5 GiB on a 98 GB Blackwell (job
+        # 65822 arm s8), where 4 shards at 16 trajectories fits. Say the
+        # number at startup so the operator sizes --minibatches with the
+        # shards instead of discovering it an episode in.
+        _mb_traj = max(1, int(num_envs) // max(1, int(args.minibatches)))
+        print(f"[rollout-shards] --minibatches {args.minibatches} puts "
+              f"{_mb_traj} of the {num_envs} trajectories in one minibatch, "
+              f"{_SHARDS if int(args.minibatches) <= envs_per_shard else 1} "
+              f"times what the same --minibatches put there at one shard; "
+              f"the update runs on ONE device, so scale --minibatches with "
+              f"--rollout-shards to keep the minibatch the size it was",
+              flush=True)
     # 8-component reward vector is still emitted by the env and used for
     # host-side display (top-N heaps, per-component means). Training-side
     # value / advantage path operates on the 3-vec (latency / peak_memory /
@@ -9116,26 +9184,40 @@ def main():
 
     # Rollout / loss / training step factories.
     def reset_envs(env_obj):
-        return jax.vmap(lambda _: env_obj.reset())(jnp.arange(num_envs))
+        # ONE SHARD's environments. A shard rolls out `envs_per_shard` of
+        # them; without shards that is every environment there is.
+        return jax.vmap(lambda _: env_obj.reset())(jnp.arange(envs_per_shard))
 
     # The environment index each rollout row carries. Constant for the run,
     # and the same order `env._batched_host` walks its slots in, so the row
     # the overflow message names is the row the telemetry names.
-    _EP_ENV_IDX = jnp.arange(num_envs, dtype=jnp.int32)
+    #
+    # --rollout-shards: the index is GLOBAL. Shard s carries
+    # `s*E .. (s+1)*E - 1`, so the concatenation of the shards' rows is in
+    # environment order without a permutation, every environment has exactly
+    # one index across the whole episode, and a stream row index is still its
+    # own environment's row. `_ep_env_idx(0)` at one shard is `arange(E)`,
+    # which is what it always was.
+    def _ep_env_idx(shard):
+        lo, hi = _shards.shard_env_range(shard, _SHARDS, envs_per_shard)
+        return jnp.arange(lo, hi, dtype=jnp.int32)
+
+    _EP_ENV_IDX = _ep_env_idx(0)
     # THE ONLY BOUND ON THE ROW INDEX (review finding 8). Every loss-side
     # read of the streams is `dynamic_slice(stream, (env_index, ...))`, and
     # `dynamic_slice` CLAMPS an out-of-range row instead of raising, so an
     # `env_index` past the end would read a neighbouring environment's
     # tokens in silence. It is checked HERE, where it is concrete and the
     # check costs nothing, rather than per read where it would not be.
-    if (int(_EP_ENV_IDX.shape[0]) != int(num_envs)
-            or not bool(jnp.all(_EP_ENV_IDX
+    _EP_IDX_ALL = jnp.concatenate([_ep_env_idx(_s) for _s in range(_SHARDS)])
+    if (int(_EP_IDX_ALL.shape[0]) != int(num_envs)
+            or not bool(jnp.all(_EP_IDX_ALL
                                 == jnp.arange(num_envs,
                                               dtype=jnp.int32)))):
         raise ValueError(
             f"the rollout's environment index must be exactly "
-            f"0..{int(num_envs) - 1}, one row per environment; got "
-            f"{_EP_ENV_IDX}")
+            f"0..{int(num_envs) - 1}, one row per environment across every "
+            f"shard; got {_EP_IDX_ALL}")
 
     # DOES THE FACE STREAM EXIST AT ALL? The SAME static flag the loss's
     # reader is gated on (`fch=... if _LIVE_FACES is not None`, under
@@ -9178,8 +9260,11 @@ def main():
         _w = (MAX_DELTA_TOKENS if win_log2 is None
               else (1 << int(win_log2)))
         L = _epstream.stream_length(int(log2), _w)
-        return (jnp.zeros((num_envs, L), DELTA_TOKEN_DTYPE),
-                jnp.zeros((num_envs, L), DELTA_TOKEN_DTYPE)
+        # ONE SHARD's rows. The driver concatenates the shards' streams into
+        # the `(num_envs, L)` pair the loss reads, and a global `env_index`
+        # picks the right row out of it.
+        return (jnp.zeros((envs_per_shard, L), DELTA_TOKEN_DTYPE),
+                jnp.zeros((envs_per_shard, L), DELTA_TOKEN_DTYPE)
                 if _EP_FACE else None)
 
     # THE BIN, AND THE ONLY PLACE IT IS CHOSEN. The bins are a small set of
@@ -9255,6 +9340,15 @@ def main():
         """Called at the top of EVERY attempt, including the repeats."""
         _EP_HOST_SNAP[0] = _ep_env_mod.episode_telemetry_snapshot()
         _ep_env_mod.set_plan_log_attempt(_EP_ATTEMPT[0])
+        # THE HOST FACE PREFIX IS RESET WITH THE ATTEMPT (owner ruling
+        # 2026-09-15, item 2). It is not in the telemetry snapshot: it is a
+        # buffer the callbacks write in place, and `_telemetry_copy` shares
+        # array leaves on purpose, so a snapshot of it would be the very array
+        # the repeat overwrites. Its correct value at the top of any attempt is
+        # "no rows", which is what this says. The repeat's own first callback
+        # at `step_count == 0` empties it again, so this is the second of two
+        # guards rather than the only one.
+        _ep_env_mod.face_prefix_reset()
 
     def _ep_discard(result, pool_drain: bool = True):
         """Roll a discarded attempt back, in the trainer AND in the actors.
@@ -9611,15 +9705,16 @@ def main():
                     if _live_face_decide is not None:
                         # Same prefix and history as the sizes: the stage-2
                         # masks must be composed on the tokenizer state the
-                        # stage-1 masks were read from.
-                        def face_decide_fn(_v, _skips, _rows,
-                                           _o=state.order,
-                                           _s=state.sparsity_specs,
-                                           _k=state.step_count,
-                                           _fh=_fh_w,
-                                           _kh=_kh_w):
-                            return _live_face_decide(
-                                _o, _s, _k, _v, _fh, _kh, _skips, _rows)
+                        # stage-1 masks were read from. Bound through
+                        # face_driver so this closure narrows to the step's
+                        # ROW exactly as the other two do (owner ruling
+                        # 2026-09-15, item 2); it used to be written out here
+                        # and was the one binding the row wire would have
+                        # missed.
+                        face_decide_fn = bind_decide_callback(
+                            _live_face_decide,
+                            state.order, state.sparsity_specs,
+                            state.step_count, _fh_w, _kh_w)
 
             if args.dynamic_substeps:
                 # Live per-vertex DIAG/COMPRESS masks for the current graph
@@ -10451,9 +10546,9 @@ def main():
         # 21785 at 16). With remat each of the K steps stores only its
         # boundary `(carry, vmem_sums, vmem_counts)` and recomputes its own
         # forward when the cotangent arrives -- the same trade `_block` and
-        # `_chunk_d` already make one level down, and the reason nesting is
-        # correct rather than doubly wasteful: the inner remat bounds what a
-        # single recomputed step costs.
+        # `count_vjp.count_loop` already make one level down, and the reason
+        # nesting is correct rather than doubly wasteful: the inner remat
+        # bounds what a single recomputed step costs.
         #
         # NOTHING COMPUTED CHANGES, only where the activations live: the
         # recomputation replays the identical jaxpr on the identical inputs,
@@ -11336,6 +11431,13 @@ def main():
         # traced loss program per pair, and a pair already compiled costs
         # nothing to return to.
         win_log2,
+        # WHICH ROLLOUT SHARD this call is (--rollout-shards). A plain Python
+        # int, so `eqx.filter_jit` treats it as static and every shard gets
+        # its own trace -- which it needs, because the shard index selects the
+        # environment block, its keys, its preferences and the rendezvous slot
+        # of its step callback. 0 at one shard, and then every expression
+        # below collapses to the one that was there before.
+        shard=0,
     ):
         _W_EP = 1 << int(win_log2)
         if int(env_obj.delta_window) != _W_EP:
@@ -11353,7 +11455,20 @@ def main():
                 f"`env.with_delta_window(1 << win_log2)`.")
         subkey, key = jrand.split(key)
         rollout_key, key = jrand.split(key)
+        # ONE KEY PER ENVIRONMENT OF THE WHOLE EPISODE, split from the
+        # episode's key exactly as before; the shard then takes its own block.
+        # THIS IS WHAT MAKES A TRAJECTORY INDEPENDENT OF THE GPU THAT ROLLED
+        # IT: a global environment index names a key, and the key does not
+        # depend on how the environments were divided between devices. At one
+        # shard `num_envs == envs_per_shard` and this line is literally the
+        # one it replaces.
         rollout_keys = jrand.split(rollout_key, num_envs)
+        _prefs = preferences_per_env
+        if _SHARDS > 1:
+            _lo, _hi = _shards.shard_env_range(shard, _SHARDS, envs_per_shard)
+            rollout_keys = rollout_keys[_lo:_hi]
+            _prefs = jax.tree_util.tree_map(
+                lambda _x: _x[_lo:_hi], preferences_per_env)
         # Phase-0: start the attribution clock at the top of the episode.
         env_states = _pp_mark(None, env_states)
 
@@ -11363,6 +11478,7 @@ def main():
         # See attention_entropy_diagnostic: representation diagnostic, not a
         # policy entropy.
         _ep_tok0, _ep_ftok0 = _episode_streams(ep_log2, win_log2)
+        _env_idx = _ep_env_idx(shard)
         # NAME THE PATH FOR THE WHOLE ROLLOUT TRACE. Every reader inside
         # `rollout_fn` names its own path as an argument; this block is for
         # the one that cannot, `palimpsa_mix` inside the mixer module, which
@@ -11383,7 +11499,7 @@ def main():
                 env_states,
                 rollout_keys,
                 base_mem,
-                preferences_per_env,
+                _prefs,
                 op_legality_override_arg,
                 pin_rules_to_exact_arg,
                 # vertex_temperature: None in training (the vmap in_axes
@@ -11391,7 +11507,7 @@ def main():
                 None,
                 _ep_tok0,
                 _ep_ftok0,
-                _EP_ENV_IDX,
+                _env_idx,
             )
         # THE ROLLOUT'S WHOLE OUTPUT, as one tuple. `subkey` rides along
         # because the update's epoch keys are split from it and the split
@@ -14575,6 +14691,27 @@ def main():
                         + _cache_line,
                         file=sys.stderr,
                     )
+                # THE PER-STEP HOST ROUND TRIPS (owner ruling 2026-09-15,
+                # item 1). One counter per host body, bumped once per
+                # `pure_callback` INVOCATION (each serves the whole batch,
+                # `vmap_method="broadcast_all"`), so this line is the number
+                # of device-to-host round trips the face path made this
+                # episode. `faces.count_legality` is the MERGED count+mask
+                # call; a nonzero `faces.live_count` beside it means the
+                # merge is not engaged on this arm.
+                try:
+                    from alphagrad.approx.common.face_driver import (
+                        consume_callback_census as _ccc)
+                    _cen = _ccc()
+                    if _cen:
+                        tqdm.write(
+                            f"[cb-census ep={ep:3d}] "
+                            + "  ".join(f"{k}={v}"
+                                        for k, v in sorted(_cen.items())),
+                            file=sys.stderr,
+                        )
+                except Exception:
+                    pass
                 # Phase-0 per-decision attribution + the size distributions
                 # that size the bucket grids. Both are separately gated
                 # (ALPHAGRAD_PROFILE_POLICY / ALPHAGRAD_PROFILE_DIST) and
@@ -14747,6 +14884,94 @@ def main():
     # here (it is the default device); naming it is what makes them
     # COMMITTED, which is the point -- see the loop body.
     _train_dev = jax.local_devices()[0]
+
+    # ---- --rollout-shards: one rollout shard per GPU ---------------------
+    #
+    # `rollout_fn` returns this many PER-ENVIRONMENT outputs. `_episode_rollout`
+    # returns them plus the episode's subkey, which is not per environment.
+    _ROLL_N = 13
+    #
+    # THE RENDEZVOUS IS INSTALLED ONCE, before anything traces a sharded env,
+    # because `env.tokenize` reads it at TRACE time. One shard installs
+    # nothing and wraps nothing.
+    if _SHARDS > 1:
+        _ep_env_mod.set_shard_gather(
+            _shards.ShardGather(_SHARDS, envs_per_shard,
+                                log=lambda *a, **k: print(*a, **k)))
+
+    # The env each shard rolls out with: the window bin as a shape, the shard
+    # index as aux data, and its arrays ON ITS OWN DEVICE. Cached, because the
+    # env carries the target's arguments and constants and re-shipping them to
+    # seven devices every episode would cost more than the rollout saves.
+    _SHARD_ENV_CACHE: dict = {}
+
+    def _shard_env(win_log2, shard):
+        _k = (int(win_log2), int(shard))
+        _got = _SHARD_ENV_CACHE.get(_k)
+        if _got is None:
+            _got = env_episode.with_delta_window(1 << int(win_log2))
+            if _SHARDS > 1:
+                _got = _to_device(
+                    _got.with_rollout_shard(shard, _SHARDS),
+                    _SHARD_DEVS[int(shard)])
+            _SHARD_ENV_CACHE[_k] = _got
+        return _got
+
+    def _to_device(x, dev):
+        """Commit every jax.Array leaf of `x` to `dev`; leave the rest alone.
+
+        `eqx.filter_jit` runs where its COMMITTED arguments live and refuses a
+        call whose arguments are committed to two devices. The agent, the
+        optimiser state and the base memory come off the trainer's device
+        committed, so a shard has to be handed its own copy or the whole
+        rollout runs back on device 0.
+        """
+        if _SHARDS == 1:
+            # One shard runs where it always ran, and placing an array that is
+            # already there would still be a dispatch this path never made.
+            return x
+        return jax.tree_util.tree_map(
+            lambda _x: (jax.device_put(_x, dev)
+                        if isinstance(_x, jax.Array) else _x), x)
+
+    def _shard_rollout(one, win_log2):
+        """`one(shard, env)` on every shard, concatenated in env order.
+
+        Each shard is dispatched from its OWN Python thread. That is not a
+        convenience: a host callback runs on the thread that dispatched its
+        program (probe job 65806 on pgi15-gpu19), so dispatching the shards
+        from one thread would run their callbacks one after another and the
+        rollouts would not overlap at all.
+
+        Every leaf a rollout returns is per environment, because `rollout_fn`
+        is vmapped over environments -- except the trailing `subkey` of
+        `_episode_rollout`, which is a scalar key every shard derives from the
+        same episode key by the same splits. So the per-environment leaves
+        concatenate and the key is taken from shard 0.
+        """
+        if _SHARDS == 1:
+            return one(0, _shard_env(win_log2, 0))
+        _outs = _shards.dispatch(
+            [(lambda _s=_s: one(_s, _shard_env(win_log2, _s)))
+             for _s in range(_SHARDS)])
+        _n = len(_outs[0])
+        if any(len(_o) != _n for _o in _outs):
+            raise ValueError(
+                "the rollout shards returned different numbers of outputs; "
+                "they run the same program and cannot.")
+        if _n not in (_ROLL_N, _ROLL_N + 1):
+            raise ValueError(
+                f"a rollout shard returned {_n} outputs; `rollout_fn` returns "
+                f"{_ROLL_N} per-environment ones and `_episode_rollout` adds "
+                f"the episode's subkey to them.")
+        _joined = _shards.concat_shards(
+            [tuple(_o[:_ROLL_N]) for _o in _outs], _train_dev)
+        if _n == _ROLL_N:
+            return _joined
+        # The subkey is NOT per environment: every shard splits it from the
+        # same episode key by the same two splits, so they all hold the same
+        # value and shard 0's is the episode's.
+        return tuple(_joined) + (jax.device_put(_outs[0][_ROLL_N], _train_dev),)
 
     # THE MEASURE ACTORS' PER-EPISODE TELEMETRY, TAKEN ONCE (measure-pipeline).
     # `host_log` normally drains the actors itself, which is right while the
@@ -15461,6 +15686,10 @@ def main():
 
         eval_samples = generate_eval_samples(env, ep_eval_key, args.num_eval_samples)
         env_episode = eqx.tree_at(lambda e: e.eval_args_samples, env, eval_samples)
+        # The eval samples ride the env and are drawn afresh every episode, so
+        # a per-shard copy from the previous episode is a STALE SAMPLE. Drop
+        # them here, where the env they were made from is replaced.
+        _SHARD_ENV_CACHE.clear()
         # ONE ray.put per EPISODE instead of one serialisation per STEP.
         # `eval_args_samples` rides the env, so it is a closed-over constant
         # of the step callback and the pool re-shipped the whole tuple (tens
@@ -15548,18 +15777,39 @@ def main():
                     # the bin, and `reset` is deterministic and makes no
                     # host callback under delta_obs, so this is the same
                     # states at the same width and nothing else.
-                    _env_w = env_episode.with_delta_window(1 << int(_w))
-                    _s = reset_envs(_env_w)
-                    _t0, _f0 = _episode_streams(_n, _w)
-                    with _read_path("rollout"):
-                        _out = rollout_fn(
-                            agent, _env_w, num_valid, _s,
-                            jrand.split(_k, num_envs), base_mem,
-                            preferences_per_env, stage_override,
-                            stage_pin_rules,
-                            _wt,  # positional: vmap in_axes is positional
-                            _t0, _f0, _EP_ENV_IDX,
+                    # THE WARM-UP IS A ROLLOUT LIKE ANY OTHER, so it is
+                    # sharded like any other. It has to be: the shards'
+                    # step callbacks rendezvous, and a rollout that ran on
+                    # one shard while the others stood still would wait at
+                    # the first step for shards that never arrive.
+                    def _wone(_sh, _env_s):
+                        _dev = _SHARD_DEVS[_sh]
+                        _lo, _hi = _shards.shard_env_range(
+                            _sh, _SHARDS, envs_per_shard)
+                        _ks = jrand.split(_k, num_envs)[_lo:_hi]
+                        _pf = jax.tree_util.tree_map(
+                            lambda _x: _x[_lo:_hi], preferences_per_env)
+                        _t0, _f0 = _episode_streams(_n, _w)
+                        return rollout_fn(
+                            _to_device(agent, _dev), _env_s, num_valid,
+                            _to_device(reset_envs(_env_s), _dev),
+                            _to_device(_ks, _dev),
+                            _to_device(base_mem, _dev),
+                            _to_device(_pf, _dev),
+                            _to_device(stage_override, _dev),
+                            _to_device(stage_pin_rules, _dev),
+                            # positional: vmap in_axes is a positional tuple
+                            _to_device(_wt, _dev),
+                            _to_device(_t0, _dev), _to_device(_f0, _dev),
+                            _to_device(_ep_env_idx(_sh), _dev),
                         )
+                    # NAME THE PATH FOR THE WHOLE WARM-UP TRACE, exactly as
+                    # the measured rollout does. `_shard_rollout` traces and
+                    # joins inside this call, so the ambient name covers
+                    # every shard, and `palimpsa_mix` -- the one reader that
+                    # cannot name its own path -- reads 'rollout' here too.
+                    with _read_path("rollout"):
+                        _out = _shard_rollout(_wone, int(_w))
                     # The overflows arrive as device arrays, read here on
                     # the host AFTER the rollout finished (finding 2). THE
                     # WINDOW IS CHECKED FIRST: a step whose delta does not
@@ -15794,28 +16044,39 @@ def main():
             The ticket is opened before the rollout and closed after it, so
             the terminal callback has exactly one place to submit to and a
             rollout that never reaches a terminal step leaves an empty ticket
-            rather than a stray submission.
+            rather than a stray submission. With `--measure-pipeline 0` there
+            is no ticket at all and the terminal rows are measured inside the
+            callback as they always were; this function is still the one the
+            SHARDED path uses, because a sharded rollout cannot be composed
+            with the update under one jit.
 
-            Reading the overflow arrays blocks on the rollout, which means the
-            terminal callback has already run when this returns: the plans are
-            with the measure actors and the ticket carries the future.
+            Reading the overflow arrays blocks on every shard, which means
+            every terminal callback has already run when this returns.
+
+            THE SHARDS SHARE ONE TICKET AND MAKE ONE SUBMISSION. The terminal
+            step's rows rendezvous like every other step's, so the pool is
+            handed all `N*E` terminal plans in one `submit_batch`, and the
+            driver's collect fills one reward row per environment of the whole
+            episode.
             """
             _ep_begin_attempt()
-            _tkt = _ep_env_mod.open_measure_ticket()
+            _tkt = _ep_env_mod.open_measure_ticket() if _MPIPE else None
             try:
-                _env_w = env_episode.with_delta_window(1 << int(_win_n))
-                _roll = _episode_rollout_jit(
-                    agent,
-                    reset_envs(_env_w),
-                    _env_w,
-                    base_mem,
-                    preferences_per_env,
-                    ep_key,
-                    stage_override,
-                    stage_pin_rules,
-                    _ep_n,
-                    int(_win_n),
-                )
+                def _one(_s, _env_s):
+                    return _episode_rollout_jit(
+                        _to_device(agent, _SHARD_DEVS[_s]),
+                        _to_device(reset_envs(_env_s), _SHARD_DEVS[_s]),
+                        _env_s,
+                        _to_device(base_mem, _SHARD_DEVS[_s]),
+                        _to_device(preferences_per_env, _SHARD_DEVS[_s]),
+                        _to_device(ep_key, _SHARD_DEVS[_s]),
+                        _to_device(stage_override, _SHARD_DEVS[_s]),
+                        _to_device(stage_pin_rules, _SHARD_DEVS[_s]),
+                        _ep_n,
+                        int(_win_n),
+                        _s,
+                    )
+                _roll = _shard_rollout(_one, int(_win_n))
                 _wov = _epstream.window_overflow_from(
                     _roll[8], _roll[9], _win_n, _roll[10])
                 _ov = (_wov if _wov is not None
@@ -15825,10 +16086,12 @@ def main():
                 # A rollout that died leaves no attempt to collect, and an
                 # open ticket would refuse every later one. Drop it and let
                 # the original error out.
-                _ep_env_mod.close_measure_ticket()
-                _ep_env_mod.drop_measurement(_tkt)
+                if _tkt is not None:
+                    _ep_env_mod.close_measure_ticket()
+                    _ep_env_mod.drop_measurement(_tkt)
                 raise
-            _ep_env_mod.close_measure_ticket()
+            if _tkt is not None:
+                _ep_env_mod.close_measure_ticket()
             return (_roll, _tkt), _ov
 
         def _ep_discard_rollout(result):
@@ -15848,7 +16111,11 @@ def main():
             yet. Draining here would throw that episode's plans away.
             """
             _roll_d, _tkt_d = result
-            _ep_env_mod.drop_measurement(_tkt_d)
+            # `_tkt_d` is None when the rollout was split for the SHARDS
+            # rather than for the pipeline: there was no ticket, so there is
+            # no submission to drop.
+            if _tkt_d is not None:
+                _ep_env_mod.drop_measurement(_tkt_d)
             _ep_discard_episode(_roll_d, pool_drain=not _PIPE_DEEP)
 
         def _ep_attempt(_ep_n, _win_n):
@@ -15987,8 +16254,13 @@ def main():
                          _EP_BIN.last_used, int(_WIN_BIN.last_used)),
             }
             continue
-        if _MPIPE:
-            # ---- THE PIPELINE. Rollout now, update one episode late. ----
+        if _MPIPE or _SHARDS > 1:
+            # ---- THE SPLIT EPISODE: rollout first, update after. ----
+            # `--measure-pipeline 1` runs the update one episode LATE, so the
+            # host's wait for the measure actors is filled by the previous
+            # episode's update. `--rollout-shards N` takes this path whatever
+            # the pipeline does, because a rollout spread over N devices
+            # cannot be composed with the update under one jit.
             _roll, _tkt = _epstream.run_episode(
                 _EP_BIN,
                 "episode %d" % ep,
@@ -16012,6 +16284,22 @@ def main():
                      if isinstance(x, jax.Array)])
                 jax.profiler.stop_trace()
                 _xtr_on = False
+            if not _MPIPE:
+                # SHARDED, NOT PIPELINED. There was no ticket, so the terminal
+                # rows were measured inside the callback and the trajectory
+                # already holds them. The update runs now, on this episode.
+                _EP_CTX.update(win_max=_win_max, face_max=_face_max,
+                               xtr_on=_xtr_on)
+                _this = {
+                    "roll": _roll,
+                    "ctx": _EP_CTX,
+                    "args": (default_freeze_mask, stage_override,
+                             stage_vertex_mult, stage_pin_rules,
+                             stage_micro_mult, _kl_ref_coef_arg,
+                             _EP_BIN.last_used, int(_WIN_BIN.last_used)),
+                }
+                _pipe_finish(_this, _pipe_update_dispatch(_this))
+                continue
             # 1. DISPATCH the previous episode's update (asynchronous).
             _prev = _PIPE_PENDING[0]
             _prev_out = (None if _prev is None

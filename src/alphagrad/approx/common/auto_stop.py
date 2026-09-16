@@ -3,6 +3,12 @@
 Ticket ``dsnn-dfw.6``, owner ruling of 2026-09-15. OFF by default, opt-in
 through ``--auto-stop``, and never on the gate arm.
 
+Two further owner rulings, 2026-09-16. The return condition reads the RAW
+weighted mean return and not the PopArt-z one (the note over
+``RETURN_TOLERANCE`` holds the measurement behind that). A move whose ABSOLUTE
+value is below ``RETURN_ABSOLUTE_FLOOR`` counts as no move, whatever the
+relative test says.
+
 WHY THIS EXISTS. The thesis matrix runs arms A, B and C for 1000 episodes
 each. Arm A is predicted to collapse to quality 0 and arm B is predicted to
 stay at the identity. An arm that has already done so learns nothing in the
@@ -112,17 +118,29 @@ CHECK_POINTS = (250, 500)
 # the raw return held steady. The z-scored value is RECORDED beside the raw
 # one in every reason, so the two can be compared on a real arm.
 #
-# A RUN WHOSE RAW MEAN RETURN IS ITSELF AT FLOAT NOISE AROUND ZERO still never
-# meets this condition, and that is left alone. A relative move against a mean
-# of 1e-10 is 40 percent when the mean shifts by 4e-11, which is nothing. That
-# state is reachable with the quality channel OUT of the reward
-# (`--rewards cmp mem`) under the campaign's paired-log cost form, where a
-# plan that IS rev-exact scores exactly 0 on both cost slots. No thesis arm is
-# in it -- A, B and C all carry the quality channel, so a settled arm's return
-# is order 1 -- and the rule is the owner's, so no absolute floor is invented
-# here. It is named so that an arm that drops the quality channel knows why it
-# never stops.
+# A RUN WHOSE RAW MEAN RETURN IS ITSELF AT FLOAT NOISE AROUND ZERO is the case
+# the absolute floor below answers. A relative move against a mean of 1e-10 is
+# 40 percent when the mean shifts by 4e-11, which is nothing. That state is
+# reachable with the quality channel OUT of the reward (`--rewards cmp mem`)
+# under the campaign's paired-log cost form, where a plan that IS rev-exact
+# scores exactly 0 on both cost slots. No thesis arm is in it -- A, B and C all
+# carry the quality channel, so a settled arm's return is order 1 -- but the
+# owner ruled on 2026-09-16 that such a run must still be able to stop.
 RETURN_TOLERANCE = 0.02
+
+#: A move whose ABSOLUTE value is below this counts as NO MOVE, whatever the
+#: relative test says. The owner's ruling of 2026-09-16.
+#
+# WHY. The relative test divides by the previous window's mean. When that mean
+# is itself float noise around zero, the quotient carries no information: job
+# 65938 measured -6.98e-10 against -4.08e-10 over two settled windows and read
+# that as a 41.6 percent move, so an arm in that state could never stop. An
+# absolute floor states the thing the relative test cannot: a return that moved
+# by less than a millionth of a reward unit did not move. The two rules are an
+# OR. A move passes condition 2 when it is below the floor, or when it is below
+# the tolerance in relative terms. Strictly below, in both halves: a move of
+# exactly 1e-6 is not below the floor.
+RETURN_ABSOLUTE_FLOOR = 1e-6
 
 #: Arm A's collapse: the median terminal quality over the window is below
 #: this.
@@ -299,6 +317,7 @@ class AutoStopMonitor:
 
     def __init__(self, *, window: int = WINDOW, points=CHECK_POINTS,
                  return_tolerance: float = RETURN_TOLERANCE,
+                 return_absolute_floor: float = RETURN_ABSOLUTE_FLOOR,
                  collapse_quality_median: float = COLLAPSE_QUALITY_MEDIAN):
         self.window = int(window)
         if self.window <= 0:
@@ -306,6 +325,11 @@ class AutoStopMonitor:
                 f"an auto-stop window must be positive, got {window}.")
         self.points = tuple(sorted(int(p) for p in points))
         self.return_tolerance = float(return_tolerance)
+        self.return_absolute_floor = float(return_absolute_floor)
+        if self.return_absolute_floor < 0.0:
+            raise AutoStopError(
+                f"an auto-stop absolute return floor cannot be negative, got "
+                f"{return_absolute_floor}.")
         self.collapse_quality_median = float(collapse_quality_median)
         #: episode index -> one row. Pruned to the last 2*window rows.
         self.rows: dict = {}
@@ -403,6 +427,7 @@ class AutoStopMonitor:
             "recent_window": [episode - w, episode - 1],
             "previous_window": [episode - 2 * w, episode - w - 1],
             "return_tolerance": self.return_tolerance,
+            "return_absolute_floor": self.return_absolute_floor,
             "collapse_quality_median": self.collapse_quality_median,
         }
         if recent is None or previous is None:
@@ -440,13 +465,21 @@ class AutoStopMonitor:
         m_previous = float(np.mean(r_previous)) if r_previous else None
         if m_recent is None or m_previous is None:
             rel = None
+            absolute = None
+            below_floor = False
             return_flat = False
-        elif m_previous == 0.0:
-            rel = 0.0 if m_recent == 0.0 else float("inf")
-            return_flat = rel < self.return_tolerance
         else:
-            rel = abs(m_recent - m_previous) / abs(m_previous)
-            return_flat = rel < self.return_tolerance
+            # The owner's ruling of 2026-09-16: a move whose ABSOLUTE value is
+            # below the floor counts as no move. The two halves are an OR, so a
+            # return that sits at float noise around zero can still settle even
+            # though the relative quotient is meaningless there.
+            absolute = abs(m_recent - m_previous)
+            below_floor = bool(absolute < self.return_absolute_floor)
+            if m_previous == 0.0:
+                rel = 0.0 if m_recent == 0.0 else float("inf")
+            else:
+                rel = absolute / abs(m_previous)
+            return_flat = bool(below_floor or rel < self.return_tolerance)
 
         # (3a) arm A's collapse: the median terminal quality is under 0.05.
         ep_medians = [r["q_median"] for r in recent if r["q_median"] is not None]
@@ -477,6 +510,7 @@ class AutoStopMonitor:
             conditions={
                 "archive_admitted_nothing": archive_quiet,
                 "return_moved_less_than_tolerance": return_flat,
+                "return_move_below_absolute_floor": below_floor,
                 "collapse_or_plan_frozen": third,
                 "collapse_detector_fired": collapse,
                 "collapse_quality": collapse_quality,
@@ -488,6 +522,7 @@ class AutoStopMonitor:
                 "mean_return_recent": m_recent,
                 "mean_return_previous": m_previous,
                 "relative_return_move": rel,
+                "absolute_return_move": absolute,
                 "episodes_with_a_measured_return": len(r_recent),
                 # RECORDED, NOT DECIDED ON. The PopArt-z of the same return
                 # (`scalarized_return`), so a reader can see both numbers.
@@ -529,6 +564,7 @@ class AutoStopMonitor:
             "window": self.window,
             "points": list(self.points),
             "return_tolerance": self.return_tolerance,
+            "return_absolute_floor": self.return_absolute_floor,
             "collapse_quality_median": self.collapse_quality_median,
             "rows": [self.rows[ep] for ep in sorted(self.rows)],
         }
@@ -599,15 +635,21 @@ def _message(reason: dict) -> str:
             f"return, so the return condition cannot be established "
             f"(condition 2 does not hold)")
     else:
+        if c["return_moved_less_than_tolerance"]:
+            if c["return_move_below_absolute_floor"]:
+                verdict = (f" (condition 2 HOLDS: the absolute move is "
+                           f"{n['absolute_return_move']:.3g}, below the floor "
+                           f"of {reason['return_absolute_floor']:g})")
+            else:
+                verdict = (f" (condition 2 HOLDS, the tolerance is "
+                           f"{100.0 * reason['return_tolerance']:.1f} percent)")
+        else:
+            verdict = " (condition 2 does not hold)"
         held.append(
             f"the mean scalar return moved "
             f"{100.0 * n['relative_return_move']:.3f} percent, from "
             f"{n['mean_return_previous']:.6g} over episodes {plo}..{phi} to "
-            f"{n['mean_return_recent']:.6g}"
-            + (f" (condition 2 HOLDS, the tolerance is "
-               f"{100.0 * reason['return_tolerance']:.1f} percent)"
-               if c["return_moved_less_than_tolerance"]
-               else " (condition 2 does not hold)"))
+            f"{n['mean_return_recent']:.6g}" + verdict)
     third = []
     if c["collapse_quality"]:
         third.append(

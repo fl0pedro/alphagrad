@@ -235,6 +235,10 @@ REQUIRED_FLAGS = [
     # THE MEASUREMENT PIPELINE (owner ruling 2026-09-14).  Named so an arm
     # cannot inherit the trainer's synchronous default in silence.
     "--measure-pipeline",
+    # DATA PARALLELISM OVER ENVIRONMENTS (owner ruling 2026-09-15).  Named so
+    # an arm states how many GPUs roll the episode out instead of inheriting a
+    # default, in either direction.
+    "--rollout-shards",
     # WHERE THE PER-STEP TOKENIZATION RUNS (owner ruling 2026-09-15).  Named
     # for the same reason: it decides whether the measure actors are free
     # during a rollout, and therefore whether the pipeline overlaps a
@@ -672,7 +676,16 @@ SHARED_CLI = [
     ("--walk-rotate", None),
     ("--init-scheme", "classic"),
     ("--face-read", "last-row"),
+    # ENVIRONMENTS PER SHARD (owner ruling 2026-09-15).  --num-envs is what
+    # ONE GPU rolls out; --rollout-shards says how many GPUs do.
     ("--num-envs", "16"),
+    # DATA PARALLELISM OVER ENVIRONMENTS: one rollout shard per GPU the job
+    # holds, so an episode holds CAMPAIGN_GPUS * 16 environments and the PPO
+    # update runs on all of them concatenated.  See CAMPAIGN_ROLLOUT_SHARDS.
+    # ONE, for now.  The literal is checked against CAMPAIGN_ROLLOUT_SHARDS
+    # where that is defined, which is further down this file than SHARED_CLI is
+    # built, so the two cannot drift apart.
+    ("--rollout-shards", "1"),
     ("--minibatches", "4"),
     ("--grad-window", "0"),
     # One PPO epoch makes the importance ratio identically 1 for the whole
@@ -1492,6 +1505,24 @@ CAMPAIGN_RAY_MEASURE_TIMEOUT = "600"
 # identically 1 at epoch 0 (the arms run --ppo-epochs 1).
 CAMPAIGN_MEASURE_PIPELINE = "1"
 
+# DATA PARALLELISM OVER ENVIRONMENTS (owner ruling 2026-09-15, "use the idle
+# GPUs for the rollout").  --num-envs is PER SHARD, and --rollout-shards says
+# how many devices roll an episode out.  The PPO update runs on the shards
+# concatenated, which is the same program a single device would run for that
+# many environments.
+#
+# ONE, FOR NOW (owner ruling 2026-09-15, the follow-up).  Sharding was measured
+# at 1, 4 and 8 shards on pgi15-gpu19 and it did not pay: the per-step host
+# callbacks are Python, one thread per shard is the most concurrency a single
+# process can have, and the host cost per environment does not fall.  It is
+# armed here at 1 until the host path is cheap enough that the device work it
+# hides is worth having.
+CAMPAIGN_ROLLOUT_SHARDS = "1"
+assert dict(SHARED_CLI)["--rollout-shards"] == CAMPAIGN_ROLLOUT_SHARDS, (
+    "SHARED_CLI's --rollout-shards literal and CAMPAIGN_ROLLOUT_SHARDS must "
+    "agree; SHARED_CLI is built before this line runs, so this is what keeps "
+    "them equal.")
+
 # WHERE THE PER-STEP TOKENIZATION RUNS (owner ruling 2026-09-15).  A
 # non-terminal callback row measures nothing under terminal rewards: it
 # tokenizes the prefix, decides face legality and returns the delta
@@ -1789,6 +1820,8 @@ def campaign_arm(*, phase: int, tag: str, profile: str, node: str, what: str,
         "--ray-measure": CAMPAIGN_RAY_MEASURE,
         "--ray-measure-timeout": CAMPAIGN_RAY_MEASURE_TIMEOUT,
         "--measure-pipeline": CAMPAIGN_MEASURE_PIPELINE,
+        # HOW MANY DEVICES ROLL AN EPISODE OUT (owner ruling 2026-09-15).
+        "--rollout-shards": CAMPAIGN_ROLLOUT_SHARDS,
         "--tokenize-where": CAMPAIGN_TOKENIZE_WHERE,
         "--face-wire-faces": CAMPAIGN_FACE_WIRE_FACES,
         # THE GATE .45 INPUTS, the two the trainer cannot measure for itself.

@@ -295,7 +295,7 @@ def run_trace(case=None, steps=None):
     """One seeded rollout -> the semantic trace (a plain JSON-able dict)."""
     from alphagrad.approx.common import carry_stream as CS
     from alphagrad.approx.common.face_driver import (
-        bind_sizes_callback, bind_step_callbacks)
+        bind_decide_callback, bind_sizes_callback, bind_step_callbacks)
     from alphagrad.approx.common.masks import vertex_avail_at_step
     from alphagrad.approx.ppo import _mask_vertex_logits
 
@@ -355,10 +355,13 @@ def run_trace(case=None, steps=None):
             state.order, state.sparsity_specs, state.step_count,
             state.face_specs, state.face_skips)
 
-        def decide_fn(_v, _skips, _rows, _o=state.order,
-                      _s=state.sparsity_specs, _k=state.step_count,
-                      _fh=state.face_specs, _kh=state.face_skips):
-            return case["decide_cb"](_o, _s, _k, _v, _fh, _kh, _skips, _rows)
+        # Through face_driver's own bind, like the other two above: ppo.py
+        # binds all three there now (owner ruling 2026-09-15, item 2), and a
+        # hand-written closure here would be the one binding the gate does not
+        # cover. Same values -- `bind_decide_callback` is this closure.
+        decide_fn = bind_decide_callback(
+            case["decide_cb"], state.order, state.sparsity_specs,
+            state.step_count, state.face_specs, state.face_skips)
 
         (vertex_idx, micro, vertex_dist, _od, _id_, _jd, _ed, _kd,
          micro_qlp, micro_pair_v, micro_comp_v, face_out, value,

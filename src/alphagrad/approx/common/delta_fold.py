@@ -219,6 +219,15 @@ def extend_fold(agent, carry, tokens, count, *, window, chunk=None,
     zero row when a token is invalid. Its cotangent is zero too, so folding it
     changes neither value nor gradient.
 
+    ``budget`` -- an unbatched, batch-wide bound on ``count`` -- makes the
+    loop ``count_vjp.count_loop``, which runs the live chunks only, in both
+    directions. That is the ONLY loop on the budget path (owner ruling
+    2026-09-15) and ``remat`` is refused together with it, because
+    ``count_loop``'s backward always recomputes the chunk and there is no
+    stored-residual form left to ask for. Without a budget every chunk of the
+    window is live and the loop is the ordinary ``lax.scan``, with ``remat``
+    and ``ALPHAGRAD_FOLD_REMAT`` governing it as before.
+
     Returns ``(new_carry, acc)``. NOTE the rows are never returned -- that is
     the point; a caller who needs them wants ``encode_extend``.
 
@@ -288,12 +297,18 @@ def extend_fold(agent, carry, tokens, count, *, window, chunk=None,
     # means the backward cannot read a different operator from the forward.
     _fast = _fast_read(path)
 
-    if budget is None:
-        nb_live = nb
-    else:
+    if budget is not None:
         nb_live = jnp.minimum(
             (jnp.maximum(jnp.asarray(budget, jnp.int32), 0) + C - 1) // C,
             nb).astype(jnp.int32)
+        if remat is not None:
+            # `remat` picks between the scan's stored-residual and recomputed
+            # forms, and the budget path is not a scan any more. Silently
+            # ignoring the argument would be a lie about what ran.
+            raise ValueError(
+                "extend_fold(remat=...) has no meaning together with a "
+                "budget: the budget path is count_vjp.count_loop, whose "
+                "backward always recomputes the chunk. Drop the argument.")
 
     def _make_run(i, tk):
         off = i * C
@@ -317,60 +332,64 @@ def extend_fold(agent, carry, tokens, count, *, window, chunk=None,
 
         return _run
 
+    # COUNT-PROPORTIONAL BACKWARD, THE ONLY LOOP ON THE BUDGET PATH (owner
+    # ruling 2026-09-15). A `lax.scan` here would be `nb = ceil(window /
+    # chunk)` iterations long whatever the real delta is, in the forward pass
+    # and again in the backward pass, because reverse-mode AD cannot transpose
+    # a `while_loop`. Inside a `custom_vjp` it never has to:
+    # `count_vjp.count_loop` runs the live chunks with a `while_loop` in BOTH
+    # directions and hand-writes the reverse sweep. See
+    # `common/count_vjp.py` for the equivalence and the residual claim, and
+    # `tests/count_vjp_oracle.py` for the old scan-and-cond body, which
+    # survives there as the gradient oracle and nowhere else.
+    #
+    # `ALPHAGRAD_FOLD_REMAT` does not reach this path any more. It asked for
+    # the stored-residual form of the scan, and `count_loop` always recomputes
+    # the chunk in its backward, so there is no stored-residual form to ask
+    # for. It still governs the no-budget scan below.
+    if budget is not None:
+        _cf0, _ci0, _cspec = _cvjp.split_inexact(carry)
+        if len(_ci0) > 1:
+            raise TypeError(
+                "extend_fold's encode carry has %d integer leaves; "
+                "count_vjp.count_loop carries floats only and this loop "
+                "freezes exactly one integer leaf (`pos`) around it. Thread "
+                "the extra integer state outside the loop."
+                % (len(_ci0),))
+
+        def _cbody(i, st):
+            cf, acc = st
+            # The integer leaf of the encode carry is `pos`, and the chunk
+            # body never reads it: `_encode_chunk` either calls the parallel
+            # path (which takes its tokens as an argument) or
+            # `encode_extend(start=0)`. So freezing it here changes nothing,
+            # and its final value is the clipped addition below.
+            enc = _cvjp.merge_inexact(cf, _ci0, _cspec)
+            _tk = None if b_tok is None else b_tok[i]
+            enc2, acc2 = _make_run(i, _tk)((enc, acc))
+            _f2, _o2, _ = _cvjp.split_inexact(enc2)
+            return (_f2, acc2), None
+
+        (cf_f, acc_f), _ = _cvjp.count_loop(
+            _cbody, (_cf0, init_acc), nb=nb, nb_live=nb_live)
+        # `pos` advances by `clip(cnt - i*C, 0, C)` on every LIVE chunk,
+        # which sums to `min(cnt, nb_live * C)` exactly.
+        _adv = jnp.clip(cnt, 0, nb_live * C)
+        enc_f = _cvjp.merge_inexact(
+            cf_f, [x + _adv for x in _ci0], _cspec)
+        return enc_f, acc_f
+
+    # NO BUDGET: every chunk of the window is live, so there is nothing to
+    # skip and a plain scan is already count-proportional.
     def _body(state, xs):
         if b_tok is None:
             i, tk = xs, None     # read INSIDE `_run`; see above
         else:
             i, tk = xs
-        _run = _make_run(i, tk)
-        if budget is None:
-            return _run(state), None
-        return lax.cond(i < nb_live, _run, lambda s: s, state), None
+        return _make_run(i, tk)(state), None
 
     use_remat = (os.environ.get("ALPHAGRAD_FOLD_REMAT", "1") != "0"
                  if remat is None else bool(remat))
-
-    # COUNT-PROPORTIONAL BACKWARD (owner ruling 2026-09-14). With a budget the
-    # scan below is `nb = ceil(window / chunk)` iterations long whatever the
-    # real delta is, in the forward pass and again in the backward pass,
-    # because reverse-mode AD cannot transpose a `while_loop`. Inside a
-    # `custom_vjp` it never has to: `count_vjp.count_loop` runs the live
-    # chunks with a `while_loop` in BOTH directions and hand-writes the
-    # reverse sweep. See `common/count_vjp.py` for why the numbers do not
-    # move and why the residual claim does not either.
-    #
-    # Only on the differentiated path (`budget is not None`): with no budget
-    # the trip count is already the static `nb` and there is nothing to skip.
-    # Only with remat: the custom_vjp ALWAYS recomputes the chunk's forward in
-    # the backward, so `ALPHAGRAD_FOLD_REMAT=0`, which exists to ask for the
-    # stored-residual form, keeps the scan.
-    if budget is not None and use_remat and _cvjp.enabled():
-        _cf0, _ci0, _cspec = _cvjp.split_inexact(carry)
-        if len(_ci0) <= 1:
-            def _cbody(i, st):
-                cf, acc = st
-                # The integer leaf of the encode carry is `pos`, and the chunk
-                # body never reads it: `_encode_chunk` either calls the
-                # parallel path (which takes its tokens as an argument) or
-                # `encode_extend(start=0)`. So freezing it here changes
-                # nothing, and its final value is the clipped addition below.
-                enc = _cvjp.merge_inexact(cf, _ci0, _cspec)
-                _tk = None if b_tok is None else b_tok[i]
-                enc2, acc2 = _make_run(i, _tk)((enc, acc))
-                _f2, _o2, _ = _cvjp.split_inexact(enc2)
-                return (_f2, acc2), None
-
-            (cf_f, acc_f), _ = _cvjp.count_loop(
-                _cbody, (_cf0, init_acc), nb=nb, nb_live=nb_live)
-            # `pos` advances by `clip(cnt - i*C, 0, C)` on every LIVE chunk,
-            # which sums to `min(cnt, nb_live * C)` exactly -- the same
-            # integer the scan/cond form arrives at, since the skipped chunks
-            # freeze the carry and advance nothing.
-            _adv = jnp.clip(cnt, 0, nb_live * C)
-            enc_f = _cvjp.merge_inexact(
-                cf_f, [x + _adv for x in _ci0], _cspec)
-            return enc_f, acc_f
-
     body = jax.checkpoint(_body) if use_remat else _body
     _xs = (jnp.arange(nb, dtype=jnp.int32) if b_tok is None
            else (jnp.arange(nb, dtype=jnp.int32), b_tok))

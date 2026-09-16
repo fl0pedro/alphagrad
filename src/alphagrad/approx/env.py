@@ -1787,6 +1787,28 @@ def current_env_slot() -> int:
 
 
 # ---------------------------------------------------------------------------
+# THE ROLLOUT SHARDS' MEASUREMENT RENDEZVOUS (--rollout-shards).
+#
+# With one shard per GPU, each shard's step callback would make its own pool
+# call, and `CpuApproxPool._pick()` sentinels every slot it cannot get an
+# actor for -- seven of eight shards would measure nothing. The rendezvous
+# gathers the shards' rows into ONE call instead. It is a process-wide object
+# because the callback closure is built at TRACE time, inside a jit, and
+# `tokenize` has nowhere else to find it. `None` = no shards.
+_SHARD_GATHER = [None]
+
+
+def set_shard_gather(gather) -> None:
+    """Install (or, with None, remove) the rollout shards' rendezvous."""
+    _SHARD_GATHER[0] = gather
+
+
+def shard_gather():
+    """The installed rendezvous, or None."""
+    return _SHARD_GATHER[0]
+
+
+# ---------------------------------------------------------------------------
 # THE PIPELINED TERMINAL MEASUREMENT (owner ruling 2026-09-14).
 #
 # The terminal rewards of episode e are read by exactly one thing, the PPO
@@ -2578,6 +2600,231 @@ def face_wire_faces() -> int:
     """The number of face columns the live-face callbacks are handed."""
     n = _FACE_WIRE_FACES[0]
     return MAX_FACES if n <= 0 else min(int(n), MAX_FACES)
+
+
+# ---------------------------------------------------------------------------
+# THE ELIMINATION-PREFIX FACE HISTORY, KEPT ON THE HOST (owner ruling
+# 2026-09-15, item 2).
+#
+# Narrowing the wire to `face_wire_faces()` columns took the rollout's
+# device-to-host traffic from 59.4 gigabytes per episode to about 2.4. What is
+# left is still the WHOLE PREFIX: every face callback, and the env step
+# callback, is handed `(N, W, FACE_SLOTS, 3)` int32 plus `(N, W)` skips, for a
+# 95-step episode at sixteen environments, on every one of about four calls per
+# step. The rows below `step_count` are the same bytes every time.
+#
+# So the device sends ONE ROW -- the last row of the call's own prefix -- and
+# this module keeps the prefix. Three structural facts make that sound, and the
+# guard below checks the first two instead of assuming them:
+#
+#   1. `step_count` rises by exactly one per rollout step, so a call at prefix
+#      n either finds n rows already here (this step's siblings, and the row it
+#      carries must MATCH the one stored) or n-1 (it is the first call of the
+#      step, and its row is appended).
+#   2. A REPEAT of a discarded episode restarts at `step_count == 0`, which
+#      empties the prefix, and its first step then arrives at prefix 1, whose
+#      whole history IS the row in hand. `face_prefix_reset` empties it
+#      explicitly too, and ppo.py calls that at the top of every attempt.
+#   3. Rows below `step_count` never move: `env.step` shift-and-inserts at
+#      `idx = step_count` only. That is the same fact the pop-extend in
+#      `live_faces._tokenizer_at` and the key chain in `live_faces.hist_key`
+#      already rest on.
+#
+# ANYTHING ELSE RAISES. There is no truncation and no silent resynchronisation:
+# without the history arrays there is no way to rebuild the prefix, so a
+# disagreement between what this module holds and what the device says the step
+# index is has to stop the run. That is the trade the ruling made, and this is
+# where it is paid.
+#
+# ONE BATCHED BUFFER, NOT ONE PER ENVIRONMENT. Every callback here is dispatched
+# with `vmap_method="broadcast_all"` and walks the batch in index order, so the
+# loop index IS the environment identity (the same fact `EdgeSlotTable` and the
+# per-env key chain already rest on). Holding the batch in one array means the
+# arrays handed on are the buffers themselves -- the per-env reader takes a
+# view, the batched reader takes the whole thing -- and nothing is stacked or
+# copied per call.
+#
+# ALPHAGRAD_FACE_ROW_WIRE=0 restores the full-history operand, byte for byte,
+# for an A/B of the change.
+# ---------------------------------------------------------------------------
+_FACE_PREFIX: dict = {}
+_FACE_PREFIX_STATS = {"append": 0, "verify": 0, "reset": 0, "alloc": 0}
+
+
+def face_row_wire() -> bool:
+    """True when the callbacks ride with ONE row instead of the prefix."""
+    return os.environ.get("ALPHAGRAD_FACE_ROW_WIRE", "1") == "1"
+
+
+def face_prefix_reset() -> None:
+    """Empty every environment's prefix, keeping the buffers.
+
+    Called at the top of EVERY episode attempt (ppo.py `_ep_begin_attempt`)
+    and by :func:`episode_telemetry_reset`, which is this module's "a fresh
+    episode starts here" hook. A discarded attempt's rows are therefore gone
+    before the repeat writes its own, and the repeat's own first call at
+    `step_count == 0` would empty it again anyway.
+    """
+    n = _FACE_PREFIX.get("n")
+    if n is not None and any(n):
+        _FACE_PREFIX_STATS["reset"] += 1
+    if n is not None:
+        for i in range(len(n)):
+            n[i] = 0
+
+
+def face_prefix_stats() -> dict:
+    """The counters, and reset. `append` + `verify` is the number of calls
+    served; a nonzero `reset` past one per attempt means somebody is asking
+    for prefixes out of order."""
+    out = dict(_FACE_PREFIX_STATS)
+    for k in _FACE_PREFIX_STATS:
+        _FACE_PREFIX_STATS[k] = 0
+    return out
+
+
+def face_prefix_step(step_counts, rows, skips, steps, joins=None):
+    """Extend the host prefix by one row per environment; return the history.
+
+    ``step_counts`` is the PREFIX LENGTH each environment's call is about --
+    `state.step_count` for a face callback, `step_count + 1` for the env step
+    callback, which has just committed its own row. ``rows[i]`` / ``skips[i]``
+    (and ``joins[i]``) is the row at index ``step_counts[i] - 1``: the last row
+    of that call's own prefix, and the only row the device has to send.
+
+    Returns ``(rows_hist, skips_hist, joins_hist)`` shaped
+    ``(B, steps) + row.shape[1:]`` -- the buffers themselves, exactly what the
+    full-history operand used to be. ``joins_hist`` is None until some call
+    passes ``joins``.
+
+    RAISES on any step-index disagreement. See the block comment.
+    """
+    rows = np.asarray(rows, np.int32)
+    skips = np.asarray(skips, np.int32)
+    joins = None if joins is None else np.asarray(joins, np.int32)
+    B = int(rows.shape[0])
+    T = int(steps)
+    sc = np.asarray(step_counts).reshape(-1)
+    if sc.size == 1 and B > 1:
+        sc = np.repeat(sc, B)
+    if sc.size != B:
+        raise RuntimeError(
+            f"face_prefix_step: {sc.size} step counts for {B} environments")
+
+    want = (B, T, tuple(rows.shape[1:]), tuple(skips.shape[1:]))
+    if _FACE_PREFIX.get("shape") != want:
+        # A DIFFERENT SHAPE IS A DIFFERENT GRAPH, not a lost prefix: B is the
+        # environment count, T the episode length and the row shape the face
+        # wire, and none of the three moves inside one episode. Reallocating is
+        # therefore not a resynchronisation, and it is counted.
+        _FACE_PREFIX.clear()
+        _FACE_PREFIX.update(
+            shape=want,
+            n=[0] * B,
+            rows=np.zeros((B, T) + tuple(rows.shape[1:]), np.int32),
+            skips=np.zeros((B, T) + tuple(skips.shape[1:]), np.int32),
+            joins=None)
+        _FACE_PREFIX_STATS["alloc"] += 1
+    if joins is not None and _FACE_PREFIX["joins"] is None:
+        _FACE_PREFIX["joins"] = np.zeros(
+            (B, T) + tuple(joins.shape[1:]), np.int32)
+
+    have = _FACE_PREFIX["n"]
+    R, K, J = (_FACE_PREFIX["rows"], _FACE_PREFIX["skips"],
+               _FACE_PREFIX["joins"])
+    for i in range(B):
+        n = int(sc[i])
+        if n <= 0:
+            have[i] = 0
+            continue
+        if n > T:
+            raise RuntimeError(
+                f"face_prefix_step: env {i} is at prefix {n} and the history "
+                f"holds {T} steps")
+        if n == 1 or have[i] == n - 1:
+            # PREFIX 1 IS THE ROW IN HAND, whatever the store held before.
+            # Its history is rows [0, 1), which IS the row the device just
+            # sent, so nothing is inferred and nothing is resynchronised --
+            # and this is the only thing that tells the store an episode
+            # started. `env.reset` runs no step callback, so the env step
+            # callback's first call of an episode is at prefix 1 and never at
+            # 0; without this rule a second episode on the same env object
+            # would look like a gap (measured: 20 test modules that run two
+            # plans through one env).
+            R[i, n - 1] = rows[i]
+            K[i, n - 1] = skips[i]
+            if joins is not None:
+                J[i, n - 1] = joins[i]
+            have[i] = n
+            _FACE_PREFIX_STATS["append"] += 1
+        elif have[i] == n:
+            # A SIBLING CALL OF THE SAME STEP. Its row must be the row already
+            # stored, or the device has decided something this prefix does not
+            # know about -- never patched over, because a patched row would
+            # make the tokenizer replay a graph the plan was not measured on.
+            if not (np.array_equal(R[i, n - 1], rows[i])
+                    and np.array_equal(K[i, n - 1], skips[i])):
+                raise RuntimeError(
+                    f"face_prefix_step: env {i} at prefix {n} carries a face "
+                    f"row the host prefix does not hold. The host prefix is "
+                    f"extended one row per step and rows below step_count "
+                    f"never move (env.py, THE ELIMINATION-PREFIX FACE HISTORY); "
+                    f"a row that changed under it means an attempt was "
+                    f"repeated without face_prefix_reset.")
+            if joins is not None:
+                J[i, n - 1] = joins[i]
+            _FACE_PREFIX_STATS["verify"] += 1
+        else:
+            raise RuntimeError(
+                f"face_prefix_step: the host face prefix for env {i} holds "
+                f"{have[i]} rows and the device is at step {n}. The device "
+                f"sends one row per step and the host keeps the rest, so the "
+                f"two indices cannot differ by more than one "
+                f"(ALPHAGRAD_FACE_ROW_WIRE=0 restores the full-history "
+                f"operand).")
+    return R, K, J
+
+
+def _face_prefix_host(fn, steps):
+    """Wrap a host callback so its face operands are ROWS, not histories.
+
+    ``fn`` is the env step callback's host function, which wants
+    ``(args, consts, order, specs, face_specs, face_skips, face_joins, stop,
+    *eval)`` with the two history arrays. The wrapper takes the same
+    positions carrying ONE ROW each -- this step's, which ``env.step`` already
+    has in hand -- extends the host prefix to ``stop`` rows and hands ``fn``
+    the history buffers. ``fn`` sees exactly what it always saw.
+
+    The batch is read the way :func:`_batched_host` reads it: ``order`` is
+    ``(B, N)`` under ``vmap`` (``_env_callback`` dispatches with
+    ``vmap_method="expand_dims"``) and ``(N,)`` outside one.
+    """
+    def _wrapped(args, consts, order, specs, face_row, skip_row, join_row,
+                 stop, *eval_samples):
+        _o = np.asarray(order)
+        _b = _o.ndim >= 2
+        _r = np.asarray(face_row)
+        _k = np.asarray(skip_row)
+        _j = None if join_row is None else np.asarray(join_row)
+        if not _b:
+            _r, _k = _r[None], _k[None]
+            _j = None if _j is None else _j[None]
+        _B = int(_o.shape[0]) if _b else 1
+        # An operand `vmap` did not map arrives with a leading 1 (expand_dims);
+        # the face row is mapped on every real rollout, so this only fires for
+        # a caller that broadcasts one row across the batch.
+        if _r.shape[0] == 1 and _B > 1:
+            _r = np.repeat(_r, _B, axis=0)
+            _k = np.repeat(_k, _B, axis=0)
+            _j = None if _j is None else np.repeat(_j, _B, axis=0)
+        R, K, J = face_prefix_step(
+            np.asarray(stop).reshape(-1), _r, _k, steps, _j)
+        if not _b:
+            R, K = R[0], K[0]
+            J = None if J is None else J[0]
+        return fn(args, consts, order, specs, R, K,
+                  (None if join_row is None else J), stop, *eval_samples)
+    return _wrapped
 FACE_SLOTS = 3  # pre (lhs), post (rhs), new (res)
 NUM_AXIS_PAIRS = 4
 
@@ -8978,6 +9225,15 @@ class VertexEliminationEnv:
     # pytree child.
     _remote_pool: Any = None
     _remote_timeout_s: float = 60.0
+    # WHICH ROLLOUT SHARD THIS ENV BELONGS TO (--rollout-shards). Data
+    # parallelism over environments gives every GPU its own block of them and
+    # every shard its own copy of this env, on its own device. The pair rides
+    # in ``tree_flatten``'s aux data, so two shards are two different static
+    # arguments and each gets its own trace -- which is what lets the step
+    # callback of shard `i` be the one the rendezvous knows as `i`.
+    # ``(0, 1)`` is a run without shards and wraps nothing at all.
+    rollout_shard: int = 0
+    rollout_shards: int = 1
 
     def __init__(
         self,
@@ -8991,6 +9247,8 @@ class VertexEliminationEnv:
         axis_valid_static: Array | None = None,
         remote_pool: Any = None,
         remote_timeout_s: float = 60.0,
+        rollout_shard: int = 0,
+        rollout_shards: int = 1,
     ):
         object.__setattr__(self, "config", config)
         object.__setattr__(self, "args", tuple(args))
@@ -8998,6 +9256,12 @@ class VertexEliminationEnv:
         object.__setattr__(self, "eval_args_samples", eval_args_samples)
         object.__setattr__(self, "_remote_pool", remote_pool)
         object.__setattr__(self, "_remote_timeout_s", float(remote_timeout_s))
+        if not (0 <= int(rollout_shard) < int(rollout_shards)):
+            raise ValueError(
+                f"rollout_shard {rollout_shard} is not in "
+                f"0..{int(rollout_shards) - 1}")
+        object.__setattr__(self, "rollout_shard", int(rollout_shard))
+        object.__setattr__(self, "rollout_shards", int(rollout_shards))
 
         if num_envs is None:
             num_envs = jax.local_device_count()
@@ -9066,6 +9330,8 @@ class VertexEliminationEnv:
             axis_valid_static=self.axis_valid_static,
             remote_pool=self._remote_pool,
             remote_timeout_s=self._remote_timeout_s,
+            rollout_shard=self.rollout_shard,
+            rollout_shards=self.rollout_shards,
         )
 
     @classmethod
@@ -9209,6 +9475,7 @@ class VertexEliminationEnv:
         aux_data = (
             self.config, self.valid_vertices, self.num_envs,
             self._remote_pool, self._remote_timeout_s,
+            self.rollout_shard, self.rollout_shards,
         )
         return children, aux_data
 
@@ -9218,15 +9485,23 @@ class VertexEliminationEnv:
             children
         )
         # Back-compat: aux_data tuples produced before the remote-pool
-        # fields were added are 3-tuples; new ones are 5-tuples.
+        # fields were added are 3-tuples; the remote-pool ones are 5-tuples;
+        # the rollout-shard ones are 7.
+        rollout_shard, rollout_shards = 0, 1
         if len(aux_data) == 3:
             config, valid_vertices, num_envs = aux_data
             remote_pool = None
             remote_timeout_s = 60.0
+        elif len(aux_data) == 5:
+            (
+                config, valid_vertices, num_envs,
+                remote_pool, remote_timeout_s,
+            ) = aux_data
         else:
             (
                 config, valid_vertices, num_envs,
                 remote_pool, remote_timeout_s,
+                rollout_shard, rollout_shards,
             ) = aux_data
         return cls(
             config, args, consts, valid_vertices, num_envs, eval_args_samples,
@@ -9234,7 +9509,63 @@ class VertexEliminationEnv:
             axis_valid_static=axis_valid_static,
             remote_pool=remote_pool,
             remote_timeout_s=remote_timeout_s,
+            rollout_shard=rollout_shard,
+            rollout_shards=rollout_shards,
         )
+
+    def with_rollout_shard(self, shard: int, n_shards: int):
+        """A copy of this env as rollout shard `shard` of `n_shards`.
+
+        Everything bound on the env travels, exactly as in
+        :meth:`with_delta_window`: losing the measurement pool here would move
+        every measurement back into the driver in silence.
+        """
+        if (int(shard) == int(self.rollout_shard)
+                and int(n_shards) == int(self.rollout_shards)):
+            return self
+        return type(self)(
+            self.config,
+            self.args,
+            self.consts,
+            self.valid_vertices,
+            self.num_envs,
+            self.eval_args_samples,
+            axis_state_static=self.axis_state_static,
+            axis_valid_static=self.axis_valid_static,
+            remote_pool=self._remote_pool,
+            remote_timeout_s=self._remote_timeout_s,
+            rollout_shard=int(shard),
+            rollout_shards=int(n_shards),
+        )
+
+    def _shard_wrap(self, fn):
+        """The BATCHED step callback as rollout shard `self.rollout_shard`.
+
+        Without shards (`rollout_shards == 1`) this is the identity and the
+        trace is the one a run without the flag produced. With shards it is
+        the rendezvous of :mod:`common.rollout_shards`: the N shards deposit
+        their `E` environment rows, ONE of them calls `fn` once over all
+        `N*E` rows in global environment order, and each takes its own slice
+        back. The pool therefore still sees exactly one `evaluate_batch` per
+        step, and the terminal step still makes one submission under one
+        ticket.
+        """
+        if int(self.rollout_shards) <= 1:
+            return fn
+        g = shard_gather()
+        if g is None:
+            raise RuntimeError(
+                f"this env is rollout shard {self.rollout_shard} of "
+                f"{self.rollout_shards} but no measurement rendezvous is "
+                f"installed. `ppo.main` calls `env.set_shard_gather(...)` "
+                f"before it traces a shard; a caller that shards the rollout "
+                f"itself has to do the same.")
+        if int(g.n) != int(self.rollout_shards):
+            raise RuntimeError(
+                f"the installed measurement rendezvous is for {g.n} shards "
+                f"and this env is shard {self.rollout_shard} of "
+                f"{self.rollout_shards}.")
+        return g.wrap(int(self.rollout_shard), fn)
 
     def tokenize(self, init: bool = False, batched: bool = False,
                  bound_dropped: bool = False):
@@ -9253,6 +9584,20 @@ class VertexEliminationEnv:
         owns them. A row served in THIS process then reads them from
         :func:`local_bound_operands` instead.
         """
+        if batched and int(self.rollout_shards) > 1 and not _BATCHED_CALLBACK:
+            # THE RENDEZVOUS ONLY EXISTS FOR THE BATCHED CALLBACK. Without
+            # ALPHAGRAD_BATCHED_CALLBACK the step callback runs once per
+            # environment, there is nothing to gather, and every shard would
+            # make its own measurement call -- which the pool answers by
+            # sentinelling the rows it could not place an actor for. Refuse
+            # here rather than in the driver alone, so a second caller that
+            # shards a rollout cannot reach that state at all.
+            raise RuntimeError(
+                f"this env is rollout shard {self.rollout_shard} of "
+                f"{self.rollout_shards} and ALPHAGRAD_BATCHED_CALLBACK is "
+                f"off, so its step callback runs one environment at a time "
+                f"and the shards have nothing to gather into one measurement "
+                f"call.")
         if self._remote_pool is None:
             # THE JOIN CHANNEL IS KEYWORD-ONLY ON `_callback`, ON PURPOSE.
             # `io_callback` / `pure_callback` pass their operands POSITIONALLY,
@@ -9272,8 +9617,10 @@ class VertexEliminationEnv:
                     face_joins=face_joins)
             # Only the STEP callback runs under vmap; reset() is called once,
             # unbatched, and must not be wrapped.
-            return (_batched_host(_fn, n_out=self.wire_arity)
-                    if (batched and _BATCHED_CALLBACK) else _fn)
+            if batched and _BATCHED_CALLBACK:
+                return self._shard_wrap(
+                    _batched_host(_fn, n_out=self.wire_arity))
+            return _fn
 
         # The pool's ``evaluate`` signature is
         # ``(order, specs, step, eval_samples, *, init)`` — but
@@ -9641,7 +9988,7 @@ class VertexEliminationEnv:
                 _trace("cb_batched.exit")
                 return (tk, ei, rw) if _eqn else (tk, rw)
 
-            return _remote_callback_batched
+            return self._shard_wrap(_remote_callback_batched)
 
         def _remote_callback(args, consts, order, specs, face_specs,
                              face_skips, face_joins, step, *eval_samples):
@@ -10014,16 +10361,41 @@ class VertexEliminationEnv:
         # step earlier, before the decisions are even written. The default is
         # the full width, and then these slices are the identity.
         _fw = face_wire_faces()
+        # AND ONLY THE ROW THIS STEP DECIDED (owner ruling 2026-09-15, item 2).
+        # The narrowed history above is still the WHOLE PREFIX -- `(N, W,
+        # FACE_SLOTS, 3)` per environment, the same rows on every step. The
+        # host keeps it (`face_prefix_step`), so the device sends `face_rows` /
+        # `face_skip` / `face_join`, which are this step's row and are already
+        # in hand: `new_face_specs[idx]` IS `face_rows`. The host extends its
+        # prefix to `new_step` rows and hands `_callback` the very arrays it
+        # used to be handed. ALPHAGRAD_FACE_ROW_WIRE=0 restores the operand.
+        # AND ONLY WHERE THE HOST CAN TELL THE ENVIRONMENTS APART.
+        # `_env_callback` dispatches through `pure_callback` with
+        # `vmap_method="expand_dims"` under ALPHAGRAD_BATCHED_CALLBACK, and the
+        # host then sees the WHOLE BATCH in index order, which is what makes
+        # the loop index the environment identity -- the same fact
+        # `EdgeSlotTable` and the per-env key chain rest on. Without it the
+        # dispatch is `io_callback`, which `vmap` runs once per environment
+        # with no batch axis and nothing on the wire saying which environment
+        # it is, so a host prefix would mix every environment's rows into slot
+        # 0. Measured: `--num-envs 2` under the sequential dispatch raised the
+        # step-index guard at step 2 (tests/popart_seed_init_test.py). The
+        # face callbacks are not affected -- they dispatch with
+        # `vmap_method="broadcast_all"` unconditionally.
+        _row_wire = face_row_wire() and _BATCHED_CALLBACK
+        _fn = self.tokenize(batched=True, bound_dropped=_drop_bound)
         _cbout = _env_callback(
-            self.tokenize(batched=True, bound_dropped=_drop_bound),
+            _face_prefix_host(_fn, int(new_order.shape[-1]))
+            if _row_wire else _fn,
             self._callback_shape,
             _z if _drop_bound else self.args,
             _z if _drop_bound else self.consts,
             new_order,
             new_specs,
-            new_face_specs[:, :_fw],
-            new_face_skips[:, :_fw],
-            (None if new_face_joins is None else new_face_joins[:, :_fw]),
+            (face_rows[:_fw] if _row_wire else new_face_specs[:, :_fw]),
+            (face_skip[:_fw] if _row_wire else new_face_skips[:, :_fw]),
+            (None if new_face_joins is None else
+             (face_join[:_fw] if _row_wire else new_face_joins[:, :_fw])),
             new_step,
             *(() if _drop_bound
               else (self.eval_args_samples
@@ -10443,6 +10815,16 @@ def episode_telemetry_reset() -> None:
     episode_telemetry_restore(
         {_n: _telemetry_copy(_v)
          for _n, _v in _EPISODE_TELEMETRY_FRESH.items()})
+    # THE HOST FACE PREFIX IS PER-EPISODE HOST STATE TOO (owner ruling
+    # 2026-09-15, item 2). It is not in `_EPISODE_TELEMETRY_NAMES` because it
+    # is not an accumulator a reader drains: it is a buffer the callbacks WRITE
+    # IN PLACE, so `_telemetry_copy`'s share-the-leaves rule -- which is right
+    # for the plan records -- would hand the snapshot the very arrays the next
+    # attempt overwrites. Its zero is "no rows", and this is where a fresh
+    # episode says so. ppo.py also calls it at the top of every attempt, which
+    # is the case that matters: a discarded attempt's rows must be gone before
+    # the repeat writes its own.
+    face_prefix_reset()
 
 
 def episode_telemetry_fixed_counters() -> tuple:
