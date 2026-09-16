@@ -310,7 +310,15 @@ def test_popart_sets_no_symlog_at_every_site_and_only_on_c_popart(gen, matrix):
 def test_the_arms_differ_only_where_the_matrix_says_they_do(gen, matrix):
     """Every pair of runs with the same arm and the same target differs ONLY
     in --seed and --name; every pair with the same target and seed differs
-    only in the five keys the matrix defines."""
+    only in the keys the matrix defines.
+
+    --ray-measure is excluded from both comparisons because it is NOT a
+    matrix coordinate: it is the node's GPU count minus the trainer's one
+    GPU, and the runs are spread round-robin over nodes of two sizes.
+    `test_the_nodes_and_the_actors_per_node_size` is what pins it, per arm,
+    against that node's own size.
+    """
+    node_derived = {"--ray-measure"}
     allowed_between_arms = {
         "--name", "--face-none-bias", "--reward-mode", "--quality-floor",
         "--advantage-norm", "--no-symlog", "--symlog-channels",
@@ -326,6 +334,7 @@ def test_the_arms_differ_only_where_the_matrix_says_they_do(gen, matrix):
                 cli = _cli(gen, by_key[(arm, t, s)])
                 diff = {k for k in set(ref) | set(cli)
                         if ref.get(k, _MISSING) != cli.get(k, _MISSING)}
+                diff -= node_derived
                 assert diff == {"--seed", "--name"}, (arm, t, s, sorted(diff))
     for t in TARGETS:
         ref = _cli(gen, by_key[("C", t, SEEDS[0])])
@@ -333,6 +342,7 @@ def test_the_arms_differ_only_where_the_matrix_says_they_do(gen, matrix):
             cli = _cli(gen, by_key[(arm, t, SEEDS[0])])
             diff = {k for k in set(ref) | set(cli)
                     if ref.get(k, _MISSING) != cli.get(k, _MISSING)}
+            diff -= node_derived
             assert diff <= allowed_between_arms, (arm, t, sorted(diff))
 
 
