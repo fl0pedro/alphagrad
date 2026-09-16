@@ -263,6 +263,101 @@ def carried_jacobians(seq, t: int, weights, *, check_zeros: bool = True):
             + tuple(sg(jac[s_i][w_i]) for s_i, w_i in RSNN_CARRY_BLOCKS))
 
 
+def eprop_traces(seq, t: int, weights):
+    """THE E-PROP INFLUENCE MATRIX: the same eleven blocks, block diagonal.
+
+    Zenke and Neftci (arXiv 2010.11931) approximate real-time recurrent
+    learning by replacing the state-to-state Jacobian ``A_t`` with its BLOCK
+    DIAGONAL, one block per neuron: a neuron's own synaptic current, membrane
+    and adaptation survive and the coupling through OTHER neurons' spikes is
+    dropped. Running ``G_t = blockdiag(A_t) G_(t-1) + F_t`` over the prefix
+    leaves ONE ELIGIBILITY TRACE PER SYNAPSE. For
+    :func:`graphax.examples.neuromorphic.rsnn_cell` the traces are, per
+    postsynaptic unit ``j`` and presynaptic index ``i``:
+
+        psi[j]     = 1 / (scale * |U[j] - thresh - beta_a * a_prev[j]| + 1)^2
+        eI[j,i]   <- a_syn * eI[j,i] + V[j,j] * eS[j,i] + direct[j,i]
+        eU[j,i]   <- a_mem * eU[j,i] + (1 - a_mem) * eI[j,i] - thresh * eS[j,i]
+        eS[j,i]   <- psi[j] * (eU[j,i] - beta_a * ea[j,i])
+        ea[j,i]   <- rho * ea[j,i] + eS[j,i]
+
+    with ``direct = x[i]`` for the input weight and ``direct = S_prev[i]`` for
+    the recurrent weight, and every trace zero at the start of the recording.
+    THE ONE TERM THE EXACT RECURSION HAS AND THIS DOES NOT is
+    ``V[j,k] * eS[k,i]`` for ``k != j``: the recurrent coupling. Set ``V`` to a
+    diagonal matrix and the two agree exactly; that is the test.
+
+    The readout blocks stay EXACT and are a plain leaky filter of the hidden
+    traces, because the readout feeds nothing back:
+
+        eUo[m,j,i] <- a_out * eUo[m,j,i] + (1 - a_out) * Wo[m,j] * eS[j,i]
+
+    The returned tuple has the SAME SHAPE as :func:`carried_jacobians`, so the
+    two are interchangeable as the ``rtrl`` given values and the difference
+    between the gradients they produce IS the e-prop approximation.
+
+    THE STORE IS THE POINT. The exact influence matrix is 226 MB of dense
+    blocks; these traces are ``4 * (h * n_in + h * h)`` numbers, 1.7 MB, plus
+    whatever the readout filter is expanded to for the drop-in shape.
+    """
+    from graphax.examples.neuromorphic import (
+        RSNN_CARRY_BLOCKS, RSNN_SURROGATE_SCALE)
+
+    cell = _cell()
+    a_syn, a_mem, a_out, rho = decay_constants()
+    c = _consts()
+    W, V, Wo = weights
+    h, n_in, n_out = RSNN_HIDDEN, SHD_CHANNELS, SHD_CLASSES
+    vd = jnp.diag(V)[:, None]
+
+    st = zero_state()
+    zW = jnp.zeros((h, n_in))
+    zV = jnp.zeros((h, h))
+    tr = {"W": [zW, zW, zW, zW], "V": [zV, zV, zV, zV]}   # eS, eI, eU, ea
+    oW = jnp.zeros((n_out, h, n_in))
+    oV = jnp.zeros((n_out, h, h))
+    oWo = jnp.zeros((n_out, n_out, h))
+
+    for u in range(int(t)):
+        S_prev, I_prev, U_prev, a_prev, Uo_prev = st
+        x = seq[u]
+        nxt = cell(x, *st, W, V, Wo, *c)
+        S, I, U, a, Uo = nxt
+        psi = 1.0 / (RSNN_SURROGATE_SCALE
+                     * jnp.abs(U - (THRESH + BETA_A * a_prev)) + 1.0) ** 2
+        psi = psi[:, None]
+        for name, direct in (("W", jnp.broadcast_to(x[None, :], (h, n_in))),
+                             ("V", jnp.broadcast_to(S_prev[None, :], (h, h)))):
+            eS, eI, eU, ea = tr[name]
+            nI = a_syn * eI + vd * eS + direct
+            nU = a_mem * eU + (1.0 - a_mem) * nI - THRESH * eS
+            nS = psi * (nU - BETA_A * ea)
+            na = rho * ea + nS
+            tr[name] = [nS, nI, nU, na]
+        # the readout, exact, filtering the hidden traces
+        oW = a_out * oW + (1.0 - a_out) * (Wo[:, :, None] * tr["W"][0][None])
+        oV = a_out * oV + (1.0 - a_out) * (Wo[:, :, None] * tr["V"][0][None])
+        # d Uo[m] / d Wo[m, k] = (1 - a_out) * S[k], filtered
+        oWo = a_out * oWo + (1.0 - a_out) * (
+            jnp.eye(n_out)[:, :, None] * S[None, None, :])
+        st = nxt
+
+    def expand(mat):
+        """``(h, n)`` trace -> the full ``(h, h, n)`` block, diagonal in (j, j)."""
+        return jnp.eye(mat.shape[0])[:, :, None] * mat[:, None, :]
+
+    blocks = {
+        (0, 0): expand(tr["W"][0]), (0, 1): expand(tr["V"][0]),
+        (1, 0): expand(tr["W"][1]), (1, 1): expand(tr["V"][1]),
+        (2, 0): expand(tr["W"][2]), (2, 1): expand(tr["V"][2]),
+        (3, 0): expand(tr["W"][3]), (3, 1): expand(tr["V"][3]),
+        (4, 0): oW, (4, 1): oV, (4, 2): oWo,
+    }
+    sg = jax.lax.stop_gradient
+    return (tuple(sg(x) for x in weights)
+            + tuple(sg(blocks[b]) for b in RSNN_CARRY_BLOCKS))
+
+
 def future_adjoints(seq, y, t: int, weights, state_prev):
     """The BPTT attachment: five adjoints ``lambda_(t+1) = dL_(>t)/ds_t``."""
     _, state_t = step_target_loss(seq, y, t, weights, state_prev)
