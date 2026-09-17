@@ -2294,6 +2294,7 @@ THESIS_REQUIRED_FLAGS = REQUIRED_FLAGS + [
     "--example", "--dataset", "--episodes", "--seed", "--name",
     "--checkpoint-every", "--resume", "--auto-stop",
     "--lag-eta", "--lag-init", "--lag-min", "--lag-max",
+    "--grad-oracle-cadence",
 ]
 
 THESIS_HEAD = f"""THE THESIS MATRIX (epic dsnn-dfw, ticket dsnn-dfw.4) under
@@ -2414,7 +2415,7 @@ def thesis_run_name(arm: str, target: str, seed: str) -> str:
 
 def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
                episodes: str, checkpoint_every: str,
-               auto_stop: bool) -> dict:
+               auto_stop: bool, grad_oracle_cadence: str = "50") -> dict:
     """The `cli` override dict of one thesis run.
 
     Everything the owner fixed is HERE, once, so the block and the smoke
@@ -2455,6 +2456,7 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
         # --- the run
         "--episodes": episodes,
         "--checkpoint-every": checkpoint_every,
+        "--grad-oracle-cadence": grad_oracle_cadence,
         "--pareto-dump-every": THESIS_PARETO_DUMP_EVERY,
         "--plan-log": THESIS_PLAN_LOG,
     }
@@ -2492,7 +2494,8 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
                checkpoint_every: str = THESIS_CHECKPOINT_EVERY,
                auto_stop: bool = True, what: str | None = None,
                prediction: str | None = None, held: str | None = None,
-               time: str = THESIS_TIME, extra_cli: dict | None = None) -> dict:
+               time: str = THESIS_TIME, extra_cli: dict | None = None,
+               grad_oracle_cadence: str = "50") -> dict:
     """One thesis run -> one `arm(...)`.  Returns the arm."""
     _require(node in THESIS_NODES,
              f"node {node!r} is not one of the released thesis nodes "
@@ -2511,7 +2514,8 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
              f"seed {seed!r} is not one of {THESIS_SEEDS}")
     cli = thesis_cli(arm=arm, target=target, seed=seed, node=node, name=name,
                      episodes=episodes, checkpoint_every=checkpoint_every,
-                     auto_stop=auto_stop)
+                     auto_stop=auto_stop,
+                     grad_oracle_cadence=grad_oracle_cadence)
     if extra_cli:
         cli.update(extra_cli)
     gpus = THESIS_NODE_GPUS[node]
@@ -2579,14 +2583,26 @@ def thesis_block1_arms() -> list[dict]:
             if not a.get("held") and not a.get("smoke")]
 
 
+# Target-pinned nodes (owner ruling 2026-09-17): TLM on 8-GPU nodes (gpu19,
+# 7 Ray measure actors), NN256 on 4-GPU nodes (gpu16, 3 Ray measure actors),
+# obeying the weekday limit of at most 2 GPU nodes active simultaneously.
+# Activated via THESIS_TARGET_NODES=1.
+THESIS_TARGET_NODES = {
+    "tlm": "pgi15-gpu19",
+    "nn256": "pgi15-gpu16",
+}
+_USE_TARGET_NODES = os.environ.get("THESIS_TARGET_NODES", "0") == "1"
+
 # --- the 50 runs of the matrix ----------------------------------------------
 for _i, (_arm, _target, _seed) in enumerate(thesis_submission_order()):
+    _node = (THESIS_TARGET_NODES[_target] if _USE_TARGET_NODES
+             else THESIS_NODES[_i % len(THESIS_NODES)])
     thesis_arm(
         arm=_arm, target=_target, seed=_seed,
-        node=THESIS_NODES[_i % len(THESIS_NODES)],
+        node=_node,
         held=None if _i < THESIS_BLOCK1 else _THESIS_HELD,
     )
-del _i, _arm, _target, _seed
+del _i, _arm, _target, _seed, _node
 
 
 # ---------------------------------------------------------------------------
@@ -2638,6 +2654,7 @@ thesis_arm(
     arm="C", target="tlm", seed=THESIS_SEEDS[0], node=THESIS_SMOKE_NODE,
     name="smoke_C_tlm", episodes=THESIS_SMOKE_EPISODES,
     checkpoint_every=THESIS_SMOKE_CHECKPOINT_EVERY, auto_stop=False,
+    grad_oracle_cadence="10",
     time="04:00:00", what=_SMOKE_WHAT, prediction=_SMOKE_PREDICTION,
 )
 ARMS[-1]["smoke"] = True
@@ -2647,6 +2664,7 @@ thesis_arm(
     arm="C", target="tlm", seed=THESIS_SEEDS[0], node=THESIS_SMOKE_NODE,
     name="smoke_C_tlm", episodes=THESIS_SMOKE_EPISODES,
     checkpoint_every=THESIS_SMOKE_CHECKPOINT_EVERY, auto_stop=False,
+    grad_oracle_cadence="10",
     time="04:00:00", what=_SMOKE_WHAT, prediction=_SMOKE_PREDICTION,
     extra_cli={"--resume": _THESIS_RESUME_PLACEHOLDER},
 )

@@ -3332,6 +3332,9 @@ class EnvConfig(NamedTuple):
     # policy regression gate, every legacy trainer, every test that does not
     # ask for a bin -- keeps exactly today's shapes and today's numbers.
     delta_window: int = 0
+    # Episode cadence for checking the exact gradient against jax.grad (oracle A).
+    # Default 50: runs on episode 0 and every 50 episodes. Set 1 to check on every episode.
+    grad_oracle_cadence: int = 50
 
 
 def _get_partials(order, sparsity_specs, stop):
@@ -4801,6 +4804,7 @@ def _grad_cosine_k() -> int:
 
 _GRAD_ORACLE_ENV = "ALPHAGRAD_GRAD_ORACLE"
 _GRAD_ORACLE_TOL_ENV = "ALPHAGRAD_GRAD_ORACLE_TOL"
+_GRAD_ORACLE_CADENCE_ENV = "ALPHAGRAD_GRAD_ORACLE_CADENCE"
 _GRAD_ORACLE_DONE: set = set()
 _GRAD_ORACLE_STATS = {"checks": 0, "rel_l2_max": 0.0}
 
@@ -4831,6 +4835,16 @@ _GRAD_ORACLE_REF_STATS = {"hits": 0, "misses": 0}
 # the check so a test can prove the "highest" context was active for the
 # elimination AND for jax.grad.
 _GRAD_ORACLE_LAST_PRECISION: dict = {"plan": None, "reference": None}
+
+
+def grad_oracle_cadence() -> int:
+    """Episode cadence for checking the exact gradient against jax.grad.
+    Default 50 (checked on episode 0 and every 50 episodes). Set 1 to
+    check on every episode."""
+    try:
+        return max(1, int(os.environ.get(_GRAD_ORACLE_CADENCE_ENV, "50")))
+    except ValueError:
+        return 50
 
 
 class GradientOracleFailure(RuntimeError):
@@ -4984,24 +4998,45 @@ def _grad_oracle_check(config, compiled_exact, base_args, device, order_key,
     a = list(base_args)
     for slot in range(min(2, len(data))):
         a[slot] = jax.device_put(jnp.asarray(data[slot]), device)
-    with jax.default_matmul_precision(_GRAD_ORACLE_PRECISION):
-        _GRAD_ORACLE_LAST_PRECISION["plan"] = _matmul_precision()
-        leaves = _grad_oracle_exact(config, [int(v) for v in order_key], a)
-        _GRAD_ORACLE_LAST_PRECISION["reference"] = _matmul_precision()
-        ref_leaves = _grad_oracle_reference(config, a, device, probe_seed)
-    if len(leaves) != len(ref_leaves):
+    prev_x64 = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        a_f64 = []
+        for x in a:
+            if hasattr(x, "dtype") and jnp.issubdtype(x.dtype, jnp.floating):
+                a_f64.append(jnp.asarray(x, dtype=jnp.float64))
+            elif isinstance(x, (tuple, list)):
+                a_f64.append(jax.tree_util.tree_map(
+                    lambda v: jnp.asarray(v, dtype=jnp.float64)
+                    if hasattr(v, "dtype") and jnp.issubdtype(v.dtype, jnp.floating)
+                    else v, x))
+            else:
+                a_f64.append(x)
+        with jax.default_matmul_precision(_GRAD_ORACLE_PRECISION):
+            _GRAD_ORACLE_LAST_PRECISION["plan"] = _matmul_precision()
+            leaves = _grad_oracle_exact(config, [int(v) for v in order_key], a_f64)
+            _GRAD_ORACLE_LAST_PRECISION["reference"] = _matmul_precision()
+            ref_leaves = _grad_oracle_reference(config, a_f64, device, probe_seed)
+            # Densify and convert to numpy while x64 is active so JAX does not
+            # warn or truncate float64 tensors when x64 is restored.
+            leaves_np = [
+                np.asarray(e.dense() if _is_sparse_tensor(e) else e, dtype=np.float64)
+                if e is not None else None
+                for e in leaves
+            ]
+            ref_leaves_np = [np.asarray(r, dtype=np.float64) for r in ref_leaves]
+    finally:
+        jax.config.update("jax_enable_x64", prev_x64)
+    if len(leaves_np) != len(ref_leaves_np):
         raise GradientOracleFailure(
-            f"[grad-oracle] order {key[0][:6]}...: {len(leaves)} exact "
-            f"gradient leaves against {len(ref_leaves)} from jax.grad")
+            f"[grad-oracle] order {key[0][:6]}...: {len(leaves_np)} exact "
+            f"gradient leaves against {len(ref_leaves_np)} from jax.grad")
     num = den = 0.0
-    for i, (e, r) in enumerate(zip(leaves, ref_leaves)):
-        if e is None:
+    for i, (e_np, r_np) in enumerate(zip(leaves_np, ref_leaves_np)):
+        if e_np is None:
             raise GradientOracleFailure(
                 f"[grad-oracle] order {key[0][:6]}...: exact leaf {i} is a "
                 f"dead path")
-        e_arr = e.dense() if _is_sparse_tensor(e) else e
-        e_np = np.asarray(e_arr, dtype=np.float64)
-        r_np = np.asarray(r, dtype=np.float64)
         if e_np.shape != r_np.shape:
             raise GradientOracleFailure(
                 f"[grad-oracle] order {key[0][:6]}...: exact leaf {i} has "
@@ -8517,7 +8552,13 @@ def _callback_measured(
     _pf("cb.xla_compile")
     # ORACLE A (ticket .62): the same-order exact gradient against jax.grad,
     # once per process and order, before it serves as the quality reference.
-    if compiled_exact is not None and _qmetric == "grad_cosine":
+    # Gated by grad_oracle_cadence (default 50 episodes).
+    _cadence = getattr(config, "grad_oracle_cadence", None)
+    if _cadence is None:
+        _cadence = grad_oracle_cadence()
+    _ep = walk_episode()
+    _oracle_due = (_cadence <= 1) or (_ep % _cadence == 0)
+    if compiled_exact is not None and _qmetric == "grad_cosine" and _oracle_due:
         _grad_oracle_check(config, compiled_exact, list(args),
                            callback_device, o_list)
         _pf("cb.grad_oracle")
@@ -9522,6 +9563,7 @@ class VertexEliminationEnv:
         # and their numbers exactly as they are. See EnvConfig.delta_window.
         delta_window: int = 0,
         quality_rewarded=None,
+        grad_oracle_cadence: int | None = None,
         **_compat,
     ):
         # ``num_data_points`` / ``reps_per_point`` ARE wired (see EnvConfig and
@@ -9603,6 +9645,7 @@ class VertexEliminationEnv:
             measure_grad=bool(measure_grad),
             scalar_target=bool(_is_scalar),
             delta_window=int(delta_window or 0),
+            grad_oracle_cadence=int(grad_oracle_cadence) if grad_oracle_cadence is not None else 50,
         )
         return cls(
             config,

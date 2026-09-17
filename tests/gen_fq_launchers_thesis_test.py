@@ -51,6 +51,7 @@ DUAL_ETA = "2.0"
 DUAL_MIN = "12"
 DUAL_MAX = "32"
 ORDER = "free"
+GRAD_ORACLE_CADENCE = "50"
 
 _PLACEHOLDER = re.compile(r"\$\{([A-Z0-9_]+):\?[^}]*\}")
 _EXPORT = re.compile(r"^\s*export\s+([A-Za-z_][A-Za-z0-9_]*)=", re.M)
@@ -181,6 +182,7 @@ def test_every_arm_carries_the_shared_thesis_flags(gen, matrix):
         # the run
         assert cli["--episodes"] == EPISODES, a["name"]
         assert cli["--checkpoint-every"] == CHECKPOINT_EVERY, a["name"]
+        assert cli["--grad-oracle-cadence"] == GRAD_ORACLE_CADENCE, a["name"]
         assert cli["--pareto-dump-every"] == PARETO_DUMP_EVERY, a["name"]
         assert cli["--plan-log"] == "auto", a["name"]
         assert "--auto-stop" in cli and cli["--auto-stop"] is None, a["name"]
@@ -494,7 +496,9 @@ def test_the_smoke_is_the_three_runs_the_owner_asked_for(gen, smoke):
     assert _cli(gen, first)["--episodes"] == "20"
     assert _cli(gen, first)["--example"] == "TransformerLM"
     assert _cli(gen, first)["--reward-mode"] == "lagrangian"
+    assert _cli(gen, first)["--grad-oracle-cadence"] == "10"
     assert "--preference-conditioned" not in _cli(gen, first)
+    assert _cli(gen, resume)["--grad-oracle-cadence"] == "10"
 
     assert _cli(gen, cond)["--episodes"] == "5"
     assert _cli(gen, cond)["--example"] == "NeuralNetwork"
@@ -609,3 +613,20 @@ def test_auto_stop_needs_the_checkpoint_the_matrix_gives_it(gen, matrix):
         ns = make_argparser().parse_args(gen.cli_tokens(a))
         _auto.check_auto_stop_args(ns)          # raises on a bad pair
         assert _auto.check_points(ns) == (250, 500), a["name"]
+
+
+def test_target_nodes_routing(monkeypatch):
+    monkeypatch.setenv("THESIS_TARGET_NODES", "1")
+    spec = importlib.util.spec_from_file_location("gen_fq_launchers_tgt", _GEN)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    matrix = [a for a in mod.thesis_arms() if not a.get("smoke")]
+    for a in matrix:
+        if a["thesis_target"] == "tlm":
+            assert a["node"] == "pgi15-gpu19", a["name"]
+            assert a["gpus"] == 8, a["name"]
+            assert _cli(mod, a)["--ray-measure"] == "7", a["name"]
+        elif a["thesis_target"] == "nn256":
+            assert a["node"] == "pgi15-gpu16", a["name"]
+            assert a["gpus"] == 4, a["name"]
+            assert _cli(mod, a)["--ray-measure"] == "3", a["name"]
