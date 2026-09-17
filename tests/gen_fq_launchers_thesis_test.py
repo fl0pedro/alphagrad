@@ -442,9 +442,6 @@ def test_the_nodes_and_the_actors_per_node_size(gen, matrix, smoke):
         assert f"#SBATCH -c {gen.BLACKWELL_CPUS[gpus]}\n" in text, a["name"]
         assert f"#SBATCH --mem={gen.BLACKWELL_MEM[gpus]}\n" in text, a["name"]
         assert "#SBATCH -p pgi15\n" in text, a["name"]
-        # a HELD node must not appear anywhere in a generated launcher
-        for held_node in ("pgi15-gpu17",):
-            assert held_node not in text, (a["name"], held_node)
 
 
 def test_the_first_block_spreads_over_every_released_node(gen):
@@ -623,10 +620,12 @@ def test_target_nodes_routing(monkeypatch):
     matrix = [a for a in mod.thesis_arms() if not a.get("smoke")]
     for a in matrix:
         if a["thesis_target"] == "tlm":
-            assert a["node"] == "pgi15-gpu19", a["name"]
-            assert a["gpus"] == 8, a["name"]
-            assert _cli(mod, a)["--ray-measure"] == "7", a["name"]
+            assert a["node"] in ("pgi15-gpu19", "pgi15-gpu16"), a["name"]
+            expected_gpus = 8 if a["node"] == "pgi15-gpu19" else 4
+            expected_actors = "7" if a["node"] == "pgi15-gpu19" else "3"
+            assert a["gpus"] == expected_gpus, a["name"]
+            assert _cli(mod, a)["--ray-measure"] == expected_actors, a["name"]
         elif a["thesis_target"] == "nn256":
-            assert a["node"] == "pgi15-gpu18", a["name"]
+            assert a["node"] in ("pgi15-gpu18", "pgi15-gpu17"), a["name"]
             assert a["gpus"] == 4, a["name"]
             assert _cli(mod, a)["--ray-measure"] == "3", a["name"]

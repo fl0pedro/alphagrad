@@ -2184,8 +2184,7 @@ THESIS_TIME = "24:00:00"
 # ---------------------------------------------------------------------------
 THESIS_NODES_ALL = ("pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu17",
                     "pgi15-gpu18", "pgi15-gpu19", "pgi15-gpu20")
-THESIS_NODES = ("pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu18",
-                "pgi15-gpu19", "pgi15-gpu20")
+THESIS_NODES = THESIS_NODES_ALL
 THESIS_NODE_GPUS = {"pgi15-gpu15": 4, "pgi15-gpu16": 4, "pgi15-gpu17": 4,
                     "pgi15-gpu18": 4, "pgi15-gpu19": 8, "pgi15-gpu20": 8}
 #: --ray-measure by node size: every GPU the trainer does not hold.
@@ -2583,10 +2582,22 @@ def thesis_block1_arms() -> list[dict]:
             if not a.get("held") and not a.get("smoke")]
 
 
-# Target-pinned nodes (owner ruling 2026-09-17): TLM on 8-GPU nodes (gpu19,
-# 7 Ray measure actors), NN256 on 4-GPU nodes (gpu16, 3 Ray measure actors),
-# obeying the weekday limit of at most 2 GPU nodes active simultaneously.
+# Target-pinned nodes (owner ruling 2026-09-17: "max 4* 2 tlm 2 nn256"):
+# 2 nodes for TLM (pgi15-gpu19 [8 GPUs, 7 Ray actors], pgi15-gpu16 [4 GPUs, 3 Ray actors]),
+# 2 nodes for NN256 (pgi15-gpu18 [4 GPUs, 3 Ray actors], pgi15-gpu17 [4 GPUs, 3 Ray actors]).
 # Activated via THESIS_TARGET_NODES=1.
+THESIS_TARGET_ARM_NODES = {
+    ("tlm", "C"): "pgi15-gpu19",
+    ("tlm", "C_popart"): "pgi15-gpu16",
+    ("tlm", "condC"): "pgi15-gpu19",
+    ("tlm", "A"): "pgi15-gpu16",
+    ("tlm", "B"): "pgi15-gpu19",
+    ("nn256", "C"): "pgi15-gpu18",
+    ("nn256", "C_popart"): "pgi15-gpu17",
+    ("nn256", "condC"): "pgi15-gpu18",
+    ("nn256", "A"): "pgi15-gpu17",
+    ("nn256", "B"): "pgi15-gpu18",
+}
 THESIS_TARGET_NODES = {
     "tlm": "pgi15-gpu19",
     "nn256": "pgi15-gpu18",
@@ -2595,7 +2606,8 @@ _USE_TARGET_NODES = os.environ.get("THESIS_TARGET_NODES", "0") == "1"
 
 # --- the 50 runs of the matrix ----------------------------------------------
 for _i, (_arm, _target, _seed) in enumerate(thesis_submission_order()):
-    _node = (THESIS_TARGET_NODES[_target] if _USE_TARGET_NODES
+    _node = (THESIS_TARGET_ARM_NODES.get((_target, _arm), THESIS_TARGET_NODES.get(_target, "pgi15-gpu16"))
+             if _USE_TARGET_NODES
              else THESIS_NODES[_i % len(THESIS_NODES)])
     thesis_arm(
         arm=_arm, target=_target, seed=_seed,
