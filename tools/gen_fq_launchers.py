@@ -2275,9 +2275,9 @@ THESIS_ARM_SPEC = {
     # arm: (face_none_bias, form, advantage_norm, conditioned)
     "A": ("0", "fixed", "none", False),
     "B": ("4", "fixed", "none", False),
-    "C": ("4", "L", "none", False),
-    "C_popart": ("4", "L", "popart", False),
-    "condC": ("4", "L", "none", True),
+    "C": ("2", "L", "none", False),
+    "C_popart": ("2", "L", "popart", False),
+    "condC": ("2", "L", "none", True),
 }
 
 THESIS_FLAGS_FILES = REQUIRED_FLAGS_FILES + [
@@ -2436,6 +2436,9 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
         "--face-none-bias": bias,
         "--scale-face-head": SCALE_FACE_HEAD_MVP,
         "--face-logit-clamp": FACE_LOGIT_CLAMP_MVP,
+        "--face-entropy-weight": "0.05",
+        "--face-entropy-floor": "0.3",
+        "--face-entropy-floor-weight": "10.0",
         # --- the reward
         "--rewards": "cmp mem acc",
         "--lambda-cmp": "1",

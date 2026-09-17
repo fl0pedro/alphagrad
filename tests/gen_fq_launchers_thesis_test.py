@@ -203,6 +203,9 @@ def test_every_arm_carries_the_shared_thesis_flags(gen, matrix):
         # the face head at init
         assert cli["--scale-face-head"] == "0.1", a["name"]
         assert cli["--face-logit-clamp"] == "15", a["name"]
+        assert cli["--face-entropy-weight"] == "0.05", a["name"]
+        assert cli["--face-entropy-floor"] == "0.3", a["name"]
+        assert cli["--face-entropy-floor-weight"] == "10.0", a["name"]
         # the measurement protocol
         assert cli["--measure-pipeline"] == "1", a["name"]
         assert cli["--tokenize-where"] == "local", a["name"]
@@ -277,7 +280,7 @@ def test_the_three_c_arms_are_the_lagrangian_dual(gen, matrix):
         assert cli["--lag-min"] == DUAL_MIN, a["name"]
         assert cli["--lag-max"] == DUAL_MAX, a["name"]
         assert cli["--lag-init"] == LAMBDA_Q, a["name"]
-        assert cli["--face-none-bias"] == "4", a["name"]
+        assert cli["--face-none-bias"] == "2", a["name"]
 
 
 def test_c_is_not_conditioned_and_condc_is(gen, matrix):
