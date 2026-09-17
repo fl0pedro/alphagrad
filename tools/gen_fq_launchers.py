@@ -2275,9 +2275,9 @@ THESIS_ARM_SPEC = {
     # arm: (face_none_bias, form, advantage_norm, conditioned)
     "A": ("0", "fixed", "none", False),
     "B": ("4", "fixed", "none", False),
-    "C": ("0", "L", "none", False),
-    "C_popart": ("0", "L", "popart", False),
-    "condC": ("0", "L", "none", True),
+    "C": ("4", "L", "none", False),
+    "C_popart": ("4", "L", "popart", False),
+    "condC": ("4", "L", "none", True),
 }
 
 THESIS_FLAGS_FILES = REQUIRED_FLAGS_FILES + [
