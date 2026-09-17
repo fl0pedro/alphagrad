@@ -421,10 +421,8 @@ def test_the_nodes_and_the_actors_per_node_size(gen, matrix, smoke):
     assert gen.THESIS_NODES_ALL == (
         "pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu17", "pgi15-gpu18",
         "pgi15-gpu19", "pgi15-gpu20")
-    # the released subset: on 2026-09-16 gpu17 stayed out because another
-    # agent may still take it. gpu19 came back when the SNN agent finished.
-    assert gen.THESIS_NODES == ("pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu18",
-                                "pgi15-gpu19", "pgi15-gpu20")
+    # all six nodes released
+    assert gen.THESIS_NODES == gen.THESIS_NODES_ALL
     assert set(gen.THESIS_NODES) <= set(gen.THESIS_NODES_ALL)
     assert gen.THESIS_RAY_MEASURE == {4: "3", 8: "7"}
     used = {a["node"] for a in matrix}
@@ -562,7 +560,7 @@ def test_thesis_arm_raises_on_a_row_outside_the_rulings(gen):
         ({"arm": "D"}, "is not one of"),
         ({"target": "snn"}, "is not one of"),
         ({"seed": "42"}, "is not one of"),
-        ({"node": "pgi15-gpu17"}, "released"),
+        ({"node": "pgi15-gpu14"}, "released"),
         ({"node": "pgi15-cpu1"}, "released"),
     ):
         with pytest.raises(gen.CampaignRowError) as e:
