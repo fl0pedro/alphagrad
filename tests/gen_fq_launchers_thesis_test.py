@@ -627,6 +627,6 @@ def test_target_nodes_routing(monkeypatch):
             assert a["gpus"] == 8, a["name"]
             assert _cli(mod, a)["--ray-measure"] == "7", a["name"]
         elif a["thesis_target"] == "nn256":
-            assert a["node"] == "pgi15-gpu16", a["name"]
+            assert a["node"] == "pgi15-gpu18", a["name"]
             assert a["gpus"] == 4, a["name"]
             assert _cli(mod, a)["--ray-measure"] == "3", a["name"]

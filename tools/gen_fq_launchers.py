@@ -2589,7 +2589,7 @@ def thesis_block1_arms() -> list[dict]:
 # Activated via THESIS_TARGET_NODES=1.
 THESIS_TARGET_NODES = {
     "tlm": "pgi15-gpu19",
-    "nn256": "pgi15-gpu16",
+    "nn256": "pgi15-gpu18",
 }
 _USE_TARGET_NODES = os.environ.get("THESIS_TARGET_NODES", "0") == "1"
 
