@@ -3480,9 +3480,11 @@ class Agent(eqx.Module):
                         rs_f = self._face_row_specs(
                             row, axis_state[vertex_idx], nout_f)
                         return (sk.astype(jnp.int32),
-                                tuple(row[k] for k in _WK2), lp, e, rs_f)
+                                tuple(row[k] for k in _WK2), lp, e, rs_f,
+                                jnp.stack([jnp.asarray(_sp, jnp.float32),
+                                           jnp.asarray(_ar, jnp.float32)]))
 
-                    _sk2, _wa2, _lp2, _e2, _rs2 = jax.vmap(_redraw)(
+                    _sk2, _wa2, _lp2, _e2, _rs2, _sp2 = jax.vmap(_redraw)(
                         jnp.arange(_F, dtype=jnp.int32), _fctx, _pair2,
                         _comp2, f_valid, _sizes2, _quant2, _nout2)
                     # Padding faces never ran in the loop: END rows, no skip,
@@ -3512,6 +3514,29 @@ class Agent(eqx.Module):
                             mask_sizes_sum=jnp.sum(_sizes2),
                             nf2=jnp.asarray(_nf2, jnp.int32),
                             ctx_absmax=jnp.max(jnp.abs(_fctx)))
+                        _ax = tuple(range(1, jnp.ndim(_pair2)))
+                        _ac = tuple(range(1, jnp.ndim(_comp2)))
+                        _aq = tuple(range(1, jnp.ndim(_quant2)))
+                        _as = tuple(range(1, jnp.ndim(_sizes2)))
+                        _fdump.record(
+                            "s2b_face",
+                            key=jnp.asarray(face_dump_key, jnp.int32),
+                            live=_live[:_K].astype(jnp.int32),
+                            fvalid=f_valid[:_K],
+                            p_skip=_sp2[:_K, 0], arity=_sp2[:_K, 1],
+                            skip=_sk2[:_K],
+                            ent=_e2[:_K], logp=_lp2[:_K],
+                            op=_wa2[_WK2.index("op_type")][:_K],
+                            ctx_absmax=jnp.max(jnp.abs(_fctx[:_K]), axis=-1),
+                            s1_pair=jnp.sum(f_pair[:_K], axis=_ax),
+                            s2_pair=jnp.sum(_pair2[:_K], axis=_ax),
+                            s1_comp=jnp.sum(f_comp[:_K], axis=_ac),
+                            s2_comp=jnp.sum(_comp2[:_K], axis=_ac),
+                            s1_quant=jnp.sum(f_quant[:_K], axis=_aq),
+                            s2_quant=jnp.sum(_quant2[:_K], axis=_aq),
+                            s1_sizes=jnp.sum(f_sizes[:_K], axis=_as),
+                            s2_sizes=jnp.sum(_sizes2[:_K], axis=_as),
+                            s2_nout=_nout2[:_K])
                     _rs_pad = -jnp.ones_like(_rs2).at[..., 2].set(0)
                     fa = FaceAction(
                         skip=_keep(_sk2, jnp.zeros((_F,), jnp.int32)),

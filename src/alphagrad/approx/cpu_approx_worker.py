@@ -757,6 +757,22 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *, seed: int = 0)
     target_fn, xs, argnums = grad_target_setup(args, target_fn, xs, args.example)
     closed_jaxpr = _traced_inlined(target_fn, xs)
 
+    # THE FACE WIDTH IS DERIVED HERE TOO, and it must be, because this build
+    # is the trainer's twin in another process: ppo.main derives the bound
+    # from the graph and calls `configure_max_faces` before any shape is built
+    # from it, while this process left `env.MAX_FACES` at the module default
+    # 16. The measurement then refused every vertex with more than 16 faces
+    # ("20 faces exceed the derived bound 16", dsnn-dfw.36) although the
+    # trainer's bound is 1920 and its wire carries --face-wire-faces columns.
+    # Same function, same graph, same number.
+    if bool(getattr(args, "face_actions", False)):
+        from alphagrad.approx.env import (
+            configure_max_faces as _cfg_faces,
+            derived_max_faces as _derive_faces,
+        )
+        _cfg_faces(_derive_faces(
+            closed_jaxpr.jaxpr, argnums, closed_jaxpr.literals, xs))
+
     # Always pass target_fun so env._callback runs the JIT-compile +
     # cost_analysis + ResourceMonitor path on every step — this is what
     # populates flops, bytes_accessed, latency_ns, peak_memory. Previously
