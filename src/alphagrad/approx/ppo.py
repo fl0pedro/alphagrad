@@ -1167,6 +1167,13 @@ def _face_entropy_floor_penalty(h_face, floor, weight):
     return weight * jnp.maximum(0.0, floor - h_face) ** 2
 
 
+def _key_bits(k):
+    # ALPHAGRAD_FACE_DUMP: a PRNG key as plain words, new-style or old.
+    if jnp.issubdtype(k.dtype, jax.dtypes.prng_key):
+        return jrand.key_data(k).astype(jnp.uint32)
+    return jnp.asarray(k, jnp.uint32)
+
+
 def _fdump_traj(fa, face_valid, step_count, env_index):
     # ALPHAGRAD_FACE_DUMP: the row as the trajectory stores it. Identity off.
     if not _fdump.on():
@@ -3471,9 +3478,10 @@ class Agent(eqx.Module):
 
                     def _redraw(f, ctx_f, pair_f, comp_f, valid_f, sizes_f,
                                 quant_f, nout_f):
+                        _kf = jrand.fold_in(face_key, f)
                         sk, row, lp, e, _ar, _sp, _od = _pol.sample_face(
                             features, factor_tables,
-                            jrand.fold_in(face_key, f), f, pair_f, comp_f,
+                            _kf, f, pair_f, comp_f,
                             valid_f, face_context=ctx_f,
                             face_sizes_f=sizes_f, face_quant_f=quant_f,
                             op_legality_override=op_legality_override)
@@ -3482,9 +3490,12 @@ class Agent(eqx.Module):
                         return (sk.astype(jnp.int32),
                                 tuple(row[k] for k in _WK2), lp, e, rs_f,
                                 jnp.stack([jnp.asarray(_sp, jnp.float32),
-                                           jnp.asarray(_ar, jnp.float32)]))
+                                           jnp.asarray(_ar, jnp.float32),
+                                           jrand.uniform(_kf)]),
+                                _key_bits(_kf))
 
-                    _sk2, _wa2, _lp2, _e2, _rs2, _sp2 = jax.vmap(_redraw)(
+                    (_sk2, _wa2, _lp2, _e2, _rs2, _sp2,
+                     _kb2) = jax.vmap(_redraw)(
                         jnp.arange(_F, dtype=jnp.int32), _fctx, _pair2,
                         _comp2, f_valid, _sizes2, _quant2, _nout2)
                     # Padding faces never ran in the loop: END rows, no skip,
@@ -3524,6 +3535,7 @@ class Agent(eqx.Module):
                             live=_live[:_K].astype(jnp.int32),
                             fvalid=f_valid[:_K],
                             p_skip=_sp2[:_K, 0], arity=_sp2[:_K, 1],
+                            u_direct=_sp2[:_K, 2], kbits=_kb2[:_K],
                             skip=_sk2[:_K],
                             ent=_e2[:_K], logp=_lp2[:_K],
                             op=_wa2[_WK2.index("op_type")][:_K],
@@ -3976,8 +3988,9 @@ class Agent(eqx.Module):
                 summ = jnp.concatenate([summ, _elr[0], _elr[1]])
             if want_stage2:
                 fctx = fctx.at[f].set(summ)
+            _kf = jrand.fold_in(key, f)
             sk, row, lp, e, _ar, _sp, _od = pol.sample_face(
-                features, factor_tables, jrand.fold_in(key, f),
+                features, factor_tables, _kf,
                 f, f_pair[f], f_comp[f], f_valid[f], face_context=summ,
                 # --per-face-masks: this face's LIVE dim sizes (which become
                 # its AxisTokenFeatures, hence its pair_ok gate AND the factor
@@ -4003,6 +4016,7 @@ class Agent(eqx.Module):
                     op_dist=jnp.asarray(_od, jnp.float32),
                     op=jnp.asarray(row["op_type"], jnp.int32),
                     ct_raw=ct_raw, ct_eff=ct_eff,
+                    kbits=_key_bits(_kf), u_direct=jrand.uniform(_kf),
                     ctx_absmax=jnp.max(jnp.abs(summ)),
                     ctx_absmean=jnp.mean(jnp.abs(summ)))
             # RAW, not clamped -- see the docstring and the ct_eff comment.
