@@ -8875,6 +8875,14 @@ def _callback_measured(
             argnums=config.argnums,
             has_aux=config.has_aux,
             sparse_representation=config.sparse,
+            # ONE JAXPR FOR BOTH PATHS (dsnn-dfw.24). The order and the face
+            # keys are numbered on `config.jaxpr`; a fresh trace inside
+            # `.lower()` is a different equation list for the same function
+            # (measured on window2: 90 equations against 72, every
+            # `convert_element_type` moved), and then the plan addresses
+            # vertices that are not there.
+            jaxpr=config.jaxpr,
+            consts=list(consts),
             **_kw,
         )
 
@@ -9000,6 +9008,10 @@ def _callback_measured(
                     sparse_representation=config.sparse,
                     transforms=[],
                     face_transforms=None,
+                    # The paired reference walks the SAME graph as the
+                    # candidate, or the ratio is not about the plan.
+                    jaxpr=config.jaxpr,
+                    consts=list(consts),
                 ),
                 keep_unused=True,
             ).lower(*args_for_lower)
@@ -9115,6 +9127,8 @@ def _callback_measured(
                             sparse_representation=True,
                             transforms=transforms,
                             face_transforms=ft_by_vertex,
+                            jaxpr=config.jaxpr,
+                            consts=list(consts),
                         ),
                         keep_unused=True,
                     )

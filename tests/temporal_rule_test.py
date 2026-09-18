@@ -1604,3 +1604,248 @@ def test_the_wires_travel_by_position_and_the_carry_rows_are_exact(container):
         row = f2[pos2[int(v)]]
         assert int(row[..., 0].max()) == -1, v
         assert int(k2[pos2[int(v)]].max()) == 0, v
+
+
+# ---------------------------------------------------------------------------
+# 16. ONE JAXPR FOR BOTH PATHS (ticket dsnn-dfw.24)
+# ---------------------------------------------------------------------------
+# The environment numbers vertices and face keys on ``config.jaxpr``, the
+# INLINED trace of the target. The measurement used to hand ``jacve`` the
+# function again and let it trace a fresh one inside ``jax.jit(...).lower()``.
+# A fresh trace of the same function is not the same equation list: on the
+# two-copy window arm the env's jaxpr has 90 equations and the measurement's
+# 72, the difference being every ``convert_element_type`` of the six scalar
+# constants, so the plan's last 18 vertices addressed nothing and the face
+# keys addressed the wrong edges. The unapplied-face guard caught it as 26
+# refused vertices per plan (job 66114). ``jacve(jaxpr=..., consts=...)`` is
+# the fix: the measurement walks the jaxpr the env numbered.
+
+def _env_for_example(example, extra=()):
+    """A landscape_map env for any registered target, no dataset."""
+    import alphagrad.approx.tools.landscape_map as lm
+    argv = ["--example", example, "--dataset", "none", "--num-eval-samples",
+            "1", "--num-data-points", "1", "--reps-per-point", "1",
+            "--out-dir", "/tmp/carry_test"] + list(extra)
+    env, _samples, _cj = lm.build_env(lm.make_argparser().parse_args(argv))
+    return env
+
+
+def _jaxpr_the_eliminator_walks(env, order, weak_consts=True):
+    """The jaxpr the measurement's ``jacve`` hands the elimination.
+
+    Traced the way the measurement traces it -- inside ``jax.jit(...).lower()``
+    -- and with the scalar constants passed WEAK-TYPED, which is the one
+    difference that moved the equation list. The elimination itself is stubbed
+    out: this asks which jaxpr it was given, not what it computes.
+    """
+    import graphax.core as gxcore
+    from graphax import jacve
+
+    seen = {}
+
+    class _Stop(Exception):
+        pass
+
+    def _stub(jaxpr, *a, **kw):
+        seen["jaxpr"] = jaxpr
+        raise _Stop()
+
+    args = list(env.args)
+    if weak_consts:
+        args = [float(a) if getattr(a, "shape", ()) == () and
+                jnp.issubdtype(getattr(a, "dtype", jnp.int32), jnp.floating)
+                else a for a in args]
+    fn = jacve(env.config.target_fun, list(order),
+               argnums=env.config.argnums, has_aux=env.config.has_aux,
+               sparse_representation=env.config.sparse,
+               jaxpr=env.config.jaxpr, consts=list(env.consts))
+    orig = gxcore.vertex_elimination_jaxpr
+    gxcore.vertex_elimination_jaxpr = _stub
+    try:
+        jax.jit(fn, keep_unused=True).lower(*args)
+    except _Stop:
+        pass
+    finally:
+        gxcore.vertex_elimination_jaxpr = orig
+    return seen.get("jaxpr")
+
+
+@pytest.mark.parametrize("rule", ["tbptt", "bptt", "rtrl", "window2"])
+def test_the_eliminator_walks_the_jaxpr_the_env_numbers_snn(rule):
+    _lm, _CP, env = _env_for(rule)
+    order = [int(v) for v in sorted(env.valid_vertices, reverse=True)]
+    walked = _jaxpr_the_eliminator_walks(env, order)
+    assert walked is env.config.jaxpr
+    assert ([str(e.primitive) for e in walked.eqns]
+            == [str(e.primitive) for e in env.config.jaxpr.eqns])
+
+
+@pytest.mark.parametrize("example,extra", [
+    ("NeuralNetwork", ()),
+    ("TransformerLM", ("--hidden-dim", "16", "--vocab-size", "16",
+                       "--num-layers", "1")),
+])
+def test_the_eliminator_walks_the_jaxpr_the_env_numbers(example, extra):
+    env = _env_for_example(example, extra)
+    order = [int(v) for v in sorted(env.valid_vertices, reverse=True)]
+    walked = _jaxpr_the_eliminator_walks(env, order)
+    assert walked is env.config.jaxpr
+    assert ([str(e.primitive) for e in walked.eqns]
+            == [str(e.primitive) for e in env.config.jaxpr.eqns])
+
+
+def test_the_elimination_walks_every_vertex_of_the_window_arms_order():
+    """THE REGRESSION ITSELF. With the measurement on its own trace, the last
+    18 vertices of the window arm's order were not in that graph at all and
+    the elimination silently walked 71 of 89."""
+    import graphax.core as gxcore
+    from graphax import jacve
+
+    _lm, _CP, env = _env_for("window2")
+    order = [int(v) for v in sorted(env.valid_vertices, reverse=True)]
+    walked = []
+    orig = gxcore._eliminate_vertex
+
+    def spy(vertex, *a, **kw):
+        walked.append(int(vertex))
+        return orig(vertex, *a, **kw)
+
+    fn = jacve(env.config.target_fun, list(order),
+               argnums=env.config.argnums, has_aux=env.config.has_aux,
+               sparse_representation=env.config.sparse,
+               jaxpr=env.config.jaxpr, consts=list(env.consts))
+    gxcore._eliminate_vertex = spy
+    try:
+        jax.eval_shape(fn, *env.args)
+    finally:
+        gxcore._eliminate_vertex = orig
+    assert walked == order
+
+
+# ---------------------------------------------------------------------------
+# 17. THE DIAG PLAN IS THE E-PROP RECURSION (owner ruling 2026-09-18)
+# ---------------------------------------------------------------------------
+
+_EPROP_HAND = r'''
+import os, json
+os.environ["JAX_ENABLE_X64"] = "1"
+import numpy as np, jax, jax.numpy as jnp
+from alphagrad.approx.common import examples as ex, rsnn_shd as R
+from graphax.examples.neuromorphic import RSNN_SURROGATE_SCALE, rsnn_cell
+
+assert jax.config.jax_enable_x64
+H, NIN, NOUT, T = 6, 700, 20, 9
+R.RSNN_HIDDEN = H
+key = jax.random.split(jax.random.PRNGKey(5), 3)
+seq = jax.random.bernoulli(key[0], 0.2, (T, NIN)).astype(jnp.float64)
+y = jax.nn.one_hot(3, NOUT).astype(jnp.float64)
+W, V, Wo = R.rsnn_weights(key[1])
+weights = (W, V, Wo)
+c = R._consts()
+a_syn, a_mem, a_out, rho = R.decay_constants()
+fn = ex.get_fn("RSNN_SHD")
+
+
+def states(t):
+    st = R.zero_state()
+    out = [st]
+    for u in range(t):
+        st = rsnn_cell(seq[u], *st, W, V, Wo, *c)
+        out.append(st)
+    return out
+
+
+def hand_traces(t):
+    """THE E-PROP RECURSION, written out here: one eligibility trace per
+    synapse, the block diagonal of the state-to-state Jacobian at every step,
+    plus the two readout filters. Independent of `common.rsnn_shd`."""
+    vd = jnp.diag(V)[:, None]
+    zW, zV = jnp.zeros((H, NIN)), jnp.zeros((H, H))
+    trW, trV = (zW, zW, zW, zW), (zV, zV, zV, zV)
+    fW, fV, g = zW, zV, jnp.zeros(H)
+    st = R.zero_state()
+    for u in range(t):
+        S_prev = st[0]
+        a_prev = st[3]
+        st = rsnn_cell(seq[u], *st, W, V, Wo, *c)
+        psi = (1.0 / (RSNN_SURROGATE_SCALE
+                      * jnp.abs(st[2] - (1.0 + 1.0 * a_prev)) + 1.0) ** 2)
+        psi = psi[:, None]
+
+        def adv(tr, direct):
+            eS, eI, eU, ea = tr
+            nI = a_syn * eI + vd * eS + direct
+            nU = a_mem * eU + (1.0 - a_mem) * nI - 1.0 * eS
+            nS = psi * (nU - 1.0 * ea)
+            return (nS, nI, nU, rho * ea + nS)
+
+        trW = adv(trW, jnp.broadcast_to(seq[u][None, :], (H, NIN)))
+        trV = adv(trV, jnp.broadcast_to(S_prev[None, :], (H, H)))
+        fW = a_out * fW + (1.0 - a_out) * trW[0]
+        fV = a_out * fV + (1.0 - a_out) * trV[0]
+        g = a_out * g + (1.0 - a_out) * st[0]
+    return trW, trV, fW, fV, g
+
+
+def hand_gradient(t):
+    """(eligibility trace) x (learning signal), the e-prop gradient."""
+    trW, trV, fW, fV, g = hand_traces(t)
+    st = states(t)[t]
+
+    def step(state, ws):
+        nxt = rsnn_cell(seq[t], *state, *ws, *c)
+        return jnp.sum(-y * jax.nn.log_softmax(nxt[4]))
+
+    lam, direct = jax.grad(step, argnums=(0, 1))(tuple(st), weights)
+    lS, lI, lU, la, lUo = lam
+    gW = (lS[:, None] * trW[0] + lI[:, None] * trW[1] + lU[:, None] * trW[2]
+          + la[:, None] * trW[3] + (lUo @ Wo)[:, None] * fW)
+    gV = (lS[:, None] * trV[0] + lI[:, None] * trV[1] + lU[:, None] * trV[2]
+          + la[:, None] * trV[3] + (lUo @ Wo)[:, None] * fV)
+    gWo = lUo[:, None] * g[None, :]
+    return (direct[0] + gW, direct[1] + gV, direct[2] + gWo)
+
+
+def rel(a, b):
+    a, b = np.asarray(a, np.float64), np.asarray(b, np.float64)
+    n = np.linalg.norm(b)
+    return float(np.linalg.norm(a - b) / n) if n else float(np.linalg.norm(a - b))
+
+
+out = {}
+for t in (3, 7):
+    st = tuple(jax.lax.stop_gradient(x)
+               for x in R.prefix_state(seq, t, weights)(*weights))
+    head = (seq[t], y) + st + weights + c
+    given = R.carry_under_plan(seq, t, weights, "diag")
+    plan_g = jax.grad(fn, argnums=(7, 8, 9))(*(head + tuple(given)))
+    hand_g = hand_gradient(t)
+    out[f"diag_vs_hand_eprop_t{t}"] = max(
+        rel(a, b) for a, b in zip(plan_g, hand_g))
+    out[f"carry_bytes_t{t}"] = int(sum(np.asarray(x).nbytes
+                                       for x in given[3:]))
+print("RESULT " + json.dumps(out))
+'''
+
+
+def _run_float64(src):
+    """One float64 subprocess, the pattern section 7 uses."""
+    env = dict(os.environ)
+    env["JAX_ENABLE_X64"] = "1"
+    out = subprocess.run([sys.executable, "-c", textwrap.dedent(src)],
+                         capture_output=True, text=True, env=env)
+    lines = [l for l in out.stdout.splitlines() if l.startswith("RESULT ")]
+    assert lines, (out.stdout[-4000:], out.stderr[-4000:])
+    return json.loads(lines[-1][len("RESULT "):])
+
+
+def test_the_diag_plan_is_the_eprop_recursion_in_float64():
+    """THE PLAN-PRODUCED CARRY IS E-PROP. A Diag on the carried-Jacobian face
+    makes the container the eligibility traces of Zenke and Neftci, and the
+    gradient the measured program then computes is the e-prop gradient --
+    eligibility trace times learning signal -- and not a per-step
+    diagonalisation of an exact carry."""
+    out = _run_float64(_EPROP_HAND)
+    for t in (3, 7):
+        assert out[f"diag_vs_hand_eprop_t{t}"] < 1e-12, out
+        assert out[f"carry_bytes_t{t}"] > 0

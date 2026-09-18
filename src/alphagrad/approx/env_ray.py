@@ -665,6 +665,9 @@ def _callback(
                     has_aux=config.has_aux,
                     sparse_representation=config.sparse,
                     transforms=transforms,
+                    # ONE JAXPR FOR BOTH PATHS (dsnn-dfw.24).
+                    jaxpr=config.jaxpr,
+                    consts=list(consts),
                 ),
                 keep_unused=True,
             )
@@ -681,6 +684,9 @@ def _callback(
                     has_aux=config.has_aux,
                     sparse_representation=config.sparse,
                     transforms=None,
+                    # ONE JAXPR FOR BOTH PATHS (dsnn-dfw.24).
+                    jaxpr=config.jaxpr,
+                    consts=list(consts),
                 ),
                 keep_unused=True,
             )
