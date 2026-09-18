@@ -1630,54 +1630,57 @@ def _env_for_example(example, extra=()):
     return env
 
 
-def _jaxpr_the_eliminator_walks(env, order, weak_consts=True):
-    """The jaxpr the measurement's ``jacve`` hands the elimination.
+def _jaxpr_the_measurement_walks(env, order):
+    """The jaxpr the ENVIRONMENT's own measurement hands the elimination.
 
-    Traced the way the measurement traces it -- inside ``jax.jit(...).lower()``
-    -- and with the scalar constants passed WEAK-TYPED, which is the one
-    difference that moved the equation list. The elimination itself is stubbed
-    out: this asks which jaxpr it was given, not what it computes.
+    Driven through ``landscape_map.measure``, which IS ``env._callback``, so
+    this asks what the measured program is built on, not what a test could
+    build. The elimination itself is stubbed out and raises at once: the
+    question is which jaxpr it was given, and a refused plan is a path the
+    callback already handles.
     """
+    import alphagrad.approx.tools.landscape_map as lm
     import graphax.core as gxcore
-    from graphax import jacve
 
     seen = {}
 
-    class _Stop(Exception):
-        pass
-
     def _stub(jaxpr, *a, **kw):
-        seen["jaxpr"] = jaxpr
-        raise _Stop()
+        seen.setdefault("jaxpr", jaxpr)
+        raise ValueError("stubbed elimination (test): jaxpr recorded")
 
-    args = list(env.args)
-    if weak_consts:
-        args = [float(a) if getattr(a, "shape", ()) == () and
-                jnp.issubdtype(getattr(a, "dtype", jnp.int32), jnp.floating)
-                else a for a in args]
-    fn = jacve(env.config.target_fun, list(order),
-               argnums=env.config.argnums, has_aux=env.config.has_aux,
-               sparse_representation=env.config.sparse,
-               jaxpr=env.config.jaxpr, consts=list(env.consts))
+    plan = {"specs": None, "face_specs": None, "face_skips": None,
+            "n_faces_approx": 0, "n_slot_rows": 0, "total_live_faces": 0,
+            "per_vertex_faces": [], "wires": [], "op": "identity",
+            "budget": "identity"}
     orig = gxcore.vertex_elimination_jaxpr
     gxcore.vertex_elimination_jaxpr = _stub
     try:
-        jax.jit(fn, keep_unused=True).lower(*args)
-    except _Stop:
-        pass
+        try:
+            lm.measure(env, env.eval_args_samples, list(order), plan)
+        except ValueError:
+            pass
     finally:
         gxcore.vertex_elimination_jaxpr = orig
     return seen.get("jaxpr")
 
 
+def _assert_one_jaxpr(env, name):
+    order = [int(v) for v in sorted(env.valid_vertices, reverse=True)]
+    walked = _jaxpr_the_measurement_walks(env, order)
+    assert walked is not None, f"{name}: the measurement never reached jacve"
+    assert walked is env.config.jaxpr, (
+        f"{name}: the measurement eliminates a jaxpr of "
+        f"{len(walked.eqns)} equations and the environment numbered one of "
+        f"{len(env.config.jaxpr.eqns)}. The order and the face keys belong to "
+        f"the environment's jaxpr; on another one they address other edges.")
+    assert ([str(e.primitive) for e in walked.eqns]
+            == [str(e.primitive) for e in env.config.jaxpr.eqns])
+
+
 @pytest.mark.parametrize("rule", ["tbptt", "bptt", "rtrl", "window2"])
 def test_the_eliminator_walks_the_jaxpr_the_env_numbers_snn(rule):
     _lm, _CP, env = _env_for(rule)
-    order = [int(v) for v in sorted(env.valid_vertices, reverse=True)]
-    walked = _jaxpr_the_eliminator_walks(env, order)
-    assert walked is env.config.jaxpr
-    assert ([str(e.primitive) for e in walked.eqns]
-            == [str(e.primitive) for e in env.config.jaxpr.eqns])
+    _assert_one_jaxpr(env, f"RSNN_SHD/{rule}")
 
 
 @pytest.mark.parametrize("example,extra", [
@@ -1686,18 +1689,13 @@ def test_the_eliminator_walks_the_jaxpr_the_env_numbers_snn(rule):
                        "--num-layers", "1")),
 ])
 def test_the_eliminator_walks_the_jaxpr_the_env_numbers(example, extra):
-    env = _env_for_example(example, extra)
-    order = [int(v) for v in sorted(env.valid_vertices, reverse=True)]
-    walked = _jaxpr_the_eliminator_walks(env, order)
-    assert walked is env.config.jaxpr
-    assert ([str(e.primitive) for e in walked.eqns]
-            == [str(e.primitive) for e in env.config.jaxpr.eqns])
+    _assert_one_jaxpr(_env_for_example(example, extra), example)
 
 
 def test_the_elimination_walks_every_vertex_of_the_window_arms_order():
-    """THE REGRESSION ITSELF. With the measurement on its own trace, the last
-    18 vertices of the window arm's order were not in that graph at all and
-    the elimination silently walked 71 of 89."""
+    """THE REGRESSION ITSELF. On the measurement's own trace the last 18
+    vertices of the window arm's order were not in that graph at all, and the
+    elimination silently walked 71 of 89."""
     import graphax.core as gxcore
     from graphax import jacve
 
