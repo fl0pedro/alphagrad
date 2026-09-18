@@ -263,11 +263,21 @@ def test_the_node_is_the_seed(gen, rows):
     assert per_node == {"pgi15-gpu14": 12, "pgi15-gpu13": 6}
 
 
-def test_every_order_only_job_is_a_per_node_singleton(gen, rows):
+def test_every_order_only_job_is_a_cross_agent_per_node_singleton(gen, rows):
+    """Orchestrator ruling 2026-09-18: `node-<node>`, not `thesis-<node>`.
+    Singleton serializes jobs that share a NAME, three agents submit to
+    pgi15-gpu14, and a name only one agent uses serializes nothing -- two
+    jobs of this user on one node and the epilog kills both."""
     for a in rows:
         text = gen.render(a)
+        assert a["job"] == f"node-{a['node']}", a["name"]
+        assert f"#SBATCH -J node-{a['node']}\n" in text, a["name"]
+        assert f"#SBATCH -J thesis-{a['node']}\n" not in text, a["name"]
+    # and the matrix keeps its own name, so this change moved no matrix row
+    for a in gen.thesis_arms():
+        if a.get("orderonly"):
+            continue
         assert a["job"] == f"thesis-{a['node']}", a["name"]
-        assert f"#SBATCH -J thesis-{a['node']}\n" in text, a["name"]
         assert "#SBATCH --dependency=singleton\n" in text, a["name"]
         assert f"#SBATCH -w {a['node']}\n" in text, a["name"]
         assert (f"#SBATCH -o {gen.CAMPAIGN_RUNS}/{a['name']}_%j.log\n"

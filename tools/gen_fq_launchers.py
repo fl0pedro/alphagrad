@@ -2898,6 +2898,24 @@ def orderonly_pref_run_name(seed: str) -> str:
     return f"orderonly_nn256_pref_s{seed}"
 
 
+def orderonly_job_name(node: str) -> str:
+    """THE CROSS-AGENT SINGLETON NAME (orchestrator ruling 2026-09-18).
+
+    Slurm's `--dependency=singleton` serializes jobs of one user that share a
+    NAME, and `thesis-<node>` is the thesis matrix's name.  Three agents now
+    submit to pgi15-gpu14, so a name that only one of them uses serializes
+    nothing: two jobs of this user would land on the node together and the
+    node epilog would kill both (memory note pgi15-epilog-kills-sibling-jobs).
+    `node-<node>` is the name EVERY agent uses, so one job of ours runs on a
+    node at a time whoever submitted it.
+    """
+    if node not in THESIS_NODE_GPUS and node not in NODE_GPUS:
+        raise CampaignRowError(
+            f"node {node!r} is not a GPU node this generator knows "
+            f"({sorted(set(THESIS_NODE_GPUS) | set(NODE_GPUS))})")
+    return f"node-{node}"
+
+
 def orderonly_node(seed: str) -> str:
     """THE NODE OF A SEED.  One node per seed, so every weight of one seed is
     measured on one GPU model and the weight comparison never straddles two."""
@@ -2944,7 +2962,8 @@ def orderonly_arm(*, seed: str, lam_cmp: str | None = None,
             f"WEIGHT (--lambda-cmp {lam_cmp}, --lambda-mem {lam_mem}) at seed "
             f"{seed}, one of the five ruled pairs.")
     a = dict(
-        name=name, job=thesis_job_name(node), kind="train", runtime="scratch",
+        name=name, job=orderonly_job_name(node), kind="train",
+        runtime="scratch",
         node=node, time=THESIS_TIME, gpus=gpus, singleton=True, thesis=True,
         orderonly=True, thesis_arm=arm_name, thesis_target=ORDERONLY_TARGET,
         thesis_seed=seed, orderonly_weights=(None if pref
