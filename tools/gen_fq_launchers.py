@@ -2815,14 +2815,25 @@ ORDERONLY_SEEDS = THESIS_SEEDS[:3]
 #: (--lambda-cmp, --lambda-mem), the five pairs of the ruling, in order.
 ORDERONLY_WEIGHTS = (("2", "0"), ("1.5", "0.5"), ("1", "1"),
                      ("0.5", "1.5"), ("0", "2"))
-#: One node per seed, in seed order.  Every node here was cleared by running
-#: the measure toolchain gate ON the node before it was listed: gpu16 carries
-#: /usr/local/cuda-12.9, gpu13 carries /usr/local/cuda-12.9, and gpu14 needs
-#: NODE_CUDA_BIN.  pgi15-gpu8, -gpu9, -gpu11 and -gpu12 carry CUDA 12.8 alone
+#: ONE NODE PER SEED, in seed order.  A node may carry more than one seed; a
+#: seed may never be split, because the weight comparison inside a seed is the
+#: thing this round decides and it must not straddle two GPU models.
+#:
+#: Every node here was cleared by running the measure toolchain gate ON the
+#: node, and the whole command line under it for one episode, before it was
+#: listed: gpu13 finds the matched pair at /usr/local/cuda-12, gpu14 needs
+#: NODE_CUDA_BIN (jobs 66341 and 66342, both "toolchain gate OK" and TRAINER
+#: exited 0).  OUT: pgi15-gpu8, -gpu9, -gpu11 and -gpu12 carry CUDA 12.8 alone
 #: against the venv's 12.9 ptxas, with no matched pair anywhere on the node
-#: and no nvlink in the venv to point PATH at, so they are OUT (finding 03:
-#: a 12.8 nvlink refuses 12.9 cubins and every measurement degrades SILENTLY).
-ORDERONLY_NODES = ("pgi15-gpu16", "pgi15-gpu13", "pgi15-gpu14")
+#: and no nvlink in the venv to point PATH at (finding 03: a 12.8 nvlink
+#: refuses 12.9 cubins and every measurement degrades SILENTLY).
+#:
+#: pgi15-gpu16 held seed 250197 until 2026-09-18 19:10, when another group
+#: took gpu15, gpu16, gpu17 and gpu18 on a three-day reservation.  No
+#: Blackwell node is reachable, so that seed moved to gpu14, which then
+#: carries two whole seeds.  The BASELINE that follows this round still goes
+#: on Blackwell (owner ruling); this is the tuning round.
+ORDERONLY_NODES = ("pgi15-gpu14", "pgi15-gpu13", "pgi15-gpu14")
 #: --lambda-cmp and --lambda-mem are the swept flags, so the pre-flight greps
 #: for them by name rather than trusting that ppo.py still defines them.
 ORDERONLY_REQUIRED_FLAGS = THESIS_REQUIRED_FLAGS + ["--lambda-cmp",

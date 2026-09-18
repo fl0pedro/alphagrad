@@ -31,7 +31,7 @@ _GEN = os.path.join(_ALPHAGRAD, "tools", "gen_fq_launchers.py")
 # THE OWNER'S NUMBERS, TYPED HERE ON PURPOSE (bead dsnn-dfw.29).
 SEEDS = ("250197", "250198", "250199")
 WEIGHTS = (("2", "0"), ("1.5", "0.5"), ("1", "1"), ("0.5", "1.5"), ("0", "2"))
-NODES = ("pgi15-gpu16", "pgi15-gpu13", "pgi15-gpu14")
+NODES = ("pgi15-gpu14", "pgi15-gpu13", "pgi15-gpu14")
 PROFILE = "none"
 ORDER = "free"
 EPISODES = "1000"
@@ -237,20 +237,30 @@ def test_the_node_is_the_seed(gen, rows):
     Three models carry this round, so all six configurations of one seed run
     on ONE node and the weight comparison never straddles two."""
     assert gen.ORDERONLY_NODES == NODES
-    assert len(set(NODES)) == len(SEEDS)
     for a in rows:
         assert a["node"] == NODES[SEEDS.index(a["thesis_seed"])], a["name"]
-    by_node = {}
+    # THE INVARIANT: a seed is never split.  A node may carry more than one
+    # seed (gpu14 does, since another group took every Blackwell node on
+    # 2026-09-18), but no seed may span two nodes -- that would put a weight
+    # comparison across two GPU models, which is the one thing this routing
+    # exists to prevent.
+    by_seed = {}
     for a in rows:
-        by_node.setdefault(a["node"], set()).add(a["thesis_seed"])
-    assert set(by_node) == set(NODES)
-    for node, seeds in by_node.items():
-        assert len(seeds) == 1, (node, seeds)
-    # every node carries a whole seed: five weights and the conditioned row
+        by_seed.setdefault(a["thesis_seed"], set()).add(a["node"])
+    assert set(by_seed) == set(SEEDS)
+    for seed, nodes in by_seed.items():
+        assert len(nodes) == 1, (seed, nodes)
+    # and every seed carries its whole set: five weights and the conditioned
+    # row, all six on that one node
     counts = {}
     for a in rows:
-        counts[a["node"]] = counts.get(a["node"], 0) + 1
+        counts[a["thesis_seed"]] = counts.get(a["thesis_seed"], 0) + 1
     assert set(counts.values()) == {len(WEIGHTS) + 1}
+    # the node totals follow, and every node used is one of the cleared ones
+    per_node = {}
+    for a in rows:
+        per_node[a["node"]] = per_node.get(a["node"], 0) + 1
+    assert per_node == {"pgi15-gpu14": 12, "pgi15-gpu13": 6}
 
 
 def test_every_order_only_job_is_a_per_node_singleton(gen, rows):
