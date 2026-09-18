@@ -464,3 +464,26 @@ def test_the_matrix_and_the_campaign_still_have_their_own_counts(gen):
     assert all(a.get("thesis") for a in gen.orderonly_arms())
     # the matrix rows never carry --approx-profile none
     assert {_cli(gen, a)["--approx-profile"] for a in matrix} == {"all"}
+    # block 1 is the 34 the owner authorised on 2026-09-16, and a tuning row
+    # is not one of them: a stray `sbatch` over the block must not start one
+    block = gen.thesis_block1_arms()
+    assert len(block) == gen.THESIS_BLOCK1 == 34
+    assert not any(a.get("orderonly") for a in block)
+
+
+def test_the_target_node_switch_does_not_move_the_tuning_rows(gen):
+    """THESIS_TARGET_NODES=1 pins the MATRIX to target-specific nodes.  The
+    tuning round's node is its seed, which that switch must not touch --
+    moving one seed's runs to another node would split a weight comparison
+    across two GPU models."""
+    import importlib.util as _ilu
+
+    os.environ["THESIS_TARGET_NODES"] = "1"
+    try:
+        spec = _ilu.spec_from_file_location("gen_fq_launchers_tgt_oo", _GEN)
+        mod = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    finally:
+        del os.environ["THESIS_TARGET_NODES"]
+    for a in mod.orderonly_arms():
+        assert a["node"] == NODES[SEEDS.index(a["thesis_seed"])], a["name"]

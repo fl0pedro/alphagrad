@@ -2641,8 +2641,12 @@ def thesis_arms() -> list[dict]:
 
 
 def thesis_block1_arms() -> list[dict]:
+    # The order-only tuning rows (ticket dsnn-dfw.29) are thesis arms but not
+    # matrix coordinates: block 1 is the 34 runs of the matrix the owner
+    # authorised on 2026-09-16 and nothing else.
     return [a for a in thesis_arms()
-            if not a.get("held") and not a.get("smoke")]
+            if not a.get("held") and not a.get("smoke")
+            and not a.get("orderonly")]
 
 
 # Target-pinned nodes (owner ruling 2026-09-17: "max 4* 2 tlm 2 nn256"):

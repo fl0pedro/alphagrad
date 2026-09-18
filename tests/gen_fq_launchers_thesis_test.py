@@ -626,7 +626,8 @@ def test_target_nodes_routing(monkeypatch):
     spec = importlib.util.spec_from_file_location("gen_fq_launchers_tgt", _GEN)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    matrix = [a for a in mod.thesis_arms() if not a.get("smoke")]
+    matrix = [a for a in mod.thesis_arms()
+              if not a.get("smoke") and not a.get("orderonly")]
     for a in matrix:
         if a["thesis_target"] == "tlm":
             assert a["node"] in ("pgi15-gpu19", "pgi15-gpu16"), a["name"]
