@@ -70,29 +70,52 @@ STATUS_TIMEOUT = "timeout"
 ORACLE_ACTOR_NUM_CPUS = 4
 
 
-def make_ray_oracle_actor_factory(num_cpus: int = ORACLE_ACTOR_NUM_CPUS):
+def make_ray_oracle_actor_factory(args_dict: dict,
+                                   num_cpus: int = ORACLE_ACTOR_NUM_CPUS):
     """A zero-arg callable returning a fresh Ray actor that runs the check.
 
     ONE ACTOR IS ONE PROCESS, ``num_gpus=0``: the check never touches a GPU
-    and must not compete with the trainer's own device for one. THE ACTOR
-    IMPORTS ENV.PY ITSELF, inside its own method, so a respawned actor after
-    a kill starts from a clean import and the driver never has to ship a
-    closure over a module it happened to have imported already.
+    and must not compete with the trainer's own device for one.
 
-    ``ray`` is imported here, lazily, so a process that never asks for a Ray
-    oracle -- every test in this file -- never has to have it installed.
+    THE ACTOR BUILDS ITS OWN ``EnvConfig``, ONCE, FROM ``args_dict`` (the
+    parsed CLI namespace as a plain dict -- every value a string, number or
+    bool). It does NOT receive the trainer's live ``env.config``: that object
+    carries ``target_fun``, a closure the check must CALL, and on job 66267 /
+    66288 Ray's own serializer refused to ship it (found the whole argument
+    tuple non-serializable, tracing to a ``PjitFunction`` inside it). This is
+    the same problem ``CpuApproximationActor``'s pool already solved --
+    ``cpu_approx_worker._build_env_from_args`` rebuilds ``target_fun`` and
+    the jaxpr from ``args_dict`` LOCALLY, inside the worker process, instead
+    of shipping the live callable -- so the oracle actor reuses that exact
+    function rather than inventing a second way to do the same rebuild.
+
+    ``ray`` and ``_build_env_from_args`` are imported here, lazily, so a
+    process that never asks for a Ray oracle -- every test in this file --
+    never has to have Ray or the rest of alphagrad importable.
     """
     import ray
 
     @ray.remote(num_cpus=num_cpus, num_gpus=0)
     class _GradOracleActor:
-        def check(self, config, args_np, order, probe_seed):
+        def __init__(self, args_dict):
+            self._args_dict = dict(args_dict)
+            self._config = None       # built lazily, once, on first check()
+
+        def _config_once(self):
+            if self._config is None:
+                from alphagrad.approx.cpu_approx_worker import (
+                    _build_env_from_args)
+                self._config = _build_env_from_args(
+                    self._args_dict, None).config
+            return self._config
+
+        def check(self, args_np, order, probe_seed):
             from alphagrad.approx import env as _env
             return _env.grad_oracle_cpu_check(
-                config, args_np, order, probe_seed)
+                self._config_once(), args_np, order, probe_seed)
 
     def _factory():
-        return _GradOracleActor.remote()
+        return _GradOracleActor.remote(args_dict)
 
     return _factory
 
@@ -111,12 +134,14 @@ class AsyncGradOracle:
     fail and can hang without costing a compile or an actor.
 
     ``actor_factory`` (RAY / ACTOR MODE, used by the trainer) is a zero-arg
-    callable returning a fresh actor handle whose ``.check.remote(config,
-    args_np, order, probe_seed)`` runs the same check in its own process.
-    ``arg_resolver(episode)`` returns the ``(config, args_np)`` that episode
-    froze; it plays the role the driver-side closure over ``_GRAD_ORACLE_ARGS``
-    played in thread mode, because the actor has none of the trainer's state
-    and must be handed everything it needs as call arguments.
+    callable returning a fresh actor handle whose ``.check.remote(args_np,
+    order, probe_seed)`` runs the same check in its own process, against a
+    ``config`` the actor built ITSELF (see :func:`make_ray_oracle_actor_factory`
+    -- a live ``config.target_fun`` cannot cross Ray's wire). ``arg_resolver
+    (episode)`` returns the ``args_np`` that episode froze; it plays the role
+    the driver-side closure over ``_GRAD_ORACLE_ARGS`` played in thread mode,
+    because the actor has none of the trainer's per-episode state and must be
+    handed it as a call argument.
 
     The class is deliberately ignorant of JAX, of env.py and of the plan log:
     it schedules, times and counts. ``env.grad_oracle_cpu_check`` is the real
@@ -255,9 +280,9 @@ class AsyncGradOracle:
             rec["ref"] = None
             rec["memo_result"] = (status, rel)
             return
-        config, args_np = self._arg_resolver(rec["episode"])
+        args_np = self._arg_resolver(rec["episode"])
         rec["ref"] = self._actor.check.remote(
-            config, args_np, rec["order"], rec["probe_seed"])
+            args_np, rec["order"], rec["probe_seed"])
         rec["memo_result"] = None
 
     def _count(self, res) -> None:

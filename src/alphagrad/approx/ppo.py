@@ -8149,35 +8149,36 @@ def main():
 
         def _grad_oracle_resolve_args(episode):
             """ACTOR MODE ONLY. Same lookup as `_grad_oracle_run_check`, but
-            returns (config, args_np) for the driver to hand the actor as
-            call arguments: the actor has none of the trainer's state and
-            imports env.py itself, so nothing about it may be a closure over
-            what THIS process happened to import.
-
-            `config.data_gen` STAYS BEHIND. `env.config` is a NamedTuple
-            carrying `target_fun` (needed, called by the check) and
-            `data_gen` (NOT needed: `_grad_oracle_reference` only reads
-            `id(config.data_gen)` for its cache key, never calls it). Ray's
-            own serializer cannot ship a `PjitFunction` -- data_gen's runtime
-            type here -- across the wire, and refused the whole argument
-            tuple on it (found on job 66267: 'Could not serialize the
-            argument EnvConfig(...)'). Stripping the one field that is never
-            called removes the only unpicklable one without changing what
-            the check computes."""
+            returns just `args_np`: the actor builds its own `config` (see
+            `make_ray_oracle_actor_factory`) because a live `config.target_fun`
+            cannot cross Ray's wire -- found on jobs 66267 and 66288, where
+            Ray's serializer refused the whole argument tuple, first tracing
+            to `EnvConfig.data_gen` (a PjitFunction, stripped, harmless: only
+            its `id()` is ever read) and, with that gone, to `target_fun`
+            itself (a closure the check must CALL, so it cannot be stripped
+            the same way)."""
             _sub = _GRAD_ORACLE_ARGS.get(int(episode))
             if _sub is None:
                 raise RuntimeError(
                     f"the gradient oracle was handed episode {int(episode)} "
                     f"with no frozen arguments; this is a scheduling defect, "
                     f"not a gradient defect")
-            return env.config._replace(data_gen=None), _sub
+            return _sub
 
         _have_measure_pool = int(getattr(args, "ray_measure", 0) or 0) > 0
         if _have_measure_pool:
+            # A PLAIN, PICKLABLE COPY OF THE CLI ARGS -- every value a
+            # string, number or bool -- for the actor to rebuild its OWN
+            # `env`/`config` from, the same way `_spawn` above hands the
+            # measure actors `_args_dict` rather than a live env object.
+            # A fresh dict, not `_args_dict` (already built above): that one
+            # was mutated with the measure pool's own `num_cpu_workers`,
+            # which has nothing to do with the oracle.
+            _oracle_args_dict = dict(vars(args))
             _GRAD_ORACLE = _AsyncGradOracle(
                 _grad_oracle_run_check,
                 timeout_s=float(args.grad_oracle_timeout),
-                actor_factory=_make_oracle_actor_factory(),
+                actor_factory=_make_oracle_actor_factory(_oracle_args_dict),
                 arg_resolver=_grad_oracle_resolve_args)
             print(f"[grad-oracle] asynchronous, one Ray CPU actor "
                   f"(num_cpus=4, num_gpus=0) built with the measurement "
