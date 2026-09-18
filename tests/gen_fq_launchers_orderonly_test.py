@@ -273,15 +273,15 @@ def test_every_order_only_job_is_a_cross_agent_per_node_singleton(gen, rows):
         assert a["job"] == f"node-{a['node']}", a["name"]
         assert f"#SBATCH -J node-{a['node']}\n" in text, a["name"]
         assert f"#SBATCH -J thesis-{a['node']}\n" not in text, a["name"]
+        assert "#SBATCH --dependency=singleton\n" in text, a["name"]
+        assert f"#SBATCH -w {a['node']}\n" in text, a["name"]
+        assert (f"#SBATCH -o {gen.CAMPAIGN_RUNS}/{a['name']}_%j.log\n"
+                in text), a["name"]
     # and the matrix keeps its own name, so this change moved no matrix row
     for a in gen.thesis_arms():
         if a.get("orderonly"):
             continue
         assert a["job"] == f"thesis-{a['node']}", a["name"]
-        assert "#SBATCH --dependency=singleton\n" in text, a["name"]
-        assert f"#SBATCH -w {a['node']}\n" in text, a["name"]
-        assert (f"#SBATCH -o {gen.CAMPAIGN_RUNS}/{a['name']}_%j.log\n"
-                in text), a["name"]
 
 
 def test_the_hardware_lines_follow_the_node(gen, rows):
