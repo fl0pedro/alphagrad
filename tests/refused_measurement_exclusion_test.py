@@ -240,8 +240,12 @@ def test_the_logged_loss_statistic_ignores_the_refused_environment():
     l_both = float(_surrogate(theta, both))
     l_one = float(_surrogate(theta, only_measured))
     assert l_both == l_one
-    # And it is a sane number, not the 1.2e9 of job 66201.
-    assert abs(l_both) < 1e3
+    # And it is the MEASURED environment's own number. The fixture's measured
+    # terminal carries a raw -3e5 latency channel (paired-log is exempt from
+    # symlog), so the scale here is that channel's, not the sentinel's: three
+    # orders of magnitude below the refused environment's contribution, which
+    # the counterfactual test below measures at above 1e8.
+    assert abs(l_both) < 1e8
 
 
 def test_without_the_environment_mask_the_statistic_explodes():

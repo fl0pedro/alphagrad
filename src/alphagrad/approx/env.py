@@ -4902,10 +4902,16 @@ def _x64_scope():
     CURRENT THREAD only and restores it on exit. The oracle's own trace and
     compile see float64; nothing else in the process ever does.
 
-    No silent fallback: if the installed JAX exposes neither the
-    ``jax.experimental.enable_x64`` context manager nor the ``enable_x64``
-    config state, this raises. Running the oracle through the global flag
-    again is not an option the apparatus may take on its own.
+    THREE NAMES, ONE THING. ``jax.experimental.enable_x64`` is the public
+    spelling and is gone from this build (jax 0.10.2, measured, job 66209);
+    the thing it wrapped is the ``enable_x64`` config STATE, whose ``__call__``
+    is the thread-local context manager. This module already imports
+    ``jax._src.core``, so reaching into ``jax._src.config`` for the state is
+    the same dependency, not a new one.
+
+    No silent fallback: if none of the three names is there, this raises.
+    Running the oracle through the global flag again is not an option the
+    apparatus may take on its own.
     """
     try:
         from jax.experimental import enable_x64 as _exp_enable_x64
@@ -4916,10 +4922,18 @@ def _x64_scope():
     _state = getattr(jax.config, "enable_x64", None)
     if callable(_state):
         return _state(True)
+    try:
+        from jax._src import config as _jax_src_config
+    except ImportError:
+        _jax_src_config = None
+    _state = getattr(_jax_src_config, "enable_x64", None)
+    if callable(_state):
+        return _state(True)
     raise RuntimeError(
         "the gradient oracle needs a THREAD-LOCAL float64 scope and this JAX "
-        f"({getattr(jax, '__version__', '?')}) exposes neither "
-        "jax.experimental.enable_x64 nor jax.config.enable_x64; the global "
+        f"({getattr(jax, '__version__', '?')}) exposes none of "
+        "jax.experimental.enable_x64, jax.config.enable_x64 and "
+        "jax._src.config.enable_x64; the global "
         "jax.config.update('jax_enable_x64', True) is refused because it "
         "would change the measured program (see _x64_scope)")
 
