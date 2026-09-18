@@ -1621,12 +1621,25 @@ def test_the_wires_travel_by_position_and_the_carry_rows_are_exact(container):
 # the fix: the measurement walks the jaxpr the env numbered.
 
 def _env_for_example(example, extra=()):
-    """A landscape_map env for any registered target, no dataset."""
+    """A landscape_map env for any registered target.
+
+    TransformerLM reads its token table from the wikitext cache even under
+    ``--dataset none``; without that cache the builder goes to the network,
+    which a test node does not have. That is an environment condition, not a
+    property of the code under test, so it SKIPS with the reason named --
+    export ``DSNN_WIKITEXT_DIR`` and it runs.
+    """
+    import urllib.error
+
     import alphagrad.approx.tools.landscape_map as lm
     argv = ["--example", example, "--dataset", "none", "--num-eval-samples",
             "1", "--num-data-points", "1", "--reps-per-point", "1",
             "--out-dir", "/tmp/carry_test"] + list(extra)
-    env, _samples, _cj = lm.build_env(lm.make_argparser().parse_args(argv))
+    try:
+        env, _samples, _cj = lm.build_env(lm.make_argparser().parse_args(argv))
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
+        pytest.skip(f"{example}: its data is not on this node ({exc}); "
+                    f"export DSNN_WIKITEXT_DIR / DSNN_MNIST_DIR to run it")
     return env
 
 
