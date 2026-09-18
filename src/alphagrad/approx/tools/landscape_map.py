@@ -194,15 +194,19 @@ def make_argparser() -> argparse.ArgumentParser:
                         "first-touch, not latency.")
     p.add_argument("--grad-oracle", choices=["reference", "off"],
                    default="reference",
-                   help="Oracle A (ticket .62): the exact gradient of every "
-                        "order vs jax.grad once per process, both sides at "
-                        "matmul precision highest (ticket dsnn-df8). A "
-                        "disagreement REFUSES that order and records it; the "
-                        "run continues. The bar is env.grad_oracle_tol() "
-                        "(ALPHAGRAD_GRAD_ORACLE_TOL). Same reader as ppo.py "
-                        "(ALPHAGRAD_GRAD_ORACLE). This help states no number "
-                        "because env is imported below, after the env-var "
-                        "setup, and the number must never be a second copy.")
+                   help="Oracle A (ticket .62). INERT IN THIS TOOL since the "
+                        "owner's ruling of 2026-09-18: the oracle left the "
+                        "measurement callback and became an asynchronous CPU "
+                        "check owned by ppo.py's trainer thread, and this tool "
+                        "has no such thread. Nothing here refuses an order any "
+                        "more. The value is still published as "
+                        "ALPHAGRAD_GRAD_ORACLE so one reader answers for the "
+                        "whole process; to check one order's exact gradient "
+                        "call env.grad_oracle_cpu_check directly. The bar is "
+                        "env.grad_oracle_tol() (ALPHAGRAD_GRAD_ORACLE_TOL); "
+                        "this help states no number because env is imported "
+                        "below, after the env-var setup, and the number must "
+                        "never be a second copy.")
     p.add_argument("--quality-metric", default="grad_cosine",
                    choices=["loss_drop", "grad_cosine", "jac_cosine",
                             "cosine", "none"],

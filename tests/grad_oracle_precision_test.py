@@ -22,6 +22,14 @@ Three pins. None of them needs a GPU.
    said "rel L2 > 1e-4" and "aborts the run" while the code used 1e-3 and
    refused the order and carried on. Both halves are pinned against the
    constant itself, so the help cannot drift again.
+
+WHAT MOVED ON 2026-09-18. The owner ruled the oracle a SANITY CHECK and took
+it out of the scoring: there is no synchronous in-callback check any more, so
+these tests drive the two halves the trainer actually uses --
+``env.grad_oracle_submission`` on the trainer's thread and
+``env.grad_oracle_cpu_check`` on the oracle thread. The three pins above are
+unchanged; a fourth is added, that the check runs on the CPU device in float64.
+The scheduling around it is pinned in ``tests/grad_oracle_async_test.py``.
 """
 import types
 
@@ -66,10 +74,19 @@ def _complete_order():
     return list(reversed(valid))
 
 
-#: The oracle only needs to know that an exact executable EXISTS -- it builds
-#: its own at "highest" (see ``env._grad_oracle_exact``), so a marker is
-#: enough here and a wrongly reused executable would show up as a TypeError.
-_EXACT_EXISTS = object()
+def _check(cfg, order, episode=0):
+    """ONE oracle check, through the two halves the trainer uses.
+
+    ``grad_oracle_submission`` runs on the trainer's thread and freezes the
+    probe batch and the arguments; ``grad_oracle_cpu_check`` runs on the oracle
+    thread and answers. Calling them in that order here is what makes these
+    tests tests of the live path (owner ruling 2026-09-18 -- the synchronous
+    in-callback check is gone).
+    """
+    sub = envmod.grad_oracle_submission(cfg, list(_ARGS), episode)
+    assert sub is not None, "this config has something to check"
+    probe_seed, args_np = sub
+    return envmod.grad_oracle_cpu_check(cfg, args_np, order, probe_seed)
 
 
 @pytest.fixture
@@ -79,7 +96,6 @@ def cfg(monkeypatch):
     monkeypatch.delenv("ALPHAGRAD_GRAD_ORACLE_TOL", raising=False)
     monkeypatch.delenv("ALPHAGRAD_WALK_ROTATE", raising=False)
     monkeypatch.delenv("ALPHAGRAD_WALK_EPISODE", raising=False)
-    envmod._GRAD_ORACLE_DONE.clear()
     envmod._GRAD_ORACLE_REF.clear()
     envmod._GRAD_ORACLE_REF_STATS.update(hits=0, misses=0)
     envmod._GRAD_ORACLE_LAST_PRECISION.update(plan=None, reference=None)
@@ -111,8 +127,7 @@ def test_both_sides_of_the_oracle_run_at_the_oracle_precision(cfg, monkeypatch):
     monkeypatch.setattr(envmod, "_matmul_precision", spy)
     with jax.default_matmul_precision(ambient):
         assert real() == ambient
-        envmod._grad_oracle_check(cfg, _EXACT_EXISTS, list(_ARGS), None,
-                                  _complete_order())
+        _check(cfg, _complete_order())
         assert seen == [envmod._GRAD_ORACLE_PRECISION,
                         envmod._GRAD_ORACLE_PRECISION], (
             "the oracle must read the live matmul precision once before the "
@@ -127,21 +142,35 @@ def test_both_sides_of_the_oracle_run_at_the_oracle_precision(cfg, monkeypatch):
 def test_the_check_passes_on_an_exact_order(cfg):
     """The bar is the shipped one and an exact order clears it, so the two
     cache tests below are exercising a check that actually ran."""
-    order = _complete_order()
-    envmod._grad_oracle_check(cfg, _EXACT_EXISTS, list(_ARGS), None, order)
-    assert (tuple(order), str(None)) in envmod._GRAD_ORACLE_DONE
+    status, rel = _check(cfg, _complete_order())
+    assert status == "pass"
+    assert rel <= envmod.grad_oracle_tol()
     assert envmod._GRAD_ORACLE_STATS["checks"] > 0
+
+
+def test_the_check_runs_on_the_cpu_device_in_float64(cfg):
+    """WHERE AND IN WHAT the asynchronous oracle runs (owner ruling
+    2026-09-18). The device is ``jax.devices("cpu")[0]`` -- named, not
+    inherited -- and the float64 scope is open inside the check and shut
+    outside it, which is what lets this run beside the trainer's float32
+    work."""
+    assert envmod.grad_oracle_cpu_device().platform == "cpu"
+    envmod._GRAD_ORACLE_LAST_X64.update(inside=None, outside=None)
+    _check(cfg, _complete_order())
+    assert envmod._GRAD_ORACLE_LAST_X64["inside"] is True
+    assert envmod._GRAD_ORACLE_LAST_X64["outside"] is False
+    assert bool(jax.config.jax_enable_x64) is False
 
 
 # ------------------------------------------------- 2. the reference cache
 def test_the_reference_is_computed_once_and_reused_by_the_next_order(cfg):
     order = _complete_order()
-    envmod._grad_oracle_check(cfg, _EXACT_EXISTS, list(_ARGS), None, order)
+    _check(cfg, order)
     assert envmod._GRAD_ORACLE_REF_STATS == {"hits": 0, "misses": 1}
 
     other = list(reversed(order))
     assert other != order, "need two DIFFERENT orders to test the reuse"
-    envmod._grad_oracle_check(cfg, _EXACT_EXISTS, list(_ARGS), None, other)
+    _check(cfg, other)
     assert envmod._GRAD_ORACLE_REF_STATS == {"hits": 1, "misses": 1}, (
         "jax.grad does not depend on the elimination order, so the second "
         "order must reuse the first order's reference")
@@ -152,13 +181,12 @@ def test_a_new_probe_batch_misses_the_reference_cache(cfg, monkeypatch):
     """A new episode under ``--walk-rotate`` draws a NEW probe batch, and a
     reference computed on the old batch is then the wrong answer."""
     order = _complete_order()
-    envmod._grad_oracle_check(cfg, _EXACT_EXISTS, list(_ARGS), None, order)
+    _check(cfg, order, episode=0)
     assert envmod._GRAD_ORACLE_REF_STATS == {"hits": 0, "misses": 1}
 
     monkeypatch.setenv("ALPHAGRAD_WALK_ROTATE", "1")
-    monkeypatch.setenv("ALPHAGRAD_WALK_EPISODE", "1")
     other = list(reversed(order))
-    envmod._grad_oracle_check(cfg, _EXACT_EXISTS, list(_ARGS), None, other)
+    _check(cfg, other, episode=1)
     assert envmod._GRAD_ORACLE_REF_STATS == {"hits": 0, "misses": 2}, (
         "a new probe batch must invalidate the cached reference")
     assert len(envmod._GRAD_ORACLE_REF) == 2
@@ -175,11 +203,15 @@ def test_the_grad_oracle_help_states_the_tolerance_the_code_uses():
 
     assert f"{envmod.grad_oracle_tol():.0e}" in help_text, help_text
     assert "1e-4" not in help_text, help_text
-    # A refusal refuses ONE ORDER. It does not abort the run: the exception is
-    # a plain RuntimeError, the measure path sentinels that plan and records
-    # it as refused, and the next plan is measured.
-    assert "abort" not in help_text.lower(), help_text
-    assert "continue" in help_text.lower(), help_text
+    # WHAT A DISAGREEMENT DOES, since the owner's ruling of 2026-09-18: it no
+    # longer refuses a plan (the oracle is not in the scoring path at all), and
+    # it stops the run at the next episode boundary AFTER that episode's
+    # checkpoint, so the run resumes from it. The help has to say both, because
+    # the two behaviours it replaced are what an operator remembers.
+    assert "no plan is refused" in help_text.lower(), help_text
+    assert "checkpoint" in help_text.lower(), help_text
+    assert "cpu" in help_text.lower(), help_text
+    assert "float64" in help_text.lower(), help_text
 
 
 def test_the_tolerance_constant_is_the_shipped_bar():
