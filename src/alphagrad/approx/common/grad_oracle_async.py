@@ -98,6 +98,16 @@ def make_ray_oracle_actor_factory(args_dict: dict,
     @ray.remote(num_cpus=num_cpus, num_gpus=0)
     class _GradOracleActor:
         def __init__(self, args_dict):
+            # Ray's num_cpus is a scheduling hint only. XLA:CPU sizes its
+            # thread pool from the affinity mask at the first jax import, so
+            # pin the mask here, the way the measure actors already do.
+            try:
+                import os as _os
+                _avail = sorted(_os.sched_getaffinity(0))
+                if 0 < num_cpus < len(_avail):
+                    _os.sched_setaffinity(0, set(_avail[-num_cpus:]))
+            except (AttributeError, OSError, ValueError):
+                pass
             self._args_dict = dict(args_dict)
             self._config = None       # built lazily, once, on first check()
 
