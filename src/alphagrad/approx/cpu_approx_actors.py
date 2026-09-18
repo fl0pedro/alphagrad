@@ -347,4 +347,10 @@ class CpuApproximationActor:
                 out[_key] = int(getattr(_e, _fn)())
             except Exception:
                 pass
+        # THE REFUSAL RATE, PER KIND. Flat numeric keys so
+        # `merge_pool_collapse_stats` sums them across actors exactly as it
+        # sums everything else here. `refused_total` is the numerator of the
+        # rate the trainer logs; the per-kind keys say WHY.
+        for _k, _v in _e.consume_refused_counts().items():
+            out[f"refused_{_k}"] = int(_v)
         return out
