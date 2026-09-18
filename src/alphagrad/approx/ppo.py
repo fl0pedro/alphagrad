@@ -7621,7 +7621,8 @@ def main():
     os.environ["ALPHAGRAD_GRAD_ORACLE"] = str(args.grad_oracle)
     print(f"[alphagrad] gradient oracle (--grad-oracle) = {args.grad_oracle}"
           + (" (exact gradient vs jax.grad once per process and order, on the "
-             "CPU device in float64, on the trainer's oracle THREAD; nothing "
+             "CPU device in float64, on the oracle's own worker -- a Ray CPU "
+             "actor when a measurement pool exists, else a thread; nothing "
              f"waits for it and no plan is refused; rel L2 > "
              f"{_env_grad_oracle_tol():.0e} stops the run at the next episode "
              "boundary, after that episode's checkpoint)"
@@ -8151,14 +8152,25 @@ def main():
             returns (config, args_np) for the driver to hand the actor as
             call arguments: the actor has none of the trainer's state and
             imports env.py itself, so nothing about it may be a closure over
-            what THIS process happened to import."""
+            what THIS process happened to import.
+
+            `config.data_gen` STAYS BEHIND. `env.config` is a NamedTuple
+            carrying `target_fun` (needed, called by the check) and
+            `data_gen` (NOT needed: `_grad_oracle_reference` only reads
+            `id(config.data_gen)` for its cache key, never calls it). Ray's
+            own serializer cannot ship a `PjitFunction` -- data_gen's runtime
+            type here -- across the wire, and refused the whole argument
+            tuple on it (found on job 66267: 'Could not serialize the
+            argument EnvConfig(...)'). Stripping the one field that is never
+            called removes the only unpicklable one without changing what
+            the check computes."""
             _sub = _GRAD_ORACLE_ARGS.get(int(episode))
             if _sub is None:
                 raise RuntimeError(
                     f"the gradient oracle was handed episode {int(episode)} "
                     f"with no frozen arguments; this is a scheduling defect, "
                     f"not a gradient defect")
-            return env.config, _sub
+            return env.config._replace(data_gen=None), _sub
 
         _have_measure_pool = int(getattr(args, "ray_measure", 0) or 0) > 0
         if _have_measure_pool:
