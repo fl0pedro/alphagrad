@@ -321,6 +321,26 @@ def test_the_node_whose_toolkit_is_outside_usr_local_puts_it_on_path(gen,
         assert "exit 72" in text, a["name"]
 
 
+def test_the_toolchain_block_still_searches_usr_local(gen):
+    """A PLACEHOLDER THAT SURVIVES RENDERING IS A SILENT NODE-WIDE FAILURE.
+
+    An earlier attempt at the gpu14 path put a @EXTRA_DIRS@ marker in the
+    search glob and never substituted it.  Every launcher then globbed
+    `@EXTRA_DIRS@/usr/local/cuda-*/bin`, which matches nothing, so the gate
+    found no toolkit on ANY node and aborted 72 even where /usr/local carried
+    the matched pair (jobs 66328 and 66329, pgi15-gpu16 and pgi15-gpu13).
+    The glob is pinned literally, and no rendered launcher may carry an
+    unsubstituted @NAME@ marker.
+    """
+    marker = re.compile(r"@[A-Z][A-Z0-9_]*@")
+    for a in gen.ARMS:
+        text = gen.render(a)
+        if a["kind"] != "cpu" or a.get("needs_tool"):
+            assert "\nfor d in /usr/local/cuda-*/bin; do\n" in text, a["name"]
+        left = marker.findall(text)
+        assert not left, (a["name"], sorted(set(left)))
+
+
 # ------------------------------------------------------- 4. the environment
 
 def test_no_order_only_launcher_exports_an_xla_flag_or_a_promoted_var(gen,

@@ -518,7 +518,7 @@ TOOLCHAIN_BLOCK = r"""# ---------------------- MEASURE TOOLCHAIN ---------------
 # prove the version.  72 = no matched @WANT@ toolkit on this node.
 FQ_CUDA_WANT=@WANT@
 FQ_CUDA_BIN=""
-for d in @EXTRA_DIRS@/usr/local/cuda-*/bin; do
+for d in /usr/local/cuda-*/bin; do
   [ -x "$d/ptxas" ] && [ -x "$d/nvlink" ] || continue
   pv=$("$d/ptxas" --version 2>&1 | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p' | tail -1)
   nv=$("$d/nvlink" --version 2>&1 | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p' | tail -1)
