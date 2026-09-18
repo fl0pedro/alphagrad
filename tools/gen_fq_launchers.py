@@ -518,7 +518,7 @@ TOOLCHAIN_BLOCK = r"""# ---------------------- MEASURE TOOLCHAIN ---------------
 # prove the version.  72 = no matched @WANT@ toolkit on this node.
 FQ_CUDA_WANT=@WANT@
 FQ_CUDA_BIN=""
-for d in /usr/local/cuda-*/bin; do
+for d in @EXTRA_DIRS@/usr/local/cuda-*/bin; do
   [ -x "$d/ptxas" ] && [ -x "$d/nvlink" ] || continue
   pv=$("$d/ptxas" --version 2>&1 | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p' | tail -1)
   nv=$("$d/nvlink" --version 2>&1 | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p' | tail -1)
@@ -2213,6 +2213,66 @@ assert blackwell_gres(CAMPAIGN_GPUS) == CAMPAIGN_GRES, (
     "from blackwell_gres, and a drift would give two arms different hardware "
     "under one name")
 
+# ---------------------------------------------------------------------------
+# NODES THAT ARE NOT BLACKWELL (ticket dsnn-dfw.29, owner 2026-09-18: "tuning
+# on any node whose toolchain gate passes, the baseline on Blackwell").  The
+# thesis matrix and the campaign run on Blackwell alone and every table above
+# is keyed on the GPU COUNT, which is enough while one GPU model is in play.
+# A tuning round that spreads over three GPU models needs the node itself as
+# the key, so the four tables below hold ONLY the non-Blackwell nodes and
+# every helper falls back to the Blackwell expression it replaced.  No arm
+# that existed before this section moves by one byte.
+#
+# `sinfo -N -o "%n %c %m %G %P"`, 2026-09-18.  Memory is the SLURM limit, not
+# the hardware: a --mem above it is never scheduled at all.
+# ---------------------------------------------------------------------------
+NODE_GRES_TYPE = {
+    "pgi15-gpu13": "nvidia_geforce_rtx_4090",
+    "pgi15-gpu14": "nvidia_h100_80gb_hbm3",
+}
+NODE_GPUS = {"pgi15-gpu13": 4, "pgi15-gpu14": 8}
+NODE_CPUS = {"pgi15-gpu13": 64, "pgi15-gpu14": 128}
+NODE_MEM = {"pgi15-gpu13": "700G", "pgi15-gpu14": "1000G"}
+#: pgi15-gpu14 is the only node of the `pgi15-h100` partition; every other
+#: node here is in `pgi15`.
+NODE_PARTITION = {"pgi15-gpu14": "pgi15-h100"}
+#: A node whose matched CUDA pair is OUTSIDE /usr/local, which is all the
+#: measure-toolchain block searches.  The arm puts it on PATH and the block
+#: still proves the two versions, so a wrong path aborts 72 (finding 03).
+NODE_CUDA_BIN = {
+    "pgi15-gpu14": "/opt/nvidia/hpc_sdk/Linux_x86_64/26.5/cuda/12.9/bin",
+}
+
+
+def node_gpu_count(node: str) -> int:
+    if node in THESIS_NODE_GPUS:
+        return THESIS_NODE_GPUS[node]
+    if node in NODE_GPUS:
+        return NODE_GPUS[node]
+    raise CampaignRowError(
+        f"node {node!r} has no GPU count on this cluster; known nodes are "
+        f"{sorted(set(THESIS_NODE_GPUS) | set(NODE_GPUS))}")
+
+
+def node_gres(node: str, gpus: int) -> str:
+    if node in NODE_GRES_TYPE:
+        return f"gpu:{NODE_GRES_TYPE[node]}:{gpus}"
+    return blackwell_gres(gpus)
+
+
+def node_cpus(node: str, gpus: int) -> int:
+    return NODE_CPUS[node] if node in NODE_CPUS else BLACKWELL_CPUS[gpus]
+
+
+def node_mem(node: str, gpus: int) -> str:
+    return NODE_MEM[node] if node in NODE_MEM else BLACKWELL_MEM[gpus]
+
+
+def node_partition(node: str) -> str:
+    if node in NODE_PARTITION:
+        return NODE_PARTITION[node]
+    return "pgi15-cpu" if node == "pgi15-cpu1" else "pgi15"
+
 
 def thesis_job_name(node: str) -> str:
     """THE PER-NODE SINGLETON NAME (owner ruling 2026-09-16).
@@ -2227,10 +2287,10 @@ def thesis_job_name(node: str) -> str:
     shards died that way on 2026-09-13).  A singleton queue cannot produce
     that state, and it needs no babysitting.
     """
-    if node not in THESIS_NODE_GPUS:
+    if node not in THESIS_NODE_GPUS and node not in NODE_GPUS:
         raise CampaignRowError(
-            f"node {node!r} is not a Blackwell node of this cluster "
-            f"({sorted(THESIS_NODE_GPUS)})")
+            f"node {node!r} is not a GPU node this generator knows "
+            f"({sorted(set(THESIS_NODE_GPUS) | set(NODE_GPUS))})")
     return f"thesis-{node}"
 
 
@@ -2422,7 +2482,7 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
     changes on purpose (episodes, checkpoint interval, auto-stop).
     """
     bias, form, advantage_norm, conditioned = THESIS_ARM_SPEC[arm]
-    gpus = THESIS_NODE_GPUS[node]
+    gpus = node_gpu_count(node)
     cli: dict = {
         "--name": name,
         "--seed": seed,
@@ -2520,7 +2580,7 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
                      grad_oracle_cadence=grad_oracle_cadence)
     if extra_cli:
         cli.update(extra_cli)
-    gpus = THESIS_NODE_GPUS[node]
+    gpus = node_gpu_count(node)
     a = dict(
         name=name, job=thesis_job_name(node), kind="train", runtime="scratch",
         node=node, time=time, gpus=gpus, singleton=True, thesis=True,
@@ -2702,6 +2762,220 @@ ARMS[-1]["falsifier"] = _SMOKE_FALSIFIER
 
 def thesis_smoke_arms() -> list[dict]:
     return [a for a in ARMS if a.get("smoke")]
+
+
+# ================  ORDER-ONLY SCALARIZATION TUNING, ROUND 1  ================
+# Ticket `dsnn-dfw.29`, owner rulings 2026-09-18.  ROUND 1 ONLY: the weights.
+# Round 2 (the PPO knobs at the winning weight) needs the owner's word after
+# round 1 reports and is NOT generated here.
+#
+# THE ARM is the epic's REQUIRED order-only arm on NN256: --approx-profile
+# none with --fixed-order free, so the policy chooses the ELIMINATION ORDER
+# and nothing else.  With no approximation applied the grad cosine is 1 on
+# every plan, the Lagrangian constraint at tau 0.90 is never violated and
+# lambda decays to its floor, so the C form reduces to a pure SCALARIZATION
+#
+#     lambda_cmp * paired-log latency + lambda_mem * paired-log temp memory
+#
+# and round 1 sweeps its two weights.  That is the MORL-to-SORL step: five
+# fixed weights, three seeds each, against one preference-conditioned run
+# that amortises the whole front.
+#
+# THE WEIGHTS sum to 2 on every row, so the five rows differ in the DIRECTION
+# of the scalarization and not in its scale -- a run at (1, 1) and a run at
+# (2, 2) would be the same objective at twice the advantage.
+#
+# WHY THE SEED IS THE NODE (AGENTS.md: "latency and memory numbers are not
+# comparable across GPU models; compare only within one node and one job").
+# Three GPU models carry this round, so the node is assigned BY SEED: all six
+# configurations of one seed run on one node, one after another through the
+# per-node singleton.  The weight comparison -- the thing the round decides --
+# is therefore WITHIN a node and within a GPU model in every seed column, and
+# the seed spread carries the cross-model variation instead of hiding it
+# inside a weight.  The reward channels are paired log ratios against a
+# rev-exact reference measured back to back in the same actor, which is what
+# makes the columns comparable at all; the ratios are still read per column
+# first and pooled only after.
+# ---------------------------------------------------------------------------
+ORDERONLY_TARGET = "nn256"
+#: --approx-profile none IS the arm: no approximation class is available.
+ORDERONLY_PROFILE = "none"
+#: The C form, unchanged from the matrix (THESIS_ARM_SPEC): the Lagrangian
+#: dual at tau 0.90.  Inert here because quality is constant 1, and kept so
+#: this round and the matrix's C rows differ in the swept flags alone.
+ORDERONLY_ARM = "C"
+ORDERONLY_PREF_ARM = "condC"
+#: Three seeds (owner: 3 seeds for the tuning, 5 for the baseline that
+#: follows it).  The first three of the matrix's five, never a new one.
+ORDERONLY_SEEDS = THESIS_SEEDS[:3]
+#: (--lambda-cmp, --lambda-mem), the five pairs of the ruling, in order.
+ORDERONLY_WEIGHTS = (("2", "0"), ("1.5", "0.5"), ("1", "1"),
+                     ("0.5", "1.5"), ("0", "2"))
+#: One node per seed, in seed order.  Every node here was cleared by running
+#: the measure toolchain gate ON the node before it was listed: gpu16 carries
+#: /usr/local/cuda-12.9, gpu13 carries /usr/local/cuda-12.9, and gpu14 needs
+#: NODE_CUDA_BIN.  pgi15-gpu8, -gpu9, -gpu11 and -gpu12 carry CUDA 12.8 alone
+#: against the venv's 12.9 ptxas, with no matched pair anywhere on the node
+#: and no nvlink in the venv to point PATH at, so they are OUT (finding 03:
+#: a 12.8 nvlink refuses 12.9 cubins and every measurement degrades SILENTLY).
+ORDERONLY_NODES = ("pgi15-gpu16", "pgi15-gpu13", "pgi15-gpu14")
+#: --lambda-cmp and --lambda-mem are the swept flags, so the pre-flight greps
+#: for them by name rather than trusting that ppo.py still defines them.
+ORDERONLY_REQUIRED_FLAGS = THESIS_REQUIRED_FLAGS + ["--lambda-cmp",
+                                                    "--lambda-mem"]
+
+_ORDERONLY_HEAD = f"""ORDER-ONLY SCALARIZATION TUNING, ROUND 1 (ticket
+dsnn-dfw.29) under the owner's rulings of 2026-09-18.  The epic's REQUIRED
+order-only arm on NN256: --approx-profile {ORDERONLY_PROFILE} with
+--fixed-order {THESIS_ORDER}, so the policy chooses THE ELIMINATION ORDER and
+nothing else.  No approximation is applied, the grad cosine is 1 on every
+plan and the C form's constraint at tau {THESIS_TAU} is never violated, so the
+objective is the pure scalarization
+
+    --lambda-cmp * paired-log latency + --lambda-mem * paired-log temp memory
+
+whose two weights this round sweeps.  Everything else is the matrix row it
+comes from: --episodes {THESIS_EPISODES} with --auto-stop, --checkpoint-every
+{THESIS_CHECKPOINT_EVERY}, --pareto-dump-every {THESIS_PARETO_DUMP_EVERY},
+--plan-log {THESIS_PLAN_LOG}, no XLA environment, wandb online to the project
+the matrix already writes to.
+
+THE NODE IS THE SEED.  Three GPU models carry this round and latency and
+memory are not comparable across models, so all six configurations of one
+seed run on ONE node through the per-node singleton queue.  The weight
+comparison is within a node; the seed spread carries the model variation.
+
+ROUND 2 (the PPO knobs at the winning weight) is NOT in this file.  It needs
+the owner's word after this round reports."""
+
+_ORDERONLY_PREDICTION = """REGISTERED BEFORE THE RUN, NEVER EDITED AFTER
+(ticket dsnn-dfw.29): the five weights trace a front -- (2, 0) reaches the
+lowest paired latency ratio of the five and (0, 2) the lowest paired memory
+ratio, with the three mixed weights between them and no weight dominating
+another on both channels.  The preference-conditioned run's front spans at
+least the latency range the five fixed weights span between them."""
+
+_ORDERONLY_FALSIFIER = """If every weight lands on the same terminal plan --
+the same paired ratios within the drift floor at all five -- the scalarization
+weight is NOT what decides this arm and round 2 is pointless at any weight;
+the result is reported as that, and no weight is declared the winner.  If the
+preference-conditioned run spans less than the fixed weights do, the
+conditioning is reported as not amortising this front."""
+
+
+def orderonly_run_name(lam_cmp: str, lam_mem: str, seed: str) -> str:
+    """`orderonly_nn256_l<X>m<Y>_s<seed>` (owner ruling 2026-09-18)."""
+    if (lam_cmp, lam_mem) not in ORDERONLY_WEIGHTS:
+        raise CampaignRowError(
+            f"({lam_cmp!r}, {lam_mem!r}) is not one of the five ruled weight "
+            f"pairs {ORDERONLY_WEIGHTS}")
+    if seed not in ORDERONLY_SEEDS:
+        raise CampaignRowError(
+            f"seed {seed!r} is not one of {ORDERONLY_SEEDS}")
+    return f"orderonly_nn256_l{lam_cmp}m{lam_mem}_s{seed}"
+
+
+def orderonly_pref_run_name(seed: str) -> str:
+    """`orderonly_nn256_pref_s<seed>` (owner ruling 2026-09-18)."""
+    if seed not in ORDERONLY_SEEDS:
+        raise CampaignRowError(
+            f"seed {seed!r} is not one of {ORDERONLY_SEEDS}")
+    return f"orderonly_nn256_pref_s{seed}"
+
+
+def orderonly_node(seed: str) -> str:
+    """THE NODE OF A SEED.  One node per seed, so every weight of one seed is
+    measured on one GPU model and the weight comparison never straddles two."""
+    if seed not in ORDERONLY_SEEDS:
+        raise CampaignRowError(
+            f"seed {seed!r} is not one of {ORDERONLY_SEEDS}")
+    return ORDERONLY_NODES[ORDERONLY_SEEDS.index(seed)]
+
+
+def orderonly_arm(*, seed: str, lam_cmp: str | None = None,
+                  lam_mem: str | None = None, pref: bool = False) -> dict:
+    """One round-1 run -> one `arm(...)`.  Returns the arm.
+
+    `pref=True` is the preference-conditioned row: the Dirichlet preference
+    over (latency, memory) replaces the fixed pair, so it carries the matrix's
+    own --lambda-cmp 1 --lambda-mem 1 and sweeps nothing.
+    """
+    node = orderonly_node(seed)
+    if pref:
+        _require(lam_cmp is None and lam_mem is None,
+                 "the preference-conditioned row sweeps no weight: the "
+                 "Dirichlet preference over (latency, memory) IS the weight, "
+                 "and a fixed pair beside it would say two different things")
+        name = orderonly_pref_run_name(seed)
+        arm_name = ORDERONLY_PREF_ARM
+    else:
+        _require(lam_cmp is not None and lam_mem is not None,
+                 "a fixed-weight row needs both --lambda-cmp and --lambda-mem")
+        name = orderonly_run_name(lam_cmp, lam_mem, seed)
+        arm_name = ORDERONLY_ARM
+    cli = thesis_cli(arm=arm_name, target=ORDERONLY_TARGET, seed=seed,
+                     node=node, name=name, episodes=THESIS_EPISODES,
+                     checkpoint_every=THESIS_CHECKPOINT_EVERY,
+                     auto_stop=True)
+    cli["--approx-profile"] = ORDERONLY_PROFILE
+    if not pref:
+        cli["--lambda-cmp"] = lam_cmp
+        cli["--lambda-mem"] = lam_mem
+    gpus = node_gpu_count(node)
+    what = (f"THE PREFERENCE-CONDITIONED ROW at seed {seed}: one run over a "
+            f"Dirichlet preference on (latency, memory), against the five "
+            f"fixed weights of the same seed on the same node."
+            if pref else
+            f"WEIGHT (--lambda-cmp {lam_cmp}, --lambda-mem {lam_mem}) at seed "
+            f"{seed}, one of the five ruled pairs.")
+    a = dict(
+        name=name, job=thesis_job_name(node), kind="train", runtime="scratch",
+        node=node, time=THESIS_TIME, gpus=gpus, singleton=True, thesis=True,
+        orderonly=True, thesis_arm=arm_name, thesis_target=ORDERONLY_TARGET,
+        thesis_seed=seed, orderonly_weights=(None if pref
+                                             else (lam_cmp, lam_mem)),
+        env=dict(THESIS_TARGET_ENV[ORDERONLY_TARGET]),
+        required_flags=ORDERONLY_REQUIRED_FLAGS,
+        required_flags_file=" ".join(THESIS_FLAGS_FILES),
+        cli=cli,
+        purpose=_ORDERONLY_HEAD + "\n\n" + what,
+        prediction=_ORDERONLY_PREDICTION,
+        falsifier=_ORDERONLY_FALSIFIER,
+    )
+    if node in NODE_CUDA_BIN:
+        a["cuda_bin"] = NODE_CUDA_BIN[node]
+    arm_(**a)
+    return a
+
+
+def orderonly_submission_order() -> list[tuple[str, str | None, str | None]]:
+    """(seed, lambda_cmp, lambda_mem) in submission order; the pair is None
+    on the preference-conditioned row.
+
+    Seed-major, so the six runs of one node queue together behind that node's
+    singleton and the three nodes fill at once.  The weights run in the ruled
+    order inside a seed and the conditioned row runs last of its node, after
+    the five it is compared against.
+    """
+    order: list[tuple[str, str | None, str | None]] = []
+    for s in ORDERONLY_SEEDS:
+        for lc, lm in ORDERONLY_WEIGHTS:
+            order.append((s, lc, lm))
+        order.append((s, None, None))
+    return order
+
+
+#: The 18 runs of round 1: five weights x three seeds, plus one
+#: preference-conditioned run per seed.
+ORDERONLY_RUNS = len(ORDERONLY_SEEDS) * (len(ORDERONLY_WEIGHTS) + 1)
+
+for _seed, _lc, _lm in orderonly_submission_order():
+    orderonly_arm(seed=_seed, lam_cmp=_lc, lam_mem=_lm, pref=_lc is None)
+del _seed, _lc, _lm
+
+
+def orderonly_arms() -> list[dict]:
+    return [a for a in ARMS if a.get("orderonly")]
 
 
 # ---------------------------------------------------------------------------
@@ -3110,7 +3384,7 @@ def render(a: dict) -> str:
     # member only of the pgi15-cpu partition, never of pgi15 (a head node is
     # in neither).  pgi15-cpu2 sits in both; it takes the ordinary GPU-node
     # partition, pgi15, like every other non-head node here.
-    L.append("#SBATCH -p " + ("pgi15-cpu" if a["node"] == "pgi15-cpu1" else "pgi15"))
+    L.append("#SBATCH -p " + node_partition(a["node"]))
     L.append(f"#SBATCH -w {a['node']}")
     if scratch:
         # THE CAMPAIGN HARDWARE: the whole Blackwell node, by its gres name.
@@ -3118,9 +3392,9 @@ def render(a: dict) -> str:
         # BOTH Blackwell sizes: gpu19 and gpu20 carry eight GPUs and 128 CPUs,
         # gpu15-gpu18 carry four and 64 (sinfo, 2026-09-16).  A campaign arm
         # is 8 GPUs and renders the identical three lines it always did.
-        L.append(f"#SBATCH --gres={blackwell_gres(gpus)}")
-        L.append(f"#SBATCH -c {BLACKWELL_CPUS[gpus]}")
-        L.append(f"#SBATCH --mem={BLACKWELL_MEM[gpus]}")
+        L.append(f"#SBATCH --gres={node_gres(a['node'], gpus)}")
+        L.append(f"#SBATCH -c {node_cpus(a['node'], gpus)}")
+        L.append(f"#SBATCH --mem={node_mem(a['node'], gpus)}")
     elif gpus:
         L.append(f"#SBATCH --gres=gpu:{gpus}")
         L.append("#SBATCH -c 64")
@@ -3247,6 +3521,14 @@ def render(a: dict) -> str:
             if k not in {kk for kk, _ in SHARED_ENV} and v is not _DELETE:
                 L.append(f"export {k}={v}")
         L.extend(_jax_cache_lines())
+    if a.get("cuda_bin"):
+        # This node's matched toolkit is outside /usr/local, which is all the
+        # block below searches.  Put it on PATH here, through the environment
+        # and nothing else: the block still PROVES that ptxas and nvlink both
+        # read CUDA_WANT, so a wrong directory aborts 72 instead of degrading
+        # every measurement of the run (finding 03).
+        L.append("")
+        L.append(f'export PATH="{a["cuda_bin"]}:$PATH"')
     L.append("")
     L.append(_toolchain_block(kind))
     L.append("")

@@ -78,8 +78,16 @@ def gen():
 
 @pytest.fixture(scope="module")
 def matrix(gen):
-    """The 50 runs of the matrix, without the three smoke arms."""
-    arms = [a for a in gen.thesis_arms() if not a.get("smoke")]
+    """The 50 runs of the matrix, without the three smoke arms.
+
+    The order-only tuning rows of ticket dsnn-dfw.29 are thesis arms too --
+    they carry the per-node singleton and the NeuralNetwork target shape, so
+    the tests below that sweep EVERY thesis arm must keep reaching them -- but
+    they are not matrix coordinates.  They are out of this fixture and pinned
+    by tests/gen_fq_launchers_orderonly_test.py instead.
+    """
+    arms = [a for a in gen.thesis_arms()
+            if not a.get("smoke") and not a.get("orderonly")]
     assert arms, "the generator emits no thesis arm"
     return arms
 
