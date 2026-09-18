@@ -133,6 +133,8 @@ from alphagrad.approx.common.face_driver import (
 from alphagrad.approx.unified_face_policy import UnifiedFacePolicy
 from alphagrad.approx.face_action import FaceAction
 from alphagrad.approx import face_action as _rec
+from alphagrad.approx.common import face_dump as _fdump
+from alphagrad.approx.heads import _approx_allowed as _approx_ok_of
 from alphagrad.approx.heads import (
     COMPRESS_KINDS,
     MAX_EXPONENT,
@@ -1163,6 +1165,24 @@ def _face_entropy_floor_penalty(h_face, floor, weight):
     parameterization.
     """
     return weight * jnp.maximum(0.0, floor - h_face) ** 2
+
+
+def _fdump_traj(fa, face_valid, step_count, env_index):
+    # ALPHAGRAD_FACE_DUMP: the row as the trajectory stores it. Identity off.
+    if not _fdump.on():
+        return fa
+    _fv = jnp.asarray(face_valid, jnp.float32) > 0.5
+    _fdump.record(
+        "s5_traj",
+        key=jnp.stack([jnp.asarray(step_count, jnp.int32),
+                       jnp.asarray(env_index, jnp.int32)]),
+        fvalid_sum=jnp.sum(_fv.astype(jnp.int32)),
+        skip_sum=jnp.sum(fa.skip * _fv.astype(fa.skip.dtype)),
+        op_hist=jnp.stack([
+            jnp.sum(((fa.op_type == k) & _fv[:, None]).astype(jnp.int32))
+            for k in range(4)]),
+        skip_head=fa.skip[:8], op_head=fa.op_type[:8])
+    return fa
 
 
 def _causal_quality_mask(face_valid, face_skip, face_op_type):
@@ -3126,6 +3146,7 @@ class Agent(eqx.Module):
         endpoint_rows=None,       # (V+1, E) read(base+dyn) rows (--face-endpoint-read)
         edge_rows=None,           # (K, E) edge-memory read rows (--face-edge-mem)
         delta_window=None,        # the per-step DELTA WINDOW BIN; None = the hard cap
+        face_dump_key=None,       # ALPHAGRAD_FACE_DUMP: (step, env) row key
     ):
         """Same as :meth:`sample_action` but routes the rule head through
         :class:`MicroActionPolicy`. ``axis_state`` and ``axis_valid_mask``
@@ -3270,6 +3291,8 @@ class Agent(eqx.Module):
 
         # P1c: per-path decisions for the chosen vertex, from the SAME
         # v_context/features the micro path used (no extra full encode).
+        if face_dump_key is None:
+            face_dump_key = -jnp.ones((2,), jnp.int32)
         face_out = None
         _have_faces = ((_face_from_fn is not None)
                        or (face_masks_all is not None)
@@ -3408,6 +3431,7 @@ class Agent(eqx.Module):
                     face_nout=f_nout,
                     want_stage2=(face_decide_fn is not None),
                     window=delta_window,
+                    dump_key=face_dump_key,
                 )
                 _fctx = _rs1 = None
                 if face_decide_fn is not None:
@@ -3469,6 +3493,25 @@ class Agent(eqx.Module):
                         m = _live.reshape((_F,) + (1,) * (jnp.ndim(new) - 1))
                         return jnp.where(m, new, zero)
 
+                    if _fdump.on():
+                        _K = 8
+                        _fdump.record(
+                            "s2_stage2",
+                            key=jnp.asarray(face_dump_key, jnp.int32),
+                            vertex=vertex_idx.astype(jnp.int32),
+                            n2=_n2, n_live=jnp.sum(_live.astype(jnp.int32)),
+                            fvalid_sum=jnp.sum(f_valid),
+                            pre_skip_sum=jnp.sum(fa.skip),
+                            pre_op_head=fa.op_type[:_K],
+                            redraw_skip_sum=jnp.sum(
+                                jnp.where(_live, _sk2, 0)),
+                            redraw_skip_head=_sk2[:_K],
+                            mask_pair_sum=jnp.sum(_pair2),
+                            mask_comp_sum=jnp.sum(_comp2),
+                            mask_quant_sum=jnp.sum(_quant2),
+                            mask_sizes_sum=jnp.sum(_sizes2),
+                            nf2=jnp.asarray(_nf2, jnp.int32),
+                            ctx_absmax=jnp.max(jnp.abs(_fctx)))
                     _rs_pad = -jnp.ones_like(_rs2).at[..., 2].set(0)
                     fa = FaceAction(
                         skip=_keep(_sk2, jnp.zeros((_F,), jnp.int32)),
@@ -3480,6 +3523,19 @@ class Agent(eqx.Module):
                     face_ent = jnp.sum(jnp.where(_live, _e2, 0.0))
                     f_pair, f_comp = _pair2, _comp2
                     f_sizes, f_quant, f_nout = _sizes2, _quant2, _nout2
+            if _fdump.on():
+                _KP = 8
+                _fdump.record(
+                    "s3_packed",
+                    key=jnp.asarray(face_dump_key, jnp.int32),
+                    vertex=vertex_idx.astype(jnp.int32),
+                    fvalid_sum=jnp.sum(f_valid),
+                    skip_sum=jnp.sum(fa.skip * (f_valid > 0.5)),
+                    op_hist=jnp.stack([
+                        jnp.sum(((fa.op_type == _k)
+                                 * (f_valid > 0.5)[:, None]).astype(jnp.int32))
+                        for _k in range(4)]),
+                    skip_head=fa.skip[:_KP], op_head=fa.op_type[:_KP])
             face_out = (fa, face_logp, face_ent, f_pair, f_comp, f_valid,
                         f_cnt, f_dt, f_ends)
             # --face-edge-mem appends the read slots + write metadata;
@@ -3709,7 +3765,8 @@ class Agent(eqx.Module):
                    vertex_idx, vertex_specs, axis_state_v,
                    op_legality_override, n_faces, endpoint_rows=None,
                    edge_rows=None, face_sizes=None, face_quant=None,
-                   face_nout=None, want_stage2=False, window=None):
+                   face_nout=None, want_stage2=False, window=None,
+                   dump_key=None):
         """Read face f's chunk, decide face f, repeat -- for the ACTUAL face
         count, as a while_loop.
 
@@ -3742,6 +3799,8 @@ class Agent(eqx.Module):
         loss's gated evaluate scores as exactly zero, the same contract the
         unrolled loop's padding iterations had."""
         pol = self.face_path_policy
+        if dump_key is None:
+            dump_key = -jnp.ones((2,), jnp.int32)
         F = pol.max_faces
         # The SHAPE width, which is the head's --approx-add width (3/3/3/4/5),
         # never `FACE_SLOTS` (always the 3 CONTRACTION slots).
@@ -3906,6 +3965,21 @@ class Agent(eqx.Module):
                 row, axis_state_v,
                 None if face_nout is None else face_nout[f]))
             skips = skips.at[f].set(sk.astype(jnp.int32))
+            if _fdump.on():
+                _fdump.record(
+                    "s1_sample", key=jnp.asarray(dump_key, jnp.int32),
+                    vertex=vertex_idx.astype(jnp.int32),
+                    f=f.astype(jnp.int32), n=n.astype(jnp.int32),
+                    face_valid=f_valid[f].astype(jnp.float32),
+                    approx_ok=jnp.asarray(
+                        _approx_ok_of(op_legality_override), jnp.float32),
+                    skip=sk.astype(jnp.int32),
+                    p_skip=jnp.asarray(_sp, jnp.float32),
+                    op_dist=jnp.asarray(_od, jnp.float32),
+                    op=jnp.asarray(row["op_type"], jnp.int32),
+                    ct_raw=ct_raw, ct_eff=ct_eff,
+                    ctx_absmax=jnp.max(jnp.abs(summ)),
+                    ctx_absmean=jnp.mean(jnp.abs(summ)))
             # RAW, not clamped -- see the docstring and the ct_eff comment.
             cnts = cnts.at[f].set(ct_raw)
             wa = tuple(w.at[f].set(row[k]) for w, k in zip(wa, _WK))
@@ -9808,6 +9882,9 @@ def main():
                     endpoint_rows=_ep_rows,
                     edge_rows=_em_rows,
                     delta_window=_W_BIN,
+                    face_dump_key=jnp.stack([
+                        state.step_count.astype(jnp.int32),
+                        jnp.asarray(env_index, jnp.int32)]),
                 )
                 # prof/action: the vertex pointer sample + the micro/face
                 # head loop (INCLUDES the faces.live_chunk host callbacks,
@@ -9916,6 +9993,18 @@ def main():
                     state.axis_state,
                     face_action=face_action if face_out is not None else None,
                 )
+                if _fdump.on() and face_out is not None:
+                    _fr = env_action.face_rows
+                    _fdump.record(
+                        "s4_wire",
+                        key=jnp.stack([
+                            state.step_count.astype(jnp.int32),
+                            jnp.asarray(env_index, jnp.int32)]),
+                        vertex=vertex_idx.astype(jnp.int32),
+                        skip_sum=jnp.sum(env_action.face_skip),
+                        live_rows=jnp.sum(
+                            (_fr[..., 0] >= 0).astype(jnp.int32)),
+                        rows_head=_fr[:8], skip_head=env_action.face_skip[:8])
                 # Legacy fields zero-filled; dynamic fields populated.
                 pair_seq = _legacy_zero_pair_seq
                 factor_seq = _legacy_zero_factor_seq
@@ -10166,7 +10255,8 @@ def main():
                 axis_state=state.axis_state,
                 axis_valid_mask=state.axis_valid_mask,
                 # USE 2: the record, whole. Ten named copies before.
-                face_action=face_action,
+                face_action=_fdump_traj(face_action, face_valid_v,
+                                        state.step_count, env_index),
                 # BIT-PACKED on the way in (see `pack_mask_bits`). The
                 # sampler above read the UNPACKED arrays it was handed; only
                 # the stored copy is packed, and the loss unpacks it back to
