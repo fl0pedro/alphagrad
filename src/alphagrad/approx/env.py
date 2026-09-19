@@ -5840,6 +5840,18 @@ def _cosine_reference(ref_ex, ref_key, args, device, probe_seed):
     return out
 
 
+# THE CONFIGURATION HAS NO QUALITY CHANNEL AT ALL: no rev-exact reference and
+# no data generator, so no probe batch exists and no plan of this run can ever
+# be scored. This is NOT the refusable case. `None` means the apparatus DID
+# draw a probe batch and the exact gradient on it was identically zero, which
+# is one plan's missing datum (dsnn-dfw.51). Refusing on the structural case
+# refuses EVERY terminal of the run, which leaves the episode with no
+# measurement at all and turns the analytic AD benchmarks -- Helmholtz,
+# RoeFlux, Lighthouse, RobotArm, BlackScholes, Simple, and every toy env in
+# the test suite -- into a run that measures nothing.
+_QUALITY_NO_CHANNEL = object()
+
+
 def _grad_cosine_quality(config, compiled_approx, ref_ex, ref_key, base_args,
                          device, k_batches: int = 1):
     """THE GRADIENT COSINE: cos(g_approx, g_exact) at the INITIAL weights,
@@ -5850,8 +5862,10 @@ def _grad_cosine_quality(config, compiled_approx, ref_ex, ref_key, base_args,
     executed once per probe batch, not once per plan (see ``_cosine_reference``
     and the owner's ruling of 2026-09-18).
 
-    Returns ``(quality, rel_frobs, cosines)`` or ``None`` when undefined (no
-    data generator -- the same fall-back signal ``_loss_drop_quality`` uses).
+    Returns ``(quality, rel_frobs, cosines)``; ``None`` when the probe batch
+    was drawn and the exact gradient on it is identically zero, which is a
+    REFUSED measurement; and ``_QUALITY_NO_CHANNEL`` when this configuration
+    has no channel to measure at all.
 
     This differs from the legacy Jacobian cosine in WHERE it is evaluated, not
     only in WHAT is compared: the legacy channel scored at the calibration eval
@@ -5860,14 +5874,14 @@ def _grad_cosine_quality(config, compiled_approx, ref_ex, ref_key, base_args,
     the compared leaves are gradient-shaped either way.
     """
     if ref_ex is None:
-        return None
+        return _QUALITY_NO_CHANNEL
     cos_all: list[float] = []
     frob_all: list[float] = []
     _degenerate = 0
     for k in range(max(1, int(k_batches))):
         data = _probe_batch(config, base_args, role="train", index=k)
         if data is None:
-            return None
+            return _QUALITY_NO_CHANNEL
         a = list(base_args)
         # WHICH SLOTS THE BATCH FILLS is the generator's statement
         # (`data_slots`), not this function's guess. It used to be
@@ -9700,7 +9714,27 @@ def _callback_measured(
             _gc = _grad_cosine_quality(
                 config, compiled_approx, _ref_ex, paired_ref_key, list(args),
                 callback_device, _grad_cosine_k(config))
-            if _gc is None:
+            if _gc is _QUALITY_NO_CHANNEL:
+                # NO CHANNEL IS NOT A REFUSAL. This configuration has no data
+                # generator and no rev-exact reference, so there is no probe
+                # batch, no plan of this run can be scored, and refusing would
+                # refuse every terminal of every episode -- the run would
+                # measure nothing at all. The channel reads 0.0 and says so
+                # once, which is what it did before dsnn-dfw.51 and what the
+                # analytic AD benchmarks and the toy envs depend on.
+                if not _WALK_UNDEFINED_WARNED:
+                    _WALK_UNDEFINED_WARNED.append(1)
+                    print(
+                        "[measure] WARNING quality channel: the GRADIENT "
+                        "COSINE HAS NO CHANNEL for this configuration (no "
+                        "data_gen, or the rev-exact reference failed to build "
+                        "or to execute on the probe batch). The channel reads "
+                        "0.0 for every plan of this run; ask for "
+                        "ALPHAGRAD_QUALITY_METRIC=jac_cosine to score at the "
+                        "calibration samples instead, or =none to drop the "
+                        "channel.", flush=True)
+                cosines.append(0.0)
+            elif _gc is None:
                 # AN UNDEFINED COSINE IS A REFUSED MEASUREMENT, NOT A SCORE
                 # (owner ruling 2026-09-19, dsnn-dfw.51). It used to read 0.0,
                 # which under `--reward-mode lagrangian --quality-floor 0.90`
@@ -9716,10 +9750,9 @@ def _callback_measured(
                     _WALK_UNDEFINED_WARNED.append(1)
                     print(
                         "[measure] WARNING quality channel: the GRADIENT "
-                        "COSINE is UNDEFINED for this configuration (no "
-                        "data_gen, the exact gradient identically zero on "
-                        "every probe batch, or the rev-exact reference failed "
-                        "to build or to execute on the probe batch). "
+                        "COSINE is UNDEFINED for this measurement (the exact "
+                        "gradient is identically zero on every probe batch "
+                        "this plan was scored on). "
                         "Every affected measurement is REFUSED and excluded "
                         "from the update; watch `refused/quality-undefined`. "
                         "On a spiking target this means the sampled steps "
