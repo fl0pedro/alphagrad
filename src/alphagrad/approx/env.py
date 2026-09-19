@@ -5591,10 +5591,56 @@ def _adam_step(w, g, m, v, t, lr, b1, b2, eps):
 
 
 
-def _grad_cosine_quality(config, compiled_approx, compiled_exact, base_args,
+# THE QUALITY COSINE'S EXACT REFERENCE (owner ruling 2026-09-18). The exact
+# gradient does not depend on the elimination order -- two exact orders agree
+# to 1e-6 in float32 (reports-2026-09-16/agent-oracle-report.md) -- so the
+# cosine reads the REV-EXACT reference the paired cost channel already
+# compiles and caches, executed ONCE PER PROBE BATCH instead of once per plan.
+# Before this every plan compiled its own same-order exact program for the
+# cosine alone: two compiles per plan under a free order, where the reference
+# is one executable for the whole process.
+_COSINE_REF: dict = {}
+_COSINE_REF_MAX = 8
+_COSINE_REF_STATS = {"hits": 0, "misses": 0}
+
+
+def _cosine_reference(ref_ex, ref_key, args, device, probe_seed):
+    """The reference gradient on ONE probe batch, computed once and reused.
+
+    THE KEY is ``(the reference executable's compile key, device, PROBE SEED,
+    arg shapes and dtypes)``. The compile key already carries the reverse
+    order, the sparse flag, the argument shapes and the device, so two
+    different reference executables cannot share an entry. The probe seed is
+    the number ``_probe_batch`` keys its own cache on, so a new probe batch --
+    a new episode under ``--walk-rotate``, a new K -- is a miss and the entry
+    dies with the batch. The target's weights are not in the key, for the
+    reason ``_grad_oracle_reference`` gives: they are drawn once per process
+    and the policy searches elimination orders, not weights.
+    """
+    key = (bytes(ref_key), str(device), int(probe_seed),
+           tuple((tuple(getattr(x, "shape", ())), str(getattr(x, "dtype", "")))
+                 for x in args))
+    hit = _COSINE_REF.get(key)
+    if hit is not None:
+        _COSINE_REF_STATS["hits"] += 1
+        return hit[1]
+    _COSINE_REF_STATS["misses"] += 1
+    out = ref_ex(*args)
+    if len(_COSINE_REF) >= _COSINE_REF_MAX:
+        _COSINE_REF.clear()
+    _COSINE_REF[key] = (ref_ex, out)
+    return out
+
+
+def _grad_cosine_quality(config, compiled_approx, ref_ex, ref_key, base_args,
                          device, k_batches: int = 1):
     """THE GRADIENT COSINE: cos(g_approx, g_exact) at the INITIAL weights,
     averaged over ``k_batches`` fixed probe batches of REAL data.
+
+    ``ref_ex`` is the REV-EXACT reference of the paired cost channel, keyed by
+    ``ref_key``; its gradient is the ``g_exact`` of the cosine and it is
+    executed once per probe batch, not once per plan (see ``_cosine_reference``
+    and the owner's ruling of 2026-09-18).
 
     Returns ``(quality, rel_frobs, cosines)`` or ``None`` when undefined (no
     data generator -- the same fall-back signal ``_loss_drop_quality`` uses).
@@ -5605,7 +5651,7 @@ def _grad_cosine_quality(config, compiled_approx, compiled_exact, base_args,
     real-data probe batches the loss-drop walk uses.  On a scalar-loss target
     the compared leaves are gradient-shaped either way.
     """
-    if compiled_exact is None:
+    if ref_ex is None:
         return None
     cos_all: list[float] = []
     frob_all: list[float] = []
@@ -5616,9 +5662,10 @@ def _grad_cosine_quality(config, compiled_approx, compiled_exact, base_args,
         a = list(base_args)
         for slot in range(min(2, len(data))):
             a[slot] = jax.device_put(jnp.asarray(data[slot]), device)
+        _seed = _walk_seed("train", None) + 104729 * int(k)
         try:
             out_a = compiled_approx(*a)
-            out_e = compiled_exact(*a)
+            out_e = _cosine_reference(ref_ex, ref_key, a, device, _seed)
         except Exception:
             return None
         jac_a = out_a[1] if config.has_aux else out_a
@@ -5626,7 +5673,7 @@ def _grad_cosine_quality(config, compiled_approx, compiled_exact, base_args,
         cos, rel = _quality_metrics(jac_e, jac_a)
         cos_all.append(float(cos))
         frob_all.append(float(rel))
-        out_a = out_e = jac_a = jac_e = None
+        out_a = jac_a = jac_e = None
     if not cos_all:
         return None
     return float(np.mean(cos_all)), frob_all, cos_all
@@ -8781,11 +8828,16 @@ def _callback_measured(
     # Jacobian, so under ``ALPHAGRAD_QUALITY_METRIC=loss_drop`` the exact
     # executable is not compiled and not executed at all. That is where the
     # 9.70 s -> 0.22 s and 4.24 GB -> 40 MB per-plan saving comes from.
-    # Under the default grad_cosine (2026-09-02) the exact executable IS
-    # built -- its compile is cached on ``exact_cache_key`` -- and executed
-    # once per plan on the probe batch, as the rev-exact reference.
+    # THE SAME-ORDER EXACT PROGRAM IS NO LONGER BUILT FOR THE GRADIENT COSINE
+    # (owner ruling 2026-09-18). Under a free order ``exact_cache_key`` is a
+    # new key for every plan, so that compile was a SECOND compile per plan
+    # for a quantity the cached rev-exact reference already carries: the exact
+    # gradient is order-independent to 1e-6 in float32. The cosine now reads
+    # the reference (see ``_cosine_reference``); ``jac_cosine``, which scores
+    # the plan's own Jacobian at the calibration samples and not a gradient on
+    # the probe batch, still needs the same-order program and still builds it.
     _qmetric = quality_metric(config)
-    if is_terminal and _qmetric in ("jac_cosine", "grad_cosine"):
+    if is_terminal and _qmetric == "jac_cosine":
         try:
             compiled_exact = cached_compile(
                 b"exact:" + exact_cache_key, _do_compile_exact)
@@ -8797,6 +8849,21 @@ def _callback_measured(
             return _oom_truncate("exact compile", _exc)
     else:
         compiled_exact = None
+    # THE REV-EXACT REFERENCE, compiled here because BOTH consumers are here:
+    # the paired cost channel's timing windows below and, since 2026-09-18,
+    # the gradient cosine. One executable per (vertex set, shapes, device) and
+    # therefore one compile per process, cached on ``paired_ref_key``.
+    _ref_ex = None
+    if _paired or (is_terminal and _qmetric == "grad_cosine"):
+        try:
+            _ref_ex = cached_compile(
+                b"paired-ref:" + paired_ref_key, _do_compile_paired_ref)
+        except Exception as _exc:
+            if _is_graphax_trace_failure(_exc):
+                return _trace_truncate("paired-ref compile", _exc)
+            if not _is_oom(_exc):
+                raise
+            return _oom_truncate("paired-ref compile", _exc)
     _pf("cb.xla_compile")
     # ORACLE A (ticket .62) IS NOT HERE ANY MORE (owner ruling 2026-09-18).
     #
@@ -8816,6 +8883,9 @@ def _callback_measured(
     # `alphagrad.approx.common.grad_oracle_async`. Nothing in this callback
     # waits for it, and the `refused/oracle` telemetry kind is therefore gone:
     # the oracle can no longer refuse anything.
+    #
+    # The async oracle is still fed the CANDIDATE's own orders, while the
+    # cosine now reads the reverse order's reference (dsnn-dfw.41).
 
     # XLA cost analysis — flops + bytes accessed. Falls back to 0 when the
     # backend doesn't expose them (CPU sometimes returns an empty dict).
@@ -8977,16 +9047,10 @@ def _callback_measured(
         # caller that configures fewer than 5 measures exactly as before.
         _cfg_inner = max(1, int(getattr(config, "latency_inner_reps", 1)))
 
-        # ---- THE PAIRED REFERENCE'S EXECUTABLE (ticket .9) --------------
-        # Compiled BEFORE the timing loop, because since 2026-09-14 its
-        # windows are INTERLEAVED with the candidate's instead of forming a
-        # second block after them. The compile is cached on `paired_ref_key`,
-        # which depends on neither half's counts, so this moves no work --
-        # only the moment the cache is consulted.
-        _ref_ex = None
-        if _paired:
-            _ref_ex = cached_compile(
-                b"paired-ref:" + paired_ref_key, _do_compile_paired_ref)
+        # THE PAIRED REFERENCE'S EXECUTABLE (ticket .9) is `_ref_ex`, built
+        # beside the candidate's compile above. It has to exist before the
+        # timing loop, because since 2026-09-14 its windows are INTERLEAVED
+        # with the candidate's instead of forming a second block after them.
 
         def _probe_one(ex, eval_args) -> float:
             """Seconds of ONE execution of `ex`, measured on the WARM-UP.
@@ -9235,7 +9299,7 @@ def _callback_measured(
         # timing/peak windows never contain it.
         if is_terminal and _qmetric == "grad_cosine":
             _gc = _grad_cosine_quality(
-                config, compiled_approx, compiled_exact, list(args),
+                config, compiled_approx, _ref_ex, paired_ref_key, list(args),
                 callback_device, _grad_cosine_k())
             if _gc is None:
                 if not _WALK_UNDEFINED_WARNED:
@@ -9243,7 +9307,8 @@ def _callback_measured(
                     print(
                         "[measure] WARNING quality channel: the GRADIENT "
                         "COSINE is UNDEFINED for this configuration (no "
-                        "data_gen, or the exact reference failed to build). "
+                        "data_gen, or the rev-exact reference failed to "
+                        "build or to execute on the probe batch). "
                         "The channel reads 0.0 for every affected plan; ask "
                         "for ALPHAGRAD_QUALITY_METRIC=jac_cosine to score at "
                         "the calibration samples instead.", flush=True)
