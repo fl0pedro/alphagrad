@@ -83,6 +83,7 @@ from alphagrad.approx.common.schedules import cosine_warmup_exp_decay_lr
 from alphagrad.approx.env import (
     quality_metric as _env_quality_metric,
     grad_oracle_tol as _env_grad_oracle_tol,
+    grad_oracle_cadence as _env_grad_oracle_cadence,
     APPROX_ADD_CHOICES,
     APPROX_ADD_CLI,
     APPROX_ADD_DEFAULT,
@@ -617,6 +618,115 @@ def _resolve_plan_log_path(args) -> str | None:
         _dir, f"plan_log_{getattr(args, 'name', None) or 'run'}.jsonl")
     print(f"[plan-log] every terminal plan -> {_PLAN_LOG_PATH}", flush=True)
     return _PLAN_LOG_PATH
+
+
+# ---------------------------------------------------------------------------
+# THE ASYNCHRONOUS GRADIENT ORACLE, TRAINER SIDE (owner ruling 2026-09-18).
+#
+# The oracle is a SANITY CHECK and not part of the scoring. The scheduling
+# lives in `common/grad_oracle_async.py` and the check itself in
+# `env.grad_oracle_cpu_check`; these three functions are the trainer's own
+# half, at module level so they can be tested without running a campaign.
+#
+#   `_grad_oracle_jobs`     what to check, read off the episode's plan records
+#   `_grad_oracle_write`    the late records, appended to the plan log
+#   `_grad_oracle_boundary` the episode boundary: take the answers, write them,
+#                           and RAISE on a fail
+#
+# THE BOUNDARY IS CALLED AFTER `_ckpt_write`. That order is the whole reason a
+# fail is allowed to stop the run: the checkpoint at that episode exists before
+# the raise, so the run resumes from it once the defect is fixed. A test pins
+# the order in the source, because it is a property of the call site and not of
+# any of these functions.
+# ---------------------------------------------------------------------------
+def _grad_oracle_jobs(records):
+    """The DISTINCT elimination orders of one episode, with the plans each one
+    belongs to.
+
+    Read off the episode's terminal plan records -- which are what the dedupe
+    already collapsed, and which carry the integer wire `jacve` was handed
+    rather than an action sequence that would have to be interpreted. One job
+    per distinct order; `plan_hashes` lists every plan of this episode with
+    that order, because the oracle checks the ORDER and a plan's approximation
+    rules are not part of what it checks.
+
+    A record with no order or no hash is skipped, not guessed at.
+    """
+    jobs: dict = {}
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        order = rec.get("order")
+        plan_hash = rec.get("plan_hash")
+        if not order or not plan_hash:
+            continue
+        key = tuple(int(v) for v in order)
+        jobs.setdefault(key, []).append(str(plan_hash))
+    return [{"order": k, "plan_hashes": v} for k, v in jobs.items()]
+
+
+def _grad_oracle_write(path, results, checked_at_episode, tol):
+    """Append ONE late ``oracle_result`` record per plan. Returns how many.
+
+    The plan log is append-only, so nothing is rewritten: the answer is its own
+    line, joined to the plan by the content hash and the episode.
+    """
+    from alphagrad.approx.common.grad_oracle_async import (
+        result_record as _orec)
+    from alphagrad.approx.common.plan_log import append_records as _append
+    if path is None:
+        return 0
+    recs = []
+    for res in results:
+        res = dict(res)
+        res["checked_at_episode"] = int(checked_at_episode)
+        for plan_hash in res["plan_hashes"]:
+            recs.append(_orec(res, plan_hash=plan_hash, tol=float(tol)))
+    if not recs:
+        return 0
+    return int(_append(path, recs))
+
+
+def _grad_oracle_boundary(oracle, path, episode, tol, log=print):
+    """ONE episode boundary of the asynchronous oracle.
+
+    Takes every answer that has arrived and every check that has been in flight
+    too long, writes them, and RAISES on a fail.
+
+    A FAIL STOPS THE RUN. In float64 on the CPU every order of these targets
+    sits at 1e-14, so a relative L2 above the bar is a real defect in the
+    elimination and not noise -- and a policy trained against a wrong quality
+    reference is a run that has to be thrown away, which is more expensive than
+    stopping now. A TIMEOUT DOES NOT STOP THE RUN: it is missing data, it is
+    counted, and the next episode goes on.
+
+    Returns the results it wrote.
+    """
+    if oracle is None:
+        return []
+    results = oracle.take_results()
+    _grad_oracle_write(path, results, episode, tol)
+    fails = [r for r in results if r["status"] == "fail"]
+    times = [r for r in results if r["status"] == "timeout"]
+    if times:
+        log(f"[grad-oracle] ep{int(episode)}: {len(times)} check(s) timed out "
+            f"and are counted as missing, not as failures: "
+            + ", ".join(f"{tuple(r['order'])[:6]}..." for r in times[:4]))
+    if not fails:
+        return results
+    from alphagrad.approx.env import GradientOracleFailure
+    first = fails[0]
+    raise GradientOracleFailure(
+        f"[grad-oracle] THE EXACT GRADIENT IS WRONG. Order "
+        f"{tuple(int(v) for v in first['order'])} of episode "
+        f"{int(first['episode'])} disagrees with jax.grad by "
+        f"rel_l2={first['rel_l2']} > {float(tol)} in FLOAT64 on the CPU"
+        + (f" ({first['error']})" if first.get("error") else "")
+        + f". Plan hash {first['plan_hashes'][0] if first['plan_hashes'] else '?'}"
+        f". In float64 on the CPU every order of this target sits at 1e-14, so "
+        f"this is a graphax defect and not noise. {len(fails)} order(s) failed "
+        f"at this boundary. The checkpoint at episode {int(episode)} is "
+        f"written: fix the defect and resume from it.")
 
 
 # Slot 2 was named "cos" until 2026-08-07; it is the value head for reward
@@ -5158,23 +5268,40 @@ def make_argparser() -> argparse.ArgumentParser:
              "front whose sequences are then discarded at process exit.")
     p.add_argument(
         "--grad-oracle", choices=["reference", "off"], default="reference",
-        help="Oracle A (ticket dsnn-3qm.62): check the exact gradient of every "
-             "elimination order ONCE per process against jax.grad on the probe "
-             "batch before it serves as the grad-cosine reference. Both sides "
-             "run at matmul precision 'highest' (ticket dsnn-df8: the default "
-             "float32 dot is TF32 here, and a TF32 reference is further from "
-             "the truth than the bar it guards). A disagreement (rel L2 > "
-             f"{_env_grad_oracle_tol():.0e}, ALPHAGRAD_GRAD_ORACLE_TOL) "
-             "REFUSES that order: its plan record is written as refused with a "
-             "sentinel reward and the run CONTINUES. Published as "
-             "ALPHAGRAD_GRAD_ORACLE so the measure actors read the same value. "
-             "off disables the check.")
+        help="Oracle A (ticket dsnn-3qm.62): a SANITY CHECK, not part of the "
+             "scoring (owner ruling 2026-09-18). One worker -- a Ray CPU "
+             "actor built with the measurement pool when one exists, else "
+             "one worker thread -- checks the exact gradient of every "
+             "elimination order ONCE per process against jax.grad, on the "
+             "CPU device, in float64, AFTER the episode that produced the "
+             "order. The trainer never waits for it: no plan is refused, no "
+             "reward moves, no episode is slower. A disagreement (rel L2 > "
+             f"{_env_grad_oracle_tol():.0e}, ALPHAGRAD_GRAD_ORACLE_TOL) in "
+             "float64 on the CPU is a real graphax defect, so the run STOPS "
+             "at the next episode boundary, after that episode's checkpoint "
+             "is written, and resumes from it once the defect is fixed. "
+             "Answers are written as late oracle_result records in the plan "
+             "log and counted as oracle/* in wandb. Needs --plan-log (or "
+             "--record-all-plans): the oracle reads its orders off the plan "
+             "log's records, and the two flags are refused together at "
+             "startup. off disables the check.")
     p.add_argument(
         "--grad-oracle-cadence", type=int, default=50,
         help="Episode cadence for checking the exact gradient against "
              "jax.grad (default 50: runs on episode 0 and every 50 episodes). "
-             "Set 1 to check on every episode. Published as "
-             "ALPHAGRAD_GRAD_ORACLE_CADENCE so the measure actors read the same value.")
+             "Set 1 to check on every episode. The distinct orders of a due "
+             "episode are handed to the oracle worker when that episode ends.")
+    p.add_argument(
+        "--grad-oracle-timeout", type=float, default=600.0,
+        help="Seconds one asynchronous gradient-oracle check may be in flight "
+             "before the trainer counts it as a timeout, writes it as one and "
+             "stops waiting for it (default 600). A timeout is MISSING DATA: "
+             "it is counted and it does NOT stop the run. On the Ray actor "
+             "path a timeout also KILLS AND RECREATES the actor, so a hung "
+             "check no longer holds the worker for the rest of the run. Also "
+             "the budget the pending checks are drained with at process "
+             "exit, so a run ends with every check accounted for. Published "
+             "as ALPHAGRAD_GRAD_ORACLE_TIMEOUT.")
     p.add_argument(
         "--fixed-order", choices=list(_FIXED_ORDER_CHOICES), default="markowitz",
         help="The elimination order the vertex head is pinned to (ticket "
@@ -7249,6 +7376,14 @@ def main():
               f"{getattr(args, 'plan_log_cap', 4096)} "
               f"max_faces={getattr(args, 'plan_log_max_faces', 0) or 'all'})",
               flush=True)
+    if args.grad_oracle != "off" and not _plan_log_cfg:
+        raise ValueError(
+            "--grad-oracle reference needs the plan log: the oracle reads "
+            "the distinct elimination orders of an oracle-due episode off "
+            "its plan-log records, so with --plan-log off it is handed no "
+            "orders and silently checks nothing. Pass --plan-log auto (or "
+            "a PATH, or --record-all-plans), or turn the oracle off with "
+            "--grad-oracle off.")
 
     _apply_variant_preset(args)
     if args.variant != "custom":
@@ -7480,16 +7615,27 @@ def main():
           flush=True)
     os.environ["ALPHAGRAD_MEM_CHANNEL"] = str(args.mem_channel)
     # ORACLE A (ticket .62), same transport: env.grad_oracle is the one reader.
+    # The measure actors read it too and no longer act on it -- the oracle left
+    # their path on 2026-09-18 -- but the variable stays published so one
+    # process cannot believe the check is on while another believes it is off.
     os.environ["ALPHAGRAD_GRAD_ORACLE"] = str(args.grad_oracle)
     print(f"[alphagrad] gradient oracle (--grad-oracle) = {args.grad_oracle}"
-          + (" (exact gradient vs jax.grad once per process and order, both "
-             f"sides at matmul precision highest; rel L2 > "
-             f"{_env_grad_oracle_tol():.0e} refuses that order and the run "
-             "continues)" if args.grad_oracle == "reference"
-             else " (no check)"), flush=True)
+          + (" (exact gradient vs jax.grad once per process and order, on the "
+             "CPU device in float64, on the oracle's own worker -- a Ray CPU "
+             "actor when a measurement pool exists, else a thread; nothing "
+             f"waits for it and no plan is refused; rel L2 > "
+             f"{_env_grad_oracle_tol():.0e} stops the run at the next episode "
+             "boundary, after that episode's checkpoint)"
+             if args.grad_oracle == "reference" else " (no check)"), flush=True)
     os.environ["ALPHAGRAD_GRAD_ORACLE_CADENCE"] = str(int(args.grad_oracle_cadence))
     print(f"[alphagrad] gradient oracle cadence (--grad-oracle-cadence) = "
           f"{args.grad_oracle_cadence}", flush=True)
+    os.environ["ALPHAGRAD_GRAD_ORACLE_TIMEOUT"] = str(
+        float(args.grad_oracle_timeout))
+    print(f"[alphagrad] gradient oracle timeout (--grad-oracle-timeout) = "
+          f"{float(args.grad_oracle_timeout):g}s (a check still in flight "
+          f"after this is counted as a timeout and forgotten; the run does "
+          f"NOT stop)", flush=True)
     print(f"[alphagrad] memory channel (reward slot 5, --mem-channel) = "
           f"{args.mem_channel}"
           + (" (XLA static temp bytes of the timed executable; the runtime "
@@ -7571,6 +7717,11 @@ def main():
         delta_obs=True,
         grad_oracle_cadence=int(args.grad_oracle_cadence),
     )
+
+    # THE ASYNCHRONOUS GRADIENT ORACLE is built after the measurement pool,
+    # once we know whether one exists (owner ruling 2026-09-18 / dsnn-dfw.22:
+    # a Ray CPU actor when a pool is up, built with it and torn down with it;
+    # see the block below the --ray-measure setup).
 
     # THE BASE STREAM, once, on the host. `len(base_tokens())` depends only on
     # the jaxpr -- not on the elimination order -- so this is a constant every
@@ -7952,6 +8103,115 @@ def main():
         # No pool at all: the callback has always run here. Say so anyway, so
         # `tokenize_where()` reports the truth to anything that reads it.
         _tok_env_mod.set_tokenize_where("local")
+
+    # ---- THE ASYNCHRONOUS GRADIENT ORACLE (owner ruling 2026-09-18; moved
+    # off a thread onto a Ray CPU actor by owner ruling 2026-09-18 /
+    # dsnn-dfw.22) -----------------------------------------------------------
+    # BUILT HERE, AFTER --ray-measure, because that is where we learn whether
+    # a measurement pool exists: with one, the oracle is A RAY CPU ACTOR
+    # (num_cpus=4, num_gpus=0), built alongside the pool's own actors on the
+    # SAME live Ray cluster and killed exactly where `_GRAD_ORACLE.close()`
+    # already runs, at the drain after the final checkpoint -- so it is torn
+    # down with the pool. Without one (`--ray-measure 0`) the oracle falls
+    # back to the single worker thread the ruling replaced, so the flag still
+    # works with no pool to build an actor on top of. `--grad-oracle off`
+    # leaves `_GRAD_ORACLE` None and every call site below is then a no-op,
+    # which is what makes the gate arm bit-identical.
+    _GRAD_ORACLE = None
+    _GRAD_ORACLE_TOL = _env_grad_oracle_tol()
+    # ONE READER FOR THE CADENCE. `env.grad_oracle_cadence()` reads the
+    # environment variable published above, so the trainer and any other
+    # process in the run answer the same number.
+    _ORACLE_CADENCE = _env_grad_oracle_cadence()
+    # episode -> the frozen args of that episode. One entry per oracle-due
+    # episode, dropped when that episode's last answer has been taken, so a
+    # 1000-episode run holds at most the episodes still in flight.
+    _GRAD_ORACLE_ARGS: dict = {}
+    if args.grad_oracle != "off":
+        from alphagrad.approx import env as _oracle_env_mod
+        from alphagrad.approx.common.grad_oracle_async import (
+            AsyncGradOracle as _AsyncGradOracle,
+            make_ray_oracle_actor_factory as _make_oracle_actor_factory)
+
+        def _grad_oracle_run_check(order, probe_seed, episode):
+            """LOCAL (THREAD) MODE ONLY, used when there is no measurement
+            pool. `_GRAD_ORACLE_ARGS` holds what the trainer froze for that
+            episode: the probe batch and the arguments, in host memory, so
+            the worker touches no device array the trainer owns."""
+            _sub = _GRAD_ORACLE_ARGS.get(int(episode))
+            if _sub is None:
+                raise RuntimeError(
+                    f"the gradient oracle was handed episode {int(episode)} "
+                    f"with no frozen arguments; this is a scheduling defect, "
+                    f"not a gradient defect")
+            return _oracle_env_mod.grad_oracle_cpu_check(
+                env.config, _sub, order, probe_seed)
+
+        def _grad_oracle_resolve_args(episode):
+            """ACTOR MODE ONLY. Same lookup as `_grad_oracle_run_check`, but
+            returns just `args_np`: the actor builds its own `config` (see
+            `make_ray_oracle_actor_factory`) because a live `config.target_fun`
+            cannot cross Ray's wire -- found on jobs 66267 and 66288, where
+            Ray's serializer refused the whole argument tuple, first tracing
+            to `EnvConfig.data_gen` (a PjitFunction, stripped, harmless: only
+            its `id()` is ever read) and, with that gone, to `target_fun`
+            itself (a closure the check must CALL, so it cannot be stripped
+            the same way)."""
+            _sub = _GRAD_ORACLE_ARGS.get(int(episode))
+            if _sub is None:
+                raise RuntimeError(
+                    f"the gradient oracle was handed episode {int(episode)} "
+                    f"with no frozen arguments; this is a scheduling defect, "
+                    f"not a gradient defect")
+            return _sub
+
+        _have_measure_pool = int(getattr(args, "ray_measure", 0) or 0) > 0
+        if _have_measure_pool:
+            # A PLAIN, PICKLABLE COPY OF THE CLI ARGS -- every value a
+            # string, number or bool -- for the actor to rebuild its OWN
+            # `env`/`config` from, the same way `_spawn` above hands the
+            # measure actors `_args_dict` rather than a live env object.
+            # A fresh dict, not `_args_dict` (already built above): that one
+            # was mutated with the measure pool's own `num_cpu_workers`,
+            # which has nothing to do with the oracle.
+            _oracle_args_dict = dict(vars(args))
+            _GRAD_ORACLE = _AsyncGradOracle(
+                _grad_oracle_run_check,
+                timeout_s=float(args.grad_oracle_timeout),
+                actor_factory=_make_oracle_actor_factory(_oracle_args_dict),
+                arg_resolver=_grad_oracle_resolve_args)
+            print(f"[grad-oracle] asynchronous, one Ray CPU actor "
+                  f"(num_cpus=4, num_gpus=0) built with the measurement "
+                  f"pool, on {_oracle_env_mod.grad_oracle_cpu_device()}; "
+                  f"cadence {int(args.grad_oracle_cadence)}, timeout "
+                  f"{float(args.grad_oracle_timeout):g}s, bar "
+                  f"{_GRAD_ORACLE_TOL:.0e}. A check over the timeout kills "
+                  f"and recreates the actor.", flush=True)
+        else:
+            _GRAD_ORACLE = _AsyncGradOracle(
+                _grad_oracle_run_check,
+                timeout_s=float(args.grad_oracle_timeout))
+            print(f"[grad-oracle] asynchronous, one worker thread (no "
+                  f"--ray-measure pool to build a Ray actor with), on "
+                  f"{_oracle_env_mod.grad_oracle_cpu_device()}; cadence "
+                  f"{int(args.grad_oracle_cadence)}, timeout "
+                  f"{float(args.grad_oracle_timeout):g}s, bar "
+                  f"{_GRAD_ORACLE_TOL:.0e}", flush=True)
+
+    def _oracle_prune(results):
+        """Drop the frozen arguments of every episode with nothing in flight.
+
+        One entry is one episode's probe batch and weights in host memory. The
+        worker needs them only while a check of that episode is queued or
+        running, and a 1000-episode run at cadence 1 would otherwise keep a
+        thousand of them.
+        """
+        if _GRAD_ORACLE is None or not _GRAD_ORACLE_ARGS:
+            return results
+        _live = _GRAD_ORACLE.pending_episodes()
+        for _ep_k in [k for k in _GRAD_ORACLE_ARGS if k not in _live]:
+            _GRAD_ORACLE_ARGS.pop(_ep_k, None)
+        return results
 
     # DIAG per-face masking. The dynamic policy's DIAG head must be masked by the
     # LIVE per-vertex pair / compress validity — the nominal tag-bit mask admits
@@ -13832,6 +14092,35 @@ def main():
                         _plog_r["measure_ticket"] = int(_plog_tkt)
                 _plog_nw = _plog_append(_plog_path, _plog_recs)
                 host_state["_plan_log_written"] = _plog_n0 + _plog_nw
+                # ---- THE ORACLE'S SUBMISSION, AT THE END OF ITS EPISODE ----
+                # THIS IS THE ONLY PLACE THE ORACLE TOUCHES THE EPISODE PATH,
+                # and it neither waits nor blocks: it freezes the probe batch
+                # and the arguments on this thread, hands the worker the
+                # distinct orders, and returns. The records above are what the
+                # dedupe produced, so the orders are already distinct plans;
+                # `_grad_oracle_jobs` collapses the remaining duplicates.
+                #
+                # `host_log` runs one episode late under --measure-pipeline,
+                # which is exactly right: episode `ep` is over, its plans are
+                # measured and scored, and nothing the oracle says can reach
+                # them. The probe seed and the batch are `ep`'s, not the
+                # rollout's that has meanwhile happened.
+                if (_GRAD_ORACLE is not None
+                        and (int(_ORACLE_CADENCE) <= 1
+                             or int(ep) % int(_ORACLE_CADENCE) == 0)):
+                    _or_jobs = _grad_oracle_jobs(_plog_recs)
+                    _or_sub = (_oracle_env_mod.grad_oracle_submission(
+                                   env.config, env.args, int(ep))
+                               if _or_jobs else None)
+                    if _or_sub is not None:
+                        _GRAD_ORACLE_ARGS[int(ep)] = _or_sub[1]
+                        _n_or = _GRAD_ORACLE.submit(
+                            int(ep), _or_sub[0], _or_jobs)
+                        print(f"[grad-oracle] ep{ep}: {_n_or} distinct "
+                              f"order(s) of {len(_plog_recs)} plan(s) handed "
+                              f"to the oracle thread (probe seed "
+                              f"{_or_sub[0]}); the trainer does not wait",
+                              flush=True)
                 log_dict["plan_log/records_this_ep"] = int(_plog_nw)
                 log_dict["plan_log/records_total"] = int(_plog_n0 + _plog_nw)
                 log_dict["plan_log/dropped_this_ep"] = int(_plog_dropped)
@@ -14721,6 +15010,18 @@ def main():
         # carry it; survives --lean-logging (four cheap scalars).
         if extra_log:
             log_dict.update(extra_log)
+
+        # THE ASYNCHRONOUS GRADIENT ORACLE'S FOUR NUMBERS. Cumulative pass,
+        # fail and timeout over the run, and how many checks are in flight
+        # RIGHT NOW. `pending` is the one that says whether the oracle is
+        # keeping up: it walks up and comes back down, and a run that ends
+        # with pending > 0 did not account for every check. Logged whatever
+        # the plan log is doing, so the sanity check is readable with
+        # `--plan-log off`; absent under `--grad-oracle off`, because a key
+        # that reads 0 there would claim checks were made.
+        if _GRAD_ORACLE is not None:
+            for _or_k, _or_v in _GRAD_ORACLE.counts().items():
+                log_dict[f"oracle/{_or_k}"] = int(_or_v)
 
         # PER-EPISODE JSONL SINK (ALPHAGRAD_UPDATE_JSONL, default off).
         # Written BEFORE wandb.log so a crashed/offline run still has it, and
@@ -15757,6 +16058,20 @@ def main():
         # drains the pipeline first, so `ep` episodes really are complete.
         if _CKPT_EVERY > 0 and ep > 0 and ep % _CKPT_EVERY == 0:
             _ckpt_write(ep)
+        # ---- THE GRADIENT ORACLE'S BOUNDARY --------------------------------
+        # AFTER THE CHECKPOINT, DELIBERATELY. This is the one call in the loop
+        # that may stop the run: a disagreement in float64 on the CPU is a real
+        # graphax defect, and the owner's error rule says raise. Putting it
+        # after `_ckpt_write` is what makes stopping cheap -- the checkpoint at
+        # this episode is on disk before the raise, so the run resumes from it
+        # once the defect is fixed, instead of losing the episodes since the
+        # last checkpoint. A test pins this order in the source.
+        #
+        # It never blocks: it takes the answers that have arrived, writes them
+        # as late records, and returns. A timeout is counted and goes on.
+        _oracle_prune(_grad_oracle_boundary(
+            _GRAD_ORACLE, _resolve_plan_log_path(args), ep, _GRAD_ORACLE_TOL,
+            log=lambda line: print(line, flush=True)))
         # ---- AUTO-STOP (7 of 8): THE CHECK POINT ---------------------------
         # SAME PLACE AS THE CHECKPOINT, AND FOR THE SAME REASON. The decision
         # reads episode ep-1's observation, and under --measure-pipeline 1
@@ -16606,6 +16921,45 @@ def main():
     # `--episodes` episodes were complete, and a resume from that one would
     # start after the end of the run.
     _ckpt_write(_EPISODES_DONE[0])
+
+    # ---- THE ORACLE'S LAST BOUNDARY: DRAIN AT PROCESS EXIT ---------------
+    # EVERY CHECK IS ACCOUNTED FOR. The oracle is retroactive, so at the end of
+    # the run some answers are still coming. They are waited for here, ONCE,
+    # for at most --grad-oracle-timeout seconds, and whatever has not answered
+    # by then is written as a timeout. A 1000-episode run therefore ends with
+    # pass + fail + timeout equal to the number of checks it submitted, and
+    # `oracle/pending` back at 0.
+    #
+    # AFTER THE FINAL CHECKPOINT, for the same reason the in-loop boundary is:
+    # a fail found here raises, and the run has to be resumable from the
+    # checkpoint that is already on disk.
+    if _GRAD_ORACLE is not None:
+        _or_t0 = _prof_time.perf_counter()
+        _or_left = _GRAD_ORACLE.drain(float(args.grad_oracle_timeout))
+        _grad_oracle_write(_resolve_plan_log_path(args), _or_left,
+                           _EPISODES_DONE[0], _GRAD_ORACLE_TOL)
+        _or_c = _GRAD_ORACLE.counts()
+        print(f"[grad-oracle] drained at exit in "
+              f"{_prof_time.perf_counter() - _or_t0:.1f}s: "
+              f"{_or_c['pass']} pass, {_or_c['fail']} fail, "
+              f"{_or_c['timeout']} timeout, {_or_c['pending']} pending of "
+              f"{_or_c['submitted']} submitted "
+              f"(max rel_l2 seen "
+              f"{_ep_env_mod._GRAD_ORACLE_STATS['rel_l2_max']:.3e})",
+              flush=True)
+        _GRAD_ORACLE.close()
+        _or_fails = [r for r in _or_left if r["status"] == "fail"]
+        if _or_fails:
+            from alphagrad.approx.env import GradientOracleFailure
+            raise GradientOracleFailure(
+                f"[grad-oracle] THE EXACT GRADIENT IS WRONG. "
+                f"{len(_or_fails)} order(s) disagreed with jax.grad in "
+                f"float64 on the CPU, the first being "
+                f"{tuple(int(v) for v in _or_fails[0]['order'])} of episode "
+                f"{int(_or_fails[0]['episode'])} at "
+                f"rel_l2={_or_fails[0]['rel_l2']} > {_GRAD_ORACLE_TOL}. The "
+                f"run's own episodes are complete and its checkpoint is "
+                f"written; this is a graphax defect to fix.")
 
     pbar.close()
 

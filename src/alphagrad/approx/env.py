@@ -1235,15 +1235,16 @@ def _record_zero_work_plan() -> None:
 # with `--plan-log` off.
 #
 # THE KIND is the reason's prefix: `oom`, `untraceable`, `muls-cap`,
-# `no-target-fun`, `raised`, `oracle`. The detail after the colon stays on the
-# plan record's `refused` field, which is not aggregated.
+# `no-target-fun`, `raised`. The detail after the colon stays on the plan
+# record's `refused` field, which is not aggregated.
+#
+# `oracle` IS GONE (owner ruling 2026-09-18). It named the gradient oracle's
+# own float64 compile failing inside the measurement, which was 3.9 percent of
+# every plan measured and 15.6 percent of an oracle-due episode's. The oracle
+# left the measurement path: it runs asynchronously on the CPU and cannot
+# refuse a plan any more, so nothing produces that kind. `refusal_kind` still
+# parses it, because archived plan logs carry it.
 _REFUSED_KINDS: dict = {}
-# Where the LAST exception inside a measurement came from, when the callback
-# knows. Set by `_grad_oracle_check` so the wrapper can say `oracle` instead
-# of a bare `raised:XlaRuntimeError` -- the oracle's own float64 compile
-# failing is a different fault from the plan failing, and the two must not
-# share one counter. Cleared at the top of every `_callback`.
-_LAST_RAISE_SOURCE = [None]
 
 
 def refusal_kind(reason: str) -> str:
@@ -2449,6 +2450,15 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
             max_faces_recorded=_plan_log_max_faces(),
             compress_sentinel=COMPRESS_SENTINEL,
             quant_sentinel=QUANT_SENTINEL))
+        # THE CONTENT HASH OF THE FIVE WIRES (see `_plan_content_key`). It is
+        # what the per-episode dedupe already keys on, and it is the JOIN a
+        # LATE record needs: the plan log is append-only, so the asynchronous
+        # gradient oracle's answer cannot be added to this line later. It is
+        # written as its own `oracle_result` line naming this hash and this
+        # episode. Recorded on EVERY terminal plan, dedupe on or off, because
+        # a join key that exists only under a flag is not a join key.
+        rec["plan_hash"] = _plan_content_key(
+            order, rule_specs, face_specs, face_skips, face_joins).hex()
         rec["rewards"] = [float(x) for x in
                           np.asarray(reward_vec).reshape(-1).tolist()]
         rec["reward_names"] = list(REWARD_NAMES)
@@ -4849,7 +4859,11 @@ def _grad_cosine_k() -> int:
 _GRAD_ORACLE_ENV = "ALPHAGRAD_GRAD_ORACLE"
 _GRAD_ORACLE_TOL_ENV = "ALPHAGRAD_GRAD_ORACLE_TOL"
 _GRAD_ORACLE_CADENCE_ENV = "ALPHAGRAD_GRAD_ORACLE_CADENCE"
-_GRAD_ORACLE_DONE: set = set()
+_GRAD_ORACLE_TIMEOUT_ENV = "ALPHAGRAD_GRAD_ORACLE_TIMEOUT"
+# "Once per process and order" now lives with the worker that schedules the
+# checks (`common.grad_oracle_async.AsyncGradOracle`), because the trainer has
+# to know which orders it is still waiting for and a module-global set does not
+# say. This file keeps only what the check itself needs.
 _GRAD_ORACLE_STATS = {"checks": 0, "rel_l2_max": 0.0}
 
 # THE BAR THE ORACLE ENFORCES. One constant, read by the check and by the
@@ -4948,22 +4962,47 @@ def grad_oracle_cadence() -> int:
         return 50
 
 
+def grad_oracle_timeout() -> float:
+    """How long one asynchronous check may be in flight before the trainer
+    counts it as a ``timeout`` and stops waiting for it. Default 600 s,
+    ``--grad-oracle-timeout`` on ppo.py, published as
+    ``ALPHAGRAD_GRAD_ORACLE_TIMEOUT``. A timeout is MISSING DATA: it is counted
+    and written and it does not stop the run."""
+    try:
+        return max(1.0, float(os.environ.get(_GRAD_ORACLE_TIMEOUT_ENV, "600")))
+    except ValueError:
+        return 600.0
+
+
 class GradientOracleFailure(RuntimeError):
     """The exact gradient of an elimination order disagrees with ``jax.grad``
-    (oracle A, ticket dsnn-3qm.62). THE RUN CONTINUES: this is a plain
-    ``RuntimeError``, so it travels the generic measure-failure path -- the
-    order is refused, its plan record is written with
-    ``refused="raised:GradientOracleFailure"`` and a sentinel reward, and the
-    next plan is measured. Refusing is the point: every quality number of that
-    order would otherwise be measured against a wrong reference."""
+    (oracle A, ticket dsnn-3qm.62).
+
+    IT NO LONGER REFUSES A PLAN (owner ruling 2026-09-18). The oracle is a
+    sanity check and not part of the scoring: it runs on the CPU, in float64,
+    on the trainer's oracle thread, after the plan has already been measured
+    and scored. So this exception never reaches a measurement and never puts a
+    sentinel reward anywhere. It is raised by the check and recorded as a
+    ``fail``, and the TRAINER re-raises at the next episode boundary, after
+    that episode's checkpoint has been written.
+
+    THE RUN STOPS because a disagreement in float64 on the CPU is a real
+    graphax defect: every order of the campaign's targets sits at 1e-14 there
+    (agent-df8 report, 2026-09-16), so there is no noise band it could be.
+    The checkpoint is what makes stopping cheap -- the run resumes from it once
+    the defect is fixed."""
 
 
 def grad_oracle() -> str:
     """``"reference"`` (default) or ``"off"``: whether the exact gradient of
     every elimination order is checked ONCE per process against ``jax.grad``
-    before it serves as the quality reference (oracle A, owner Q6/Q21;
-    ``--grad-oracle`` on ppo.py and landscape_map, published as
-    ``ALPHAGRAD_GRAD_ORACLE`` so the measure actors read the same value)."""
+    (oracle A, owner Q6/Q21; ``--grad-oracle`` on ppo.py, published as
+    ``ALPHAGRAD_GRAD_ORACLE``).
+
+    THE CHECK IS RETROACTIVE (owner ruling 2026-09-18). It runs on the
+    trainer's oracle thread, on the CPU, AFTER the order has been measured and
+    scored -- so "reference" no longer names anything the reward path waits
+    for. The measure actors read the same value and act on none of it."""
     want = os.environ.get(_GRAD_ORACLE_ENV, "reference").strip().lower()
     if want not in ("reference", "off"):
         raise ValueError(
@@ -4984,7 +5023,14 @@ def _matmul_precision() -> str:
     return str(jax.config.jax_default_matmul_precision)
 
 
-def _grad_oracle_exact(config, order, args):
+def _is_cpu_device(device) -> bool:
+    """True when ``device`` is a CPU device. The asynchronous oracle runs on
+    one, and two decisions in this file turn on it: which compile path the
+    elimination takes, and which compiler faults are reachable at all."""
+    return str(getattr(device, "platform", "")).lower() == "cpu"
+
+
+def _grad_oracle_exact(config, order, args, device=None):
     """The plan's exact vertex-elimination gradient, TRACED AND COMPILED HERE.
 
     NOT the caller's ``compiled_exact``. Matmul precision is baked into the
@@ -4997,14 +5043,25 @@ def _grad_oracle_exact(config, order, args):
     process and order the oracle now pays, and caching the reference pays for
     most of it.
 
-    ``_compile_measure`` and not a plain ``.compile()``: outside that path the
-    XLA:GPU bitcast-hoisting pass fails a CHECK and dumps core on the
-    TransformerLM plans (dsnn-df8, jobs 66074/66075).
+    ``_compile_measure`` and not a plain ``.compile()`` ON A GPU DEVICE:
+    outside that path the XLA:GPU bitcast-hoisting pass fails a CHECK and
+    dumps core on the TransformerLM plans (dsnn-df8, jobs 66074/66075).
+
+    ON THE CPU DEVICE -- where the asynchronous oracle runs -- the plain
+    compile is the right one. Every option ``_compile_measure`` sets and every
+    fault it retries around is XLA:GPU's (ptxas, Triton, shared-memory tiles,
+    the nvlink toolchain); none of them exists on the CPU backend, and handing
+    XLA:CPU a set of ``xla_gpu_*`` options is at best a no-op and at worst an
+    INVALID_ARGUMENT. This is also why the oracle's own compile can no longer
+    refuse anything: the Blackwell shared-memory limit that refused 15.6
+    percent of oracle-due plans is not reachable from here.
     """
     fn = jacve(config.target_fun, list(order), argnums=config.argnums,
                has_aux=config.has_aux,
                sparse_representation=bool(getattr(config, "sparse", False)))
-    exe = _compile_measure(jax.jit(fn, keep_unused=True).lower(*args))
+    lowered = jax.jit(fn, keep_unused=True).lower(*args)
+    exe = (lowered.compile() if _is_cpu_device(device)
+           else _compile_measure(lowered))
     out = exe(*args)
     return _gradient_leaves(out[1] if config.has_aux else out)
 
@@ -5052,56 +5109,26 @@ def _grad_oracle_reference(config, args, device, probe_seed):
     return leaves
 
 
-def _grad_oracle_check(config, compiled_exact, base_args, device, order_key,
-                       *, rel_tol: float | None = None):
-    """Oracle A: the SAME-ORDER exact gradient against ``jax.grad`` of the
-    target on the real probe batch, once per process and order.
+def _grad_oracle_rel_l2(config, order, a, device, probe_seed):
+    """THE NUMBER THE ORACLE IS ABOUT: ``(rel_l2, n_leaves)``.
 
-    BOTH SIDES RUN AT ``_GRAD_ORACLE_PRECISION`` ("highest"), under ONE
-    context manager. At the default float32 precision this hardware uses TF32
-    for the dots, and the oracle then asks whether two TF32 evaluations of one
-    quantity agree to better than one part in a thousand while a single TF32
-    evaluation is already one part in a thousand away from the truth
-    (dsnn-df8). The elimination side is therefore re-traced inside the
-    context; see :func:`_grad_oracle_exact` for why the caller's
-    ``compiled_exact`` cannot be reused. The reference side is cached across
-    orders; see :func:`_grad_oracle_reference` for the key.
+    The plan's exact gradient of ``order`` against ``jax.grad`` of the target,
+    both in float64 under :func:`_x64_scope`, both at
+    ``_GRAD_ORACLE_PRECISION``, on ``device``, on the probe batch already
+    substituted into ``a``.
 
-    Densifying the exact output here is the oracle's job, not the reward
-    path's. Raises ``GradientOracleFailure`` when the relative L2 distance
-    exceeds ``rel_tol`` (at "highest" an exact order sits at 1e-6 or below on
-    GPU and on CPU; a wrong Jacobian sits at 1e-1..1). A raise REFUSES AND
-    RECORDS that order and the run continues -- see
-    :class:`GradientOracleFailure`.
+    IT RETURNS A NUMBER AND DOES NOT JUDGE IT. The tolerance belongs to the
+    caller: :func:`grad_oracle_cpu_check` records a ``fail`` above it and the
+    trainer stops the run at the next episode boundary, after that episode's
+    checkpoint. A STRUCTURAL disagreement -- a different number
+    of leaves, a dead path, a shape that does not match -- still raises here,
+    because there is no number to return for it.
     """
-    if rel_tol is None:
-        rel_tol = grad_oracle_tol()
-    if grad_oracle() == "off" or compiled_exact is None:
-        return
-    key = (tuple(int(v) for v in order_key), str(device))
-    if key in _GRAD_ORACLE_DONE:
-        return
-    # jax.grad needs a scalar loss and a real probe batch; the analytic
-    # Jacobian benchmarks have neither, and their grad-cosine is undefined
-    # anyway (the walk falls back to jac_cosine there).
-    if config.target_fun is None or not getattr(config, "scalar_target", False):
-        return
-    # THE EPISODE IS READ ONCE, not twice. `_probe_batch` would fold
-    # `walk_episode()` in itself, and the reference cache has to key on the
-    # SAME number the batch was drawn at. With `--walk-rotate` off this is the
-    # pre-change seed exactly, so nothing moves.
-    episode = int(walk_episode()) if walk_rotate_enabled() else 0
-    probe_seed = _walk_seed("train", episode)
-    data = _probe_batch(config, base_args, role="train", index=0,
-                        episode=episode)
-    if data is None:
-        return
-    a = list(base_args)
-    for slot in range(min(2, len(data))):
-        a[slot] = jax.device_put(jnp.asarray(data[slot]), device)
     # THE FLOAT64 SCOPE IS THE ORACLE'S ALONE (see _x64_scope). The global
     # flag is read here only to record what the process saw OUTSIDE the
-    # scope, so a test can prove the scope did not move it.
+    # scope, so a test can prove the scope did not move it. The scope is
+    # thread-local, which is what lets the oracle's worker thread hold it open
+    # while the trainer traces its own float32 work on another thread.
     _GRAD_ORACLE_LAST_X64["outside"] = bool(jax.config.jax_enable_x64)
     with _x64_scope():
         _GRAD_ORACLE_LAST_X64["inside"] = bool(jax.config.jax_enable_x64)
@@ -5118,7 +5145,8 @@ def _grad_oracle_check(config, compiled_exact, base_args, device, order_key,
                 a_f64.append(x)
         with jax.default_matmul_precision(_GRAD_ORACLE_PRECISION):
             _GRAD_ORACLE_LAST_PRECISION["plan"] = _matmul_precision()
-            leaves = _grad_oracle_exact(config, [int(v) for v in order_key], a_f64)
+            leaves = _grad_oracle_exact(
+                config, [int(v) for v in order], a_f64, device)
             _GRAD_ORACLE_LAST_PRECISION["reference"] = _matmul_precision()
             ref_leaves = _grad_oracle_reference(config, a_f64, device, probe_seed)
             # Densify and convert to numpy while x64 is active so JAX does not
@@ -5129,37 +5157,129 @@ def _grad_oracle_check(config, compiled_exact, base_args, device, order_key,
                 for e in leaves
             ]
             ref_leaves_np = [np.asarray(r, dtype=np.float64) for r in ref_leaves]
+    _o6 = tuple(int(v) for v in order)[:6]
     if len(leaves_np) != len(ref_leaves_np):
         raise GradientOracleFailure(
-            f"[grad-oracle] order {key[0][:6]}...: {len(leaves_np)} exact "
+            f"[grad-oracle] order {_o6}...: {len(leaves_np)} exact "
             f"gradient leaves against {len(ref_leaves_np)} from jax.grad")
     num = den = 0.0
     for i, (e_np, r_np) in enumerate(zip(leaves_np, ref_leaves_np)):
         if e_np is None:
             raise GradientOracleFailure(
-                f"[grad-oracle] order {key[0][:6]}...: exact leaf {i} is a "
+                f"[grad-oracle] order {_o6}...: exact leaf {i} is a "
                 f"dead path")
         if e_np.shape != r_np.shape:
             raise GradientOracleFailure(
-                f"[grad-oracle] order {key[0][:6]}...: exact leaf {i} has "
+                f"[grad-oracle] order {_o6}...: exact leaf {i} has "
                 f"shape {e_np.shape}, jax.grad {r_np.shape}")
         num += float(np.sum((e_np - r_np) ** 2))
         den += float(np.sum(r_np ** 2))
-    rel = math.sqrt(num) / max(math.sqrt(den), 1e-30)
+    return math.sqrt(num) / max(math.sqrt(den), 1e-30), len(leaves_np)
+
+
+# ---------------------------------------------------------------------------
+# THE ASYNCHRONOUS ORACLE'S TWO HALVES (owner ruling 2026-09-18).
+#
+# The oracle is a SANITY CHECK and no longer part of the scoring. It runs on
+# the CPU device, in the trainer process, on one worker thread that nothing
+# waits for -- see `alphagrad.approx.common.grad_oracle_async`. This file owns
+# the two halves that need env's own state:
+#
+#   `grad_oracle_submission`  runs on the TRAINER thread and freezes what the
+#                             check will need: the probe seed of the episode
+#                             and the arguments, on the host as numpy.
+#   `grad_oracle_cpu_check`   runs on the WORKER thread and answers.
+#
+# THE SPLIT IS NOT COSMETIC. `_probe_batch` and `_PROBE_BATCH` are process
+# globals with no lock, and `base_args` are device arrays the trainer is using;
+# reading either from the worker would be a race. Everything the worker touches
+# is therefore host memory it was handed, plus the CPU device.
+# ---------------------------------------------------------------------------
+def grad_oracle_cpu_device():
+    """The CPU device the asynchronous oracle runs on.
+
+    ``jax.devices("cpu")[0]``, ALWAYS EXPLICIT. The trainer's default device is
+    the GPU, and the whole point of the ruling is that this check does not
+    touch it: a float64 elimination of a TransformerLM plan is the compile that
+    exhausted Blackwell's shared memory, and it has no business on the device
+    the campaign is timing. Raises if the backend has no CPU device, because
+    silently falling back to the GPU is the behaviour this replaces."""
+    devs = jax.devices("cpu")
+    if not devs:
+        raise RuntimeError(
+            "the asynchronous gradient oracle runs on jax.devices('cpu')[0] "
+            "and this backend exposes no CPU device")
+    return devs[0]
+
+
+def grad_oracle_submission(config, base_args, episode):
+    """What the TRAINER freezes for one oracle-due episode.
+
+    Returns ``(probe_seed, args_np)`` or ``None`` when this configuration has
+    nothing the oracle can check (no target, no scalar loss, no data
+    generator -- the same three guards the synchronous check had).
+
+    ``args_np`` is HOST memory: the arguments with the episode's probe batch
+    already in slots 0 and 1, pulled off the device here, on the trainer's own
+    thread, at the moment the episode ends. The worker thread is then
+    independent of every device array the trainer goes on to use, and of the
+    probe-batch cache.
+    """
+    if grad_oracle() == "off":
+        return None
+    if config.target_fun is None or not getattr(config, "scalar_target", False):
+        return None
+    # THE EPISODE IS READ ONCE, not twice: `_probe_batch` would fold
+    # `walk_episode()` in itself, and the reference cache has to key on the
+    # SAME number the batch was drawn at. The episode is a PARAMETER here and
+    # not the published rotation index, because `host_log` submits one episode
+    # late under --measure-pipeline and must freeze that episode's batch.
+    ep = int(episode) if walk_rotate_enabled() else 0
+    probe_seed = _walk_seed("train", ep)
+    data = _probe_batch(config, base_args, role="train", index=0, episode=ep)
+    if data is None:
+        return None
+    a = list(jax.device_get(list(base_args)))
+    for slot in range(min(2, len(data))):
+        a[slot] = np.asarray(data[slot])
+    return int(probe_seed), a
+
+
+def grad_oracle_cpu_check(config, args_np, order, probe_seed):
+    """ONE check, on the CPU device, in float64. Returns ``(status, rel_l2)``.
+
+    ``status`` is ``"pass"`` when the relative L2 distance is at or below
+    :func:`grad_oracle_tol` and ``"fail"`` above it. A FAIL HERE IS A REAL
+    DEFECT: in float64 on the CPU every order of this target sits at 1e-14
+    (agent-df8 report, 2026-09-16), so there is no noise band to hide in and
+    nothing to widen. The caller stops the run.
+
+    ``jax.default_device`` is held over the whole call so that the arguments,
+    the elimination's own trace and compile, and ``jax.grad``'s all land on the
+    CPU; the probe batch and the arguments are ALSO device_put explicitly, so
+    the placement is stated and not inferred. Both that context and
+    :func:`_x64_scope` are thread-local, which is what makes this safe to run
+    beside the trainer.
+    """
+    dev = grad_oracle_cpu_device()
+    with jax.default_device(dev):
+        a = []
+        for x in args_np:
+            if hasattr(x, "dtype") or isinstance(x, (tuple, list)):
+                a.append(jax.device_put(x, dev))
+            else:
+                a.append(x)
+        rel, n_leaves = _grad_oracle_rel_l2(
+            config, [int(v) for v in order], a, dev, int(probe_seed))
+    tol = grad_oracle_tol()
     _GRAD_ORACLE_STATS["checks"] += 1
     _GRAD_ORACLE_STATS["rel_l2_max"] = max(_GRAD_ORACLE_STATS["rel_l2_max"], rel)
-    print(f"[grad-oracle] order {key[0][:6]}... on {device}: exact gradient "
-          f"vs jax.grad rel_l2={rel:.3e} ({len(leaves)} leaves, both sides at "
-          f"matmul precision {_GRAD_ORACLE_PRECISION})", flush=True)
-    if not (rel <= rel_tol):
-        raise GradientOracleFailure(
-            f"[grad-oracle] order {key[0][:6]}... on {device}: the exact "
-            f"gradient differs from jax.grad by rel_l2={rel:.3e} > {rel_tol} "
-            f"with both sides at matmul precision "
-            f"{_GRAD_ORACLE_PRECISION}; the quality reference of this order "
-            f"is wrong -- the order is REFUSED and recorded, the run "
-            f"continues")
-    _GRAD_ORACLE_DONE.add(key)
+    status = "pass" if rel <= tol else "fail"
+    print(f"[grad-oracle] order {tuple(int(v) for v in order)[:6]}... on "
+          f"{dev}: exact gradient vs jax.grad rel_l2={rel:.3e} "
+          f"({n_leaves} leaves, float64, matmul precision "
+          f"{_GRAD_ORACLE_PRECISION}) -> {status}", flush=True)
+    return status, rel
 
 
 def quality_metric(config=None) -> str:
@@ -7761,7 +7881,6 @@ def _callback(
     """
     _t0 = int(_PLAN_LOG_TERMINALS[0])
     _r0 = len(_PLAN_RECORDS)
-    _LAST_RAISE_SOURCE[0] = None
     try:
         return _callback_measured(
             config, args, consts, order, sparsity_specs, face_specs,
@@ -7770,12 +7889,14 @@ def _callback(
         # THE RATE IS TELEMETRY, WHATEVER THE PLAN LOG IS DOING. A raised
         # terminal is a refused measurement; the trainer excludes the whole
         # environment from the update, so without this counter the exclusion
-        # would be silent. `oracle:` separates the gradient oracle's own
-        # float64 compile failing from the plan failing -- two different
-        # faults that must not share one number.
-        _src = _LAST_RAISE_SOURCE[0]
-        _reason = (f"{_src}:{type(_exc).__name__}" if _src
-                   else f"raised:{type(_exc).__name__}")
+        # would be silent.
+        #
+        # EVERY RAISE FROM IN HERE IS THE PLAN'S NOW. It used to be necessary
+        # to separate the gradient oracle's own float64 compile failing from
+        # the plan failing, because the oracle ran inside this callback. It
+        # does not any more (owner ruling 2026-09-18), so there is one source
+        # again and `raised:` names it.
+        _reason = f"raised:{type(_exc).__name__}"
         if int(_PLAN_LOG_TERMINALS[0]) > _t0:
             _record_refusal(_reason)
         # Only when THIS call counted a terminal and wrote nothing for it.
@@ -8677,30 +8798,24 @@ def _callback_measured(
     else:
         compiled_exact = None
     _pf("cb.xla_compile")
-    # ORACLE A (ticket .62): the same-order exact gradient against jax.grad,
-    # once per process and order, before it serves as the quality reference.
-    # Gated by grad_oracle_cadence (default 50 episodes).
-    _cadence = getattr(config, "grad_oracle_cadence", None)
-    if _cadence is None:
-        _cadence = grad_oracle_cadence()
-    _ep = walk_episode()
-    _oracle_due = (_cadence <= 1) or (_ep % _cadence == 0)
-    if compiled_exact is not None and _qmetric == "grad_cosine" and _oracle_due:
-        # NAME THE SOURCE OF A RAISE FROM IN HERE. The oracle builds its own
-        # float64 copy of the elimination, which is a bigger compile than the
-        # measurement's and is the one that exhausts the device on the
-        # TransformerLM plans. When that happens the plan is refused -- the
-        # owner's ruling of 2026-09-18 keeps the oracle even so -- but the
-        # refusal belongs to the ORACLE, not to the plan, and the telemetry
-        # has to say which. The exception itself is untouched and still
-        # propagates: nothing is swallowed here.
-        try:
-            _grad_oracle_check(config, compiled_exact, list(args),
-                               callback_device, o_list)
-        except BaseException:
-            _LAST_RAISE_SOURCE[0] = "oracle"
-            raise
-        _pf("cb.grad_oracle")
+    # ORACLE A (ticket .62) IS NOT HERE ANY MORE (owner ruling 2026-09-18).
+    #
+    # It used to run right at this point: the same-order exact gradient against
+    # jax.grad, on the measure actor's GPU, in float64, BEFORE the measurement
+    # it guards. That put a sanity check inside the scoring path, and on
+    # Blackwell the check's own float64 compile exhausted the SM's shared
+    # memory and REFUSED the plan -- 15.6 percent of the plans of an
+    # oracle-due episode, which is 3.9 percent of every plan measured
+    # (agent-sentinel report, 2026-09-18, section 4). The apparatus was
+    # scoring the apparatus.
+    #
+    # The oracle is now ASYNCHRONOUS, RETROACTIVE and on the CPU: one worker
+    # thread in the TRAINER process, fed the distinct orders of an oracle-due
+    # episode after that episode is over, writing its answers back as late
+    # `oracle_result` records. See `grad_oracle_cpu_check` in this file and
+    # `alphagrad.approx.common.grad_oracle_async`. Nothing in this callback
+    # waits for it, and the `refused/oracle` telemetry kind is therefore gone:
+    # the oracle can no longer refuse anything.
 
     # XLA cost analysis — flops + bytes accessed. Falls back to 0 when the
     # backend doesn't expose them (CPU sometimes returns an empty dict).
