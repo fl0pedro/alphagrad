@@ -5667,9 +5667,10 @@ def _probe_seed(config, role: str = "train", episode: int | None = None,
     copy was short by the two terms below, so on a generator that redraws per
     environment and per episode every row after the first was scored against
     the FIRST row's exact gradient -- a gradient at another step of the
-    recording, which is an unrelated vector. Measured on RSNN_SHD rtrl,
-    job 66642: row 0 read 1.0 and rows 1 to 3 read -0.240, -0.174, -0.221
-    (dsnn-dfw.52).
+    recording, which is an unrelated vector. Job 66642 read a quality median of
+    +0.0197 over [-0.2417, +1] on plans that were all exact; probe 66655
+    reproduced it on that job's own arguments, four rows in one process:
+    +1.000, -0.240, -0.174, -0.221 (dsnn-dfw.52).
 
     On every generator that does NOT declare ``resample_per_env_episode`` this
     is exactly ``_walk_seed(role, episode) + 104729 * index``, which is what
