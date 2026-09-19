@@ -3551,7 +3551,13 @@ class Agent(eqx.Module):
                             s2_nout=_nout2[:_K],
                             ctx0_head=_fctx[0][:_K],
                             p_skip_unmapped=jnn.sigmoid(
-                                _pol.head.logits(_fctx[0])[0]))
+                                _pol.head.logits(_fctx[0])[0]),
+                            p_skip_vmap8=jnn.sigmoid(jax.vmap(
+                                _pol.head.logits)(_fctx[:_K])[:, 0]),
+                            p_skip_map8=jnn.sigmoid(lax.map(
+                                _pol.head.logits, _fctx[:_K])[:, 0]),
+                            p_skip_vmapF=jnn.sigmoid(jax.vmap(
+                                _pol.head.logits)(_fctx)[:_K, 0]))
                     _rs_pad = -jnp.ones_like(_rs2).at[..., 2].set(0)
                     fa = FaceAction(
                         skip=_keep(_sk2, jnp.zeros((_F,), jnp.int32)),
