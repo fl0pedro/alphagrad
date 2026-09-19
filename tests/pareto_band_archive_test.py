@@ -248,16 +248,19 @@ def test_members_ride_the_front_and_the_dump(tmp_path):
 
 
 def test_the_member_list_is_bounded_by_the_window_budget():
-    a = _arch(pool_cap=30)
+    # pool_cap 40 = exactly two measurements, so the pooled sample stays
+    # centred and every later plan still lands inside the band.
+    a = _arch(pool_cap=40)
     a.add(_d(FLAT), ["A"], 0)          # 20 windows pooled
-    a.add(_d(FLAT * 0.5), ["B"], 1)    # 10 more, the pool is now full
-    assert a.samples[0][0].size == 30
-    assert [m["windows"] for m in a.members[0]] == [20, 10]
-    a.add(_d(FLAT * 0.5), ["C"], 2)    # contributes nothing, not a member
+    a.add(_d(FLAT), ["B"], 1)          # 20 more, the pool is now full
+    assert a.samples[0][0].size == 40
+    assert [m["windows"] for m in a.members[0]] == [20, 20]
+    a.add(_d(FLAT), ["C"], 2)          # contributes nothing, not a member
     assert [m["seq"] for m in a.members[0]] == [["A"], ["B"]]
     assert a.counts == [3]
-    a.add(_d(FLAT * 0.5), ["B"], 3)    # already a member, still counted
+    a.add(_d(FLAT), ["B"], 3)          # already a member, still counted
     assert [m["n"] for m in a.members[0]] == [1, 2]
+    assert [m["windows"] for m in a.members[0]] == [20, 20]
 
 
 def test_members_survive_the_checkpoint_round_trip():
