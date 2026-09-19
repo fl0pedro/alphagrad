@@ -115,7 +115,8 @@ def matrix(gen):
     arms = [a for a in gen.thesis_arms()
             if not a.get("smoke") and not a.get("orderonly")
             and not a.get("orderonly_rsnn")
-            and not a.get("orderonly_final")]
+            and not a.get("orderonly_final")
+            and not a.get("orderonly_tlm_final")]
     assert arms, "the generator emits no thesis arm"
     return arms
 
@@ -782,7 +783,8 @@ def test_target_nodes_routing(monkeypatch):
     # switch pins the MATRIX and must not reach either of them.
     matrix = [a for a in mod.thesis_arms()
               if not a.get("smoke") and not a.get("orderonly")
-              and not a.get("orderonly_final")]
+              and not a.get("orderonly_final")
+              and not a.get("orderonly_tlm_final")]
     for a in matrix:
         if a["thesis_target"] == "tlm":
             assert a["node"] in ("pgi15-gpu19", "pgi15-gpu16"), a["name"]
