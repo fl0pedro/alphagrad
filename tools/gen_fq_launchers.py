@@ -663,6 +663,8 @@ SHARED_CLI = [
     # bytes of the plan's own executable, the runtime watermark is logged
     # beside it (measure/mem_parity/*).  --mem-type peak_memory above still
     # selects WHICH slot --lambda-mem weights.
+    # STE: every thesis row overrides this with THESIS_MEM_CHANNEL watermark
+    # (owner 2026-09-19); temp stays the campaign's channel.
     ("--mem-channel", "temp"),
     # THE REDUCE AXIS SPACE (ticket .20): Reduce axes are physical val axes.
     # The ppo.py default; named so no arm inherits the pre-ticket read.
@@ -1451,6 +1453,8 @@ QUALITY_FLOOR_TAU = "0.90"
 # Dual ascent (arm L only): lam <- clip(lam + eta*(violation - target), min, max).
 DUAL_ETA = "2.0"
 DUAL_LAMBDA_MIN = "12"
+# STE: every thesis row raises this cap to THESIS_DUAL_LAMBDA_MAX 64 (owner
+# 2026-09-19); 32 stays the campaign's cap.
 DUAL_LAMBDA_MAX = "32"
 CAMPAIGN_SEED = "250197"
 
@@ -1475,6 +1479,9 @@ GATE_OFFLINE_CONTRAST = {"markowitz": "0.19", "free": "0.19", "reverse": "0.00"}
 #: The paired-cost floor every campaign arm runs under (ppo.py
 #: --paired-cost-floor).  `reference` is what finding 63 priced and what the
 #: owner approved; `byte` is the pre-2026-09-13 floor.
+#: STE: every thesis row runs under THESIS_PAIRED_COST_FLOOR byte instead
+#: (owner 2026-09-19), because the reference floor made the cost reward
+#: min(0, -log ratio) and no plan could earn a gain below parity.
 PAIRED_COST_FLOOR = "reference"
 
 # The profiles of ticket .40 (ppo.py --approx-profile choices) and the orders
@@ -2207,6 +2214,34 @@ THESIS_TAU = QUALITY_FLOOR_TAU          # 0.90
 THESIS_TIME = "24:00:00"
 
 # ---------------------------------------------------------------------------
+# THE FOUR BLOCK SETTINGS (owner rulings 2026-09-19, epic dsnn-dfw).  They are
+# named HERE, in the thesis section, and not on the campaign constants above:
+# the campaign is a finished running comparison and finding 63 priced it under
+# the campaign's own values.  Every thesis row -- the A/B/C arms on NN256, TLM
+# and the SNN, the order-only NN256 and SNN rows, the preference-conditioned
+# rows -- reads these four, because every one of them is built by `thesis_cli`.
+# ---------------------------------------------------------------------------
+#: THE PAIRED-COST FLOOR (a).  byte, not the campaign's `reference`: the
+#: reference floor made the cost reward min(0, -log ratio), so no plan could
+#: earn a gain below parity.  The Lagrangian handles the skip-all exploit.
+THESIS_PAIRED_COST_FLOOR = "byte"
+#: THE LAGRANGIAN CAP (b).  64, not the campaign's 32: the skip-all plan on
+#: TLM earns about 17 nats of memory gain plus its latency gain, and the
+#: penalty is lambda times a violation of about 0.9, so 32 barely wins and 64
+#: has room.  --lag-init (THESIS_LAMBDA_Q, 16) and --lag-min (DUAL_LAMBDA_MIN,
+#: 12) do not move; the code does not tie them to the cap.
+THESIS_DUAL_LAMBDA_MAX = "64"
+#: THE MEMORY CHANNEL (c).  watermark, not the campaign's static temp bytes:
+#: the runtime water level is the real quantity and it carries the allocator
+#: step.
+THESIS_MEM_CHANNEL = "watermark"
+#: AUTO-STOP IS OFF ON A FINAL ROW (d).  A FINAL row is one `thesis_arm`
+#: emits: the A/B/C arms of the matrix and the recurrent block.  A TUNING row
+#: (orderonly_nn256_*, orderonly_rsnn_*) calls `thesis_cli` itself with
+#: auto_stop=True and keeps it.  The smoke rows pass auto_stop=False already.
+THESIS_FINAL_AUTO_STOP = False
+
+# ---------------------------------------------------------------------------
 # THE HARDWARE.  Six Blackwell nodes (owner: "all six Blackwell nodes with a
 # per-node singleton dependency").  Two of them carry eight GPUs and four
 # carry four, so the measurement fan-out is per node: one GPU for the trainer
@@ -2501,22 +2536,23 @@ the channels and the reward form, and these runs collect the fronts the thesis
 reports.
 
 WHAT IS SHARED BY EVERY ARM.  Three trained channels -- paired log-difference
-latency, paired log-difference static temp memory (both against rev-exact
-measured back to back in the same actor; --cost-form paired-log, --mem-channel
-temp) and grad-cosine quality -- weighted --lambda-cmp 1 --lambda-mem 1.
+latency, paired log-difference runtime watermark memory (both against
+rev-exact measured back to back in the same actor; --cost-form paired-log,
+--mem-channel {THESIS_MEM_CHANNEL}) and grad-cosine quality -- weighted
+--lambda-cmp 1 --lambda-mem 1.
 Terminal rewards only, gamma = GAE lambda = 1, classic init with the MVP face
 head (--scale-face-head {SCALE_FACE_HEAD_MVP}, --face-logit-clamp
 {FACE_LOGIT_CLAMP_MVP}), the face ADD --approx-add {APPROX_ADD}, the paired
-cost floor --paired-cost-floor {PAIRED_COST_FLOOR}, and THE SPATIAL ORDER FREE
+cost floor --paired-cost-floor {THESIS_PAIRED_COST_FLOOR} (owner 2026-09-19:
+the reference floor made the cost reward min(0, -log ratio), so no plan could
+earn a gain below parity), and THE SPATIAL ORDER FREE
 (--fixed-order {THESIS_ORDER}): the policy chooses the elimination order as
 well as the approximations.
 
-WHAT EACH RUN DOES.  --episodes {THESIS_EPISODES} with --auto-stop (the check
-points are after 250 and after 500 episodes; the run ends early only when the
-Pareto archive admitted nothing over the last 100 episodes AND the raw
-weighted mean return moved less than 2 percent AND the arm either collapsed or
-stopped changing its terminal plan), --checkpoint-every
-{THESIS_CHECKPOINT_EVERY} so an auto-stopped or killed run can be continued
+WHAT EACH RUN DOES.  --episodes {THESIS_EPISODES} WITHOUT --auto-stop (owner
+2026-09-19: a final row runs its full thousand episodes; the tuning rows keep
+the early stop), --checkpoint-every
+{THESIS_CHECKPOINT_EVERY} so a killed run can be continued
 exactly, --pareto-dump-every {THESIS_PARETO_DUMP_EVERY} and --plan-log
 {THESIS_PLAN_LOG} so the front over exploration and every terminal plan are on
 disk while the run is alive.
@@ -2549,8 +2585,11 @@ leave the identity".""",
          + THESIS_TAU + """ rather
 than a weighted channel; lambda is ascended once per episode on the measured
 mean violation, eta """ + DUAL_ETA + """, clipped to [""" + DUAL_LAMBDA_MIN
-         + ", " + DUAL_LAMBDA_MAX + """], started at """ + THESIS_LAMBDA_Q
-         + """.""",
+         + ", " + THESIS_DUAL_LAMBDA_MAX + """], started at """
+         + THESIS_LAMBDA_Q + """.  The cap is """ + THESIS_DUAL_LAMBDA_MAX
+         + """ and not 32 (owner 2026-09-19) so the multiplier can dominate
+the skip-all plan: that plan takes about 17 nats of memory gain plus its
+latency gain, against a penalty of lambda times a violation of about 0.9.""",
     "C_popart": """ARM C with PopArt: the same dual with per-channel
 debiased-EMA normalisation of the value targets and sigma-scaled advantages.
 --no-symlog AND --symlog-channels none ride with it (ppo.py checks the two
@@ -2642,7 +2681,8 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
         "--lambda-cmp": "1",
         "--lambda-mem": "1",
         "--lambda-acc": THESIS_LAMBDA_Q,
-        "--paired-cost-floor": PAIRED_COST_FLOOR,
+        "--paired-cost-floor": THESIS_PAIRED_COST_FLOOR,
+        "--mem-channel": THESIS_MEM_CHANNEL,
         "--advantage-norm": advantage_norm,
         # --- the measurement, sized by the node
         "--ray-measure": THESIS_RAY_MEASURE[gpus],
@@ -2673,7 +2713,7 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
         cli["--quality-floor"] = THESIS_TAU
         cli["--lag-eta"] = DUAL_ETA
         cli["--lag-min"] = DUAL_LAMBDA_MIN
-        cli["--lag-max"] = DUAL_LAMBDA_MAX
+        cli["--lag-max"] = THESIS_DUAL_LAMBDA_MAX
         cli["--lag-init"] = THESIS_LAMBDA_Q
     else:
         # ARMS A AND B: the fixed additive form with RAW quality and NO
@@ -2695,7 +2735,8 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
 def thesis_arm(*, arm: str, target: str, seed: str, node: str,
                name: str | None = None, episodes: str = THESIS_EPISODES,
                checkpoint_every: str = THESIS_CHECKPOINT_EVERY,
-               auto_stop: bool = True, what: str | None = None,
+               auto_stop: bool = THESIS_FINAL_AUTO_STOP,
+               what: str | None = None,
                prediction: str | None = None, held: str | None = None,
                time: str = THESIS_TIME, extra_cli: dict | None = None,
                grad_oracle_cadence: str = "50") -> dict:
@@ -3023,7 +3064,7 @@ def thesis_smoke_arms() -> list[dict]:
 # every plan, the Lagrangian constraint at tau 0.90 is never violated and
 # lambda decays to its floor, so the C form reduces to a pure SCALARIZATION
 #
-#     lambda_cmp * paired-log latency + lambda_mem * paired-log temp memory
+#     lambda_cmp * paired-log latency + lambda_mem * paired-log watermark memory
 #
 # and round 1 sweeps its two weights.  That is the MORL-to-SORL step: five
 # fixed weights, three seeds each, against one preference-conditioned run
@@ -3090,7 +3131,7 @@ nothing else.  No approximation is applied, the grad cosine is 1 on every
 plan and the C form's constraint at tau {THESIS_TAU} is never violated, so the
 objective is the pure scalarization
 
-    --lambda-cmp * paired-log latency + --lambda-mem * paired-log temp memory
+    --lambda-cmp * paired-log latency + --lambda-mem * paired-log watermark memory
 
 whose two weights this round sweeps.  Everything else is the matrix row it
 comes from: --episodes {THESIS_EPISODES} with --auto-stop, --checkpoint-every
@@ -3292,7 +3333,7 @@ RSNN_SHD instead of NN256, with --temporal-rule naming the recurrent rule
 this row measures.  No approximation is applied, the grad cosine is 1 on
 every plan, and the objective is the pure scalarization
 
-    --lambda-cmp * paired-log latency + --lambda-mem * paired-log temp memory
+    --lambda-cmp * paired-log latency + --lambda-mem * paired-log watermark memory
 
 --episodes {THESIS_EPISODES} with --auto-stop, --checkpoint-every
 {THESIS_CHECKPOINT_EVERY}, --pareto-dump-every {THESIS_PARETO_DUMP_EVERY},

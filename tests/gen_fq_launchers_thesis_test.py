@@ -65,7 +65,13 @@ TAU = "0.90"
 LAMBDA_Q = "16"
 DUAL_ETA = "2.0"
 DUAL_MIN = "12"
-DUAL_MAX = "32"
+#: THE BLOCK SETTINGS (owner rulings 2026-09-19): the cap is 64, the floor is
+#: byte, the memory channel is watermark, and a FINAL row carries no
+#: --auto-stop.  The tuning rows keep --auto-stop; their own test modules pin
+#: that.
+DUAL_MAX = "64"
+PAIRED_COST_FLOOR = "byte"
+MEM_CHANNEL = "watermark"
 ORDER = "free"
 GRAD_ORACLE_CADENCE = "50"
 
@@ -264,7 +270,11 @@ def test_every_arm_carries_the_shared_thesis_flags(gen, matrix):
         assert cli["--grad-oracle-cadence"] == GRAD_ORACLE_CADENCE, a["name"]
         assert cli["--pareto-dump-every"] == PARETO_DUMP_EVERY, a["name"]
         assert cli["--plan-log"] == "auto", a["name"]
-        assert "--auto-stop" in cli and cli["--auto-stop"] is None, a["name"]
+        # A FINAL ROW RUNS ITS FULL THOUSAND EPISODES (owner 2026-09-19):
+        # --auto-stop is absent, and the absence is asserted rather than
+        # trusted.
+        assert "--auto-stop" not in cli, a["name"]
+        assert gen.THESIS_FINAL_AUTO_STOP is False
         assert cli["--seed"] == a["thesis_seed"], a["name"]
         # the search space: the order is FREE in every arm
         assert cli["--fixed-order"] == ORDER, a["name"]
@@ -272,9 +282,11 @@ def test_every_arm_carries_the_shared_thesis_flags(gen, matrix):
         assert cli["--approx-add"] == gen.APPROX_ADD == "lossless", a["name"]
         # the reward stack the campaign settled
         assert cli["--cost-form"] == "paired-log", a["name"]
-        assert cli["--mem-channel"] == "temp", a["name"]
+        assert cli["--mem-channel"] == MEM_CHANNEL, a["name"]
+        assert gen.THESIS_MEM_CHANNEL == MEM_CHANNEL
         assert cli["--quality-metric"] == "grad_cosine", a["name"]
-        assert cli["--paired-cost-floor"] == "reference", a["name"]
+        assert cli["--paired-cost-floor"] == PAIRED_COST_FLOOR, a["name"]
+        assert gen.THESIS_PAIRED_COST_FLOOR == PAIRED_COST_FLOOR
         assert cli["--rewards"] == "cmp mem acc", a["name"]
         assert cli["--lambda-cmp"] == "1" and cli["--lambda-mem"] == "1"
         assert cli["--discount"] == "1.0" and cli["--gae-lambda"] == "1.0"
@@ -366,7 +378,11 @@ def test_the_three_c_arms_are_the_lagrangian_dual(gen, matrix):
         assert cli["--quality-floor"] == TAU, a["name"]
         assert cli["--lag-eta"] == DUAL_ETA, a["name"]
         assert cli["--lag-min"] == DUAL_MIN, a["name"]
+        # THE CAP IS 64 (owner 2026-09-19) so the multiplier can dominate the
+        # skip-all plan; --lag-init and --lag-min do not move with it.
         assert cli["--lag-max"] == DUAL_MAX, a["name"]
+        assert gen.THESIS_DUAL_LAMBDA_MAX == DUAL_MAX
+        assert gen.DUAL_LAMBDA_MIN == DUAL_MIN
         assert cli["--lag-init"] == LAMBDA_Q, a["name"]
         assert cli["--face-none-bias"] == "2", a["name"]
 
