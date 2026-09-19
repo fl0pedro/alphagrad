@@ -4610,27 +4610,38 @@ def paired_log_costs(latency_ns: float, peak_memory: float,
     return float(d_lat), float(d_mem), n_floored
 
 
-# TICKET dsnn-dfw.44. The DISTRIBUTION of one plan's paired ratio, in nats:
-# every candidate timed window against every interleaved reference window of
-# the SAME measurement. The median of the pair differences is the plan's own
-# log ratio and q05..q95 is how much that one measurement pins it down. The
-# floor here is PHYSICAL only (100 ns, 1 byte), never the reference floor
-# `paired_log_costs` applies: the archive's coordinate must keep the half of
-# the axis where a plan is FASTER than rev-exact, which the reward discards.
-def log_ratio_quantiles(cand_samples, ref_samples, floor: float,
-                        fallback: float) -> dict:
+# TICKET dsnn-dfw.44, second design. ONE PAIRED LOG RATIO PER CANDIDATE
+# WINDOW, in nats. The pair partner is the MEDIAN of that measurement's
+# reference windows, not the interleaved neighbour, for three reasons: it is
+# the same aggregate `_aggregate_samples` gives the reference in the paired
+# cost, so the plan's median window ratio IS its cost channel; the median of
+# 160 reference windows carries about one eighth of a single candidate
+# window's standard error, so holding it fixed loses almost nothing; and a
+# neighbour would fold one reference window's noise into every ratio and
+# widen the band without saying anything more about the CANDIDATE, which is
+# the thing being compared. The floor is PHYSICAL only (100 ns, 1 byte),
+# never the reference floor `paired_log_costs` applies: the archive's
+# coordinate must keep the half of the axis where a plan is FASTER than
+# rev-exact, which the reward discards.
+def paired_window_log_ratios(cand_samples, ref_samples, floor: float,
+                             fallback: float) -> np.ndarray:
     c = np.asarray(list(cand_samples), dtype=np.float64)
     r = np.asarray(list(ref_samples), dtype=np.float64)
     if c.size == 0 or r.size == 0:
-        # A channel with no per-window sample (the static temp) is a
-        # degenerate band at its own single reading.
-        f = float(fallback)
-        return {"q05": f, "median": f, "q95": f, "n": 0}
-    lc = np.log(np.maximum(c, float(floor)))
-    lr = np.log(np.maximum(r, float(floor)))
-    d = (lc[:, None] - lr[None, :]).ravel()
-    q05, med, q95 = (float(x) for x in np.quantile(d, (0.05, 0.5, 0.95)))
-    return {"q05": q05, "median": med, "q95": q95, "n": int(d.size)}
+        # A channel with no timed window (the static temp) is one reading.
+        return np.array([float(fallback)], dtype=np.float64)
+    ref = float(np.median(np.maximum(r, float(floor))))
+    return np.log(np.maximum(c, float(floor))) - math.log(ref)
+
+
+def window_ratio_record(windows) -> dict:
+    """The plan-log form of one objective's windows: the ratios themselves,
+    so any rule can be recomputed offline, and the band the archive fits."""
+    from alphagrad.approx.common.pareto_archive import median_band
+    w = np.asarray(windows, dtype=np.float64).reshape(-1)
+    med, lo, hi = median_band(w)
+    return {"windows": [float(x) for x in w], "median": med,
+            "lo": lo, "hi": hi, "n": int(w.size)}
 
 
 def _static_temp_bytes(compiled) -> float | None:
@@ -9950,12 +9961,12 @@ def _callback_measured(
             _mem_c, _mem_r = ((), ()) if mem_channel() == "temp" else (
                 peak_mem_samples, _ref_peak_samples)
             _ratio_log = {
-                "latency": log_ratio_quantiles(
+                "latency": window_ratio_record(paired_window_log_ratios(
                     latency_samples if config.measure_latency else (),
                     _ref_lat_samples if config.measure_latency else (),
-                    _LAT_FLOOR_NS, _lat_fb),
-                "memory": log_ratio_quantiles(
-                    _mem_c, _mem_r, _MEM_LOG_FLOOR_BYTES, _mem_fb),
+                    _LAT_FLOOR_NS, _lat_fb)),
+                "memory": window_ratio_record(paired_window_log_ratios(
+                    _mem_c, _mem_r, _MEM_LOG_FLOOR_BYTES, _mem_fb)),
             }
             _paired_ref_rec = {
                 "ratio_log": _ratio_log,

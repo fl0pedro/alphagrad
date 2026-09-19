@@ -1,132 +1,178 @@
-"""The distribution-aware archive rule (ticket dsnn-dfw.44)."""
+"""The distribution-aware archive rule (ticket dsnn-dfw.44, second design).
+
+The band is a 90 percent distribution-free interval for the MEDIAN of the
+plan's per-window paired log ratios, there is no drift floor, and a merged
+measurement POOLS its windows into the point it landed in.
+"""
 import json
 
 import numpy as np
 import pytest
 
-from alphagrad.approx.common.pareto_archive import RatioBandArchive
+from alphagrad.approx.common.pareto_archive import (
+    RatioBandArchive, _median_order_stat_lo, median_band)
 
 OBJ = ("latency", "peak_memory")
+FLAT = np.linspace(-1.0, 1.0, 20)          # median 0, band x_(6)..x_(15)
 
 
-def _d(lat, mem=(0.0, 0.0, 0.0)):
-    return {"latency": {"q05": lat[0], "median": lat[1], "q95": lat[2]},
-            "peak_memory": {"q05": mem[0], "median": mem[1], "q95": mem[2]}}
+def _d(lat, mem=(0.0,)):
+    return {"latency": np.asarray(lat, dtype=np.float64),
+            "peak_memory": np.asarray(mem, dtype=np.float64)}
 
 
 def _arch(**kw):
     return RatioBandArchive(OBJ, **kw)
 
 
-def test_median_beyond_q95_is_dominated():
+# ---- the interval itself ------------------------------------------------
+
+def test_order_statistic_is_the_binomial_one():
+    # 20 windows: P(Bin(20,1/2) <= 5) = 0.0207 <= 0.05, P(<= 6) = 0.0577 > 0.05
+    assert _median_order_stat_lo(20) == 6
+    assert _median_order_stat_lo(8) == 2
+    assert _median_order_stat_lo(6) == 1
+    # too few windows to exclude any order statistic
+    assert _median_order_stat_lo(4) == 0
+    assert _median_order_stat_lo(1) == 0
+    with pytest.raises(ValueError):
+        _median_order_stat_lo(0)
+
+
+def test_median_band_is_the_order_statistic_pair():
+    a = np.arange(20, dtype=np.float64)
+    med, lo, hi = median_band(a)
+    assert med == pytest.approx(9.5)
+    assert lo == pytest.approx(5.0)          # x_(6), 1-based
+    assert hi == pytest.approx(14.0)         # x_(15)
+    with pytest.raises(ValueError):
+        median_band([])
+
+
+def test_a_short_sample_gets_the_whole_range():
+    med, lo, hi = median_band([3.0, 1.0, 2.0])
+    assert (med, lo, hi) == (2.0, 1.0, 3.0)
+
+
+def test_the_band_narrows_as_the_sample_grows():
+    m1, l1, h1 = median_band(FLAT)
+    m2, l2, h2 = median_band(np.concatenate([FLAT, FLAT]))
+    assert (h2 - l2) < (h1 - l1)
+
+
+# ---- the archive rule ---------------------------------------------------
+
+def test_median_beyond_the_band_is_dominated():
     a = _arch()
-    assert a.add(_d((-0.10, -0.08, -0.06)), [1], 0)
-    # worse than the point's q95 on latency, inside its band on memory
-    assert not a.add(_d((0.01, 0.03, 0.05)), [2], 1)
+    assert a.add(_d(FLAT - 5.0), [1], 0)
+    hi = a.hi[0][0]
+    assert a.add(_d(FLAT + (hi + 1.0)), [2], 1) is False
     assert len(a.pts) == 1
 
 
-def test_median_below_q05_removes_the_point():
+def test_median_below_the_band_removes_the_point():
     a = _arch()
-    assert a.add(_d((-0.02, 0.00, 0.02)), [1], 0)
-    assert a.add(_d((-0.30, -0.28, -0.26)), [2], 1)
+    assert a.add(_d(FLAT), [1], 0)
+    lo = a.lo[0][0]
+    assert a.add(_d(FLAT + (lo - 1.0)), [2], 1)
     assert len(a.pts) == 1
     assert a.seqs == [[2]]
 
 
-def test_inside_the_band_merges_and_counts():
+def test_inside_the_band_pools_the_windows_and_narrows_it():
     a = _arch()
-    assert a.add(_d((-0.10, -0.08, -0.06)), [1], 0)
-    assert not a.add(_d((-0.09, -0.07, -0.065)), [2], 1)
-    assert len(a.pts) == 1
+    assert a.add(_d(FLAT), [1], 0)
+    w0 = a.band_width(0)
+    assert a.add(_d(FLAT * 0.5), [2], 1) is False      # median 0, inside
     assert a.counts == [2]
     assert a.n_merged == 1
     assert a.seqs == [[1]]
+    assert a.samples[0][0].size == 40
+    assert a.band_width(0) < w0
+
+
+def test_pooling_moves_the_point_to_the_pooled_median():
+    a = _arch()
+    a.add(_d(FLAT), [1], 0)
+    assert a.pts[0][0] == pytest.approx(0.0)
+    a.add(_d(FLAT + 0.2), [2], 1)
+    assert a.pts[0][0] == pytest.approx(0.1, abs=0.06)
+
+
+def test_the_pooled_sample_is_capped():
+    a = _arch(pool_cap=25)
+    a.add(_d(FLAT), [1], 0)
+    a.add(_d(FLAT), [2], 1)
+    assert a.samples[0][0].size == 25
+    a.add(_d(FLAT), [3], 2)
+    assert a.samples[0][0].size == 25
+    assert a.counts == [3]
+
+
+def test_there_is_no_drift_floor_any_more():
+    a = _arch()
+    assert not hasattr(a, "drift_floor")
+    assert not hasattr(a, "set_drift_floor")
 
 
 def test_non_dominated_pair_is_kept():
     a = _arch()
-    assert a.add(_d((-0.10, -0.08, -0.06), (0.10, 0.12, 0.14)), [1], 0)
-    assert a.add(_d((0.10, 0.12, 0.14), (-0.10, -0.08, -0.06)), [2], 1)
+    assert a.add(_d(FLAT - 5.0, FLAT + 5.0), [1], 0)
+    assert a.add(_d(FLAT + 5.0, FLAT - 5.0), [2], 1)
     assert len(a.pts) == 2
-
-
-def test_drift_floor_widens_the_band_into_a_merge():
-    a = _arch()
-    assert a.add(_d((-0.001, 0.000, 0.001)), [1], 0)
-    a.set_drift_floor(0.20)
-    lo, hi = a.band(0)
-    assert lo[0] == pytest.approx(-0.1)
-    assert hi[0] == pytest.approx(0.1)
-    # 0.05 is beyond q95 but inside the widened band
-    assert not a.add(_d((0.049, 0.050, 0.051)), [2], 1)
-    assert a.counts == [2]
-
-
-def test_drift_floor_never_narrows_a_band():
-    a = _arch()
-    a.add(_d((-0.50, 0.00, 0.50)), [1], 0)
-    a.set_drift_floor(0.10)
-    lo, hi = a.band(0)
-    assert lo[0] == pytest.approx(-0.5)
-    assert hi[0] == pytest.approx(0.5)
-
-
-def test_non_finite_drift_floor_keeps_the_last_reading():
-    a = _arch()
-    a.set_drift_floor(0.3)
-    a.set_drift_floor(float("nan"))
-    assert a.drift_floor == pytest.approx(0.3)
-    with pytest.raises(ValueError):
-        a.set_drift_floor(-1.0)
 
 
 def test_cap_drops_the_widest_band():
     a = _arch(cap=3)
-    # three mutually non-dominated points; the second has the widest band
-    assert a.add(_d((-0.31, -0.30, -0.29), (0.29, 0.30, 0.31)), ["a"], 0)
-    assert a.add(_d((-0.20, -0.10, 0.00), (-0.05, 0.05, 0.15)), ["b"], 0)
-    assert a.add(_d((0.29, 0.30, 0.31), (-0.31, -0.30, -0.29)), ["c"], 0)
+    tight = FLAT * 0.01
+    assert a.add(_d(tight - 3.0, tight + 3.0), ["a"], 0)
+    assert a.add(_d(FLAT * 3.0 - 1.0, FLAT * 3.0 + 0.5), ["b"], 0)
+    assert a.add(_d(tight + 3.0, tight - 3.0), ["c"], 0)
     assert len(a.pts) == 3
-    assert a.add(_d((-0.26, -0.25, -0.24), (0.18, 0.19, 0.20)), ["d"], 1)
+    widest = int(np.argmax([a.band_width(i) for i in range(3)]))
+    assert a.seqs[widest] == ["b"]
+    assert a.add(_d(tight - 2.5, tight + 2.0), ["d"], 1)
     assert len(a.pts) == 3
     assert a.n_dropped_cap == 1
-    assert ["b"] not in a.seqs
-    assert ["d"] in a.seqs
+    assert ["b"] not in a.seqs and ["d"] in a.seqs
 
 
 def test_admitted_count_is_the_auto_stop_contract():
     a = _arch()
-    sols = [(_d((-0.10, -0.08, -0.06)), [1], 1.0),
-            (_d((-0.09, -0.07, -0.065)), [2], 1.0),
-            (_d((0.20, 0.22, 0.24), (-0.30, -0.28, -0.26)), [3], 1.0)]
+    sols = [(_d(FLAT), [1], 1.0),
+            (_d(FLAT * 0.5), [2], 1.0),
+            (_d(FLAT + 5.0, FLAT - 5.0), [3], 1.0)]
     assert a.add_many(sols, 0) == 2
     assert a.n_merged == 1
 
 
 def test_quality_floor_refuses_an_infeasible_plan():
     a = _arch(quality_floor=0.9)
-    assert not a.add(_d((-0.50, -0.48, -0.46)), [1], 0, quality=0.80)
-    assert a.add(_d((-0.10, -0.08, -0.06)), [2], 0, quality=0.90)
+    assert a.add(_d(FLAT - 9.0), [1], 0, quality=0.80) is False
+    assert a.add(_d(FLAT), [2], 0, quality=0.90)
     assert len(a.pts) == 1
 
 
-def test_missing_or_broken_distribution_raises():
+def test_missing_or_broken_windows_raise():
     a = _arch()
     with pytest.raises(ValueError):
         a.add(None, [1], 0)
     with pytest.raises(ValueError):
-        a.add(_d((0.10, 0.05, 0.20)), [1], 0)          # q05 above the median
+        a.add({"latency": np.array([]), "peak_memory": np.array([0.0])}, [1], 0)
     with pytest.raises(ValueError):
-        a.add(_d((float("nan"), 0.0, 0.1)), [1], 0)
+        a.add(_d([0.0, float("nan"), 1.0]), [1], 0)
+    with pytest.raises(ValueError):
+        _arch(cap=0)
+    with pytest.raises(ValueError):
+        _arch(pool_cap=0)
 
 
 def test_hypervolume_and_size_stay_meaningful():
     a = _arch()
     assert a.hypervolume() == 0.0
-    a.add(_d((-0.02, 0.00, 0.02)), [1], 0)
+    a.add(_d(FLAT), [1], 0)
     hv1 = a.hypervolume()
-    a.add(_d((-0.32, -0.30, -0.28)), [2], 1)
+    a.add(_d(FLAT - 4.0), [2], 1)
     hv2 = a.hypervolume()
     assert np.isfinite(hv1) and np.isfinite(hv2)
     assert hv2 > hv1
@@ -135,49 +181,57 @@ def test_hypervolume_and_size_stay_meaningful():
 
 def test_dump_front_writes_the_bands(tmp_path):
     a = _arch()
-    a.set_drift_floor(0.05)
-    a.add(_d((-0.10, -0.08, -0.06)), [[1, []], [2, []]], 7)
+    a.add(_d(FLAT), [[1, []], [2, []]], 7)
     p = tmp_path / "pareto_front.json"
     a.dump_front(str(p), extra={"episode": 7})
     doc = json.loads(p.read_text())
     assert doc["objectives"] == list(OBJ)
-    assert doc["drift_floor"] == pytest.approx(0.05)
+    assert doc["pool_cap"] == 512
+    assert "median" in doc["band"]
     row = doc["front"][0]
-    for k in ("obj", "q05", "q95", "band_lo", "band_hi"):
+    for k in ("obj", "band_lo", "band_hi"):
         assert set(row[k]) == set(OBJ)
-    assert row["band_lo"]["latency"] < row["q05"]["latency"]
-    assert row["band_hi"]["latency"] > row["q95"]["latency"]
+    assert row["band_lo"]["latency"] < row["obj"]["latency"]
+    assert row["band_hi"]["latency"] > row["obj"]["latency"]
     assert row["n"] == 1 and row["episode"] == 7
+    assert row["windows"]["latency"] == 20
+
+
+# ---- the env side -------------------------------------------------------
+
+def test_the_pair_partner_is_the_reference_median():
+    from alphagrad.approx.env import paired_window_log_ratios
+    # mean 3.25e5, median 1e5: only the median puts the ratio at 0
+    ref = [1.0e5] * 120 + [1.0e6] * 40
+    w = paired_window_log_ratios([1.0e5] * 20, ref, 100.0, 0.0)
+    assert w.size == 20
+    assert np.allclose(w, 0.0)
+
+
+def test_a_channel_without_windows_is_one_reading():
+    from alphagrad.approx.env import paired_window_log_ratios
+    w = paired_window_log_ratios((), (), 1.0, -0.4)
+    assert w.tolist() == [-0.4]
+
+
+def test_window_record_carries_the_ratios_and_the_band():
+    from alphagrad.approx.env import (paired_window_log_ratios,
+                                      window_ratio_record)
+    w = paired_window_log_ratios([1.0e5] * 20, [1.0e5] * 160, 100.0, 0.0)
+    rec = window_ratio_record(w)
+    assert rec["n"] == 20 and len(rec["windows"]) == 20
+    assert rec["lo"] <= rec["median"] <= rec["hi"]
+    assert median_band(rec["windows"])[0] == pytest.approx(rec["median"])
 
 
 def test_point_keeps_the_half_of_the_axis_the_reward_floors_away():
-    # ticket dsnn-dfw.44 part 1: --paired-cost-floor reference maps every
-    # plan at or below parity onto reward 0; the archive's coordinate must not.
-    from alphagrad.approx.env import log_ratio_quantiles, paired_log_costs
-    cand = [65.0e3] * 20
-    ref = [100.0e3] * 160
-    d = log_ratio_quantiles(cand, ref, 100.0, 0.0)
-    assert d["median"] == pytest.approx(np.log(0.65), abs=1e-9)
-    assert d["n"] == 20 * 160
+    # ticket dsnn-dfw.44 part 1: --paired-cost-floor reference maps every plan
+    # at or below parity onto reward 0; the archive's coordinate must not.
+    from alphagrad.approx.env import paired_window_log_ratios, paired_log_costs
+    w = paired_window_log_ratios([65.0e3] * 20, [100.0e3] * 160, 100.0, 0.0)
+    assert float(np.median(w)) == pytest.approx(np.log(0.65), abs=1e-9)
     d_lat, _d_mem, _n = paired_log_costs(65.0e3, 1.0, 100.0e3, 1.0)
     assert d_lat == 0.0
     a = _arch()
-    assert a.add({"latency": d, "peak_memory": _d((0.0, 0.0, 0.0))["latency"]},
-                 [1], 0)
+    assert a.add({"latency": w, "peak_memory": np.array([0.0])}, [1], 0)
     assert a.pts[0][0] == pytest.approx(np.log(0.65), abs=1e-9)
-
-
-def test_log_ratio_quantiles_without_windows_is_a_degenerate_band():
-    from alphagrad.approx.env import log_ratio_quantiles
-    d = log_ratio_quantiles((), (), 1.0, -0.4)
-    assert d == {"q05": -0.4, "median": -0.4, "q95": -0.4, "n": 0}
-
-
-def test_log_ratio_quantiles_spread_covers_both_halves():
-    from alphagrad.approx.env import log_ratio_quantiles
-    rng = np.random.default_rng(0)
-    cand = list(1.0e5 * np.exp(rng.normal(0.0, 0.05, 20)))
-    ref = list(1.0e5 * np.exp(rng.normal(0.0, 0.05, 160)))
-    d = log_ratio_quantiles(cand, ref, 100.0, 0.0)
-    assert d["q05"] < d["median"] < d["q95"]
-    assert d["q95"] - d["q05"] > 0.1

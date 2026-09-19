@@ -390,19 +390,23 @@ def bin_policy_from_json(bp, d: dict) -> None:
 def pareto_archive_to_json(archive) -> dict:
     """The archive's points, sequences and admission episodes, plus the
     candidate log and the hypervolume reference."""
-    # TICKET dsnn-dfw.44: the band archive carries a q05/q95 pair and a merge
-    # count per point, and has no reward indices at all.
-    if hasattr(archive, "q05"):
+    # TICKET dsnn-dfw.44: the band archive carries a band, a merge count and
+    # the POOLED WINDOWS per point, and has no reward indices at all. The
+    # windows are the state a resumed run needs to keep re-fitting a band
+    # that is already tighter than one measurement.
+    if hasattr(archive, "samples"):
         return {
             "kind": "ratio-band",
             "obj_names": [str(n) for n in archive.obj_names],
             "cap": int(archive.cap),
-            "drift_floor": float(archive.drift_floor),
+            "pool_cap": int(archive.pool_cap),
             "quality_floor": (None if archive.quality_floor is None
                               else float(archive.quality_floor)),
             "pts": [[float(x) for x in p] for p in archive.pts],
-            "q05": [[float(x) for x in p] for p in archive.q05],
-            "q95": [[float(x) for x in p] for p in archive.q95],
+            "lo": [[float(x) for x in p] for p in archive.lo],
+            "hi": [[float(x) for x in p] for p in archive.hi],
+            "samples": [[[float(x) for x in w] for w in s]
+                        for s in archive.samples],
             "counts": [int(c) for c in archive.counts],
             "seqs": list(archive.seqs),
             "eps": [int(e) for e in archive.eps],
@@ -434,7 +438,7 @@ def pareto_archive_from_json(archive, d: dict) -> None:
         raise CheckpointError(
             f"the Pareto archive's objectives are {archive.obj_names} on this "
             f"run and {d['obj_names']} in the checkpoint.")
-    _band = hasattr(archive, "q05")
+    _band = hasattr(archive, "samples")
     if _band != (str(d.get("kind") or "") == "ratio-band"):
         raise CheckpointError(
             f"the Pareto archive is {'a band' if _band else 'a reward-vector'} "
@@ -442,10 +446,12 @@ def pareto_archive_from_json(archive, d: dict) -> None:
             f"archive in the checkpoint.")
     if _band:
         archive.cap = int(d["cap"])
-        archive.drift_floor = float(d["drift_floor"])
+        archive.pool_cap = int(d["pool_cap"])
         archive.pts = [np.asarray(p, dtype=np.float64) for p in d["pts"]]
-        archive.q05 = [np.asarray(p, dtype=np.float64) for p in d["q05"]]
-        archive.q95 = [np.asarray(p, dtype=np.float64) for p in d["q95"]]
+        archive.lo = [np.asarray(p, dtype=np.float64) for p in d["lo"]]
+        archive.hi = [np.asarray(p, dtype=np.float64) for p in d["hi"]]
+        archive.samples = [[np.asarray(w, dtype=np.float64) for w in s]
+                           for s in d["samples"]]
         archive.counts = [int(c) for c in d["counts"]]
         archive.seqs = list(d["seqs"])
         archive.eps = [int(e) for e in d["eps"]]

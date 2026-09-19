@@ -14421,10 +14421,10 @@ def main():
                 # (ticket .7: a counter read in a process that does not own
                 # it reads 0 and nothing says so).
                 host_state["_gate_records"] = list(_plog_recs)
-                # TICKET dsnn-dfw.44: this episode's ratio BANDS, keyed by the
-                # plan's elimination order -- the same key `_decode_arch`
-                # hands the archive. Two envs that drew one order share one
-                # band, so the first record wins.
+                # TICKET dsnn-dfw.44: this episode's per-window ratio SAMPLES,
+                # keyed by the plan's elimination order -- the same key
+                # `_decode_arch` hands the archive. Two envs that drew one
+                # order share one sample, so the first record wins.
                 if _RATIO_ARCHIVE:
                     _rd: dict = {}
                     for _r in _plog_recs:
@@ -14433,8 +14433,9 @@ def main():
                             continue
                         _k = tuple(int(v) for v in (_r.get("order") or ()))
                         if _k and _k not in _rd:
-                            _rd[_k] = {args.cmp_type: _rl["latency"],
-                                       args.mem_type: _rl["memory"]}
+                            _rd[_k] = {
+                                args.cmp_type: _rl["latency"]["windows"],
+                                args.mem_type: _rl["memory"]["windows"]}
                     host_state["_ratio_dists"] = _rd
                 host_state["_gate_drain"] = (
                     {"records": list(_plog_local.get("records") or ())},
@@ -14856,8 +14857,6 @@ def main():
                 # TICKET dsnn-dfw.44. A band, not a reward slot: the reward's
                 # reference floor maps every plan at or below parity onto 0,
                 # which is exactly the half of the axis a front must keep.
-                pareto_archive.set_drift_floor(
-                    log_dict.get("gate/g5/drift_floor_lat"))
                 _rdists = host_state.get("_ratio_dists") or {}
                 _sols = []
                 for i in elig_idx:
@@ -14877,8 +14876,13 @@ def main():
                 log_dict["pareto/missing_band"] = int(
                     host_state.get("pareto_missing_band", 0))
                 log_dict["pareto/merged"] = int(pareto_archive.n_merged)
-                log_dict["pareto/drift_floor"] = float(
-                    pareto_archive.drift_floor)
+                if pareto_archive.pts:
+                    _bw = [pareto_archive.band_width(i)
+                           for i in range(len(pareto_archive.pts))]
+                    log_dict["pareto/band_width_min"] = float(min(_bw))
+                    log_dict["pareto/band_width_max"] = float(max(_bw))
+                    log_dict["pareto/pooled_windows_max"] = int(max(
+                        s[0].size for s in pareto_archive.samples))
             else:
                 _AS_ADMITTED = int(pareto_archive.add_many(
                     ((all_rets[i], _decode_arch(i)) for i in elig_idx), ep
