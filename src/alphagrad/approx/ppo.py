@@ -15148,14 +15148,20 @@ def main():
                     return "n/a"
                 return _f % float(log_dict[_k])
             _hv = (lambda _v, _f="%.4g": "n/a" if warmup else _f % float(_v))
+            # `refused` is on this line because a refusal is the one number
+            # that makes the trainer's own silence readable: a refused
+            # terminal is excluded from the update, so a run whose refusal
+            # rate walks up trains on fewer and fewer environments while
+            # every other field here still looks healthy (dsnn-dfw.51).
             tqdm.write("[health %s] ppo=%s value=%s ent=%s "
                        "ratio/max_log=%s kl/approx=%s mu_quality=%s "
-                       "sec/ep=%s" % (
+                       "refused=%s sec/ep=%s" % (
                            _hlabel, _hv(ppo_loss), _hv(value_loss),
                            _hv(policy_entropy),
                            _hk("ratio/max_log", "%.3g"),
                            _hk("kl/approx", "%.3g"),
                            _hk("popart/mu_quality", "%.4g", False),
+                           _hk("refused/total", "%d", False),
                            _hk("time/sec_per_episode", "%.1f", False)))
             if _LIVE_FACES is not None:
                 # A chunk that fails soft is EMPTY, and an empty chunk leaves
