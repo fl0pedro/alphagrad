@@ -64,6 +64,11 @@ _COMMON = [
     "--advantage-norm", "popart", "--seed", "42", "--num-envs", "2",
     "--minibatches", "1", "--vocab-size", "512", "--wandb", "disabled",
     "--example", "Helmholtz",
+    # THE GRADIENT ORACLE IS OFF because the plan log is. The oracle reads the
+    # distinct elimination orders of an oracle-due episode off the plan-log
+    # records (agent/oracle-cap, dsnn-dfw.22) and ppo.py refuses the pair
+    # rather than check nothing. This file is about resume equivalence.
+    "--grad-oracle", "off",
 ]
 
 #: The environment the configuration is pinned by. Inherited ALPHAGRAD_*

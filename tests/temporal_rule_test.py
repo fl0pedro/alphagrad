@@ -747,7 +747,7 @@ def test_the_declared_slots_must_match_the_arrays():
     liar.data_slots = (0, 1)
     with pytest.raises(ValueError, match="declares 2 slots"):
         envmod._grad_cosine_quality(
-            _Cfg(liar), lambda *a: a, lambda *a: a,
+            _Cfg(liar), lambda *a: a, lambda *a: a, b"slots-liar",
             [jnp.zeros((2,)), jnp.zeros((2,))], None, 1)
 
 
@@ -1004,9 +1004,12 @@ def test_the_oracle_reference_makes_the_accumulated_error_visible():
 
     envmod._PROBE_BATCH.clear()
     envmod._PROBE_META.clear()
-    got = envmod._grad_cosine_quality(cfg, exact_plan, exact_plan, xs, None, 1)
+    envmod._COSINE_REF.clear()
+    got = envmod._grad_cosine_quality(
+        cfg, exact_plan, exact_plan, b"ref-draw-visible", xs, None, 1)
     envmod._PROBE_BATCH.clear()
     envmod._PROBE_META.clear()
+    envmod._COSINE_REF.clear()
     assert got is not None
     q = got[0]
 
@@ -1053,9 +1056,12 @@ def test_without_the_reference_draw_the_same_channel_reads_one():
 
     envmod._PROBE_BATCH.clear()
     envmod._PROBE_META.clear()
-    got = envmod._grad_cosine_quality(cfg, exact_plan, exact_plan, xs, None, 1)
+    envmod._COSINE_REF.clear()
+    got = envmod._grad_cosine_quality(
+        cfg, exact_plan, exact_plan, b"no-ref-draw", xs, None, 1)
     envmod._PROBE_BATCH.clear()
     envmod._PROBE_META.clear()
+    envmod._COSINE_REF.clear()
     assert got is not None
     assert abs(got[0] - 1.0) < 1e-6, got[0]
 
