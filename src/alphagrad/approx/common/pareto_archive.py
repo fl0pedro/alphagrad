@@ -15,6 +15,7 @@ Two artefacts:
 from __future__ import annotations
 
 import json
+import functools
 import numpy as np
 
 # Exact-match sentinel signature shared with the reward plumbing
@@ -254,6 +255,298 @@ class ParetoArchive:
                 "during training (including later-pruned ones); the full reward_vec "
                 "is stored so any objective set can be re-scored offline."
             ),
+            "candidates": self.all_candidates,
+        }
+        if extra:
+            payload.update(extra)
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=2)
+
+
+# TICKET dsnn-dfw.44, owner rulings 2026-09-19 (second design). Points live in
+# LOG-RATIO space against the paired rev-exact reference: 0 is parity and LOWER
+# IS BETTER. The coordinate is the UNFLOORED log ratio, because
+# `env.paired_log_costs` floors the REWARD at the reference and that maps every
+# plan at or below parity onto exactly 0. A point is a BAND: a 90 percent
+# distribution-free interval for the MEDIAN of the plan's per-window paired log
+# ratios. The first design used the q05..q95 of the ratios themselves, widened
+# to the instrument drift floor; that band is the spread of ONE window, it was
+# ten times wider than the differences between orders, and the whole run
+# archived one point. This band is the uncertainty of the MEDIAN, it shrinks as
+# a point absorbs measurements, and there is no drift floor.
+_POOL_CAP = 512          # pooled windows kept per point per objective
+
+
+@functools.lru_cache(maxsize=4096)
+def _median_order_stat_lo(n: int) -> int:
+    """1-based lower order statistic of the 90 percent median interval.
+
+    The largest ``l`` with ``P(Bin(n, 1/2) <= l - 1) <= 0.05``, decided in
+    exact integers (``20 * sum_k C(n, k) <= 2**n``) so the band carries no
+    floating-point tie and no RNG. 0 when the sample is too small to exclude
+    any order statistic.
+    """
+    if n < 1:
+        raise ValueError(f"a median interval needs at least one sample, got {n}")
+    total = 1 << n
+    term = 1                       # C(n, 0), stepped by C(n,k+1)=C(n,k)(n-k)/(k+1)
+    cum = 0
+    lo = 0
+    for k in range(0, n):
+        cum += term
+        if cum * 20 > total:
+            break
+        lo = k + 1
+        term = term * (n - k) // (k + 1)
+    return lo
+
+
+def median_band(x) -> tuple:
+    """``(median, lo, hi)`` of a sample, the 90 percent median interval."""
+    a = np.sort(np.asarray(x, dtype=np.float64))
+    if a.size == 0:
+        raise ValueError("median_band got an empty sample")
+    med = float(np.median(a))
+    l = _median_order_stat_lo(int(a.size))
+    if l < 1:
+        # Too few windows to exclude any order statistic: the whole range.
+        return med, float(a[0]), float(a[-1])
+    return med, float(a[l - 1]), float(a[a.size - l])
+
+
+class RatioBandArchive:
+
+    def __init__(self, obj_names, cap: int = 64, quality_floor=None,
+                 pool_cap: int = _POOL_CAP):
+        self.obj_names = list(obj_names)
+        if not self.obj_names:
+            raise ValueError("RatioBandArchive needs at least one objective")
+        self.cap = int(cap)
+        if self.cap < 1:
+            raise ValueError(f"RatioBandArchive cap must be >= 1, got {cap!r}")
+        self.pool_cap = int(pool_cap)
+        if self.pool_cap < 1:
+            raise ValueError(
+                f"RatioBandArchive pool_cap must be >= 1, got {pool_cap!r}")
+        self.quality_floor = (None if quality_floor is None
+                              else float(quality_floor))
+        self.pts: list[np.ndarray] = []       # the medians ARE the coordinate
+        self.lo: list[np.ndarray] = []
+        self.hi: list[np.ndarray] = []
+        self.samples: list[list] = []         # pooled windows, per objective
+        self.counts: list[int] = []           # measurements pooled into a point
+        # THE MEMBER PLANS of each point (owner ruling 2026-09-19). A point is
+        # a band, and several plans can measure inside it; before this the
+        # merged plans were anonymous and the point kept the plan that founded
+        # it. A member is the FULL plan -- order and per-face approximation
+        # actions, the shape `_decode_arch` hands in -- with the windows it
+        # contributed and the episodes it was seen in. `seqs` is derived: it
+        # is the REPRESENTATIVE, the member with the most pooled windows.
+        self.members: list[list] = []
+        self.seqs: list = []
+        self.eps: list[int] = []
+        self.all_candidates: list[dict] = []
+        self._seen: set = set()
+        self._hv_ref: np.ndarray | None = None
+        self.n_merged = 0
+        self.n_dropped_cap = 0
+
+    def _record_member(self, i: int, seq, contributed: int, episode: int):
+        """Credit ``seq`` with the windows it just put into point ``i``.
+
+        A plan becomes a member only when its windows actually entered the
+        pool, so the member list is bounded by the same ``pool_cap`` budget
+        the sample is. Once the pool is full a plan already on the list still
+        has its measurement counted, and a new plan is not recorded.
+        """
+        key = repr(seq)
+        for m in self.members[i]:
+            if m["key"] == key:
+                m["windows"] += int(contributed)
+                m["n"] += 1
+                m["last_episode"] = int(episode)
+                self._set_representative(i)
+                return
+        if int(contributed) > 0:
+            self.members[i].append({
+                "key": key, "seq": seq, "windows": int(contributed), "n": 1,
+                "first_episode": int(episode), "last_episode": int(episode)})
+            self._set_representative(i)
+
+    def _set_representative(self, i: int) -> None:
+        ms = self.members[i]
+        best = 0
+        for j in range(1, len(ms)):
+            if (ms[j]["windows"] > ms[best]["windows"]
+                    or (ms[j]["windows"] == ms[best]["windows"]
+                        and ms[j]["first_episode"] < ms[best]["first_episode"])):
+                best = j
+        self.seqs[i] = ms[best]["seq"]
+
+    def _windows(self, dist) -> list:
+        out = []
+        for nm in self.obj_names:
+            w = np.asarray(dist[nm], dtype=np.float64).reshape(-1)
+            if w.size == 0:
+                raise ValueError(
+                    f"RatioBandArchive: objective {nm!r} has no per-window "
+                    f"ratio; a channel with no windows must still hand its one "
+                    f"reading as a length-1 sample")
+            if not np.all(np.isfinite(w)):
+                raise ValueError(
+                    f"RatioBandArchive: objective {nm!r} has a non-finite "
+                    f"window ratio: {w.tolist()[:8]}")
+            out.append(w)
+        return out
+
+    def _fit(self, sample) -> tuple:
+        med = np.empty((len(self.obj_names),), dtype=np.float64)
+        lo = np.empty_like(med)
+        hi = np.empty_like(med)
+        for k, w in enumerate(sample):
+            med[k], lo[k], hi[k] = median_band(w)
+        return med, lo, hi
+
+    def band(self, i: int) -> tuple:
+        return self.lo[i], self.hi[i]
+
+    def band_width(self, i: int) -> float:
+        return float(np.sum(self.hi[i] - self.lo[i]))
+
+    def add(self, dist, seq, episode: int, quality=None) -> bool:
+        if dist is None:
+            raise ValueError(
+                "RatioBandArchive.add got no distribution: a plan with no "
+                "per-window ratios has no point (needs --cost-form "
+                "paired-log and a plan log)")
+        w = self._windows(dist)
+        med, _lo, _hi = self._fit(w)
+        if (self.quality_floor is not None and quality is not None
+                and float(quality) < self.quality_floor):
+            return False
+        dominates: list[int] = []
+        for i in range(len(self.pts)):
+            better = med < self.lo[i]
+            worse = med > self.hi[i]
+            if not better.any() and not worse.any():
+                # Inside the band everywhere: POOL the windows into the point
+                # and re-fit, so a point that is measured again knows more.
+                _before = int(self.samples[i][0].size)
+                self.samples[i] = [
+                    np.concatenate([self.samples[i][k], w[k]])[:self.pool_cap]
+                    for k in range(len(self.obj_names))]
+                self.pts[i], self.lo[i], self.hi[i] = self._fit(self.samples[i])
+                self.counts[i] += 1
+                self.n_merged += 1
+                # The plan that landed here is a MEMBER of this point, not an
+                # anonymous count. The objective-0 pool is the budget.
+                self._record_member(
+                    i, seq, int(self.samples[i][0].size) - _before, episode)
+                return False
+            if worse.any() and not better.any():
+                return False
+            if better.any() and not worse.any():
+                dominates.append(i)
+        _drop = set(dominates)
+        keep = [i for i in range(len(self.pts)) if i not in _drop]
+        self.pts = [self.pts[i] for i in keep] + [med]
+        self.lo = [self.lo[i] for i in keep] + [_lo]
+        self.hi = [self.hi[i] for i in keep] + [_hi]
+        self.samples = [self.samples[i] for i in keep] + [
+            [x[:self.pool_cap] for x in w]]
+        self.counts = [self.counts[i] for i in keep] + [1]
+        self.members = [self.members[i] for i in keep] + [[{
+            "key": repr(seq), "seq": seq,
+            "windows": int(min(w[0].size, self.pool_cap)), "n": 1,
+            "first_episode": int(episode), "last_episode": int(episode)}]]
+        self.seqs = [self.seqs[i] for i in keep] + [seq]
+        self.eps = [self.eps[i] for i in keep] + [int(episode)]
+        while len(self.pts) > self.cap:
+            widths = [self.band_width(i) for i in range(len(self.pts))]
+            drop = int(np.argmax(np.asarray(widths)))
+            for lst in (self.pts, self.lo, self.hi, self.samples,
+                        self.counts, self.members, self.seqs, self.eps):
+                del lst[drop]
+            self.n_dropped_cap += 1
+        key = repr(seq)
+        if key not in self._seen:
+            self._seen.add(key)
+            self.all_candidates.append({
+                "episode": int(episode),
+                "obj": self._named(med),
+                "band_lo": self._named(_lo),
+                "band_hi": self._named(_hi),
+                "seq": seq,
+            })
+        return True
+
+    def _named(self, vec) -> dict:
+        return {nm: float(vec[k]) for k, nm in enumerate(self.obj_names)}
+
+    def add_many(self, solutions, episode: int) -> int:
+        return sum(int(self.add(d, s, episode, quality=q))
+                   for d, s, q in solutions)
+
+    def hypervolume(self) -> float:
+        if not self.pts:
+            return 0.0
+        # The sweep MAXIMISES, so minimisation medians enter negated.
+        pts = -np.stack(self.pts)
+        if self._hv_ref is None:
+            self._hv_ref = pts.min(axis=0) - 1.0
+        return hypervolume(pts, self._hv_ref)
+
+    def front(self) -> list:
+        out = []
+        for i in range(len(self.pts)):
+            out.append({
+                "obj": self._named(self.pts[i]),
+                "band_lo": self._named(self.lo[i]),
+                "band_hi": self._named(self.hi[i]),
+                "n": int(self.counts[i]),
+                "windows": {nm: int(self.samples[i][k].size)
+                            for k, nm in enumerate(self.obj_names)},
+                "episode": int(self.eps[i]),
+                # The REPRESENTATIVE, then every plan that measured inside
+                # this band, best supported first.
+                "seq": self.seqs[i],
+                "num_members": len(self.members[i]),
+                "members": [
+                    {"seq": m["seq"], "windows": int(m["windows"]),
+                     "n": int(m["n"]),
+                     "first_episode": int(m["first_episode"]),
+                     "last_episode": int(m["last_episode"])}
+                    for m in sorted(self.members[i],
+                                    key=lambda m: (-m["windows"],
+                                                   m["first_episode"]))],
+            })
+        return out
+
+    def dump_front(self, path: str, extra: dict | None = None) -> None:
+        _hv = self.hypervolume()
+        payload = {
+            "objectives": list(self.obj_names),
+            "space": "log ratio against the paired rev-exact reference; "
+                     "0 is parity and lower is better",
+            "band": "90 percent distribution-free interval for the median of "
+                    "the pooled per-window paired log ratios",
+            "hypervolume": _hv if np.isfinite(_hv) else None,
+            "num_points": len(self.pts),
+            "cap": int(self.cap),
+            "pool_cap": int(self.pool_cap),
+            "merged_measurements": int(self.n_merged),
+            "dropped_at_cap": int(self.n_dropped_cap),
+            "front": self.front(),
+        }
+        if extra:
+            payload.update(extra)
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=2)
+
+    def dump_all_candidates(self, path: str, extra: dict | None = None) -> None:
+        payload = {
+            "objectives": list(self.obj_names),
+            "num_candidates": len(self.all_candidates),
             "candidates": self.all_candidates,
         }
         if extra:

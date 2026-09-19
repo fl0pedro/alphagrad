@@ -7201,11 +7201,26 @@ def _dump_pareto(archive, args, ep, *, final=False):
         # archive's minimisation convention, so rank by objective 0.
         _pts = [list(map(float, p)) for p in archive.pts]
         _order = sorted(range(len(_pts)), key=lambda i: _pts[i][0])
+        # A band point can have several MEMBER PLANS. `seq` is the
+        # representative (most pooled windows); `members` is every plan that
+        # measured inside the band, so a replay can try the others.
+        _mem = getattr(archive, "members", None)
+
+        def _members_of(i):
+            if not _mem:
+                return None
+            return [{"seq": m["seq"], "windows": int(m["windows"]),
+                     "n": int(m["n"])}
+                    for m in sorted(_mem[i], key=lambda m: (-m["windows"],
+                                                            m["first_episode"]))]
+
         _doc = {
             "best_overall": {"seq": archive.seqs[_order[0]],
-                             "obj": _pts[_order[0]]},
+                             "obj": _pts[_order[0]],
+                             "members": _members_of(_order[0])},
             "best_per_channel": {
-                f"rank{r}": {"seq": archive.seqs[i], "obj": _pts[i]}
+                f"rank{r}": {"seq": archive.seqs[i], "obj": _pts[i],
+                             "members": _members_of(i)}
                 for r, i in enumerate(_order)
             },
             "_provenance": {"source": "ParetoArchive.dump", "episode": int(ep),
@@ -13475,12 +13490,35 @@ def main():
     popart_m2 = jnp.zeros((NUM_VALUE_HEADS,), dtype=jnp.float32)
     popart_w = jnp.zeros((NUM_VALUE_HEADS,), dtype=jnp.float32)
 
-    from alphagrad.approx.common.pareto_archive import ParetoArchive
-    pareto_archive = ParetoArchive(
-        obj_names=(args.cmp_type, args.mem_type, "cosine_sim"),
-        obj_idx=(cmp_idx, mem_idx, cosine_idx),
-        quality_floor=args.quality_floor,
-    )
+    # TICKET dsnn-dfw.44. Under paired-log the archive is DISTRIBUTION-AWARE
+    # and lives in log-ratio space; the reward-vector archive stays for
+    # --cost-form absolute, where no reference and so no ratio exists.
+    # The bands ride the plan-log drain, so with --plan-log off no plan has a
+    # point and the reward-vector archive is the only one that can be built.
+    _RATIO_ARCHIVE = (getattr(args, "cost_form", "absolute") == "paired-log"
+                      and _PLAN_LOG_PATH is not None)
+    if (getattr(args, "cost_form", "absolute") == "paired-log"
+            and _PLAN_LOG_PATH is None):
+        print("[pareto] --cost-form paired-log, but --plan-log is OFF: the "
+              "per-window ratio bands the distribution-aware archive is made "
+              "of ride the plan-log drain, so this run archives the "
+              "REWARD-VECTOR front instead, whose latency axis is floored at "
+              "the reference (ticket dsnn-dfw.44). Give --plan-log auto for "
+              "the band archive.", flush=True)
+    if _RATIO_ARCHIVE:
+        from alphagrad.approx.common.pareto_archive import RatioBandArchive
+        pareto_archive = RatioBandArchive(
+            obj_names=(args.cmp_type, args.mem_type),
+            cap=64,
+            quality_floor=args.quality_floor,
+        )
+    else:
+        from alphagrad.approx.common.pareto_archive import ParetoArchive
+        pareto_archive = ParetoArchive(
+            obj_names=(args.cmp_type, args.mem_type, "cosine_sim"),
+            obj_idx=(cmp_idx, mem_idx, cosine_idx),
+            quality_floor=args.quality_floor,
+        )
     elim_order_table = wandb.Table(columns=["episode", "return", "elimination order"])
     pbar = tqdm(total=args.episodes)
 
@@ -14398,6 +14436,22 @@ def main():
                 # (ticket .7: a counter read in a process that does not own
                 # it reads 0 and nothing says so).
                 host_state["_gate_records"] = list(_plog_recs)
+                # TICKET dsnn-dfw.44: this episode's per-window ratio SAMPLES,
+                # keyed by the plan's elimination order -- the same key
+                # `_decode_arch` hands the archive. Two envs that drew one
+                # order share one sample, so the first record wins.
+                if _RATIO_ARCHIVE:
+                    _rd: dict = {}
+                    for _r in _plog_recs:
+                        _rl = (_r or {}).get("ratio_log")
+                        if not _rl:
+                            continue
+                        _k = tuple(int(v) for v in (_r.get("order") or ()))
+                        if _k and _k not in _rd:
+                            _rd[_k] = {
+                                args.cmp_type: _rl["latency"]["windows"],
+                                args.mem_type: _rl["memory"]["windows"]}
+                    host_state["_ratio_dists"] = _rd
                 host_state["_gate_drain"] = (
                     {"records": list(_plog_local.get("records") or ())},
                     dict(_plog_pool or {}))
@@ -14814,9 +14868,42 @@ def main():
         _AS_ADMITTED = 0
         if pareto_archive is not None and elig_rets.shape[0]:
             elig_idx = [i for i in range(all_rets.shape[0]) if eligible[i]]
-            _AS_ADMITTED = int(pareto_archive.add_many(
-                ((all_rets[i], _decode_arch(i)) for i in elig_idx), ep
-            ))
+            if _RATIO_ARCHIVE:
+                # TICKET dsnn-dfw.44. A band, not a reward slot: the reward's
+                # reference floor maps every plan at or below parity onto 0,
+                # which is exactly the half of the axis a front must keep.
+                _rdists = host_state.get("_ratio_dists") or {}
+                _sols = []
+                for i in elig_idx:
+                    _seq = _decode_arch(i)
+                    _s = _seq["seq"] if isinstance(_seq, dict) else _seq
+                    _key = tuple(int(v) for v, _calls in _s)
+                    _dist = _rdists.get(_key)
+                    if _dist is None:
+                        # The plan drain missed this env's record; a point
+                        # without its band is not archived and is counted.
+                        host_state["pareto_missing_band"] = 1 + int(
+                            host_state.get("pareto_missing_band", 0))
+                        continue
+                    _sols.append(
+                        (_dist, _seq, float(all_rets[i][cosine_idx])))
+                _AS_ADMITTED = int(pareto_archive.add_many(_sols, ep))
+                log_dict["pareto/missing_band"] = int(
+                    host_state.get("pareto_missing_band", 0))
+                log_dict["pareto/merged"] = int(pareto_archive.n_merged)
+                if pareto_archive.pts:
+                    _bw = [pareto_archive.band_width(i)
+                           for i in range(len(pareto_archive.pts))]
+                    log_dict["pareto/band_width_min"] = float(min(_bw))
+                    log_dict["pareto/band_width_max"] = float(max(_bw))
+                    log_dict["pareto/pooled_windows_max"] = int(max(
+                        s[0].size for s in pareto_archive.samples))
+                    log_dict["pareto/members_max"] = int(max(
+                        len(m) for m in pareto_archive.members))
+            else:
+                _AS_ADMITTED = int(pareto_archive.add_many(
+                    ((all_rets[i], _decode_arch(i)) for i in elig_idx), ep
+                ))
             # CROSS-ARM CAVEAT (audited 2026-08-07). `pareto/archive_size`
             # is the live front's cardinality and means the same thing on
             # az_gumbel. `pareto/hypervolume` uses the same ParetoArchive and
@@ -14840,11 +14927,13 @@ def main():
             if pareto_archive.pts:
                 fx = np.stack(pareto_archive.pts).astype(np.float64)
                 # 3 scatter tables: (latency|cmp x cos), (mem x cos), (cmp x mem)
-                for key, (a, b) in {
-                    "pareto/cmp_vs_cos": (0, 2),
-                    "pareto/mem_vs_cos": (1, 2),
-                    "pareto/cmp_vs_mem": (0, 1),
-                }.items():
+                # The ratio archive has no cosine axis, so only the third pair
+                # exists there.
+                _scatter = ({"pareto/cmp_vs_mem": (0, 1)} if _RATIO_ARCHIVE
+                            else {"pareto/cmp_vs_cos": (0, 2),
+                                  "pareto/mem_vs_cos": (1, 2),
+                                  "pareto/cmp_vs_mem": (0, 1)})
+                for key, (a, b) in _scatter.items():
                     # Use the episode each point was ADMITTED at, not the
                     # current one: stamping `ep` on every row made the whole
                     # front look re-measured every episode.

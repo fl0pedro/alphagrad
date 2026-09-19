@@ -390,6 +390,40 @@ def bin_policy_from_json(bp, d: dict) -> None:
 def pareto_archive_to_json(archive) -> dict:
     """The archive's points, sequences and admission episodes, plus the
     candidate log and the hypervolume reference."""
+    # TICKET dsnn-dfw.44: the band archive carries a band, a merge count and
+    # the POOLED WINDOWS per point, and has no reward indices at all. The
+    # windows are the state a resumed run needs to keep re-fitting a band
+    # that is already tighter than one measurement.
+    if hasattr(archive, "samples"):
+        return {
+            "kind": "ratio-band",
+            "obj_names": [str(n) for n in archive.obj_names],
+            "cap": int(archive.cap),
+            "pool_cap": int(archive.pool_cap),
+            "quality_floor": (None if archive.quality_floor is None
+                              else float(archive.quality_floor)),
+            "pts": [[float(x) for x in p] for p in archive.pts],
+            "lo": [[float(x) for x in p] for p in archive.lo],
+            "hi": [[float(x) for x in p] for p in archive.hi],
+            "samples": [[[float(x) for x in w] for w in s]
+                        for s in archive.samples],
+            # The MEMBER PLANS of every point. A resumed run without these
+            # would keep the band and forget which plans earned it.
+            "members": [[{"key": str(m["key"]), "seq": m["seq"],
+                          "windows": int(m["windows"]), "n": int(m["n"]),
+                          "first_episode": int(m["first_episode"]),
+                          "last_episode": int(m["last_episode"])}
+                         for m in ms] for ms in archive.members],
+            "counts": [int(c) for c in archive.counts],
+            "seqs": list(archive.seqs),
+            "eps": [int(e) for e in archive.eps],
+            "all_candidates": list(archive.all_candidates),
+            "seen": sorted(str(s) for s in archive._seen),
+            "hv_ref": (None if archive._hv_ref is None
+                       else [float(x) for x in archive._hv_ref]),
+            "n_merged": int(archive.n_merged),
+            "n_dropped_cap": int(archive.n_dropped_cap),
+        }
     return {
         "obj_names": [str(n) for n in archive.obj_names],
         "obj_idx": [int(i) for i in archive.obj_idx],
@@ -411,6 +445,35 @@ def pareto_archive_from_json(archive, d: dict) -> None:
         raise CheckpointError(
             f"the Pareto archive's objectives are {archive.obj_names} on this "
             f"run and {d['obj_names']} in the checkpoint.")
+    _band = hasattr(archive, "samples")
+    if _band != (str(d.get("kind") or "") == "ratio-band"):
+        raise CheckpointError(
+            f"the Pareto archive is {'a band' if _band else 'a reward-vector'} "
+            f"archive on this run and {d.get('kind') or 'a reward-vector'} "
+            f"archive in the checkpoint.")
+    if _band:
+        archive.cap = int(d["cap"])
+        archive.pool_cap = int(d["pool_cap"])
+        archive.pts = [np.asarray(p, dtype=np.float64) for p in d["pts"]]
+        archive.lo = [np.asarray(p, dtype=np.float64) for p in d["lo"]]
+        archive.hi = [np.asarray(p, dtype=np.float64) for p in d["hi"]]
+        archive.samples = [[np.asarray(w, dtype=np.float64) for w in s]
+                           for s in d["samples"]]
+        archive.members = [[{"key": str(m["key"]), "seq": m["seq"],
+                             "windows": int(m["windows"]), "n": int(m["n"]),
+                             "first_episode": int(m["first_episode"]),
+                             "last_episode": int(m["last_episode"])}
+                            for m in ms] for ms in d["members"]]
+        archive.counts = [int(c) for c in d["counts"]]
+        archive.seqs = list(d["seqs"])
+        archive.eps = [int(e) for e in d["eps"]]
+        archive.all_candidates = list(d["all_candidates"])
+        archive._seen = set(d["seen"])
+        archive._hv_ref = (None if d["hv_ref"] is None
+                           else np.asarray(d["hv_ref"], dtype=np.float64))
+        archive.n_merged = int(d["n_merged"])
+        archive.n_dropped_cap = int(d["n_dropped_cap"])
+        return
     if [int(i) for i in archive.obj_idx] != [int(i) for i in d["obj_idx"]]:
         raise CheckpointError(
             f"the Pareto archive's reward indices are {archive.obj_idx} on "

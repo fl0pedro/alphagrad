@@ -2457,6 +2457,10 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
             "candidate_memory_bytes": (paired_ref or {}).get(
                 "candidate_memory_bytes"),
             "mem_log_floored": (paired_ref or {}).get("mem_floored"),
+            # TICKET dsnn-dfw.44: q05 / median / q95 of this plan's paired
+            # per-window log ratios, per objective, so the archive's bands can
+            # be rebuilt from the log without a re-measure.
+            "ratio_log": (paired_ref or {}).get("ratio_log"),
             # THE COUNTS THIS PLAN WAS ACTUALLY MEASURED WITH (owner ruling
             # 2026-09-14). Under the time budget the protocol is no longer a
             # constant of the run -- a slow plan earns fewer windows than a
@@ -4604,6 +4608,40 @@ def paired_log_costs(latency_ns: float, peak_memory: float,
         float(ref_memory) < mem_floor)
     d_mem = _paired_log_delta(peak_memory, ref_memory, mem_floor)
     return float(d_lat), float(d_mem), n_floored
+
+
+# TICKET dsnn-dfw.44, second design. ONE PAIRED LOG RATIO PER CANDIDATE
+# WINDOW, in nats. The pair partner is the MEDIAN of that measurement's
+# reference windows, not the interleaved neighbour, for three reasons: it is
+# the same aggregate `_aggregate_samples` gives the reference in the paired
+# cost, so the plan's median window ratio IS its cost channel; the median of
+# 160 reference windows carries about one eighth of a single candidate
+# window's standard error, so holding it fixed loses almost nothing; and a
+# neighbour would fold one reference window's noise into every ratio and
+# widen the band without saying anything more about the CANDIDATE, which is
+# the thing being compared. The floor is PHYSICAL only (100 ns, 1 byte),
+# never the reference floor `paired_log_costs` applies: the archive's
+# coordinate must keep the half of the axis where a plan is FASTER than
+# rev-exact, which the reward discards.
+def paired_window_log_ratios(cand_samples, ref_samples, floor: float,
+                             fallback: float) -> np.ndarray:
+    c = np.asarray(list(cand_samples), dtype=np.float64)
+    r = np.asarray(list(ref_samples), dtype=np.float64)
+    if c.size == 0 or r.size == 0:
+        # A channel with no timed window (the static temp) is one reading.
+        return np.array([float(fallback)], dtype=np.float64)
+    ref = float(np.median(np.maximum(r, float(floor))))
+    return np.log(np.maximum(c, float(floor))) - math.log(ref)
+
+
+def window_ratio_record(windows) -> dict:
+    """The plan-log form of one objective's windows: the ratios themselves,
+    so any rule can be recomputed offline, and the band the archive fits."""
+    from alphagrad.approx.common.pareto_archive import median_band
+    w = np.asarray(windows, dtype=np.float64).reshape(-1)
+    med, lo, hi = median_band(w)
+    return {"windows": [float(x) for x in w], "median": med,
+            "lo": lo, "hi": hi, "n": int(w.size)}
 
 
 def _static_temp_bytes(compiled) -> float | None:
@@ -9911,7 +9949,27 @@ def _callback_measured(
             _abs_lat, _abs_mem = latency_ns, peak_memory
             latency_ns, peak_memory, _n_floored = paired_log_costs(
                 _abs_lat, _abs_mem, _ref_lat_ns, _ref_mem)
+            # TICKET dsnn-dfw.44: the band this plan is one measurement of.
+            # The memory half has per-window samples only under the WATERMARK
+            # channel; the static temp is one reading per executable.
+            _lat_fb = (
+                math.log(max(_abs_lat, _LAT_FLOOR_NS))
+                - math.log(max(_ref_lat_ns, _LAT_FLOOR_NS))
+                if (_abs_lat > 0.0 and _ref_lat_ns > 0.0) else 0.0)
+            _mem_fb = (math.log(max(_abs_mem, _MEM_LOG_FLOOR_BYTES))
+                       - math.log(max(_ref_mem, _MEM_LOG_FLOOR_BYTES)))
+            _mem_c, _mem_r = ((), ()) if mem_channel() == "temp" else (
+                peak_mem_samples, _ref_peak_samples)
+            _ratio_log = {
+                "latency": window_ratio_record(paired_window_log_ratios(
+                    latency_samples if config.measure_latency else (),
+                    _ref_lat_samples if config.measure_latency else (),
+                    _LAT_FLOOR_NS, _lat_fb)),
+                "memory": window_ratio_record(paired_window_log_ratios(
+                    _mem_c, _mem_r, _MEM_LOG_FLOOR_BYTES, _mem_fb)),
+            }
             _paired_ref_rec = {
+                "ratio_log": _ratio_log,
                 # POSITIVE units (ticket .45 logs these as ref/*).
                 "latency_ns": float(_ref_lat_ns),
                 "temp_bytes": _ref_temp,
