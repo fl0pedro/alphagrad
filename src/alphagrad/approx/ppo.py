@@ -3548,7 +3548,10 @@ class Agent(eqx.Module):
                             s2_quant=jnp.sum(_quant2[:_K], axis=_aq),
                             s1_sizes=jnp.sum(f_sizes[:_K], axis=_as),
                             s2_sizes=jnp.sum(_sizes2[:_K], axis=_as),
-                            s2_nout=_nout2[:_K])
+                            s2_nout=_nout2[:_K],
+                            ctx0_head=_fctx[0][:_K],
+                            p_skip_unmapped=jnn.sigmoid(
+                                _pol.head.logits(_fctx[0])[0]))
                     _rs_pad = -jnp.ones_like(_rs2).at[..., 2].set(0)
                     fa = FaceAction(
                         skip=_keep(_sk2, jnp.zeros((_F,), jnp.int32)),
@@ -4017,6 +4020,7 @@ class Agent(eqx.Module):
                     op=jnp.asarray(row["op_type"], jnp.int32),
                     ct_raw=ct_raw, ct_eff=ct_eff,
                     kbits=_key_bits(_kf), u_direct=jrand.uniform(_kf),
+                    ctx_head=summ[:8],
                     ctx_absmax=jnp.max(jnp.abs(summ)),
                     ctx_absmean=jnp.mean(jnp.abs(summ)))
             # RAW, not clamped -- see the docstring and the ct_eff comment.
