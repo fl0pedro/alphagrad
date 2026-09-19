@@ -6,25 +6,18 @@ actor rebuilds the SAME graph in another process through
 ``cpu_approx_worker._build_env_from_args`` and used to leave ``env.MAX_FACES``
 at the module default 16, so every terminal measurement of a vertex with more
 faces than that raised "N faces exceed the derived bound 16" while the
-trainer's own bound was far larger.
+trainer's own bound was 1920 on the 3-block TransformerLM.
 """
 import os
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
-from types import SimpleNamespace
-
-import jax.random as jrand
 import pytest
 
 import alphagrad.approx.env as E
-from alphagrad.approx.common import get_args, get_fn
-from alphagrad.approx.common.examples import grad_target_setup
-from alphagrad.approx.cpu_approx_worker import (
-    _build_env_from_args, _traced_inlined,
-)
+from alphagrad.approx.cpu_approx_worker import _build_env_from_args
 
-EXAMPLE = "Perceptron"
+EXAMPLE = "NeuralNetwork"
 MODULE_DEFAULT = 16
 
 
@@ -37,13 +30,9 @@ def _args_dict(**over):
     return d
 
 
-def _derived_bound():
-    fn = get_fn(EXAMPLE)
-    xs = get_args(EXAMPLE, jrand.PRNGKey(0), dataset=None)
-    ns = SimpleNamespace(**_args_dict())
-    fn, xs, argnums = grad_target_setup(ns, fn, xs, EXAMPLE)
-    cj = _traced_inlined(fn, xs)
-    return int(E.derived_max_faces(cj.jaxpr, argnums, cj.literals, xs))
+def _bound_of(env):
+    return int(E.derived_max_faces(
+        env.config.jaxpr, env.config.argnums, env.consts, env.args))
 
 
 @pytest.fixture(autouse=True)
@@ -55,13 +44,13 @@ def _restore_width(monkeypatch):
 
 
 def test_the_actor_env_build_configures_the_derived_face_width():
-    want = _derived_bound()
+    E.MAX_FACES = MODULE_DEFAULT
+    env = _build_env_from_args(_args_dict(), None)
+    want = _bound_of(env)
     assert want != MODULE_DEFAULT, (
         f"{EXAMPLE} derives a face bound of {want}, which is the module "
         f"default: this test cannot tell the two apart. Pick an example "
         f"whose bound is not {MODULE_DEFAULT}.")
-    E.MAX_FACES = MODULE_DEFAULT
-    _build_env_from_args(_args_dict(), None)
     assert E.MAX_FACES == want
 
 
@@ -71,12 +60,8 @@ def test_the_actor_env_build_leaves_the_width_alone_without_face_actions():
     assert E.MAX_FACES == MODULE_DEFAULT
 
 
-def test_an_explicit_face_width_override_wins():
-    want = _derived_bound()
-    os.environ["ALPHAGRAD_MAX_FACES"] = str(want + 7)
-    try:
-        E.MAX_FACES = want + 7
-        _build_env_from_args(_args_dict(), None)
-        assert E.MAX_FACES == want + 7
-    finally:
-        os.environ.pop("ALPHAGRAD_MAX_FACES", None)
+def test_an_explicit_face_width_override_wins(monkeypatch):
+    monkeypatch.setenv("ALPHAGRAD_MAX_FACES", "37")
+    E.MAX_FACES = 37
+    _build_env_from_args(_args_dict(), None)
+    assert E.MAX_FACES == 37
