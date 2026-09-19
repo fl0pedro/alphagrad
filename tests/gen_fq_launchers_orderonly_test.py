@@ -279,7 +279,7 @@ def test_every_order_only_job_is_a_cross_agent_per_node_singleton(gen, rows):
                 in text), a["name"]
     # and the matrix keeps its own name, so this change moved no matrix row
     for a in gen.thesis_arms():
-        if a.get("orderonly"):
+        if a.get("orderonly") or a.get("orderonly_rsnn"):
             continue
         assert a["job"] == f"thesis-{a['node']}", a["name"]
 
