@@ -3497,14 +3497,22 @@ class Agent(eqx.Module):
                     # the canonical inactive one, which is what the buffers
                     # start at, so the `_live` select the vmap needed is gone
                     # with the lanes it selected.
+                    #
+                    # THE SCORE IS SUMMED OVER THE WIDTH, not accumulated in
+                    # the loop: `jnp.sum` over [lp_0 .. lp_n-1, 0, 0, ...] is
+                    # the reduction the vmap's `where`-and-sum performed, and
+                    # a sequential accumulation instead moved `face.logp` by
+                    # one ulp at gate step 1. Same operands, same order, same
+                    # bits.
                     _z2 = _rec.zeros(_pol.approx_add, _F)
                     _st2 = (jnp.asarray(0, jnp.int32),
                             jnp.zeros((_F,), jnp.int32),
                             tuple(getattr(_z2, k) for k in _WK2),
-                            jnp.array(0.0), jnp.array(0.0))
+                            jnp.zeros((_F,), jnp.float32),
+                            jnp.zeros((_F,), jnp.float32))
 
                     def _redraw_body(st):
-                        f, sk_b, wa_b, lp_a, e_a = st
+                        f, sk_b, wa_b, lp_b, e_b = st
                         sk, row, lp, e, _ar, _sp, _od = _pol.sample_face(
                             features, factor_tables,
                             jrand.fold_in(face_key, f), f,
@@ -3515,7 +3523,7 @@ class Agent(eqx.Module):
                         return (f + 1, sk_b.at[f].set(sk.astype(jnp.int32)),
                                 tuple(w.at[f].set(row[k])
                                       for w, k in zip(wa_b, _WK2)),
-                                lp_a + lp, e_a + e)
+                                lp_b.at[f].set(lp), e_b.at[f].set(e))
 
                     (_f2, _sk2, _wa2, _lp2,
                      _e2) = lax.while_loop(lambda st: st[0] < _n2,
@@ -3542,7 +3550,8 @@ class Agent(eqx.Module):
                     fa = FaceAction(skip=_sk2, **dict(zip(_WK2, _wa2)))
                     _rec.check(fa, _pol.approx_add, _F,
                                where="Agent.sample_action_dynamic[stage2]")
-                    face_logp, face_ent = _lp2, _e2
+                    face_logp = jnp.sum(jnp.where(_live, _lp2, 0.0))
+                    face_ent = jnp.sum(jnp.where(_live, _e2, 0.0))
                     f_pair, f_comp = _pair2, _comp2
                     f_sizes, f_quant, f_nout = _sizes2, _quant2, _nout2
             if _fdump.on():
