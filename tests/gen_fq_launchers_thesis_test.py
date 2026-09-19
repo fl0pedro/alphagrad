@@ -99,14 +99,16 @@ def matrix(gen):
     this whole set, so a recurrent row cannot quietly drift away from the
     NN256 and TLM rows.
 
-    The order-only tuning rows of ticket dsnn-dfw.29 are thesis arms too --
-    they carry the per-node singleton and the NeuralNetwork target shape, so
-    the tests below that sweep EVERY thesis arm must keep reaching them -- but
-    they are not matrix coordinates.  They are out of this fixture and pinned
-    by tests/gen_fq_launchers_orderonly_test.py instead.
+    The order-only tuning rows of tickets dsnn-dfw.29 and dsnn-dfw.45 are
+    thesis arms too -- they carry the per-node singleton and the target
+    shape, so the tests below that sweep EVERY thesis arm must keep reaching
+    them -- but they are not matrix coordinates.  They are out of this
+    fixture and pinned by tests/gen_fq_launchers_orderonly_test.py and
+    tests/gen_fq_launchers_snnsweep_test.py instead.
     """
     arms = [a for a in gen.thesis_arms()
-            if not a.get("smoke") and not a.get("orderonly")]
+            if not a.get("smoke") and not a.get("orderonly")
+            and not a.get("orderonly_rsnn")]
     assert arms, "the generator emits no thesis arm"
     return arms
 
