@@ -14905,6 +14905,19 @@ def main():
         if not warmup:
             _HEALTH_N[0] += 1
         _hlabel = "warmup" if warmup else "ep%d" % (_HEALTH_N[0] - 1)
+        # ALPHAGRAD_FACE_DEBUG=1 ONLY (ticket dsnn-dfw, the zero-approximation
+        # absorber): the face head's own draw census -- how many faces it was
+        # asked about, which classes the legality mask left open, and which
+        # classes it drew. Empty string, and no line at all, when the flag is
+        # unset, so nothing about a normal run changes.
+        try:
+            from alphagrad.approx.unified_face_policy import (
+                face_debug_report as _face_debug_report)
+            _fdbg = _face_debug_report(_hlabel)
+        except Exception:
+            _fdbg = ""
+        if _fdbg:
+            tqdm.write(_fdbg)
         if warmup or _HEALTH_N[0] <= int(
                 os.environ.get("ALPHAGRAD_HEALTH_EPISODES", "3")):
             # The launch check, on stdout where a running job can be read

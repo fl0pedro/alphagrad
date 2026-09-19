@@ -19,6 +19,8 @@ per-vertex ratio 2.3e23 at epoch 0.
 """
 from __future__ import annotations
 
+import os
+
 import equinox as eqx
 import jax
 import jax.numpy as jnp
@@ -48,6 +50,77 @@ from alphagrad.approx.unified_face_head import (
 #: rather than being dropped -- adding a per-face field to the declaration
 #: without telling the head which logit drew it must not silently store a zero.
 _FIELDS_OF_RECORD = {"skip": "skip", "join": "join"}
+
+
+#: DIAGNOSTIC ONLY (ticket dsnn-dfw, the zero-approximation absorber).
+#: ``ALPHAGRAD_FACE_DEBUG=1`` makes :meth:`UnifiedFacePolicy.sample_face` emit
+#: one ``FACEDBG`` line per sampled face with the legality masks it drew
+#: under, the skip probability, and the classes it actually drew. Nothing
+#: else changes: the draw itself is untouched, the flag is read once at
+#: import time and the print is compiled out when it is unset.
+FACE_DEBUG = bool(int(os.environ.get("ALPHAGRAD_FACE_DEBUG", "0") or 0))
+
+#: Host-side counters the debug sink accumulates. Keys are plain ints and
+#: floats, so the sink costs one numpy pass per call and nothing on device.
+FACE_DEBUG_COUNTS: dict = {}
+
+_FACE_DEBUG_CLASSES = ("diag", "reduce", "quant", "none")
+
+
+def _face_debug_sink(fv, aok, sk, om, ops, psk):
+    """Accumulate one call's per-face draws into :data:`FACE_DEBUG_COUNTS`.
+
+    Called through ``jax.debug.callback``, so the arrays arrive either
+    unbatched (one face) or with a leading vmap axis (one face per
+    environment). Both are flattened the same way. READ-ONLY: nothing here
+    feeds back into the draw.
+    """
+    import numpy as _np
+    fv = _np.asarray(fv).reshape(-1)
+    b = int(fv.shape[0])
+    aok = _np.asarray(aok).reshape(b)
+    sk = _np.asarray(sk).reshape(b)
+    psk = _np.asarray(psk).reshape(b)
+    om = _np.asarray(om).reshape(b, -1, 4)
+    ops = _np.asarray(ops).reshape(b, -1)
+    live = fv > 0.5
+    n_live = int(live.sum())
+    if n_live == 0:
+        return
+    c = FACE_DEBUG_COUNTS
+    c["faces"] = c.get("faces", 0) + n_live
+    c["slots"] = c.get("slots", 0) + n_live * int(ops.shape[1])
+    c["skip_drawn"] = c.get("skip_drawn", 0) + int((sk[live] > 0).sum())
+    c["psk_sum"] = c.get("psk_sum", 0.0) + float(psk[live].sum())
+    c["approx_ok_zero"] = (c.get("approx_ok_zero", 0)
+                           + int((aok[live] < 0.5).sum()))
+    for k, name in enumerate(_FACE_DEBUG_CLASSES):
+        c["legal_" + name] = (c.get("legal_" + name, 0)
+                              + int((om[live][:, :, k] > 0.5).sum()))
+        c["drawn_" + name] = (c.get("drawn_" + name, 0)
+                              + int((ops[live] == k).sum()))
+
+
+def face_debug_report(tag: str = "") -> str:
+    """Format and CLEAR the accumulated counters. Empty string when off."""
+    c = FACE_DEBUG_COUNTS
+    if not c:
+        return ""
+    n = max(int(c.get("faces", 0)), 1)
+    s = max(int(c.get("slots", 0)), 1)
+    parts = [f"[facedbg{(' ' + tag) if tag else ''}]",
+             f"faces={c.get('faces', 0)}",
+             f"slots={c.get('slots', 0)}",
+             f"skip_drawn={c.get('skip_drawn', 0)}",
+             f"p_skip_mean={c.get('psk_sum', 0.0) / n:.4f}",
+             f"approx_ok_zero={c.get('approx_ok_zero', 0)}"]
+    for name in _FACE_DEBUG_CLASSES:
+        parts.append(f"legal_{name}={c.get('legal_' + name, 0)}"
+                     f"({c.get('legal_' + name, 0) / s:.3f})")
+    for name in _FACE_DEBUG_CLASSES:
+        parts.append(f"drawn_{name}={c.get('drawn_' + name, 0)}")
+    c.clear()
+    return " ".join(parts)
 
 
 class UnifiedFacePolicy(eqx.Module):
@@ -574,8 +647,29 @@ class UnifiedFacePolicy(eqx.Module):
             ctx_f, key, op_mask=om, i_mask=im, j_mask=jm, axis_mask=am,
             dtype_mask=dm, pair_ok=pair_ok, face_valid=face_valid_f > 0.5,
             approx_ok=approx_ok)
+        if FACE_DEBUG:
+            self._debug_line(om, z, fields, face_valid_f, approx_ok)
         return (fields.skip, self._wire_row(fields, ff, tables), lp, e, ar,
                 jax.nn.sigmoid(z[0]), self._op_dist(z))
+
+    def _debug_line(self, om, z, fields, face_valid_f, approx_ok):
+        """Ship one sampled face to the host counters (ALPHAGRAD_FACE_DEBUG).
+
+        ``om`` is the op legality the draw ran under, in the head's own
+        order (blockdiag, reduce, quant, none); ``fields.op`` is what the
+        draw returned, same order. ``psk`` is the skip Bernoulli's
+        probability BEFORE the ``face_valid`` / ``approx_ok`` gate and
+        ``fields.skip`` is what the gate left. Read-only.
+        """
+        jax.debug.callback(
+            _face_debug_sink,
+            jnp.asarray(face_valid_f, jnp.float32),
+            jnp.asarray(approx_ok, jnp.float32),
+            jnp.asarray(fields.skip, jnp.int32),
+            jnp.asarray(om, jnp.float32),
+            jnp.asarray(fields.op, jnp.int32),
+            jax.nn.sigmoid(z[0]),
+        )
 
     def evaluate_face(self, features: AxisTokenFeatures,
                       tables: FactorTables, fa: FaceAction, f: int,
