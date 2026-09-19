@@ -113,6 +113,20 @@ from alphagrad.approx.common.order import (
     FIXED_ORDER_CHOICES as _FIXED_ORDER_CHOICES,
     fixed_order_for_env as _fixed_order_for_env,
 )
+from alphagrad.approx.common.temporal_order import (
+    FIXED_TEMPORAL_ORDER_CHOICES as _FIXED_TEMPORAL_ORDER_CHOICES,
+    build_order_constraint as _build_order_constraint,
+    describe as _describe_order,
+)
+from alphagrad.approx.common import carry_plan as _carry_plan
+from alphagrad.approx.common.snn_shd import SHD_TARGETS as _SHD_TARGETS
+from alphagrad.approx.common.rsnn_shd import (
+    TEMPORAL_RULES as _TEMPORAL_RULES,
+    is_rsnn as _is_rsnn,
+    last_step_position as _last_step_position,
+    target_example as _target_example,
+    resolve_temporal_rule as _resolve_temporal_rule,
+)
 from alphagrad.approx.common.schedules import cosine_warmup_exp_decay_lr
 from alphagrad.approx.env import (
     quality_metric as _env_quality_metric,
@@ -5474,7 +5488,70 @@ def make_argparser() -> argparse.ArgumentParser:
              "chooses. Under a pin exactly one vertex is legal per step "
              "(masks.vertex_avail_at_step), so the vertex head's KL and "
              "gradient are structurally 0. Replaces ALPHAGRAD_FORCE_REV_ORDER, "
-             "which now fails loudly when set.")
+             "which now fails loudly when set. On a target WITH time steps "
+             "this is the SPATIAL order -- the order among the vertices of ONE "
+             "time step -- and --fixed-temporal-order is the independent "
+             "order across the step copies.")
+    p.add_argument(
+        "--fixed-temporal-order",
+        choices=list(_FIXED_TEMPORAL_ORDER_CHOICES), default="free",
+        help="The order across the step COPIES of a recurrent target "
+             "(common/temporal_order.py). reverse: later steps first -- "
+             "backpropagation through time. forward: earlier steps first -- "
+             "real-time recurrent learning. free (default): the policy picks "
+             "which copy advances. markowitz is deliberately NOT offered here: "
+             "it is a degree heuristic on the live graph and says nothing "
+             "about time. This and --fixed-order are INDEPENDENT and every "
+             "combination is legal; each pinned one is a PARTIAL order the "
+             "policy fills in (pinned temporal + free spatial = whole copies "
+             "in the pinned direction, free inside a copy; free temporal + "
+             "pinned spatial = each copy keeps the pinned relative order while "
+             "the policy chooses which copy advances; both pinned = a total "
+             "order). RAISES on a target without time steps.")
+    p.add_argument(
+        "--target-grad-window", type=int, default=None, metavar="N",
+        help="THE TARGET'S GRADIENT WINDOW (CONTEXT.md): how many time steps "
+             "of a recurrent target the gradient sees. The steps before it run "
+             "DETACHED in the args builder and only supply the carry, so the "
+             "elimination graph is one base block plus N per-step blocks. "
+             "1 = no rollout, spatial credit only; 2 = one step back; 100 = "
+             "the full SHD sequence. Replaces ALPHAGRAD_SNN_STEPS and "
+             "ALPHAGRAD_SNN_TRUNC, both of which now fail loudly when set. "
+             "RAISES on a target without time steps. NOT --grad-window, which "
+             "is the ENCODER's replay window over elimination steps and is a "
+             "different quantity entirely.")
+    p.add_argument(
+        "--temporal-rule", choices=list(_TEMPORAL_RULES), default=None,
+        help="HOW TEMPORAL CREDIT ENTERS THE ONE-STEP RECURRENT GRAPH "
+             "(--example RSNN_SHD; owner ruling 2026-09-16). The graph is "
+             "always ONE recurrent step -- inputs the weights, the carried "
+             "state and the input frame, outputs the next state and the step "
+             "loss -- and the rule says which given quantity meets it. "
+             "tbptt (default): no temporal edge, the carried state is a "
+             "constant, truncated and spatial only; the baseline. "
+             "bptt: the FUTURE feeds in. An edge from the next state to the "
+             "loss carries the adjoint dL(>t)/ds_t from a detached backward "
+             "pass over the suffix, so the gradient is exactly the "
+             "contribution step t makes to full backpropagation through time. "
+             "rtrl: the PAST feeds in. An edge from the weights to the "
+             "carried state carries the influence matrix ds(t-1)/dW from a "
+             "detached pass over the prefix, so eliminating that vertex is "
+             "one real-time-recurrent-learning step and the gradient is "
+             "exactly dL_t/dW through the whole prefix. bptt and rtrl are "
+             "both EXACT; the face where the given quantity meets the step is "
+             "where an e-prop-like approximation (Zenke and Neftci 2020) "
+             "lives. RAISES on any target without time steps.")
+    # --carry-container IS GONE (owner ruling 2026-09-16, A). The
+    # plan-produced carry is the ONLY mode and the container follows the
+    # PLAN's approximation on the carried-Jacobian face, per plan, on the
+    # measurement side (common/carry_plan.py). A run-level flag would have
+    # been one container for every plan of the run, which is exactly what
+    # the ruling removed.
+    p.add_argument(
+        "--step-position", type=int, default=None, metavar="T",
+        help="Pin the step position t of the recurrent target instead of "
+             "drawing it uniformly from the run's key. Debugging and tests "
+             "only: a pinned t measures one step of one recording forever.")
     p.add_argument(
         "--approx-profile", choices=["all", "skip", "reduce", "quant", "diag", "none"],
         default=None,
@@ -5848,7 +5925,14 @@ def make_argparser() -> argparse.ArgumentParser:
         "dominant rollout cost. PPO+GAE handles sparse rewards natively. "
         "Default on; pass --no-terminal-rewards-only for per-step rewards.",
     )
-    p.add_argument("--dataset", type=str, default="mnist", choices=["mnist", "wikitext2", "none"])
+    p.add_argument("--dataset", type=str, default="mnist",
+                   choices=["mnist", "wikitext2", "shd", "none"],
+                   help="The corpus the target's data args are drawn from. "
+                        "shd = the raw Spiking Heidelberg Digits, binned to "
+                        "700 channels x 100 bins of 10 ms over the first "
+                        "second, for LIF_SNN_SHD / ADALIF_SNN_SHD; without it "
+                        "those two targets keep the synthetic Poisson train "
+                        "they shipped with.")
     p.add_argument("--dataset-size", type=int, default=-1)
     p.add_argument("--num-eval-samples", type=int, default=10)
 
@@ -7431,6 +7515,17 @@ def main():
             "--per-face-masks needs --face-actions: it masks the per-FACE "
             "action space, and without the face head there is none.")
     args.per_face_masks = bool(args.face_actions)
+    # --temporal-rule is resolved HERE, before `dict(vars(args))` reaches the
+    # measure actors and before the wandb config is written, so the trainer,
+    # every actor and the run record carry the SAME rule. An actor that read a
+    # different rule would measure a different graph than the search acts on.
+    args.temporal_rule = _resolve_temporal_rule(args.example, args.temporal_rule)
+    # THE TARGET THE RULE BUILDS. --temporal-rule window2 is not another
+    # given edge on the one-step body; it is a two-copy graph with no given
+    # edge at all, and it has its own registered target. Resolved HERE, in
+    # the same place and for the same reason the rule is: the trainer, every
+    # measure actor and the run record must name one target.
+    args.example = _target_example(args.example, args.temporal_rule)
     # Knobs that became flags (dsnn-3qm.44) are REFUSED if a launcher still
     # exports them, never read: an ignored export would run the knob OFF.
     from alphagrad.approx.common.agent_factory import refuse_removed_env_knobs
@@ -7618,7 +7713,9 @@ def main():
     dataset_arg = None if args.dataset == "none" else args.dataset
     use_dataset = dataset_arg is not None and (
         args.example.endswith("NeuralNetwork")
-        or args.example.startswith("TransformerLM"))
+        or args.example.startswith("TransformerLM")
+        or args.example in _SHD_TARGETS
+        or _is_rsnn(args.example))
     dataset_for_call = dataset_arg if use_dataset else None
 
     from alphagrad.approx.common.examples import (
@@ -7666,9 +7763,21 @@ def main():
             f"benchmarks, or `auto`, which reads the same fact and picks "
             f"jac_cosine by itself.")
     target_fn = get_fn(args.example)
-    xs = get_args(args.example, args_key, dataset=dataset_for_call)
+    xs = get_args(args.example, args_key, dataset=dataset_for_call,
+                  grad_window=args.target_grad_window,
+                  dataset_size=args.dataset_size,
+                  temporal_rule=args.temporal_rule,
+                  step_position=args.step_position)
+    if args.temporal_rule is not None:
+        _pos = _last_step_position()
+        print(f"[cfg] --temporal-rule {args.temporal_rule}: step t={_pos.get('t')} "
+              f"of T={_pos.get('T')}, recording {_pos.get('recording')}, "
+              f"carry {_pos.get('carry')}",
+              flush=True)
     gen = data_gen(
-        args.example, dataset=dataset_for_call, dataset_size=args.dataset_size
+        args.example, dataset=dataset_for_call, dataset_size=args.dataset_size,
+        key=args_key, temporal_rule=args.temporal_rule,
+        grad_window=args.target_grad_window,
     )
     # TARGET SETUP -- routed through the shared builder so the trainer and
     # every measure-actor construct the IDENTICAL graph (jaxpr / vertex+action
@@ -7880,6 +7989,17 @@ def main():
     # once we know whether one exists (owner ruling 2026-09-18 / dsnn-dfw.22:
     # a Ray CPU actor when a pool is up, built with it and torn down with it;
     # see the block below the --ray-measure setup).
+
+    # THE CARRY CONTAINER FOLLOWS THE PLAN (owner rulings 2026-09-16, A and
+    # B). The policy acts on THIS env, which carries the dense carry edge; the
+    # measurement builds the program that each plan's own classes on the
+    # carried face imply. This is where that builder learns what the target
+    # was made from. A no-op on every target with no given temporal edge.
+    _carry_plan.register(
+        args, args_key, args.example, args.temporal_rule,
+        env.config, env.args, env.consts,
+        dataset=dataset_for_call, dataset_size=args.dataset_size,
+        step_position=args.step_position)
 
     # THE BASE STREAM, once, on the host. `len(base_tokens())` depends only on
     # the jaxpr -- not on the elimination order -- so this is a constant every
@@ -9230,10 +9350,17 @@ def main():
     vertex_valid_static = build_vertex_valid_static(env.valid_vertices, total_v)
     # --fixed-order (ticket .64): the static order table, computed ONCE here on
     # the exact graph and gathered inside vertex_avail_at_step; None = free.
-    fixed_order_table = _fixed_order_for_env(args.fixed_order, env)
-    if fixed_order_table is None:
-        print("[cfg] fixed order: free (the vertex head chooses)", flush=True)
-    else:
+    # TWO INDEPENDENT PINS. --fixed-order is the SPATIAL one (within a time
+    # step) and --fixed-temporal-order the order across step copies; together
+    # they generate a PARTIAL order, and only the "one copy" case collapses to
+    # the ticket .64 table. The builder returns exactly one of the two, and
+    # vertex_avail_at_step refuses both at once.
+    fixed_order_table, order_constraint = _build_order_constraint(
+        args.fixed_order, args.fixed_temporal_order, env, args.example)
+    print("[cfg] " + _describe_order(order_constraint, fixed_order_table,
+                                     args.fixed_order,
+                                     args.fixed_temporal_order), flush=True)
+    if fixed_order_table is not None:
         print(f"[cfg] fixed order: {args.fixed_order}, {len(fixed_order_table)} "
               f"steps, {fixed_order_table[:6].tolist()} ... "
               f"{fixed_order_table[-3:].tolist()}; only approximations are "
@@ -10115,6 +10242,7 @@ def main():
             vertex_avail_mask = vertex_avail_at_step(
                 state, vertex_valid_static, total_v, num_valid,
                 fixed_order=fixed_order_table,
+                order_constraint=order_constraint,
             )
 
             # PRE (synced through the PREVIOUS delta) and POST (synced through

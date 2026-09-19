@@ -517,19 +517,30 @@ class PPORayWorker:
         # references locally — we need both `args` (for tokenizer/eval)
         # and `valid_vertices` for the action mask.
         dataset_arg = None if self.args.dataset == "none" else self.args.dataset
+        from alphagrad.approx.common.snn_shd import SHD_TARGETS
+        from alphagrad.approx.common.rsnn_shd import is_rsnn
         use_dataset = (
             dataset_arg is not None
-            and self.args.example.endswith("NeuralNetwork")
+            and (self.args.example.endswith("NeuralNetwork")
+                 or self.args.example in SHD_TARGETS
+                 or is_rsnn(self.args.example))
         )
         dataset_for_call = dataset_arg if use_dataset else None
         from alphagrad.approx.common.examples import (
             has_scalar_loss as _has_scalar_loss)
         target_fn = get_fn(self.args.example)
-        xs = get_args(self.args.example, args_key, dataset=dataset_for_call)
+        xs = get_args(self.args.example, args_key, dataset=dataset_for_call,
+                      grad_window=getattr(self.args, "target_grad_window", None),
+                      dataset_size=self.args.dataset_size,
+                      temporal_rule=getattr(self.args, "temporal_rule", None),
+                      step_position=getattr(self.args, "step_position", None))
         gen = data_gen(
             self.args.example,
             dataset=dataset_for_call,
             dataset_size=self.args.dataset_size,
+            key=args_key,
+            temporal_rule=getattr(self.args, "temporal_rule", None),
+            grad_window=getattr(self.args, "target_grad_window", None),
         )
         # THE SCALAR-LOSS GRAPH (+ optional deprecated seed-vertex form)
         # with the matching argnums, IDENTICALLY to the measure

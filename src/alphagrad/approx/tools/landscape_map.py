@@ -131,6 +131,21 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument("--dataset", default="wikitext2",
                    help="'none' disables the dataset (Helmholtz smoke).")
     p.add_argument("--dataset-size", type=int, default=-1)
+    # The TARGET's gradient window, spelled and defaulted exactly as in ppo.py,
+    # so a replay of a recurrent arm rebuilds the SAME number of per-step
+    # blocks. Without it this tool would silently map a one-step graph against
+    # a run that trained on a hundred.
+    p.add_argument("--target-grad-window", type=int, default=None, metavar="N")
+    # A replay must rebuild the SAME graph the run trained on, so the two
+    # things that change the recurrent target's graph are accepted here too.
+    p.add_argument("--temporal-rule",
+                   choices=["tbptt", "bptt", "rtrl", "window2"],
+                   default=None)
+    p.add_argument("--step-position", type=int, default=None, metavar="T")
+    # --carry-container IS GONE (owner ruling 2026-09-16, A). The container
+    # follows the PLAN, per plan, and this tool measures plans: a singleton
+    # plan with Diag on the carried face IS the e-prop container, and the
+    # measurement builds that program itself.
     p.add_argument("--hidden-dim", type=int, default=256)
     p.add_argument("--vocab-size", type=int, default=512)
     p.add_argument("--embd-dim", type=int, default=128)
@@ -376,10 +391,24 @@ _APPROX_ADD_CHOICES = ("lossy", "lossless")
 _APPROX_ADD_DEFAULT = "lossless"
 
 
-if __name__ == "__main__":
-    ARGS = make_argparser().parse_args()
-else:
-    ARGS = make_argparser().parse_args([])
+# THE IMPORT-TIME ARGUMENTS. Everything in the block below is a PROCESS-WIDE
+# env knob that has to be set before `alphagrad.approx.env` reads it, so it is
+# decided here, at import. A probe that sets `sys.argv` and then IMPORTS this
+# module is a supported way to drive the tool (it is how every measurement
+# script of 2026-09-16 is written), and it used to be served the DEFAULTS:
+# `parse_args([])` threw the argv away, so `--quality-metric jac_cosine`
+# silently ran `grad_cosine` and `--exec-on-gpu` only worked because its line
+# below reads `sys.argv` by hand. Read argv whenever argv NAMES this tool --
+# the same test, applied to every flag instead of one.
+def _import_time_argv() -> list:
+    if __name__ == "__main__":
+        return sys.argv[1:]
+    if os.path.basename(str(sys.argv[0] or "")).startswith("landscape_map"):
+        return sys.argv[1:]
+    return []
+
+
+ARGS = make_argparser().parse_args(_import_time_argv())
 
 # --- IMPORT-TIME env knobs -------------------------------------------------
 # `_MEASURE_ACTOR` is read at import of alphagrad.approx.env. Setting it here
@@ -483,16 +512,34 @@ def build_env(args):
     key = jrand.PRNGKey(args.seed)
     key, args_key = jrand.split(key)
 
+    from alphagrad.approx.common.snn_shd import SHD_TARGETS
+    from alphagrad.approx.common.rsnn_shd import (is_rsnn,
+                                                  resolve_temporal_rule,
+                                                  target_example)
+    # THE TARGET THE RULE BUILDS (owner ruling 2026-09-16). --temporal-rule
+    # window2 is a two-copy graph with no given edge and its own registered
+    # target, resolved here exactly as the trainer resolves it.
+    args.temporal_rule = resolve_temporal_rule(
+        args.example, getattr(args, "temporal_rule", None))
+    args.example = target_example(args.example, args.temporal_rule)
     dataset_arg = None if args.dataset == "none" else args.dataset
     use_dataset = dataset_arg is not None and (
         args.example.endswith("NeuralNetwork")
-        or args.example.startswith("TransformerLM"))
+        or args.example.startswith("TransformerLM")
+        or args.example in SHD_TARGETS
+        or is_rsnn(args.example))
     dataset_for_call = dataset_arg if use_dataset else None
 
     target_fn = get_fn(args.example)
-    xs = get_args(args.example, args_key, dataset=dataset_for_call)
+    xs = get_args(args.example, args_key, dataset=dataset_for_call,
+                  grad_window=getattr(args, "target_grad_window", None),
+                  dataset_size=args.dataset_size,
+                  temporal_rule=getattr(args, "temporal_rule", None),
+                  step_position=getattr(args, "step_position", None))
     gen = data_gen(args.example, dataset=dataset_for_call,
-                   dataset_size=args.dataset_size)
+                   dataset_size=args.dataset_size, key=args_key,
+                   temporal_rule=getattr(args, "temporal_rule", None),
+                   grad_window=getattr(args, "target_grad_window", None))
     target_fn, xs, argnums = grad_target_setup(args, target_fn, xs, args.example)
     closed_jaxpr = _traced_inlined(target_fn, xs)
 
@@ -536,6 +583,16 @@ def build_env(args):
     envmod.configure_max_faces(bound)
     print(f"[landscape] face width: derived bound {bound} "
           f"(in force: {envmod.MAX_FACES})", flush=True)
+
+    # THE CARRY CONTAINER FOLLOWS THE PLAN (owner rulings 2026-09-16). The
+    # same registration the trainer makes, so this tool measures a plan
+    # through the same seam the campaign does.
+    from alphagrad.approx.common import carry_plan as _carry_plan
+    _carry_plan.register(
+        args, args_key, args.example, args.temporal_rule,
+        env.config, env.args, env.consts,
+        dataset=dataset_for_call, dataset_size=args.dataset_size,
+        step_position=getattr(args, "step_position", None))
 
     key, eval_key = jrand.split(key)
     eval_samples = generate_eval_samples(env, eval_key, args.num_eval_samples)

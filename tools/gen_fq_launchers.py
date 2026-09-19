@@ -979,9 +979,16 @@ echo "===================== P3: post-744fc3d re-baseline =================="
 for EX in LIF_SNN ADALIF_SNN ADALIF_SNN_SEQ LIF_SNN_SHD \
           Simple Lighthouse RobotArm_6DOF RoeFlux_1d BlackScholes_Jacobian; do
   echo "--- P3 example=$EX ---"
+  # THE TARGET'S GRADIENT WINDOW, named because it used to be a default.
+  # LIF_SNN_SHD read ALPHAGRAD_SNN_TRUNC and, unset, unrolled the whole T=100
+  # sequence; the flag that replaced it (--target-grad-window) defaults to ONE
+  # step, so the window this arm re-baselined is written out.  The flag RAISES
+  # on a target with no time steps, which is why the other eight do not get it.
+  WIN=""
+  [ "$EX" = "LIF_SNN_SHD" ] && WIN="--target-grad-window 100"
   CUDA_VISIBLE_DEVICES=0 $PY \
     src/alphagrad/approx/tools/landscape_map.py \
-    --example $EX --dataset none --seed 250197 \
+    --example $EX --dataset none --seed 250197 $WIN \
     --exec-on-gpu --cmp-type latency --mem-type peak_memory \
     --num-data-points 5 --reps-per-point 4 --latency-inner-reps 50 \
     --ladder 1,5 --ops quant,diag,compress --reps 3 \
@@ -2125,12 +2132,38 @@ not a summary.""",
 #   C_popart   0           Lagrangian dual, tau 0.90  ON       no
 #   condC      0           Lagrangian dual, tau 0.90  off      YES
 #
-#   target     example          dataset     target-shape env
-#   nn256      NeuralNetwork    mnist       ALPHAGRAD_NN_HIDDEN=256
-#   tlm        TransformerLM    wikitext2   the ALPHAGRAD_TLM_* triple
+#   target         example          dataset     target-shape env
+#   nn256          NeuralNetwork    mnist       ALPHAGRAD_NN_HIDDEN=256
+#   tlm            TransformerLM    wikitext2   the ALPHAGRAD_TLM_* triple
+#   rsnn_tbptt     RSNN_SHD         shd         none (the target is fixed)
+#   rsnn_bptt      RSNN_SHD         shd         none
+#   rsnn_rtrl      RSNN_SHD         shd         none
+#   rsnn_window2   RSNN_SHD         shd         none
 #
 #   seeds      250197 250198 250199 250200 250201
-#   run name   <arm>_<target>_s<seed>, e.g. C_popart_tlm_s250197
+#   run name   <arm>_<target>_s<seed>, e.g. C_popart_tlm_s250197 and
+#              C_rsnn_bptt_s250199
+#
+# THE RECURRENT TARGET IS FOUR TARGETS, NOT ONE.  --example RSNN_SHD
+# --dataset shd is shared by all four and --temporal-rule is the one flag
+# that separates them, so the rule is part of the TARGET KEY rather than a
+# fourth matrix coordinate.  That is not cosmetic.  Every helper below takes
+# exactly one (arm, target, seed) triple and `thesis_run_name` spells such a
+# triple `<arm>_<target>_s<seed>`; with the key `rsnn_bptt` that spelling IS
+# the `<arm>_rsnn_<rule>_s<seed>` the owner asked for, and there is no second
+# naming rule to keep in step with the first.  The recurrent block is
+# therefore 4 rules x 5 arms x 5 seeds = 100 rows, and the whole thesis
+# section is 50 + 100 = 150 rows plus the three smoke runs.
+#
+# --example STAYS RSNN_SHD ON ALL FOUR, window2 INCLUDED.  window2 builds a
+# different graph -- two step copies joined by the temporal edge -- but
+# common/rsnn_shd.target_example is the one place that says so, and it reads
+# the RULE off the command line ("window2 on the ONE-STEP target is legal and
+# is how a run asks for the window arm").  A launcher that named
+# RSNN_SHD_W2 itself would be a second place saying the same thing.
+#
+# EVERY ONE OF THE 100 IS HELD: the owner released the NN256/TLM first block
+# only and no RSNN_SHD run.  See _THESIS_SNN_HELD.
 #
 # WHY A AND B CARRY NO QUALITY FLOOR (owner ruling 2026-09-16, night).  A and
 # B are the CONTROLS that make the Lagrangian arm readable: the fixed additive
@@ -2339,14 +2372,48 @@ def thesis_job_name(node: str) -> str:
 # set); the trainer derives the provable bound per graph and prints it
 # ("face width: derived bound N").  The campaign arms already run without it.
 # ---------------------------------------------------------------------------
-THESIS_TARGETS = ("nn256", "tlm")
+#: THE RECURRENT TARGET's four temporal rules, which are the four SNN arms of
+#: the matrix (owner ruling 2026-09-16).  The rule says HOW the state carried
+#: between time steps enters the gradient:
+#:
+#:   tbptt     no temporal edge.  The truncated baseline, and ppo.py's default.
+#:   bptt      the one-step body plus the given FUTURE adjoint over the suffix.
+#:   rtrl      the one-step body plus the given PAST Jacobian over the prefix.
+#:   window2   TWO step copies joined by the temporal edge and NO given edge.
+#:
+#: This generator imports nothing from alphagrad -- it runs on the login host,
+#: where the stack is not importable -- so the tuple is typed here and the
+#: thesis test pins it against common/rsnn_shd.TEMPORAL_RULES, which is the
+#: tuple ppo.py builds `--temporal-rule`'s choices from.
+THESIS_TEMPORAL_RULES = ("tbptt", "bptt", "rtrl", "window2")
+THESIS_RSNN_EXAMPLE = "RSNN_SHD"
+THESIS_RSNN_DATASET = "shd"
+#: The target key of a temporal rule.  `rsnn_bptt`, so `thesis_run_name`
+#: spells the run `<arm>_rsnn_bptt_s<seed>`.
+THESIS_RSNN_TARGETS = tuple(f"rsnn_{r}" for r in THESIS_TEMPORAL_RULES)
+THESIS_TARGETS = ("nn256", "tlm") + THESIS_RSNN_TARGETS
 THESIS_TARGET_CLI = {
     "nn256": {"--example": "NeuralNetwork", "--dataset": "mnist"},
     "tlm": {"--example": "TransformerLM", "--dataset": "wikitext2"},
+    # THE RECURRENT TARGET.  --example and --dataset are the same in all four
+    # rows; --temporal-rule is the only difference between them, and it is
+    # the only flag the recurrent rows carry that the NN256 and TLM rows do
+    # not.  Everything else comes from `thesis_cli`, unchanged.
+    **{f"rsnn_{r}": {"--example": THESIS_RSNN_EXAMPLE,
+                     "--dataset": THESIS_RSNN_DATASET,
+                     "--temporal-rule": r}
+       for r in THESIS_TEMPORAL_RULES},
 }
 THESIS_TARGET_ENV = {
     "nn256": {"ALPHAGRAD_NN_HIDDEN": "256"},
     "tlm": {},          # the ALPHAGRAD_TLM_* triple is in CAMPAIGN_ENV
+    # The recurrent target's shape is NOT an environment variable: the hidden
+    # width, the time constants and the init scale are module constants of
+    # common/rsnn_shd.py (RSNN_HIDDEN = 128, the seven measured constants and
+    # WEIGHT_SCALE), chosen by the learning gate, and nothing reads an env
+    # var for them.  So these rows export nothing of their own and
+    # THESIS_TARGET_ENV_ALLOWED below does not grow.
+    **{t: {} for t in THESIS_RSNN_TARGETS},
 }
 #: The ONLY per-arm exports a thesis launcher may carry.  `render` refuses
 #: any other key, exactly as it refuses every per-arm export on a campaign arm.
@@ -2355,6 +2422,19 @@ THESIS_TARGET_ENV_ALLOWED = frozenset(
 #: Every `export NAME=` a THESIS launcher may contain: the campaign's allowed
 #: set plus the target-shape variables above.
 THESIS_ENV_ALLOWED = frozenset(CAMPAIGN_ENV_ALLOWED) | THESIS_TARGET_ENV_ALLOWED
+
+
+def thesis_temporal_rule(target: str) -> str | None:
+    """The temporal rule of a thesis target, or None when it has no time.
+
+    The rule lives in the target's own `cli` dict, so this reads it back
+    rather than parsing the key: one place defines it.
+    """
+    if target not in THESIS_TARGET_CLI:
+        raise CampaignRowError(
+            f"target {target!r} is not one of {THESIS_TARGETS}")
+    return THESIS_TARGET_CLI[target].get("--temporal-rule")
+
 
 # ---------------------------------------------------------------------------
 # THE ARMS.  Each row is the DIFFERENCE from the shared thesis configuration:
@@ -2385,6 +2465,14 @@ THESIS_REQUIRED_FLAGS = REQUIRED_FLAGS + [
     "--checkpoint-every", "--resume", "--auto-stop",
     "--lag-eta", "--lag-init", "--lag-min", "--lag-max",
     "--grad-oracle-cadence",
+    # The recurrent target's one extra flag.  It is defined in ppo.py, so the
+    # layer-1 grep passes on every row; it is listed for the same reason
+    # every other flag here is, so that a tree without it aborts 64 naming
+    # the flag rather than 65 with an argparse dump.  The grep is a NAME
+    # check and cannot see the flag's CHOICES, so a tree whose
+    # common/rsnn_shd.TEMPORAL_RULES is short of a rule this matrix names
+    # fails at layer 2 instead, by value, which is the right message.
+    "--temporal-rule",
 ]
 
 THESIS_HEAD = f"""THE THESIS MATRIX (epic dsnn-dfw, ticket dsnn-dfw.4) under
@@ -2619,6 +2707,10 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
         name=name, job=thesis_job_name(node), kind="train", runtime="scratch",
         node=node, time=time, gpus=gpus, singleton=True, thesis=True,
         thesis_arm=arm, thesis_target=target, thesis_seed=seed,
+        # None on NN256 and TLM, the rule name on a recurrent row.  It is the
+        # coordinate a reader wants and it is DERIVED from the target, never
+        # passed in, so the two cannot disagree.
+        thesis_rule=thesis_temporal_rule(target),
         env=dict(THESIS_TARGET_ENV[target]),
         required_flags=THESIS_REQUIRED_FLAGS,
         required_flags_file=" ".join(THESIS_FLAGS_FILES),
@@ -2683,6 +2775,19 @@ def thesis_block1_arms() -> list[dict]:
             and not a.get("orderonly")]
 
 
+def thesis_snn_arms() -> list[dict]:
+    """The 100 rows of the recurrent target, in generation order."""
+    return [a for a in thesis_arms() if a.get("thesis_rule")]
+
+
+def thesis_core_arms() -> list[dict]:
+    """The 50 NN256/TLM rows: the matrix without the recurrent target, the
+    smoke and the order-only tuning rows."""
+    return [a for a in thesis_arms()
+            if not a.get("smoke") and not a.get("thesis_rule")
+            and not a.get("orderonly")]
+
+
 # Target-pinned nodes (owner ruling 2026-09-17: "max 4* 2 tlm 2 nn256"):
 # 2 nodes for TLM (pgi15-gpu19 [8 GPUs, 7 Ray actors], pgi15-gpu16 [4 GPUs, 3 Ray actors]),
 # 2 nodes for NN256 (pgi15-gpu18 [4 GPUs, 3 Ray actors], pgi15-gpu17 [4 GPUs, 3 Ray actors]).
@@ -2716,6 +2821,84 @@ for _i, (_arm, _target, _seed) in enumerate(thesis_submission_order()):
         held=None if _i < THESIS_BLOCK1 else _THESIS_HELD,
     )
 del _i, _arm, _target, _seed, _node
+
+
+# ---------------------------------------------------------------------------
+# THE RECURRENT BLOCK (owner ruling 2026-09-16).  The same five arms and the
+# same five seeds as the matrix above, on --example RSNN_SHD --dataset shd,
+# crossed with the four temporal rules: 4 x 5 x 5 = 100 rows.
+#
+# NOTHING ELSE MOVES.  These rows go through the same `thesis_cli`, so the
+# reward form per arm, the free spatial order, the thousand episodes, the
+# auto-stop, the checkpoint and dump intervals, the plan log, the measurement
+# protocol, the gate inputs, the per-node singleton and the --ray-measure
+# rule (7 on the 8-GPU nodes, 3 on the 4-GPU nodes) are the ones the NN256
+# and TLM rows carry, flag for flag.  The ONLY flag a recurrent row adds is
+# --temporal-rule, and it adds no environment variable at all.
+#
+# THE ORDER of generation is rule, then arm, then seed, and the node is the
+# same round robin over THESIS_NODES the block above uses.  100 rows over
+# four nodes is 25 each, exactly.  It is a GENERATION order and not a
+# submission order: `thesis_submission_order` is the owner's priority list
+# and it still holds the 50 rows it always did, because no recurrent row is
+# released to be submitted.
+# ---------------------------------------------------------------------------
+
+_THESIS_RSNN_WHAT = {
+    "tbptt": """TEMPORAL RULE tbptt, the baseline and ppo.py's default on
+this target: NO temporal edge.  The carried state is a constant, the graph is
+one recurrent step, and the credit is truncated and spatial only.  It is the
+row every other rule is read against.""",
+    "bptt": """TEMPORAL RULE bptt: THE FUTURE FEEDS IN.  An edge from the next
+state to the loss carries the adjoint dL(>t)/ds_t from a detached backward
+pass over the suffix, so the gradient is exactly the contribution step t
+makes to full backpropagation through time.""",
+    "rtrl": """TEMPORAL RULE rtrl: THE PAST FEEDS IN.  An edge from the
+weights to the carried state carries the influence matrix ds(t-1)/dW from a
+detached pass over the prefix, so eliminating that vertex is one real-time
+recurrent-learning step and the gradient is exactly dL_t/dW through the whole
+prefix.""",
+    "window2": """TEMPORAL RULE window2, THE TWO-COPY WINDOW.  Not another
+given edge on the one-step body: a different graph, two step copies joined by
+the temporal edge, with NO given quantity at all.  It is the one arm where
+the policy picks the DIRECTION of the temporal credit itself, because the
+temporal edge is an ordinary edge of the graph and the order across it is
+free.  --example stays RSNN_SHD; common/rsnn_shd.target_example reads the
+rule and resolves the target it builds (RSNN_SHD_W2), so the launcher names
+the rule and nothing else.""",
+}
+
+_THESIS_SNN_HELD = """The recurrent block is GENERATED so that the matrix is
+complete and reviewable, and every one of its 100 rows is HELD: the owner
+authorised the NN256/TLM first block only and released no RSNN_SHD run.  A
+held launcher that is submitted by mistake aborts 73 before it starts
+anything.  Remove `held=` from the recurrent loop in
+tools/gen_fq_launchers.py and regenerate when the owner releases them."""
+
+
+def thesis_snn_order() -> list[tuple[str, str, str]]:
+    """(arm, target, seed) for the 100 recurrent rows, in GENERATION order.
+
+    Rule, then arm, then seed.  Not a submission order: every row is held.
+    """
+    order: list[tuple[str, str, str]] = []
+    for rule in THESIS_TEMPORAL_RULES:
+        for a in THESIS_ARMS:
+            for s in THESIS_SEEDS:
+                order.append((a, f"rsnn_{rule}", s))
+    return order
+
+
+# --- the 100 runs of the recurrent block ------------------------------------
+for _i, (_arm, _target, _seed) in enumerate(thesis_snn_order()):
+    thesis_arm(
+        arm=_arm, target=_target, seed=_seed,
+        node=THESIS_NODES[_i % len(THESIS_NODES)],
+        what=_THESIS_ARM_WHAT[_arm] + "\n\n"
+             + _THESIS_RSNN_WHAT[thesis_temporal_rule(_target)],
+        held=_THESIS_SNN_HELD,
+    )
+del _i, _arm, _target, _seed
 
 
 # ---------------------------------------------------------------------------

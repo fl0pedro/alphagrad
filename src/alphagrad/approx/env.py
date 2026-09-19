@@ -20,6 +20,7 @@ from jax.tree_util import register_pytree_node_class
 
 import numpy as np
 
+from alphagrad.approx.common import carry_plan as _carry
 from alphagrad.approx.common.relations import compute_eqn_ids_from_tokens
 from alphagrad.approx.common.token_vocab import (
     DELTA_HEADER_SLOTS,
@@ -2226,11 +2227,44 @@ def plan_log_attempt() -> int:
     return int(_PLAN_LOG_ATTEMPT[0])
 
 
+#: THE CONTAINER THE PLAN JUST MEASURED IMPLIED (owner ruling 2026-09-16).
+#: Written by `_callback_measured` at the container seam and read by
+#: `_record_plan`, which is the one choke point every record passes through.
+#: `None` on every target that carries no temporal edge.
+_PLAN_CARRY: list = [None]
+
+
 def _record_plan(rec: dict) -> None:
     if len(_PLAN_RECORDS) >= _plan_log_cap():
         _PLAN_LOG_DROPPED[0] += 1
         return
     rec["attempt"] = int(_PLAN_LOG_ATTEMPT[0])
+    # THE STEP POSITION (owner ruling 2026-09-16). On the one-step recurrent
+    # target the graph is the same at every step position and only the GIVEN
+    # VALUES move, so a record that does not say which step it measured cannot
+    # be read back against another. The builder is the only place that knows
+    # it; this is the one choke point every record passes through. Empty for
+    # every other target, and then nothing is written.
+    # The PROBE BATCH's draw wins when there is one: under the default
+    # grad_cosine quality metric the batch is what the quality channel was
+    # actually scored on, it is redrawn per (environment, episode), and the
+    # builder's own tuple is only the run's starting point. Falls back to the
+    # builder for a run with no probe (quality metric `none`, or a target
+    # whose generator declares no `meta`).
+    from alphagrad.approx.common.rsnn_shd import last_step_position
+    _pos = probe_meta() or last_step_position()
+    if _pos:
+        rec["step_position"] = _pos
+    # WHICH CONTAINER THE CARRY ARRIVED IN (owner ruling 2026-09-16). The
+    # given temporal value is the RULE run over the recording, and the
+    # container it is stored in is what the memory channel sees, so a record
+    # that does not name it cannot be read against another. It is a property
+    # of the PLAN, not of the run: the plan's own classes on the carried face
+    # chose it, and `_callback_measured` publishes the choice it acted on.
+    if _PLAN_CARRY[0] is not None:
+        rec["carry_container"] = str(_PLAN_CARRY[0])
+    elif _pos and _pos.get("carry") is not None:
+        rec["carry_container"] = str(_pos["carry"])
     _PLAN_RECORDS.append(rec)
 
 
@@ -4626,6 +4660,54 @@ def paired_ref_summary(records) -> dict:
     }
 
 
+def _dense_cosine(jac_exact, jac_approx):
+    """``(cos, rel_frob)`` of two gradient pytrees, leaf by leaf, DENSE.
+
+    The plain accumulator, for the one case ``_quality_metrics`` cannot serve:
+    the reference is ``jax.grad``'s pytree and the candidate is jacve's, so the
+    two do not carry the same container and the exact-structure check of
+    ticket .62 would refuse them. Shapes still have to match leaf for leaf --
+    a mismatch here is a real defect and RAISES, exactly as it does there.
+    This is the same comparison ``_grad_oracle_check`` makes.
+    """
+    leaves_a = _gradient_leaves(jac_approx)
+    leaves_e = jax.tree_util.tree_leaves(jac_exact)
+    if len(leaves_a) != len(leaves_e):
+        raise GradientStructureMismatch(
+            f"[grad_cosine] the oracle reference has {len(leaves_e)} leaves "
+            f"and the plan's gradient {len(leaves_a)}")
+    dot = ee = aa = rr = 0.0
+    for i, (e, a) in enumerate(zip(leaves_e, leaves_a)):
+        e_np = np.asarray(e, dtype=np.float64)
+        if a is None:
+            # A DEAD PATH IS A ZERO GRADIENT, not a broken pytree. A face
+            # SKIP can delete every path to one parameter, and then the
+            # plan's gradient for it IS zero: graphax's dense path returns
+            # zeros there and `_gradient_similarity` has always scored it as
+            # zero. This accumulator raised instead, so the first real policy
+            # plan that skipped its way to a dead parameter took the whole
+            # measurement down (job 66105, a one-episode run on the rtrl
+            # arm). Scored the same way here.
+            ee += float(np.sum(e_np ** 2))
+            rr += float(np.sum(e_np ** 2))
+            continue
+        a_arr = a.dense() if _is_sparse_tensor(a) else a
+        a_np = np.asarray(a_arr, dtype=np.float64)
+        if a_np.shape != e_np.shape and a_np.shape == e_np.shape[::-1]:
+            a_np = a_np.T
+        if a_np.shape != e_np.shape:
+            raise GradientStructureMismatch(
+                f"[grad_cosine] leaf {i}: the oracle reference has shape "
+                f"{e_np.shape} and the plan's gradient {a_np.shape}")
+        dot += float(np.sum(e_np * a_np))
+        ee += float(np.sum(e_np ** 2))
+        aa += float(np.sum(a_np ** 2))
+        rr += float(np.sum((e_np - a_np) ** 2))
+    if ee <= 0.0 or aa <= 0.0:
+        return 0.0, 1.0
+    return dot / math.sqrt(ee * aa), math.sqrt(rr) / math.sqrt(ee)
+
+
 def _quality_metrics(jac_exact, jac_approx, *, align: bool = False,
                      site: str = "grad_cosine"):
     """`(cosine_sim, relative_frobenius)` of `jac_approx` against `jac_exact`.
@@ -5240,8 +5322,10 @@ def grad_oracle_submission(config, base_args, episode):
     if data is None:
         return None
     a = list(jax.device_get(list(base_args)))
-    for slot in range(min(2, len(data))):
-        a[slot] = np.asarray(data[slot])
+    # THE DECLARED SLOTS, not the first two: a generator whose draw is a
+    # carried state puts arrays further along the tuple.
+    for slot, d in zip(_data_slots(config, data), data):
+        a[slot] = np.asarray(d)
     return int(probe_seed), a
 
 
@@ -5500,9 +5584,49 @@ def _walk_noise_std() -> float:
 _PROBE_BATCH: dict = {}
 _PROBE_BATCH_MAX = 4
 
+# WHAT THE LAST PROBE BATCH WAS DRAWN AT, for the plan record. A generator
+# that declares a ``meta`` callable answers "which draw is this?" -- on the
+# one-step recurrent SHD target that is the STEP POSITION, and a record that
+# does not say which step it measured cannot be read back against another
+# (owner ruling 2026-09-16). Empty for every generator that declares none.
+_PROBE_META: dict = {}
+
+# Strides folded into the probe seed when a generator asks to be redrawn per
+# (environment, episode). Large and coprime with `_WALK_EPISODE_STRIDE`, so no
+# two (env row, episode) pairs can land on one PRNGKey.
+_PROBE_ENV_STRIDE = 15485863
+_PROBE_EPISODE_STRIDE = 32452843
+
+
+def probe_meta() -> dict:
+    """What the last probe batch of this process was drawn at."""
+    return dict(_PROBE_META)
+
+
+def _data_slots(config, data) -> tuple:
+    """WHICH ARGUMENT SLOTS a probe batch fills.
+
+    The generator's own statement (``data_slots``), or the contiguous
+    ``0 .. len(data) - 1`` when it makes none -- which is what every image and
+    token generator fills and is byte-identical to the positional assumption
+    this replaces. A generator whose draw is a carried state and a block of
+    given values further along the tuple cannot be read positionally.
+    """
+    slots = getattr(config.data_gen, "data_slots", None)
+    if slots is None:
+        return tuple(range(len(data)))
+    slots = tuple(int(i) for i in slots)
+    if len(slots) != len(data):
+        raise ValueError(
+            f"the data generator declares {len(slots)} slots {slots} and "
+            f"returned {len(data)} arrays. A generator's `data_slots` is the "
+            f"contract every refresher reads; a mismatch would put one of its "
+            f"arrays in the wrong argument.")
+    return slots
+
 
 def _probe_batch(config, base_args, role: str = "train",
-                 episode: int | None = None, index: int = 0):
+                 episode: int | None = None, index: int = 0, draw=None):
     """The probe batch: real data from ``config.data_gen`` at ``_walk_seed``.
 
     ``role`` is ``"train"`` (the batch the Adam walk steps on) or ``"eval"``
@@ -5524,6 +5648,11 @@ def _probe_batch(config, base_args, role: str = "train",
     """
     if config.data_gen is None:
         return None
+    # ``draw`` is an ALTERNATIVE producer for the same (role, episode, index)
+    # SEED -- the generator's own `reference_draw`, which answers the same
+    # step position in the exact container. Same seed, different tuple, its
+    # own cache entry.
+    draw = config.data_gen if draw is None else draw
     # THE KEY CARRIES THE EPISODE. ``_walk_seed`` already folds (role,
     # episode) into the seed, and the seed is in the key, so a new episode
     # cannot be served a stale batch -- which is exactly the bug that made the
@@ -5532,17 +5661,35 @@ def _probe_batch(config, base_args, role: str = "train",
     # cosine. index=0 is bit-identical to the pre-index behaviour, so
     # the loss-drop walk's batch does not move.
     _seed = _walk_seed(role, episode) + 104729 * int(index)
-    _key = (id(config.data_gen), _seed,
+    # PER ENVIRONMENT AND PER EPISODE, when the generator asks for it (owner
+    # ruling 2026-09-16). `_walk_seed` rotates per episode only behind
+    # ALPHAGRAD_WALK_ROTATE, and never per environment, so a generator whose
+    # DRAW is the quantity under study -- the recurrent SHD step position --
+    # says so with `resample_per_env_episode` and gets both folded in here.
+    # Absent on every other generator, and then this is the identity and the
+    # batch is the one batch per process it has always been.
+    if getattr(config.data_gen, "resample_per_env_episode", False):
+        _ep = walk_episode() if episode is None else int(episode)
+        _seed += (_PROBE_EPISODE_STRIDE * int(_ep)
+                  + _PROBE_ENV_STRIDE * (current_env_slot() + 1))
+    _key = (id(config.data_gen), id(draw), _seed,
             tuple(getattr(a, "shape", ()) for a in base_args[:2]))
     hit = _PROBE_BATCH.get(_key)
     if hit is not None:
-        return hit
+        _PROBE_META.clear()
+        _PROBE_META.update(hit[1])
+        return hit[0]
     k = jrand.PRNGKey(_seed)
-    data = config.data_gen(jrand.split(k, 5))
+    keys = jrand.split(k, 5)
+    data = draw(keys)
     data = tuple(jax.device_get(d) for d in data)
+    _meta_fn = getattr(config.data_gen, "meta", None)
+    meta = dict(_meta_fn(keys)) if _meta_fn is not None else {}
     if len(_PROBE_BATCH) >= _PROBE_BATCH_MAX:
         _PROBE_BATCH.clear()
-    _PROBE_BATCH[_key] = data
+    _PROBE_BATCH[_key] = (data, meta)
+    _PROBE_META.clear()
+    _PROBE_META.update(meta)
     return data
 
 
@@ -5655,26 +5802,108 @@ def _grad_cosine_quality(config, compiled_approx, ref_ex, ref_key, base_args,
         return None
     cos_all: list[float] = []
     frob_all: list[float] = []
+    _degenerate = 0
     for k in range(max(1, int(k_batches))):
         data = _probe_batch(config, base_args, role="train", index=k)
         if data is None:
             return None
         a = list(base_args)
-        for slot in range(min(2, len(data))):
-            a[slot] = jax.device_put(jnp.asarray(data[slot]), device)
+        # WHICH SLOTS THE BATCH FILLS is the generator's statement
+        # (`data_slots`), not this function's guess. It used to be
+        # `range(min(2, len(data)))` -- true of every image / token generator,
+        # and identical to the line below for them, but false for a generator
+        # whose draw is a carried state and a block of given values further
+        # along the tuple.
+        _slots = _data_slots(config, data)
+        for slot, d in zip(_slots, data):
+            a[slot] = jax.device_put(jnp.asarray(d), device)
+        # THE REFERENCE, when the DRAW ITSELF is approximated. The in-band
+        # cosine scores the plan against the rev-exact plan ON THE SAME
+        # ARGUMENTS, so an approximation that lives in an ARGUMENT -- the
+        # temporal carry a rule accumulated over a whole recording -- is
+        # invisible to it: both sides read the same approximated value and the
+        # cosine reads 1.0 whatever the rule did. A generator that draws an
+        # approximated value publishes `reference_draw`, the EXACT draw at the
+        # SAME step position, and the reference comes from `jax.grad` of the
+        # target on that instead. Then reward slot 6 holds the error the rule
+        # ACCUMULATED over the recording (owner ruling 2026-09-16).
+        # A SKIP ON THE CARRIED FACE CHANGES THE TARGET, NOT ONLY THE DRAW.
+        # Skip means NO CARRY, so the measured program is the truncated one,
+        # and its own exact gradient is the truncated gradient -- which would
+        # score 1.0 and hide that the plan threw the whole prefix away. The
+        # reference has to come from the rule the ARM runs, on the arm's own
+        # target and argument tuple. `reference_oracle` is how a generator
+        # says that, and `reference_draw` stays the same statement for the
+        # ordinary case where only the draw is approximated.
+        _ref_oracle = getattr(config.data_gen, "reference_oracle", None)
+        _ref_draw = getattr(config.data_gen, "reference_draw", None)
+        if _ref_oracle is not None:
+            _ref_draw = _ref_oracle["draw"]
+        _oracle_ref = (_ref_draw is not None and config.target_fun is not None
+                       and bool(getattr(config, "scalar_target", False)))
         _seed = _walk_seed("train", None) + 104729 * int(k)
         try:
             out_a = compiled_approx(*a)
-            out_e = _cosine_reference(ref_ex, ref_key, a, device, _seed)
+            if _oracle_ref:
+                r_data = _probe_batch(config, base_args, role="train",
+                                      index=k, draw=_ref_draw)
+                if _ref_oracle is None:
+                    ar = list(base_args)
+                    _r_slots = _data_slots(config, r_data)
+                    _r_target = config.target_fun
+                    _r_argnums = config.argnums
+                else:
+                    ar = list(_ref_oracle["args"])
+                    _r_slots = tuple(_ref_oracle["slots"])
+                    _r_target = _ref_oracle["target"]
+                    _r_argnums = tuple(_ref_oracle["argnums"])
+                for slot, d in zip(_r_slots, r_data):
+                    ar[slot] = jax.device_put(jnp.asarray(d), device)
+                jac_e = jax.grad(_r_target, argnums=_r_argnums,
+                                 has_aux=config.has_aux)(*ar)
+                jac_e = jac_e[0] if config.has_aux else jac_e
+                out_e = None
+            else:
+                # The CACHED REV-EXACT REFERENCE, not a same-order exact
+                # program: one executable for the process, one execution per
+                # probe batch (agent/ref16, owner ruling 2026-09-18).
+                out_e = _cosine_reference(ref_ex, ref_key, a, device, _seed)
+                jac_e = out_e[1] if config.has_aux else out_e
         except Exception:
             return None
         jac_a = out_a[1] if config.has_aux else out_a
-        jac_e = out_e[1] if config.has_aux else out_e
-        cos, rel = _quality_metrics(jac_e, jac_a)
-        cos_all.append(float(cos))
+        if _oracle_ref:
+            cos, rel = _dense_cosine(jac_e, jac_a)
+        else:
+            cos, rel = _quality_metrics(jac_e, jac_a)
+        cos = float(cos)
+        if cos == 0.0 and not _oracle_ref:
+            # A ZERO REFERENCE IS NOT A BAD PLAN. The cosine is undefined when
+            # the EXACT gradient is identically zero, and the formula above
+            # then returns 0.0 -- the worst possible score, handed to a plan
+            # that reproduced the reference perfectly. It happens on a sparse
+            # spiking target: at a step where no hidden unit fired and the
+            # input frame is empty, every weight gradient is exactly zero.
+            # Drop that batch instead of scoring it.
+            _d, _ee, _aa, _rr, _tot = _gradient_similarity(
+                jac_e, jac_e, "grad_cosine")
+            if float(_ee) <= 0.0:
+                _degenerate += 1
+                out_a = out_e = jac_a = jac_e = None
+                continue
+        cos_all.append(cos)
         frob_all.append(float(rel))
         out_a = jac_a = jac_e = None
     if not cos_all:
+        if _degenerate and not _ZERO_REFERENCE_WARNED:
+            _ZERO_REFERENCE_WARNED.append(1)
+            print(
+                f"[measure] WARNING quality channel: the EXACT gradient is "
+                f"identically zero on all {_degenerate} probe batch(es), so "
+                f"the gradient cosine is undefined and the channel reads 0.0. "
+                f"On a spiking target this means the sampled step fired "
+                f"nothing; widen the probe (ALPHAGRAD_GRAD_COSINE_K) or raise "
+                f"the target's firing rate.", flush=True)
         return None
     return float(np.mean(cos_all)), frob_all, cos_all
 
@@ -5908,6 +6137,9 @@ _MEASURE_ACTOR = os.environ.get("ALPHAGRAD_MEASURE_ACTOR", "0") == "1"
 _MEM_FALLBACK_WARNED: list = []
 # One-shot warning flag for an undefinable loss-drop walk (see _callback).
 _WALK_UNDEFINED_WARNED: list = []
+
+# One-shot flag for the zero-exact-gradient case in `_grad_cosine_quality`.
+_ZERO_REFERENCE_WARNED: list = []
 # One-shot warning when the EXACT reference gradient cannot be built (see the
 # fail-soft branch of the fidelity block in `_callback`).
 _FID_REF_WARNED: list = []
@@ -7899,6 +8131,63 @@ def _face_transforms_for_order(config, consts, args, o_list, specs_list,
     return out
 
 
+def _decode_vertex_transforms(config, o_list, specs_list):
+    """``(transforms, tok_rules_by_v)`` for one order and its per-vertex rows.
+
+    Each row in ``sparsity_specs`` is ``[base_idx1, base_idx2, factor]``; the
+    decode resolves the logical axis indices and the legacy -1 (gcd) / 0
+    (drop) / 1 (no-op) sentinels into explicit ``Diag(i, j, factor)`` entries
+    with a strictly positive integer factor, which is the only form graphax's
+    ``apply_diag`` accepts. Slots with factor 0 (legacy drop-axes) or 1
+    (legacy no-op) are skipped: drop has no replacement under the new API and
+    no-op is dead weight. A rule must also fit EVERY non-literal invar of the
+    equation, because graphax's ``_eliminate_vertex`` applies each transform
+    to every incoming edge and ``apply_diag`` raises when the primal axis
+    index is out of range for any of them (a division by a scalar denominator
+    has one ``(n,)`` edge and one ``()`` edge, and a Diag with ``j=1`` only
+    fits the first).
+
+    MODULE LEVEL because it is called TWICE: once on the policy's graph, and
+    once on the program a plan's carry container implies, which is a
+    different jaxpr with a different vertex numbering.
+    """
+    transforms: list[tuple[int, tuple]] = []
+    tok_rules_by_v: dict[int, tuple] = {}
+    for v_idx, v in enumerate(o_list):
+        rules = decode_vertex_rule_specs(
+            config.jaxpr, int(v), specs_list[v_idx])
+        # TOKENIZER-side rules are the SAME rules: the decode no longer
+        # depends on the vertex's position in the prefix, so the observation
+        # and the measured graph cannot disagree about a COMPRESS.
+        tok_rules = rules
+        if rules or tok_rules:
+            if getattr(config, "per_face", False):
+                # graphax invokes a CALLABLE transform once per face, handing
+                # it that face's live operand, so this is where per-path
+                # legality is decided. Rules that do not fit a given face are
+                # skipped for that face only, not for the whole vertex.
+                from alphagrad.approx.common.masks import make_live_masked_hook
+                _face_stats = _PER_FACE_STATS
+                if rules:
+                    transforms.append(
+                        (int(v),
+                         (make_live_masked_hook(rules, stats=_face_stats,
+                                                gated=True),))
+                    )
+                # The tokenizer eliminates its OWN graph copy with equivalent
+                # hooks but no stats sink: the measured graph's hooks own the
+                # applied and skipped counters.
+                if tok_rules:
+                    tok_rules_by_v[int(v)] = (
+                        make_live_masked_hook(tok_rules),)
+            else:
+                if rules:
+                    transforms.append((int(v), tuple(rules)))
+                if tok_rules:
+                    tok_rules_by_v[int(v)] = tuple(tok_rules)
+    return transforms, tok_rules_by_v
+
+
 def _callback(
     config: EnvConfig,
     args,
@@ -8119,40 +8408,8 @@ def _callback_measured(
     # primal axis index is out of range for any of them (e.g. a div by
     # a scalar denominator has one (n,) edge and one () edge — a Diag
     # with j=1 only fits the first).
-    transforms: list[tuple[int, tuple]] = []
-    tok_rules_by_v: dict[int, tuple] = {}
-    for v_idx, v in enumerate(o_list):
-        rules = decode_vertex_rule_specs(
-            config.jaxpr, int(v), specs_list[v_idx])
-        # TOKENIZER-side rules are the SAME rules: the decode no longer
-        # depends on the vertex's position in the prefix, so the observation
-        # and the measured graph cannot disagree about a COMPRESS.
-        tok_rules = rules
-        if rules or tok_rules:
-            if getattr(config, "per_face", False):
-                # graphax invokes a CALLABLE transform once per face, handing
-                # it that face's live operand — so this is where per-path
-                # legality is decided. Rules that don't fit a given face are
-                # skipped for that face only (not for the whole vertex).
-                from alphagrad.approx.common.masks import make_live_masked_hook
-                _face_stats = _PER_FACE_STATS
-                if rules:
-                    transforms.append(
-                        (int(v),
-                         (make_live_masked_hook(rules, stats=_face_stats,
-                                                gated=True),))
-                    )
-                # The tokenizer eliminates its OWN graph copy with equivalent
-                # hooks but no stats sink — the measured graph's hooks own the
-                # applied/skipped counters.
-                if tok_rules:
-                    tok_rules_by_v[int(v)] = (
-                        make_live_masked_hook(tok_rules),)
-            else:
-                if rules:
-                    transforms.append((int(v), tuple(rules)))
-                if tok_rules:
-                    tok_rules_by_v[int(v)] = tuple(tok_rules)
+    transforms, tok_rules_by_v = _decode_vertex_transforms(
+        config, o_list, specs_list)
 
     _pf("cb.decode")
     if os.environ.get("ALPHAGRAD_INCREMENTAL_TOKENS", "1") == "1":
@@ -8314,6 +8571,68 @@ def _callback_measured(
             _pf("cb.dedupe_hit")
             return _wire(tokens, eqn_ids,
                          jnp.array(_hit_slots, dtype=jnp.float32))
+
+    # ------------------------------------------------------------------
+    # THE CARRY CONTAINER, PER PLAN (owner rulings 2026-09-16, A and B).
+    # ------------------------------------------------------------------
+    # Placed HERE, after the tokens and before anything is compiled, because
+    # that is exactly the seam the rulings describe: the POLICY sees the step
+    # body with the dense carry edge (the tokens above are built from
+    # `config`, always), and the MEASUREMENT compiles the consistent
+    # recursion -- the plan applied at every step of the prefix or the suffix
+    # -- with the carry in the container that choice implies.
+    #
+    # Everything below this point runs on the swapped program. The plan
+    # RECORD keeps the policy's own order and wires, which is what the reader
+    # of the log needs: the plan the policy emitted, plus the container it
+    # implied.
+    # A PLAN TRAVELS BY POSITION, NOT BY FACE KEY. A face key is a pair of
+    # stable var indices on the LIVE graph, and every elimination rewires it,
+    # so the keys a body vertex shows depend on what the carry block left
+    # behind -- which is exactly what the container changes. The wire arrays
+    # move to the transported order's positions and the faces are enumerated
+    # again on the variant's own replay, the way the policy's graph enumerates
+    # them.
+    _rec_order = o_list
+    _carry_container = None
+    if is_terminal and _carry.armed():
+        _carry_container = _carry.container_for_plan(
+            config, o_list, _faces_np, _skips_np, partial_specs)
+        _variant = _carry.measurement_env(_carry_container)
+        if _variant is not None:
+            (o_list, _m_specs, _m_faces, _m_skips, _m_joins) = \
+                _carry.transport_wires(
+                    o_list, _variant, partial_specs, _faces_np, _skips_np,
+                    _joins_np)
+            config = _variant["config"]
+            args = _variant["args"]
+            consts = _variant["consts"]
+            specs_list = _m_specs.tolist()
+            transforms, _ = _decode_vertex_transforms(
+                config, o_list, specs_list)
+            _m_have = bool(
+                len(o_list) and (np.any(_m_skips == 1)
+                                 or np.any(_m_faces[..., 0] >= 0)
+                                 or np.any(_m_faces[..., 0] == COMPRESS_SENTINEL)
+                                 or np.any(_m_faces[..., 0] == QUANT_SENTINEL)))
+            ft_by_vertex = (
+                _face_transforms_for_order(
+                    config, consts, args, o_list, specs_list,
+                    _m_faces, _m_skips,
+                    wire_sig=_face_wire_keys(_m_faces, _m_skips, len(o_list),
+                                             _m_joins),
+                    face_joins_list=_m_joins)
+                if _m_have else None)
+            # THE VARIANT'S OWN EVAL SAMPLES. They cannot be the base ones --
+            # the shapes of the given values move with the container -- so
+            # they are drawn from a DIGEST of the base draw, which every
+            # process that measures this plan computes the same way and which
+            # moves per episode exactly as the base draw does.
+            if eval_samples:
+                eval_samples = tuple(
+                    _carry.eval_samples_for(_carry_container, eval_samples))
+    _PLAN_CARRY[0] = _carry_container
+    _pf("cb.carry_container")
 
     # ------------------------------------------------------------------
     # Compute family — graphax counters (always) → muls_adds_fmas, max_io_sum.
@@ -8556,6 +8875,14 @@ def _callback_measured(
             argnums=config.argnums,
             has_aux=config.has_aux,
             sparse_representation=config.sparse,
+            # ONE JAXPR FOR BOTH PATHS (dsnn-dfw.24). The order and the face
+            # keys are numbered on `config.jaxpr`; a fresh trace inside
+            # `.lower()` is a different equation list for the same function
+            # (measured on window2: 90 equations against 72, every
+            # `convert_element_type` moved), and then the plan addresses
+            # vertices that are not there.
+            jaxpr=config.jaxpr,
+            consts=list(consts),
             **_kw,
         )
 
@@ -8681,6 +9008,10 @@ def _callback_measured(
                     sparse_representation=config.sparse,
                     transforms=[],
                     face_transforms=None,
+                    # The paired reference walks the SAME graph as the
+                    # candidate, or the ratio is not about the plan.
+                    jaxpr=config.jaxpr,
+                    consts=list(consts),
                 ),
                 keep_unused=True,
             ).lower(*args_for_lower)
@@ -8796,6 +9127,8 @@ def _callback_measured(
                             sparse_representation=True,
                             transforms=transforms,
                             face_transforms=ft_by_vertex,
+                            jaxpr=config.jaxpr,
+                            consts=list(consts),
                         ),
                         keep_unused=True,
                     )
@@ -9694,8 +10027,11 @@ def _callback_measured(
 
     # ---- A6 PLAN LOG: this plan, win or lose -------------------------
     if _plan_log_on:
+        # THE POLICY'S OWN ORDER, not the transported one: the record is what
+        # the policy emitted, and the container it implied is a field beside
+        # it (`_PLAN_CARRY`, read in `_record_plan`).
         _record_terminal_plan(
-            order=o_list, rule_specs=partial_specs,
+            order=_rec_order, rule_specs=partial_specs,
             face_specs=_faces_np, face_skips=_skips_np,
             face_joins=_joins_np,
             reward_vec=_reward_slots,
@@ -10472,6 +10808,13 @@ class VertexEliminationEnv:
                             else None),
                         episode=(walk_episode() if walk_rotate_enabled()
                                  else None),
+                        # THE ENVIRONMENT ROWS of these slots. `_ENV_SLOT` is
+                        # a fact of the in-process batch loop and does not
+                        # cross the Ray hop, so the row travels in the
+                        # request; a probe batch redrawn per environment
+                        # (owner ruling 2026-09-16) reads it back through
+                        # `current_env_slot`.
+                        env_rows=list(_pipe),
                     )
                     _pipe_pos = ([ro[i] for i in _pipe],
                                  [rs[i] for i in _pipe],

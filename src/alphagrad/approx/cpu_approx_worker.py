@@ -215,6 +215,7 @@ class CpuApproximationServer:
         face_specs: Any = None,
         face_skips: Any = None,
         episode: int | None = None,
+        env_row: int | None = None,
     ):
         """Run the per-step reward pipeline once.
 
@@ -242,6 +243,16 @@ class CpuApproximationServer:
                            with the trainer instead of pinning the episode it
                            was spawned on. `None` leaves the actor's
                            environment untouched.
+        * `env_row`      — optional trainer ENVIRONMENT ROW this request came
+                           from. The in-process batched callback publishes it
+                           through `env._ENV_SLOT`, but a pooled request
+                           crosses a process boundary and the row does not
+                           come with it, so `env.current_env_slot()` read -1
+                           in every actor. That is what a probe batch redrawn
+                           PER ENVIRONMENT needs (owner ruling 2026-09-16),
+                           and it is also the `env_index` the plan record
+                           stamps for gate G5's join. `None` leaves the slot
+                           unknown, exactly as before.
 
         Returns
         -------
@@ -261,6 +272,13 @@ class CpuApproximationServer:
             # is the only reader and it is a no-op unless --walk-rotate.
             from alphagrad.approx.env import set_walk_episode as _set_walk_ep
             _set_walk_ep(int(episode))
+        # THE ENVIRONMENT ROW, republished into this process. Same argument as
+        # `episode` above: the row is a fact of the trainer's batch loop and
+        # it does not survive the Ray hop on its own.
+        from alphagrad.approx.env import _ENV_SLOT as _env_slot_cell
+        _slot_was = _env_slot_cell[0]
+        if env_row is not None:
+            _env_slot_cell[0] = int(env_row)
         order_j = jnp.asarray(order, dtype=jnp.int32)
         specs_j = jnp.asarray(sparsity_specs, dtype=jnp.int32)
         es = (
@@ -457,6 +475,10 @@ class CpuApproximationServer:
             if _delta:
                 return sentinel_tokens, sentinel_reward
             return sentinel_tokens, sentinel_eqn_ids, sentinel_reward
+        finally:
+            # The slot belongs to THIS request, not to the actor. Restoring it
+            # is what keeps a raising measurement from stamping the next one.
+            _env_slot_cell[0] = _slot_was
 
     def precompile(self, order: Any, sparsity_specs: Any, step: int) -> bool:
         """STAGE-2 async: compile-only warm of the shared cluster cache.
@@ -737,14 +759,35 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *, seed: int = 0)
     key, args_key, eval_key = jrand.split(key, 3)
 
     dataset_arg = None if args.dataset == "none" else args.dataset
+    from alphagrad.approx.common.snn_shd import SHD_TARGETS
+    from alphagrad.approx.common.rsnn_shd import (is_rsnn,
+                                                  resolve_temporal_rule,
+                                                  target_example)
+    # THE TARGET THE RULE BUILDS. The trainer resolves it before the args
+    # dict travels, so this is normally already resolved; resolving it again
+    # here is the idempotent way to make the actor and the trainer build the
+    # SAME graph even if the dict was built by hand.
+    _rule = resolve_temporal_rule(args.example,
+                                  getattr(args, "temporal_rule", None))
+    args.example = target_example(args.example, _rule)
+    args.temporal_rule = _rule
     use_dataset = (
-        dataset_arg is not None and args.example.endswith("NeuralNetwork")
+        dataset_arg is not None
+        and (args.example.endswith("NeuralNetwork")
+             or args.example in SHD_TARGETS
+             or is_rsnn(args.example))
     )
     dataset_for_call = dataset_arg if use_dataset else None
     target_fn = get_fn(args.example)
-    xs = get_args(args.example, args_key, dataset=dataset_for_call)
+    xs = get_args(args.example, args_key, dataset=dataset_for_call,
+                  grad_window=getattr(args, "target_grad_window", None),
+                  dataset_size=args.dataset_size,
+                  temporal_rule=getattr(args, "temporal_rule", None),
+                  step_position=getattr(args, "step_position", None))
     gen = data_gen(
-        args.example, dataset=dataset_for_call, dataset_size=args.dataset_size
+        args.example, dataset=dataset_for_call, dataset_size=args.dataset_size,
+        key=args_key, temporal_rule=getattr(args, "temporal_rule", None),
+        grad_window=getattr(args, "target_grad_window", None),
     )
     # Gradient mode: THIS env (inside the CpuApproximationActor) does the actual
     # pooled measurement, so the grad-mode wrapping + jaxpr + argnums must mirror
@@ -875,6 +918,15 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *, seed: int = 0)
         # uses; reads ALPHAGRAD_REWARD_CHANNELS too). Any failure -> True (safe).
         quality_rewarded=_quality_is_rewarded(args),
     )
+
+    # THE CARRY CONTAINER FOLLOWS THE PLAN (owner rulings 2026-09-16). The
+    # actor measures plans, so it needs the same builder the trainer has.
+    from alphagrad.approx.common import carry_plan as _carry_plan
+    _carry_plan.register(
+        args, args_key, args.example, args.temporal_rule,
+        env.config, env.args, env.consts,
+        dataset=dataset_for_call, dataset_size=args.dataset_size,
+        step_position=getattr(args, "step_position", None))
 
     num_eval = int(getattr(args, "num_eval_samples", 10) or 10)
     eval_samples = generate_eval_samples(env, eval_key, num_eval)

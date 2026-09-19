@@ -2,10 +2,10 @@
 
 Launchers are generated (`tools/gen_fq_launchers.py`), never hand-edited, so
 the owner's rulings of 2026-09-15 and 2026-09-16 are pinned on the generator
-rather than on 50 files:
+rather than on 150 files:
 
-  1. THE MATRIX: five arms (A, B, C, C_popart, condC) x two targets (nn256,
-     tlm) x five seeds (250197..250201) = 50 runs, named
+  1. THE CORE MATRIX: five arms (A, B, C, C_popart, condC) x two targets
+     (nn256, tlm) x five seeds (250197..250201) = 50 runs, named
      `<arm>_<target>_s<seed>`.
   2. THE FLAGS, per arm: the face-head init bias, the reward form, the
      advantage normalisation and the preference conditioning are the ONLY
@@ -21,6 +21,12 @@ rather than on 50 files:
      NO auto-stop, its resume twin, and a condC run on NN256.
   7. `thesis_arm` RAISES on a row outside the rulings.
   8. ppo.py's own argparse accepts every thesis command line.
+  9. THE RECURRENT BLOCK: --example RSNN_SHD --dataset shd crossed with four
+     temporal rules (tbptt, bptt, rtrl, window2), the same five arms and the
+     same five seeds = 100 further runs, named `<arm>_rsnn_<rule>_s<seed>`,
+     carrying the NN256/TLM flags unchanged and GENERATED BUT HELD.  The
+     rule is part of the target key, so a recurrent run is one
+     (arm, target, seed) triple like every other row.
 """
 from __future__ import annotations
 
@@ -41,7 +47,17 @@ _GEN = os.path.join(_ALPHAGRAD, "tools", "gen_fq_launchers.py")
 # whole point of a pin.
 SEEDS = ("250197", "250198", "250199", "250200", "250201")
 ARMS = ("A", "B", "C", "C_popart", "condC")
+#: The two targets of the core matrix.  The recurrent target's four rules are
+#: four FURTHER targets; RSNN_TARGETS below spells them.
 TARGETS = ("nn256", "tlm")
+#: THE FOUR TEMPORAL RULES of --example RSNN_SHD (owner ruling 2026-09-16).
+#: They are ppo.py's `--temporal-rule` choices, which it builds from
+#: common/rsnn_shd.TEMPORAL_RULES; section 9 pins that they are the same four.
+TEMPORAL_RULES = ("tbptt", "bptt", "rtrl", "window2")
+RSNN_TARGETS = tuple(f"rsnn_{r}" for r in TEMPORAL_RULES)
+ALL_TARGETS = TARGETS + RSNN_TARGETS
+RSNN_EXAMPLE = "RSNN_SHD"
+RSNN_DATASET = "shd"
 EPISODES = "1000"
 CHECKPOINT_EVERY = "50"
 PARETO_DUMP_EVERY = "10"
@@ -78,7 +94,10 @@ def gen():
 
 @pytest.fixture(scope="module")
 def matrix(gen):
-    """The 50 runs of the matrix, without the three smoke arms.
+    """Every run of the matrix -- the 50 core rows AND the 100 recurrent
+    rows -- without the three smoke arms.  What is shared is asserted over
+    this whole set, so a recurrent row cannot quietly drift away from the
+    NN256 and TLM rows.
 
     The order-only tuning rows of ticket dsnn-dfw.29 are thesis arms too --
     they carry the per-node singleton and the NeuralNetwork target shape, so
@@ -89,6 +108,22 @@ def matrix(gen):
     arms = [a for a in gen.thesis_arms()
             if not a.get("smoke") and not a.get("orderonly")]
     assert arms, "the generator emits no thesis arm"
+    return arms
+
+
+@pytest.fixture(scope="module")
+def core(gen):
+    """The 50 NN256/TLM rows."""
+    arms = gen.thesis_core_arms()
+    assert arms, "the generator emits no core thesis arm"
+    return arms
+
+
+@pytest.fixture(scope="module")
+def snn(gen):
+    """The 100 recurrent rows (--example RSNN_SHD)."""
+    arms = gen.thesis_snn_arms()
+    assert arms, "the generator emits no recurrent thesis arm"
     return arms
 
 
@@ -118,28 +153,55 @@ def _bash_n(text: str) -> str | None:
 
 # ------------------------------------------------------------- 1. the matrix
 
-def test_the_matrix_is_five_arms_two_targets_five_seeds(gen, matrix):
+def test_the_core_matrix_is_five_arms_two_targets_five_seeds(gen, core):
     assert gen.THESIS_SEEDS == SEEDS
     assert gen.THESIS_ARMS == ARMS
-    assert tuple(sorted(gen.THESIS_TARGETS)) == tuple(sorted(TARGETS))
-    assert len(matrix) == len(ARMS) * len(TARGETS) * len(SEEDS) == 50
+    assert len(core) == len(ARMS) * len(TARGETS) * len(SEEDS) == 50
     got = {(a["thesis_arm"], a["thesis_target"], a["thesis_seed"])
-           for a in matrix}
+           for a in core}
     want = {(arm, t, s) for arm in ARMS for t in TARGETS for s in SEEDS}
     assert got == want
     # and every one of them is a distinct run name of the ruled shape
-    names = [a["name"] for a in matrix]
+    names = [a["name"] for a in core]
     assert len(set(names)) == len(names)
-    for a in matrix:
+    for a in core:
         assert a["name"] == (f"{a['thesis_arm']}_{a['thesis_target']}"
                              f"_s{a['thesis_seed']}")
         assert _cli(gen, a)["--name"] == a["name"]
     assert "C_popart_tlm_s250197" in names      # the owner's own example
 
 
+def test_the_whole_matrix_is_the_core_fifty_and_the_recurrent_hundred(
+        gen, matrix, core, snn):
+    """One naming rule, one (arm, target, seed) triple per row, six targets.
+
+    The recurrent rules are TARGETS and not a fourth coordinate, so the whole
+    matrix is still `THESIS_ARMS x THESIS_TARGETS x THESIS_SEEDS` and
+    `thesis_run_name` spells every row of it.
+    """
+    assert tuple(sorted(gen.THESIS_TARGETS)) == tuple(sorted(ALL_TARGETS))
+    assert len(gen.THESIS_TARGETS) == 6
+    assert len(core) == 50 and len(snn) == 100
+    assert len(matrix) == len(core) + len(snn) == 150
+    assert len(matrix) == len(ARMS) * len(ALL_TARGETS) * len(SEEDS)
+    got = {(a["thesis_arm"], a["thesis_target"], a["thesis_seed"])
+           for a in matrix}
+    want = {(arm, t, s) for arm in ARMS for t in ALL_TARGETS for s in SEEDS}
+    assert got == want
+    names = [a["name"] for a in matrix]
+    assert len(set(names)) == len(names) == 150
+    for a in matrix:
+        assert a["name"] == gen.thesis_run_name(
+            a["thesis_arm"], a["thesis_target"], a["thesis_seed"])
+        assert _cli(gen, a)["--name"] == a["name"]
+
+
 def test_the_priority_order_is_the_owners(gen):
     order = gen.thesis_submission_order()
     assert len(order) == 50 and len(set(order)) == 50
+    # the owner's priority list is the CORE matrix; no recurrent row is
+    # released to be submitted, so none of them appears here
+    assert {o[1] for o in order} == set(TARGETS)
     # 1. C and C_popart, both targets, five seeds
     assert [o[0] for o in order[:20]] == ["C"] * 10 + ["C_popart"] * 10
     assert {o[2] for o in order[:20]} == set(SEEDS)
@@ -160,13 +222,20 @@ def test_only_the_first_block_is_submittable_the_rest_is_held(gen, matrix):
     assert len(block) == gen.THESIS_BLOCK1 == 34
     assert not any(a.get("held") for a in block)
     held = [a for a in matrix if a.get("held")]
-    assert len(held) == 16
-    # every held row is an A or B row at a seed other than the first
+    # 16 core rows (A and B at the four later seeds) and every recurrent row
+    assert len(held) == 16 + 100 == 116
     for a in held:
-        assert a["thesis_arm"] in ("A", "B"), a["name"]
-        assert a["thesis_seed"] != SEEDS[0], a["name"]
         text = gen.render(a)
         assert "*** HELD" in text and "ABORT(73)" in text, a["name"]
+    # every held CORE row is an A or B row at a seed other than the first
+    core_held = [a for a in held if not a.get("thesis_rule")]
+    assert len(core_held) == 16
+    for a in core_held:
+        assert a["thesis_arm"] in ("A", "B"), a["name"]
+        assert a["thesis_seed"] != SEEDS[0], a["name"]
+    # the released block is the CORE block and nothing else: no recurrent row
+    # is submittable, whatever its arm or seed
+    assert not any(a.get("thesis_rule") for a in block)
     # and the first block holds exactly the runs the owner authorised
     got = {(a["thesis_arm"], a["thesis_target"], a["thesis_seed"])
            for a in block}
@@ -227,7 +296,7 @@ def test_every_arm_carries_the_shared_thesis_flags(gen, matrix):
                 == gen.GATE_OFFLINE_CONTRAST[ORDER]), a["name"]
 
 
-def test_the_targets_are_the_two_the_owner_named(gen, matrix):
+def test_the_targets_are_the_ones_the_owner_named(gen, matrix):
     for a in matrix:
         cli = _cli(gen, a)
         if a["thesis_target"] == "nn256":
@@ -236,9 +305,18 @@ def test_the_targets_are_the_two_the_owner_named(gen, matrix):
             assert a["env"] == {"ALPHAGRAD_NN_HIDDEN": "256"}, a["name"]
             text = gen.render(a)
             assert "export ALPHAGRAD_NN_HIDDEN=256\n" in text, a["name"]
-        else:
+        elif a["thesis_target"] == "tlm":
             assert cli["--example"] == "TransformerLM", a["name"]
             assert cli["--dataset"] == "wikitext2", a["name"]
+            assert a["env"] == {}, a["name"]
+            text = gen.render(a)
+            assert "ALPHAGRAD_NN_HIDDEN" not in text, a["name"]
+        else:
+            assert a["thesis_target"] in RSNN_TARGETS, a["name"]
+            assert cli["--example"] == RSNN_EXAMPLE, a["name"]
+            assert cli["--dataset"] == RSNN_DATASET, a["name"]
+            # the recurrent target's shape is module constants of
+            # common/rsnn_shd.py, not an environment variable
             assert a["env"] == {}, a["name"]
             text = gen.render(a)
             assert "ALPHAGRAD_NN_HIDDEN" not in text, a["name"]
@@ -342,7 +420,7 @@ def test_the_arms_differ_only_where_the_matrix_says_they_do(gen, matrix):
     by_key = {(a["thesis_arm"], a["thesis_target"], a["thesis_seed"]): a
               for a in matrix}
     for arm in ARMS:
-        for t in TARGETS:
+        for t in ALL_TARGETS:
             ref = _cli(gen, by_key[(arm, t, SEEDS[0])])
             for s in SEEDS[1:]:
                 cli = _cli(gen, by_key[(arm, t, s)])
@@ -350,7 +428,7 @@ def test_the_arms_differ_only_where_the_matrix_says_they_do(gen, matrix):
                         if ref.get(k, _MISSING) != cli.get(k, _MISSING)}
                 diff -= node_derived
                 assert diff == {"--seed", "--name"}, (arm, t, s, sorted(diff))
-    for t in TARGETS:
+    for t in ALL_TARGETS:
         ref = _cli(gen, by_key[("C", t, SEEDS[0])])
         for arm in ARMS:
             cli = _cli(gen, by_key[(arm, t, SEEDS[0])])
@@ -593,6 +671,10 @@ def test_thesis_arm_raises_on_a_row_outside_the_rulings(gen):
     for bad, frag in (
         ({"arm": "D"}, "is not one of"),
         ({"target": "snn"}, "is not one of"),
+        # the recurrent targets are the four RULED rules and nothing else: a
+        # plausible-looking fifth is refused like any other unknown target
+        ({"target": "rsnn"}, "is not one of"),
+        ({"target": "rsnn_window3"}, "is not one of"),
         ({"seed": "42"}, "is not one of"),
         ({"node": "pgi15-gpu14"}, "released"),
         ({"node": "pgi15-cpu1"}, "released"),
@@ -607,10 +689,26 @@ def test_thesis_arm_raises_on_a_row_outside_the_rulings(gen):
 def test_the_run_name_helper_refuses_an_unknown_coordinate(gen):
     assert gen.thesis_run_name("C_popart", "tlm", "250197") == \
         "C_popart_tlm_s250197"
+    # THE RECURRENT SPELLING.  The rule is part of the target key, so the one
+    # naming helper produces `<arm>_rsnn_<rule>_s<seed>` with no second rule.
+    assert gen.thesis_run_name("C_popart", "rsnn_bptt", "250199") == \
+        "C_popart_rsnn_bptt_s250199"
+    assert gen.thesis_run_name("A", "rsnn_window2", "250201") == \
+        "A_rsnn_window2_s250201"
     for bad in (("X", "tlm", "250197"), ("C", "snn", "250197"),
+                ("C", "rsnn", "250197"), ("C", "rsnn_window3", "250197"),
                 ("C", "tlm", "1")):
         with pytest.raises(gen.CampaignRowError):
             gen.thesis_run_name(*bad)
+
+
+def test_the_temporal_rule_helper_reads_the_rule_off_the_target(gen):
+    assert gen.thesis_temporal_rule("nn256") is None
+    assert gen.thesis_temporal_rule("tlm") is None
+    for rule in TEMPORAL_RULES:
+        assert gen.thesis_temporal_rule(f"rsnn_{rule}") == rule
+    with pytest.raises(gen.CampaignRowError):
+        gen.thesis_temporal_rule("rsnn_window3")
 
 
 # --------------------------------------------------------- 8. ppo's argparse
@@ -629,6 +727,7 @@ def test_ppo_argparse_accepts_every_thesis_command_line(gen, matrix, smoke):
         assert ns.episodes == int(_cli(gen, a)["--episodes"])
         assert ns.checkpoint_every == int(_cli(gen, a)["--checkpoint-every"])
         assert ns.auto_stop == ("--auto-stop" in _cli(gen, a))
+        assert ns.temporal_rule == a.get("thesis_rule"), a["name"]
 
 
 def test_auto_stop_needs_the_checkpoint_the_matrix_gives_it(gen, matrix):
@@ -638,10 +737,13 @@ def test_auto_stop_needs_the_checkpoint_the_matrix_gives_it(gen, matrix):
     fires -- and this is the test that keeps it that way."""
     from alphagrad.approx.common import auto_stop as _auto
     from alphagrad.approx.ppo import make_argparser
+    checked = 0
     for a in matrix:
         ns = make_argparser().parse_args(gen.cli_tokens(a))
         _auto.check_auto_stop_args(ns)          # raises on a bad pair
         assert _auto.check_points(ns) == (250, 500), a["name"]
+        checked += 1
+    assert checked == 150
 
 
 def test_target_nodes_routing(monkeypatch):
@@ -662,3 +764,198 @@ def test_target_nodes_routing(monkeypatch):
             assert a["node"] in ("pgi15-gpu18", "pgi15-gpu17"), a["name"]
             assert a["gpus"] == 4, a["name"]
             assert _cli(mod, a)["--ray-measure"] == "3", a["name"]
+
+
+# ------------------------------------------------- 9. the recurrent block
+
+def test_the_recurrent_block_is_four_rules_five_arms_five_seeds(gen, snn):
+    """4 x 5 x 5 = 100 rows (owner ruling 2026-09-16)."""
+    assert gen.THESIS_TEMPORAL_RULES == TEMPORAL_RULES
+    assert gen.THESIS_RSNN_TARGETS == RSNN_TARGETS
+    assert len(snn) == len(TEMPORAL_RULES) * len(ARMS) * len(SEEDS) == 100
+    got = {(a["thesis_rule"], a["thesis_arm"], a["thesis_seed"]) for a in snn}
+    want = {(r, arm, s) for r in TEMPORAL_RULES for arm in ARMS
+            for s in SEEDS}
+    assert got == want
+    # each rule carries the whole five-arm five-seed block
+    for rule in TEMPORAL_RULES:
+        rows = [a for a in snn if a["thesis_rule"] == rule]
+        assert len(rows) == 25, rule
+        assert {a["thesis_arm"] for a in rows} == set(ARMS), rule
+        assert {a["thesis_seed"] for a in rows} == set(SEEDS), rule
+        assert {a["thesis_target"] for a in rows} == {f"rsnn_{rule}"}, rule
+
+
+def test_every_recurrent_row_is_the_rsnn_shd_target(gen, snn):
+    for a in snn:
+        cli = _cli(gen, a)
+        assert cli["--example"] == RSNN_EXAMPLE == "RSNN_SHD", a["name"]
+        assert cli["--dataset"] == RSNN_DATASET == "shd", a["name"]
+        assert cli["--temporal-rule"] == a["thesis_rule"], a["name"]
+        assert a["thesis_rule"] in TEMPORAL_RULES, a["name"]
+        # and the flag really is spelled that way on the rendered command line
+        text = gen.render(a)
+        assert f"\n  --temporal-rule {a['thesis_rule']}\n" in text, a["name"]
+        assert "\n  --example RSNN_SHD\n" in text, a["name"]
+        assert "\n  --dataset shd\n" in text, a["name"]
+    # all four rules are present, each on 25 rows
+    assert {a["thesis_rule"] for a in snn} == set(TEMPORAL_RULES)
+    # --dataset shd is a value ppo.py's own argparse offers
+    ppo = open(os.path.join(_ALPHAGRAD, "src", "alphagrad", "approx",
+                            "ppo.py")).read()
+    assert '"--temporal-rule"' in ppo and '"shd"' in ppo
+
+
+def test_the_recurrent_seeds_are_the_five_the_owner_named(gen, snn):
+    assert {a["thesis_seed"] for a in snn} == set(SEEDS)
+    for a in snn:
+        assert a["thesis_seed"] in SEEDS, a["name"]
+        assert _cli(gen, a)["--seed"] == a["thesis_seed"], a["name"]
+    # every (rule, arm) pair runs all five, so no seed is short
+    for rule in TEMPORAL_RULES:
+        for arm in ARMS:
+            rows = [a for a in snn
+                    if a["thesis_rule"] == rule and a["thesis_arm"] == arm]
+            assert {a["thesis_seed"] for a in rows} == set(SEEDS), (rule, arm)
+
+
+def test_the_recurrent_run_names_are_unique_and_spelled_as_ruled(gen, snn,
+                                                                 matrix):
+    names = [a["name"] for a in snn]
+    assert len(set(names)) == len(names) == 100
+    for a in snn:
+        assert a["name"] == (f"{a['thesis_arm']}_rsnn_{a['thesis_rule']}"
+                             f"_s{a['thesis_seed']}"), a["name"]
+        assert _cli(gen, a)["--name"] == a["name"], a["name"]
+    assert "C_rsnn_bptt_s250199" in names
+    assert "C_popart_rsnn_tbptt_s250197" in names
+    assert "condC_rsnn_rtrl_s250201" in names
+    # and no recurrent name collides with a core name
+    assert len({a["name"] for a in matrix}) == 150
+
+
+def test_every_recurrent_row_carries_the_nn256_and_tlm_flags_unchanged(
+        gen, snn, core):
+    """The strongest form of "everything else matches": diff each recurrent
+    row against its own arm-and-seed twin on each core target.  The ONLY
+    keys allowed to differ are the run name and the three that say which
+    target this is.
+
+    --ray-measure is excluded because it is the node's GPU count minus one
+    and the rows are spread over nodes of two sizes;
+    `test_the_nodes_and_the_actors_per_node_size` pins it per row.
+    """
+    node_derived = {"--ray-measure"}
+    target_keys = {"--name", "--example", "--dataset", "--temporal-rule"}
+    by_key = {(a["thesis_arm"], a["thesis_target"], a["thesis_seed"]): a
+              for a in core}
+    for a in snn:
+        cli = _cli(gen, a)
+        for t in TARGETS:
+            ref = _cli(gen, by_key[(a["thesis_arm"], t, a["thesis_seed"])])
+            diff = {k for k in set(ref) | set(cli)
+                    if ref.get(k, _MISSING) != cli.get(k, _MISSING)}
+            diff -= node_derived
+            assert diff == target_keys, (a["name"], t, sorted(diff))
+
+
+def test_no_recurrent_row_carries_an_xla_flag(gen, snn):
+    """The same rule the whole matrix runs under, asserted again on the
+    recurrent rows on their own: no XLA_*, no JAX_* beyond the shared
+    compilation cache, and no per-arm export at all."""
+    jax_cache_exports = {f"export {k}={v}" for k, v in gen.JAX_CACHE_ENV}
+    jax_cache_mkdir = f"mkdir -p {gen.JAX_CACHE_DIR_EXPR}"
+    for a in snn:
+        assert a["env"] == {}, a["name"]
+        text = gen.render(a)
+        assert "XLA_FLAGS" not in text, a["name"]
+        for line in text.splitlines():
+            if line.lstrip().startswith("#"):
+                continue
+            stripped = line.strip()
+            if stripped in jax_cache_exports or stripped == jax_cache_mkdir:
+                continue
+            assert "XLA_" not in line, (a["name"], line)
+            assert "export JAX_" not in line, (a["name"], line)
+        exported = set(_EXPORT.findall(text))
+        assert exported <= set(gen.THESIS_ENV_ALLOWED), a["name"]
+        assert "ALPHAGRAD_NN_HIDDEN" not in exported, a["name"]
+
+
+def test_the_recurrent_scheduling_matches_the_rest_of_the_matrix(gen, snn):
+    """One job per run, one released node, the per-node singleton name, and
+    the actor count the node's own size gives."""
+    for a in snn:
+        assert a["node"] in gen.THESIS_NODES, a["name"]
+        gpus = gen.THESIS_NODE_GPUS[a["node"]]
+        assert a["gpus"] == gpus, a["name"]
+        assert a["job"] == f"thesis-{a['node']}", a["name"]
+        cli = _cli(gen, a)
+        assert cli["--ray-measure"] == gen.THESIS_RAY_MEASURE[gpus], a["name"]
+        assert cli["--ray-measure"] == str(gpus - 1), a["name"]
+        text = gen.render(a)
+        assert "#SBATCH --dependency=singleton\n" in text, a["name"]
+        assert f"#SBATCH -w {a['node']}\n" in text, a["name"]
+    # 100 rows round-robin over the released nodes: every node carries its
+    # share and no node carries two more than another. The node count is
+    # THESIS_NODES', which grew from four to six when gpu17 and gpu19 were
+    # released, so the share is derived and not typed.
+    counts = {}
+    for a in snn:
+        counts[a["node"]] = counts.get(a["node"], 0) + 1
+    assert set(counts) == set(gen.THESIS_NODES)
+    _n = len(gen.THESIS_NODES)
+    assert sum(counts.values()) == 100
+    assert set(counts.values()) <= {100 // _n, -(-100 // _n)}, counts
+
+
+def test_every_recurrent_row_is_generated_and_held_never_submitted(gen, snn):
+    """The rows exist as files so the matrix is reviewable; not one of them
+    can start.  `main` only ever WRITES and DIFFS launchers -- it has no
+    sbatch path at all -- so "not submitted" is the HELD guard in the file."""
+    for a in snn:
+        assert a.get("held"), a["name"]
+        text = gen.render(a)
+        assert "*** HELD" in text, a["name"]
+        assert f'ABORT(73): {a["name"]} is HELD' in text, a["name"]
+        assert "exit 73" in text, a["name"]
+    assert not any(a.get("thesis_rule") for a in gen.thesis_block1_arms())
+    # THE GENERATOR HAS NO SUBMIT PATH.  It renders, syntax-checks, diffs and
+    # writes; the only subprocess it ever starts is `bash -n`.  So "generated
+    # but not submitted" is the HELD guard above, and nothing here needs a
+    # second mechanism.
+    gen_src = open(_GEN).read()
+    assert gen_src.count("subprocess.run(") == 1
+    assert 'subprocess.run(["bash", "-n"' in gen_src
+    assert "os.system" not in gen_src
+
+
+def test_the_four_rules_are_the_four_the_tree_defines(gen, snn):
+    """The generator imports nothing from alphagrad, so the four rules are
+    typed in two places.  This is where they are held together: ppo.py builds
+    `--temporal-rule`'s choices from common/rsnn_shd.TEMPORAL_RULES, and a
+    rule the matrix names that the tree does not define would fail every
+    recurrent launcher at its layer-2 pre-flight, by value, after the
+    name-only layer-1 grep said yes."""
+    from alphagrad.approx.common import rsnn_shd
+    from alphagrad.approx.ppo import make_argparser
+    assert tuple(rsnn_shd.TEMPORAL_RULES) == TEMPORAL_RULES
+    assert gen.THESIS_TEMPORAL_RULES == TEMPORAL_RULES
+    for rule in TEMPORAL_RULES:
+        ns = make_argparser().parse_args(
+            ["--example", RSNN_EXAMPLE, "--temporal-rule", rule])
+        assert ns.temporal_rule == rule
+    # a rule nobody ruled is refused by the same choices list
+    with pytest.raises(SystemExit):
+        make_argparser().parse_args(
+            ["--example", RSNN_EXAMPLE, "--temporal-rule", "window3"])
+    # window2 is the TWO-COPY window and it is asked for by the RULE, not by
+    # a second --example: the launcher names RSNN_SHD and rsnn_shd resolves
+    # the target the rule builds.
+    assert rsnn_shd.target_example(RSNN_EXAMPLE, "window2") == \
+        rsnn_shd.RSNN_W2_TARGET
+    assert rsnn_shd.target_example(RSNN_EXAMPLE, "tbptt") == RSNN_EXAMPLE
+    for a in snn:
+        assert _cli(gen, a)["--example"] == RSNN_EXAMPLE, a["name"]
+        assert rsnn_shd.resolve_temporal_rule(
+            RSNN_EXAMPLE, a["thesis_rule"]) == a["thesis_rule"], a["name"]

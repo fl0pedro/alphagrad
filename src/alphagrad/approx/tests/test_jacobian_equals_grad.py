@@ -71,10 +71,10 @@ os.environ.setdefault("ALPHAGRAD_SKIP_COST_ANALYSIS", "1")
 os.environ.setdefault("ALPHAGRAD_TLM_SEQ", "8")
 os.environ.setdefault("ALPHAGRAD_TLM_DMODEL", "8")
 os.environ.setdefault("ALPHAGRAD_TLM_VOCAB", "16")
-# LIF_SNN_SHD unrolls T=100 steps (5603 eqns) unless truncated. The property
-# is per-step-shape-independent; 1 step keeps this a unit test. Read at import
-# of examples, so it must be set first.
-os.environ.setdefault("ALPHAGRAD_SNN_TRUNC", "1")
+# The SHD targets unroll T=100 steps (5603 eqns) at the full window. The
+# property is per-step-shape-independent, so this file builds every temporal
+# target at GRAD_WINDOW = 1 below and stays a unit test. ALPHAGRAD_SNN_TRUNC,
+# which used to say so, is an ARGUMENT now (--target-grad-window) and raises.
 
 from types import SimpleNamespace as NS                           # noqa: E402
 
@@ -114,7 +114,11 @@ TRAINABLE = [
     "MoE", "VmappedMoE",
     "ViT", "VmappedViT",
     "LIF_SNN", "ADALIF_SNN", "ADALIF_SNN_SEQ", "LIF_SNN_SHD",
+    "ADALIF_SNN_SHD",
 ]
+
+#: The gradient window every temporal target in this file is built at.
+GRAD_WINDOW = 1
 
 ANALYTIC = sorted(_ANALYTIC_JACOBIAN_TARGETS)
 
@@ -166,7 +170,10 @@ def _tlm_args(example):
 def _args_for(example):
     if base_name(example).startswith("TransformerLM"):
         return _tlm_args(example)
-    return get_args(example, jax.random.PRNGKey(0), dataset=None)
+    from alphagrad.approx.common.snn_shd import has_time_steps
+    window = GRAD_WINDOW if has_time_steps(base_name(example)) else None
+    return get_args(example, jax.random.PRNGKey(0), dataset=None,
+                    grad_window=window)
 
 
 def _assert_jacve_is_grad(loss, xs, argnums, label):
@@ -308,7 +315,8 @@ def test_aux_returning_snn_targets(example):
         float(jnp.mean(raw[0])), rel=1e-6)
 
 
-@pytest.mark.parametrize("example", ["LIF_SNN_SHD", "ADALIF_SNN_SEQ"])
+@pytest.mark.parametrize("example",
+                         ["LIF_SNN_SHD", "ADALIF_SNN_SHD", "ADALIF_SNN_SEQ"])
 def test_already_scalar_snn_targets_are_untouched(example):
     """These two reduce INSIDE the model, so the registered target is the
     model itself: not even a ``jnp.mean`` is wrapped around it, because the

@@ -165,7 +165,7 @@ def build_vertex_valid_static(valid_vertices, total_v: int):
 
 
 def vertex_avail_at_step(state, vertex_valid_static, total_v: int, num_valid: int,
-                         fixed_order=None):
+                         fixed_order=None, order_constraint=None):
     """Per-vertex availability at the current rollout step.
 
     `state.order` keeps the chosen vertices in slots `[0, step_count)` (slots
@@ -180,7 +180,29 @@ def vertex_avail_at_step(state, vertex_valid_static, total_v: int, num_valid: in
     (its KL and its gradient are structurally 0). All-zero avail (terminal)
     stays all-zero: past the last step the gather is clamped to the last
     entry, which is already chosen.
+
+    ``order_constraint`` (``common/temporal_order.OrderConstraint``): the
+    PARTIAL order the two independent pins -- spatial (within a time step) and
+    temporal (across step copies) -- generate together. A table can only
+    express a total order, so this is the other shape of the same idea and the
+    two are mutually exclusive:
+
+      spatial pinned    inside its own group a vertex is legal only when every
+                        vertex ranked before it in that group is already
+                        chosen, i.e. its rank equals the group's chosen count.
+      temporal pinned   only the FIRST group in the pinned direction that is
+                        not yet complete has any legal vertex.
+
+    Both together are a total order; either alone leaves the policy the rest of
+    the choice. When every group is complete no rank matches and the mask is
+    all-zero, exactly as the table path is past its last step.
     """
+    if fixed_order is not None and order_constraint is not None:
+        raise ValueError(
+            "vertex_avail_at_step takes fixed_order OR order_constraint, "
+            "never both: they are two spellings of the same pin and a graph "
+            "built from both would silently take the intersection. "
+            "common.temporal_order.build_order_constraint returns exactly one.")
     chosen = state.order
     step_idx = state.step_count
     arange_v = jnp.arange(num_valid)
@@ -188,12 +210,34 @@ def vertex_avail_at_step(state, vertex_valid_static, total_v: int, num_valid: in
     already_chosen = (
         jnp.zeros(total_v, dtype=jnp.float32).at[chosen - 1].add(active)
     )
-    avail = vertex_valid_static * (1.0 - jnp.clip(already_chosen, 0.0, 1.0))
+    already_chosen = jnp.clip(already_chosen, 0.0, 1.0)
+    avail = vertex_valid_static * (1.0 - already_chosen)
     if fixed_order is not None:
         table = jnp.asarray(fixed_order, dtype=jnp.int32)
         n_steps = int(table.shape[0])
         pin = table[jnp.clip(step_idx, 0, n_steps - 1)] - 1
         avail = jnp.zeros_like(avail).at[pin].set(avail[pin])
+    elif order_constraint is not None:
+        oc = order_constraint
+        n_groups = int(oc.group_size.shape[0])
+        # How many of each group's vertices are already gone. Only a VALID
+        # vertex is ever chosen, so this counts exactly the group's progress.
+        done = jnp.zeros(n_groups, dtype=jnp.float32).at[oc.group_of].add(
+            already_chosen * vertex_valid_static)
+        if oc.spatial_pinned:
+            avail = avail * (
+                oc.rank_in_group == done[oc.group_of].astype(jnp.int32)
+            ).astype(avail.dtype)
+        if oc.temporal_pinned:
+            # The active group is the earliest INCOMPLETE one in the pinned
+            # direction. n_groups is a rank no group holds, so when all are
+            # complete nothing matches and the mask stays all-zero.
+            incomplete = done < oc.group_size.astype(jnp.float32)
+            ranks = jnp.where(incomplete, oc.group_rank, n_groups)
+            active_rank = jnp.min(ranks)
+            avail = avail * (
+                oc.group_rank[oc.group_of] == active_rank
+            ).astype(avail.dtype)
     return avail
 
 

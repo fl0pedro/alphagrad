@@ -494,11 +494,14 @@ def test_no_arm_that_existed_before_this_round_moved(gen):
 
 def test_the_matrix_and_the_campaign_still_have_their_own_counts(gen):
     """The order-only rows are thesis arms -- they carry the singleton and the
-    target shape -- but they are not matrix coordinates, and the 50 of the
-    matrix plus the three smoke runs must still be exactly that."""
+    target shape -- but they are not matrix coordinates, and the matrix plus
+    the three smoke runs must still be exactly what the rulings say: the 50
+    core rows of 2026-09-15 and the 100 recurrent rows of 2026-09-16."""
     matrix = [a for a in gen.thesis_arms()
               if not a.get("smoke") and not a.get("orderonly")]
-    assert len(matrix) == 50
+    assert len(gen.thesis_core_arms()) == 50
+    assert len(gen.thesis_snn_arms()) == 100
+    assert len(matrix) == 150
     assert len(gen.thesis_smoke_arms()) == 3
     assert len(gen.orderonly_arms()) == N_RUNS
     assert all(a.get("thesis") for a in gen.orderonly_arms())
