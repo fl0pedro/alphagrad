@@ -664,6 +664,12 @@ _PARKED_BY_THE_SNAPSHOT = {
     "consume_degenerate_plan_count",
     "consume_fidelity_stats",
     "consume_memory_compression_stats",
+    # `_REFUSED_KINDS`, the per-kind count of refused terminal measurements.
+    # That its container is really parked by the snapshot is proved directly
+    # rather than assumed by this listing: refused_telemetry_test's
+    # `test_the_counters_roll_back_with_a_discarded_attempt` records a
+    # refusal, snapshots, records two more, restores, and drains exactly one.
+    "consume_refused_counts",
     "consume_sparsity_stats",
     "consume_token_length_stats",
     "consume_tokenization_truncation_stats",

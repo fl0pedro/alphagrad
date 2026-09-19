@@ -1223,6 +1223,50 @@ def _record_zero_work_plan() -> None:
 
 
 # ---------------------------------------------------------------------------
+# REFUSED TERMINAL MEASUREMENTS, BY KIND.
+# ---------------------------------------------------------------------------
+# A refused measurement is MISSING DATA (AGENTS.md: "never score them as the
+# worst result"). The trainer now excludes the whole environment from the
+# update, which is correct and also INVISIBLE: a run whose refusal rate walks
+# from 2 percent to 40 percent trains on fewer and fewer environments and
+# every panel still looks healthy. So the rate is telemetry, per episode and
+# per KIND, and it rides the counter drain every actor already answers
+# (`consume_collapse_stats`), not the plan log -- the rate must be readable
+# with `--plan-log` off.
+#
+# THE KIND is the reason's prefix: `oom`, `untraceable`, `muls-cap`,
+# `no-target-fun`, `raised`, `oracle`. The detail after the colon stays on the
+# plan record's `refused` field, which is not aggregated.
+_REFUSED_KINDS: dict = {}
+# Where the LAST exception inside a measurement came from, when the callback
+# knows. Set by `_grad_oracle_check` so the wrapper can say `oracle` instead
+# of a bare `raised:XlaRuntimeError` -- the oracle's own float64 compile
+# failing is a different fault from the plan failing, and the two must not
+# share one counter. Cleared at the top of every `_callback`.
+_LAST_RAISE_SOURCE = [None]
+
+
+def refusal_kind(reason: str) -> str:
+    """The telemetry KIND of a plan record's ``refused`` reason."""
+    r = str(reason or "unknown")
+    return r.split(":", 1)[0] or "unknown"
+
+
+def _record_refusal(reason: str) -> None:
+    """Count ONE refused terminal measurement. Never raises, never skips."""
+    k = refusal_kind(reason)
+    _REFUSED_KINDS[k] = int(_REFUSED_KINDS.get(k, 0)) + 1
+    _REFUSED_KINDS["total"] = int(_REFUSED_KINDS.get("total", 0)) + 1
+
+
+def consume_refused_counts() -> dict:
+    """Pop this process's per-kind refusal counts (mirrors the other pollers)."""
+    out = {k: int(v) for k, v in _REFUSED_KINDS.items()}
+    _REFUSED_KINDS.clear()
+    return out
+
+
+# ---------------------------------------------------------------------------
 # THE FIDELITY CHANNEL (reward slot 8) -- CLIPPED RELATIVE FROBENIUS.
 # ---------------------------------------------------------------------------
 # Owner's choice, 2026-08-28: "clipped relative-Frobenius TRAINED, cosine
@@ -4836,6 +4880,63 @@ _GRAD_ORACLE_REF_STATS = {"hits": 0, "misses": 0}
 # elimination AND for jax.grad.
 _GRAD_ORACLE_LAST_PRECISION: dict = {"plan": None, "reference": None}
 
+# What the oracle SAW as the live float64 setting, and what the PROCESS saw
+# outside the oracle. A test reads both to prove the float64 scope is the
+# oracle's alone.
+_GRAD_ORACLE_LAST_X64: dict = {"inside": None, "outside": None}
+
+
+def _x64_scope():
+    """A float64 scope for the GRADIENT ORACLE ALONE.
+
+    THE FLAG MUST NOT BE GLOBAL. ``jax.config.update("jax_enable_x64", True)``
+    changes the whole process: every later trace in that process, on any
+    thread, sees float64 weak types and float64 literals. In a measurement
+    actor that process is also the one that compiles and times the plan, so a
+    global toggle makes the measured program a different program from the one
+    measured at cadence 0. It also moves what
+    ``alphagrad.approx.common.plan_log`` writes, because the dtype names it
+    records are read off ``jax.config.jax_enable_x64``.
+
+    This helper returns a context manager that sets the SAME setting on the
+    CURRENT THREAD only and restores it on exit. The oracle's own trace and
+    compile see float64; nothing else in the process ever does.
+
+    THREE NAMES, ONE THING. ``jax.experimental.enable_x64`` is the public
+    spelling and is gone from this build (jax 0.10.2, measured, job 66209);
+    the thing it wrapped is the ``enable_x64`` config STATE, whose ``__call__``
+    is the thread-local context manager. This module already imports
+    ``jax._src.core``, so reaching into ``jax._src.config`` for the state is
+    the same dependency, not a new one.
+
+    No silent fallback: if none of the three names is there, this raises.
+    Running the oracle through the global flag again is not an option the
+    apparatus may take on its own.
+    """
+    try:
+        from jax.experimental import enable_x64 as _exp_enable_x64
+    except ImportError:
+        _exp_enable_x64 = None
+    if callable(_exp_enable_x64):
+        return _exp_enable_x64()
+    _state = getattr(jax.config, "enable_x64", None)
+    if callable(_state):
+        return _state(True)
+    try:
+        from jax._src import config as _jax_src_config
+    except ImportError:
+        _jax_src_config = None
+    _state = getattr(_jax_src_config, "enable_x64", None)
+    if callable(_state):
+        return _state(True)
+    raise RuntimeError(
+        "the gradient oracle needs a THREAD-LOCAL float64 scope and this JAX "
+        f"({getattr(jax, '__version__', '?')}) exposes none of "
+        "jax.experimental.enable_x64, jax.config.enable_x64 and "
+        "jax._src.config.enable_x64; the global "
+        "jax.config.update('jax_enable_x64', True) is refused because it "
+        "would change the measured program (see _x64_scope)")
+
 
 def grad_oracle_cadence() -> int:
     """Episode cadence for checking the exact gradient against jax.grad.
@@ -4998,9 +5099,12 @@ def _grad_oracle_check(config, compiled_exact, base_args, device, order_key,
     a = list(base_args)
     for slot in range(min(2, len(data))):
         a[slot] = jax.device_put(jnp.asarray(data[slot]), device)
-    prev_x64 = jax.config.jax_enable_x64
-    jax.config.update("jax_enable_x64", True)
-    try:
+    # THE FLOAT64 SCOPE IS THE ORACLE'S ALONE (see _x64_scope). The global
+    # flag is read here only to record what the process saw OUTSIDE the
+    # scope, so a test can prove the scope did not move it.
+    _GRAD_ORACLE_LAST_X64["outside"] = bool(jax.config.jax_enable_x64)
+    with _x64_scope():
+        _GRAD_ORACLE_LAST_X64["inside"] = bool(jax.config.jax_enable_x64)
         a_f64 = []
         for x in a:
             if hasattr(x, "dtype") and jnp.issubdtype(x.dtype, jnp.floating):
@@ -5025,8 +5129,6 @@ def _grad_oracle_check(config, compiled_exact, base_args, device, order_key,
                 for e in leaves
             ]
             ref_leaves_np = [np.asarray(r, dtype=np.float64) for r in ref_leaves]
-    finally:
-        jax.config.update("jax_enable_x64", prev_x64)
     if len(leaves_np) != len(ref_leaves_np):
         raise GradientOracleFailure(
             f"[grad-oracle] order {key[0][:6]}...: {len(leaves_np)} exact "
@@ -7659,11 +7761,23 @@ def _callback(
     """
     _t0 = int(_PLAN_LOG_TERMINALS[0])
     _r0 = len(_PLAN_RECORDS)
+    _LAST_RAISE_SOURCE[0] = None
     try:
         return _callback_measured(
             config, args, consts, order, sparsity_specs, face_specs,
             face_skips, stop, *eval_samples, init=init, face_joins=face_joins)
     except BaseException as _exc:
+        # THE RATE IS TELEMETRY, WHATEVER THE PLAN LOG IS DOING. A raised
+        # terminal is a refused measurement; the trainer excludes the whole
+        # environment from the update, so without this counter the exclusion
+        # would be silent. `oracle:` separates the gradient oracle's own
+        # float64 compile failing from the plan failing -- two different
+        # faults that must not share one number.
+        _src = _LAST_RAISE_SOURCE[0]
+        _reason = (f"{_src}:{type(_exc).__name__}" if _src
+                   else f"raised:{type(_exc).__name__}")
+        if int(_PLAN_LOG_TERMINALS[0]) > _t0:
+            _record_refusal(_reason)
         # Only when THIS call counted a terminal and wrote nothing for it.
         if int(_PLAN_LOG_TERMINALS[0]) > _t0 and len(_PLAN_RECORDS) == _r0:
             try:
@@ -7680,7 +7794,7 @@ def _callback(
                     reward_vec=_SENTINEL_BAD_REWARD,
                     face_before=None, face_after=_PER_FACE_STATS,
                     counts_from_trace=False,
-                    refused=f"raised:{type(_exc).__name__}")
+                    refused=_reason)
             except Exception:
                 pass          # a logging failure must not mask the real one
         raise
@@ -7763,7 +7877,20 @@ def _callback_measured(
         counter had already fired, so the trainer saw
         ``pool_terminals=16 ... wrote=0`` and the log of a whole campaign was
         empty (canary job 65319, 2026-09-13). A refusal is a plan-log record
-        like any other, marked ``refused`` and ``sentinelled``."""
+        like any other, marked ``refused`` and ``sentinelled``.
+
+        THE COUNT COMES FIRST and is independent of the plan log: the
+        refusal RATE has to be readable from a run with ``--plan-log`` off,
+        because it is the rate at which the trainer is now dropping whole
+        environments from the update. It is taken on the SAME predicate the
+        trainer excludes on -- every cost channel at the sentinel -- so the
+        two can never disagree about what was refused. ``no-target-fun``
+        returns a partial reward vector rather than the sentinel, the
+        trainer keeps that environment, and it is therefore not counted."""
+        if bool(np.all(
+                np.asarray(reward_vec)[list(COMPUTE_REWARD_INDICES)]
+                <= SENTINEL_COST * 0.99)):
+            _record_refusal(reason)
         if not _plan_log_on:
             return
         _record_terminal_plan(
@@ -8559,8 +8686,20 @@ def _callback_measured(
     _ep = walk_episode()
     _oracle_due = (_cadence <= 1) or (_ep % _cadence == 0)
     if compiled_exact is not None and _qmetric == "grad_cosine" and _oracle_due:
-        _grad_oracle_check(config, compiled_exact, list(args),
-                           callback_device, o_list)
+        # NAME THE SOURCE OF A RAISE FROM IN HERE. The oracle builds its own
+        # float64 copy of the elimination, which is a bigger compile than the
+        # measurement's and is the one that exhausts the device on the
+        # TransformerLM plans. When that happens the plan is refused -- the
+        # owner's ruling of 2026-09-18 keeps the oracle even so -- but the
+        # refusal belongs to the ORACLE, not to the plan, and the telemetry
+        # has to say which. The exception itself is untouched and still
+        # propagates: nothing is swallowed here.
+        try:
+            _grad_oracle_check(config, compiled_exact, list(args),
+                               callback_device, o_list)
+        except BaseException:
+            _LAST_RAISE_SOURCE[0] = "oracle"
+            raise
         _pf("cb.grad_oracle")
 
     # XLA cost analysis — flops + bytes accessed. Falls back to 0 when the
@@ -10907,7 +11046,7 @@ _EPISODE_TELEMETRY_NAMES = (
     "_PROF", "_PROF_SAMPLES", "_PROF_DIST", "_PROF_TRACE",
     # plan health counters
     "_DEGENERATE_PLANS", "_TRUNCATED_PLANS", "_ZERO_WORK_PLANS",
-    "_UNTRACEABLE_PLANS",
+    "_UNTRACEABLE_PLANS", "_REFUSED_KINDS",
     # reward-channel telemetry
     "_FIDELITY_STATS", "_COS_LOG_SEEN",
     "_SPARSITY_STATS", "_APPROX_STORE_BYTES", "_EXACT_STORE_BYTES",

@@ -90,6 +90,7 @@ from alphagrad.approx.env import (
     _AXIS_FEAT_GROUP_ID,
     consume_degenerate_plan_count,
     consume_fidelity_stats,
+    consume_refused_counts,
     consume_sparsity_stats,
     consume_truncated_plan_count,
     consume_untraceable_plan_count,
@@ -949,7 +950,72 @@ def _value_decode(x: "jax.Array") -> "jax.Array":
     return x if _NO_SYMLOG_ALL[0] else inverse_reward_normalization_fn(x)
 
 
-def _per_channel_value_loss(values, targets):
+def sentinel_step_mask(reward):
+    """``(E, T)`` True where THIS step's raw reward vector IS the sentinel.
+
+    The sentinel is an exact vector: ``SENTINEL_COST`` in ALL SIX cost
+    channels. ALL of them, with a tight bound, because channel 0 is
+    ``-muls_adds_fmas`` and channel 3 is ``-max_io_sum``, both legitimately
+    around 1e12 on nn256 -- the ep-39 cliff bug was an ``any`` over those.
+    """
+    ch = jnp.asarray(COMPUTE_REWARD_INDICES, dtype=jnp.int32)
+    return jnp.all(reward[..., ch] <= (SENTINEL_COST * 0.99), axis=-1)
+
+
+def refused_env_mask(reward):
+    """``(env_refused (E,), live (E, T))`` from the raw reward tensor.
+
+    AN ENVIRONMENT IS THE UNIT OF EXCLUSION, NOT A STEP. Under
+    ``--terminal-rewards-only`` only the last step of an environment carries
+    a reward, so only that step can BE the sentinel -- but GAE has already
+    carried it backwards into every earlier step of the same environment
+    (``advantage_t = delta_t + discount * gae_lambda * advantage_{t+1}``, and
+    the campaign runs discount 1.0 with gae_lambda 1.0, so it arrives
+    undiminished). Excluding the sentinel step alone left T-1 contaminated
+    transitions per refused environment in the actor gradient, in the value
+    target and in the logged loss -- job 66201, ``[health ep0] ppo=1.227e+09``.
+
+    A refused measurement is MISSING DATA, never the worst result
+    (AGENTS.md). A missing terminal reward leaves the whole episode without a
+    measured return, so no transition of that environment trains anything.
+    """
+    is_degen = sentinel_step_mask(reward)
+    env_refused = jnp.any(is_degen, axis=-1)                      # (E,)
+    live = jnp.broadcast_to(
+        (~env_refused)[:, None], is_degen.shape).astype(jnp.float32)
+    return env_refused, live
+
+
+def _live_mean(x, w, axis=None):
+    """``jnp.mean(x)`` over the LIVE samples only.
+
+    ``w`` is the per-sample weight ``TrainBatch.live``: 1.0 where the
+    environment's terminal measurement succeeded, 0.0 where it was REFUSED.
+    A refused measurement is missing data, so its samples must weigh nothing
+    -- not in the gradient and not in the number that is logged.
+
+    ``w`` is broadcast against the LEADING axes of ``x``, so it works for a
+    ``(B,)`` scalar-per-sample quantity and for a ``(B, K)`` per-channel one
+    alike. With ``axis=None`` the result is the scalar mean over every
+    reduced entry.
+
+    BIT-IDENTICAL when nothing is refused: ``w`` is then all ones, ``x * w``
+    is ``x`` bit for bit, and ``sum(w)`` is exactly the sample count, so this
+    is ``jnp.sum(x) / n`` -- what ``jnp.mean`` computes.
+    """
+    if w is None:
+        return jnp.mean(x, axis=axis)
+    x = jnp.asarray(x)
+    w = jnp.asarray(w, dtype=x.dtype)
+    w = w.reshape(w.shape + (1,) * (x.ndim - w.ndim))
+    num = jnp.sum(x * w, axis=axis)
+    den = jnp.sum(jnp.broadcast_to(w, x.shape), axis=axis)
+    # An all-refused batch has no measurement at all; 0/0 is not a loss, so
+    # the term is exactly 0 and nothing trains on it.
+    return jnp.where(den > 0.0, num / jnp.maximum(den, 1e-30), 0.0)
+
+
+def _per_channel_value_loss(values, targets, w=None):
     """Critic MSE, total and PER CHANNEL (sec 12.10 battery telemetry).
 
     ``values`` is the head output ``(B, NUM_VALUE_HEADS)`` (any leading
@@ -966,8 +1032,8 @@ def _per_channel_value_loss(values, targets):
     """
     sq = (values - _value_target(targets)) ** 2
     return (
-        jnp.mean(jnp.sum(sq, axis=-1)),
-        jnp.mean(sq, axis=tuple(range(sq.ndim - 1))),
+        _live_mean(jnp.sum(sq, axis=-1), w),
+        _live_mean(sq, w, axis=tuple(range(sq.ndim - 1))),
     )
 
 
@@ -1317,7 +1383,7 @@ def kl_ref_enabled(args):
             or float(getattr(args, "kl_ref_target", 0.0) or 0.0) > 0.0)
 
 
-def _kl_ref_estimate(log_p_new, log_p_ref):
+def _kl_ref_estimate(log_p_new, log_p_ref, w=None):
     """KL(reference || current) on the SAMPLED actions -- Schulman's k3.
 
     ``k3 = (r - 1) - log r`` with ``r = exp(log_p_new - log_p_ref)``. This is
@@ -1342,7 +1408,7 @@ def _kl_ref_estimate(log_p_new, log_p_ref):
     face head's OP_NONE mass diffusing away, not by it concentrating.
     """
     lr = log_p_new - log_p_ref
-    return jnp.mean(jnp.exp(lr) - 1.0 - lr)
+    return _live_mean(jnp.exp(lr) - 1.0 - lr, w)
 
 
 def _kl_ref_dual_update(coef, kl, target, eta, coef_min, coef_max):
@@ -2050,6 +2116,13 @@ class TrainBatch(NamedTuple):
     delta_participants: jax.Array  # (K, total_v + 1)
     estim_returns: jax.Array
     norm_adv: jax.Array
+    # (num_envs, T) float32, 1.0 on a sample whose environment produced a
+    # MEASURED terminal reward and 0.0 on one whose terminal measurement was
+    # REFUSED. A refused measurement is missing data, so its samples weight
+    # every mean the loss takes -- see `_live_mean` and the `_env_refused`
+    # block in train_episode. All ones whenever nothing was refused, and the
+    # masked means are then bit-identical to the plain ones.
+    live: jax.Array
     vertex_avail_mask: jax.Array
     # Feature-probe targets, threaded exactly like `delta_participants`.
     probe_targets: jax.Array = None
@@ -10382,6 +10455,16 @@ def main():
             batch = jax.tree_util.tree_map(
                 lambda x: x.reshape(-1, *x.shape[2:]), batch)
 
+        # THE PER-SAMPLE LIVE WEIGHT, flat in samples like everything below.
+        # 1.0 on a sample whose environment produced a MEASURED terminal
+        # reward, 0.0 on one whose terminal measurement was REFUSED. Every
+        # mean this loss takes is a `_live_mean` against it, so a refused
+        # environment enters neither the gradient nor the logged statistic.
+        # All ones in the ordinary case, and then every mean is bit-identical
+        # to the plain one.
+        _w_live = (None if batch.live is None
+                   else jnp.asarray(batch.live, jnp.float32).reshape(-1))
+
         keys = jrand.split(key, batch.vertex_idx.shape[0])
 
         actions = MicroAction(
@@ -10945,7 +11028,7 @@ def main():
         # are point masses.
         # Schulman's low-variance, non-negative KL estimator:
         #   k3 = (r - 1) - log r,  with r = exp(new - old)
-        _kl_approx = jnp.mean((ratio - 1.0) - _log_ratio)
+        _kl_approx = _live_mean((ratio - 1.0) - _log_ratio, _w_live)
         num_triggers = get_num_clipping_triggers(ratio, args.ppo_clip_eps)
         trigger_ratio = num_triggers / len(ratio)
 
@@ -10954,7 +11037,7 @@ def main():
             jnp.clip(ratio, 1.0 - args.ppo_clip_eps, 1.0 + args.ppo_clip_eps)
             * batch.norm_adv,
         )
-        ppo_loss = jnp.mean(-clipping_objective)
+        ppo_loss = _live_mean(-clipping_objective, _w_live)
 
         # --target-kl: PPO EARLY STOPPING, minibatch-local. The update lives
         # inside `lax.scan` over epochs x minibatches and a scan cannot
@@ -11038,7 +11121,7 @@ def main():
             _lp_vertex = jnp.log(
                 jnp.take_along_axis(new_vertex_dist, _vd_k[:, None],
                                     axis=-1).squeeze(-1) + 1e-8)
-            kl_ref = _kl_ref_estimate(log_probs - _lp_vertex, _ref_logp)
+            kl_ref = _kl_ref_estimate(log_probs - _lp_vertex, _ref_logp, _w_live)
             kl_ref_pen = jnp.asarray(kl_ref_coef, jnp.float32) * kl_ref
 
         # Entropy normalized by per-sample sub-episode length (returned by
@@ -11048,14 +11131,15 @@ def main():
         # policy divided by its OWN arity), so this is a plain mean. Dividing
         # again by sub_lengths here would re-introduce the shared-denominator
         # bug from the other side.
-        entropy_loss = jnp.mean(entropies)
+        entropy_loss = _live_mean(entropies, _w_live)
 
         # See the legacy loss path's value-mode switch for the rationale;
         # in scalar mode only slot 0 of (values, estim_returns) is alive.
         if args.loss_mode == "scalar":
-            value_loss = jnp.mean(
+            value_loss = _live_mean(
                 (values[..., 0] - _value_target(batch.estim_returns[..., 0]))
-                ** 2
+                ** 2,
+                _w_live,
             )
             # Only slot 0 is alive in scalar mode (see above); the other
             # per-channel entries are structural zeros.
@@ -11069,7 +11153,7 @@ def main():
             # per-channel vector feeds the value_loss/<channel> wandb keys
             # (sec 12.10 critic-noise telemetry).
             value_loss, _vloss_ch = _per_channel_value_loss(
-                values, batch.estim_returns)
+                values, batch.estim_returns, _w_live)
             explained_var = explained_variance(
                 jnp.sum(values, axis=-1),
                 jnp.sum(batch.estim_returns, axis=-1),
@@ -11080,11 +11164,12 @@ def main():
         # dists we also sum over the max_substeps axis after the per-step
         # KL, then divide by the per-sample sub-episode length so the
         # contribution is normalized the same way as the entropy bonus.
-        kl_vertex = jnp.mean(
+        kl_vertex = _live_mean(
             optax.kl_divergence(
                 jnp.log(new_vertex_dist + 1e-7),
                 batch.old_vertex_dist,
-            )
+            ),
+            _w_live,
         )
 
         # Active-sub-step gating mirrors old_micro_log_prob_for_action:
@@ -11112,7 +11197,7 @@ def main():
                 kl = jnp.sum(kl, axis=-1)
             kl = kl * gate  # (B, S)
             per_sample = jnp.sum(kl, axis=-1) / denom  # (B,)
-            return jnp.mean(per_sample)
+            return _live_mean(per_sample, _w_live)
 
         kl_op = _per_step_kl(new_op_dists, batch.old_micro_op_dists, active_steps)
         kl_i = _per_step_kl(
@@ -11186,30 +11271,40 @@ def main():
         kind_ent_per = _step_entropy(new_kind_dists)  # (B, S)
         quant_ent_per = jnp.zeros_like(kind_ent_per)  # factored quant: see kl_quant note
 
-        ent_vertex = jnp.mean(_step_entropy(new_vertex_dist))
-        ent_op = jnp.mean(jnp.sum(op_ent_per * active_steps, axis=-1) / denom)
-        ent_i = jnp.mean(
-            jnp.sum(i_ent_per * active_steps * is_diag_or_compress, axis=-1) / denom
+        ent_vertex = _live_mean(_step_entropy(new_vertex_dist), _w_live)
+        ent_op = _live_mean(
+            jnp.sum(op_ent_per * active_steps, axis=-1) / denom, _w_live)
+        ent_i = _live_mean(
+            jnp.sum(i_ent_per * active_steps * is_diag_or_compress, axis=-1)
+            / denom, _w_live
         )
-        ent_j = jnp.mean(
-            jnp.sum(j_ent_per * active_steps * is_diag_step, axis=-1) / denom
+        ent_j = _live_mean(
+            jnp.sum(j_ent_per * active_steps * is_diag_step, axis=-1) / denom,
+            _w_live
         )
-        ent_exp = jnp.mean(
-            jnp.sum(exp_ent_per * active_steps * is_diag_step, axis=-1) / denom
+        ent_exp = _live_mean(
+            jnp.sum(exp_ent_per * active_steps * is_diag_step, axis=-1) / denom,
+            _w_live
         )
-        ent_kind = jnp.mean(
-            jnp.sum(kind_ent_per * active_steps * is_compress_step, axis=-1) / denom
+        ent_kind = _live_mean(
+            jnp.sum(kind_ent_per * active_steps * is_compress_step, axis=-1)
+            / denom, _w_live
         )
-        ent_quant = jnp.mean(
-            jnp.sum(quant_ent_per * active_steps * is_quant_step, axis=-1) / denom
+        ent_quant = _live_mean(
+            jnp.sum(quant_ent_per * active_steps * is_quant_step, axis=-1)
+            / denom, _w_live
         )
         # Fold the kind + quant entropies into the exp slot to keep the
         # first 5 slots identical to the legacy loss path's layout. Slot 5 is
         # NEW: the per-FACE approximation head's arity-normalised entropy,
         # which is the ONLY live approximation entropy under --live-faces.
+        # ONE masked face-entropy mean, shared by the telemetry slot, the
+        # entropy bonus and the floor hinge: three readings of one quantity
+        # must not disagree about which samples count.
+        _face_ent_mean = _live_mean(face_ents, _w_live)
         _entropy_components = (
             ent_vertex, ent_op, ent_i, ent_j, ent_exp + ent_kind + ent_quant,
-            jnp.mean(face_ents),
+            _face_ent_mean,
         )
 
         # --face-entropy-weight: split the entropy bonus so the face
@@ -11218,7 +11313,7 @@ def main():
         # the global one. None = the historic single-weight expression,
         # bit-identical.
         _ent_bonus = _split_entropy_bonus(
-            entropy_loss, jnp.mean(face_ents), args.entropy_weight,
+            entropy_loss, _face_ent_mean, args.entropy_weight,
             getattr(args, "face_entropy_weight", None))
         total_loss = (
             ppo_loss
@@ -11234,7 +11329,7 @@ def main():
                 and bool(getattr(args, "face_actions", False))
                 and bool(getattr(args, "unified_face_head", False))):
             total_loss = total_loss + _face_entropy_floor_penalty(
-                jnp.mean(face_ents),
+                _face_ent_mean,
                 float(args.face_entropy_floor),
                 float(args.face_entropy_floor_weight))
         # --kl-ref-weight: the trust region enters the loss HERE and
@@ -11783,11 +11878,31 @@ def main():
         # (cosine 0.0, frob -1.0). Require ALL cost channels at it — no real
         # plan is simultaneously 10 s slow, 10 GB, and 1e10-op in one row —
         # and use a tight bound so a merely expensive plan can never qualify.
-        _SENT_CH = jnp.asarray(COMPUTE_REWARD_INDICES, dtype=jnp.int32)
-        _is_degen = jnp.all(
-            traj.reward[..., _SENT_CH] <= (SENTINEL_COST * 0.99), axis=-1
-        )  # (E,T)
-        _live = (~_is_degen).astype(jnp.float32)[..., None]                # (E,T,1)
+        _is_degen = sentinel_step_mask(traj.reward)  # (E,T)
+        # THE WHOLE ENVIRONMENT IS EXCLUDED, NOT ONLY THE SENTINELLED STEP.
+        #
+        # THE LEAK THIS CLOSES (job 66201, `[health ep0] ppo=1.227e+09`).
+        # `_is_degen` is a per-(env, step) test on the RAW reward, and under
+        # `--terminal-rewards-only` only the LAST step of an environment
+        # carries a reward at all. GAE has already run above, and its scan
+        #     advantage_t = delta_t + discount * gae_lambda * advantage_{t+1}
+        # carries the terminal row's -1e10 BACKWARDS into every earlier step
+        # of the SAME environment. With the campaign's `--discount 1.0
+        # --gae-lambda 1.0` it arrives there undiminished. Zeroing the
+        # terminal row alone therefore removed one step out of T and left
+        # T-1 transitions per refused environment carrying the sentinel into
+        # the actor gradient, into `estim_returns` (the critic's target) and
+        # into the logged `ppo` statistic. Under `--cost-form paired-log` the
+        # latency and peak-memory channels are EXEMPT from symlog
+        # (`configure_symlog`), so those rows reach the loss at the full
+        # -1e10 scale -- which is the 1.2e9 loss, exactly.
+        #
+        # A refused measurement is MISSING DATA (AGENTS.md: "never score them
+        # as the worst result"). In a terminal-reward-only MDP a missing
+        # terminal reward leaves the WHOLE episode without a measured return,
+        # so no transition of that environment may train anything.
+        _env_refused, _live_step = refused_env_mask(traj.reward)
+        _live = _live_step[..., None]                                      # (E,T,1)
         advantages = advantages * _live
 
         if use_popart:
@@ -11860,12 +11975,38 @@ def main():
         else:
             new_m1, new_m2, new_w = popart_m1, popart_m2, popart_w
 
+            # THE NEUTRAL TARGET IS NOT OPTIONAL HERE EITHER. This branch
+            # (`--advantage-norm zscore`) used to leave `estim_returns`
+            # untouched, so a refused environment's rows still trained the
+            # critic on a bootstrapped -1e10 while the two other branches
+            # substituted the critic's own prediction. Same substitution,
+            # same decode as the "none" branch: this path also runs the
+            # symlog GAE, so `_value_decode` is its inverse.
+            estim_returns = jnp.where(
+                _live > 0.5,
+                estim_returns,
+                _value_decode(traj.value),
+            )
+
             def normalize(x):
                 return (x - jnp.mean(x)) / (jnp.std(x) + 1e-7)
 
             norm_adv_components = jax.vmap(normalize, in_axes=-1, out_axes=-1)(
                 advantages.reshape(-1, advantages.shape[-1])
             ).reshape(advantages.shape)
+            # The z-score maps an exactly-zero advantage to -mu/sigma, which
+            # is NOT zero, so the excluded rows would come back to life at
+            # the very last step. Re-apply the mask AFTER the normalisation.
+            #
+            # WHAT STAYS: the excluded rows are exact zeros in `advantages`,
+            # and `jnp.mean` / `jnp.std` above still count them, so on THIS
+            # branch a refused environment still moves the normaliser of the
+            # live rows. A masked mean and variance here would not be
+            # bit-identical to the recorded golden when nothing is refused,
+            # which is a bigger change than the defect: the campaign arms all
+            # run `--advantage-norm none` or `popart`, and both of those are
+            # exact. Stated here so the limit is visible, not inferred.
+            norm_adv_components = norm_adv_components * _live
         # --adv-winsorize Z (sec 12.7 fix 2), default 0 = off (bit-identical
         # path: no clip, no extra ops on the advantage). Applied to ALL
         # channels, BEFORE preference weighting, on the per-channel
@@ -12141,6 +12282,7 @@ def main():
             delta_participants=_w_dpart,
             estim_returns=estim_returns,
             norm_adv=norm_adv,
+            live=_live_step,
             vertex_avail_mask=traj.vertex_avail_mask,
             # Threaded exactly like `delta_participants`: recorded per step in
             # the rollout, sliced by the same shuffle, read by the loss. All
@@ -13096,6 +13238,31 @@ def main():
             "value loss": value_loss,
             "total loss": total_loss,
         }
+        # ---- REFUSED TERMINAL MEASUREMENTS, PER EPISODE AND PER KIND -------
+        # The trainer now drops a refused environment from the update
+        # entirely, which is correct AND silent. This is the number that makes
+        # it visible: how many of this episode's terminal measurements were
+        # refused, and by what. `_POOL_CS` carries the measure actors' share
+        # (the counters are module globals in THEIR processes) and
+        # `consume_refused_counts()` the trainer's own local rows.
+        _ref_counts = {str(_k): int(_v)
+                       for _k, _v in consume_refused_counts().items()}
+        for _k, _v in _POOL_CS.items():
+            _ks = str(_k)
+            if _ks.startswith("refused_"):
+                _kk = _ks[len("refused_"):]
+                _ref_counts[_kk] = int(_ref_counts.get(_kk, 0)) + int(_v)
+        _ref_total = int(_ref_counts.pop("total", 0))
+        for _k in sorted(_ref_counts):
+            log_dict[f"refused/{_k}"] = int(_ref_counts[_k])
+        log_dict["refused/total"] = _ref_total
+        log_dict["refused/rate"] = (
+            float(_ref_total) / float(num_envs) if num_envs else 0.0)
+        if _ref_total:
+            print(f"[refused ep{ep}] {_ref_total} of {num_envs} terminal "
+                  f"measurements refused and EXCLUDED from the update: "
+                  + ", ".join(f"{_k}={_ref_counts[_k]}"
+                              for _k in sorted(_ref_counts)), flush=True)
         # Per-channel critic loss (sec 12.10 static-objective battery). The
         # critic-noise hypothesis -- the QUALITY head's value error drowns
         # the violation signal -- is only testable across arms with the
@@ -15858,10 +16025,11 @@ def main():
                 # the loss. Testing it after symlog (as the old code did) can
                 # never fire: symlog(-1e10) is -23, nowhere near -1e10, so
                 # every failed measurement was silently defining the scale.
-                _wl = np.asarray(
-                    ~jnp.all(_wr[..., jnp.asarray(COMPUTE_REWARD_INDICES,
-                                                  dtype=jnp.int32)]
-                             <= (SENTINEL_COST * 0.99), axis=-1))
+                # WHOLE-ENVIRONMENT, like the loss: the Monte-Carlo return
+                # below runs the same backwards recursion GAE does, so a
+                # refused terminal contaminates every earlier step of that
+                # environment and a per-step mask would seed PopArt off it.
+                _wl = np.asarray(refused_env_mask(_wr)[1] > 0.5)
                 if args.reward_mode == "mult":
                     _wr = _apply_mult_gate(
                         _wr, mult_cost_weights, args.gate_tau, args.gate_w,
