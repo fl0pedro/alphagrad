@@ -250,6 +250,15 @@ def _toy_env():
         num_data_points=1, reps_per_point=1)
 
 
+def _env_without_a_data_gen():
+    """The same target with NO generator, so no probe batch can be drawn."""
+    from alphagrad.approx.env import VertexEliminationEnv
+    closed = jax.make_jaxpr(_toy)(_X)
+    return VertexEliminationEnv.from_jaxpr(
+        closed, args=[_X], argnums=(0,), num_envs=0, target_fun=_toy,
+        measure_latency=False, num_data_points=1, reps_per_point=1)
+
+
 def _run_terminal(env):
     from alphagrad.approx.env import (FACE_SLOTS, MAX_FACES,
                                       MAX_RULES_PER_VERTEX, StepAction)
@@ -309,6 +318,34 @@ def test_a_defined_cosine_is_still_a_score(monkeypatch):
     assert not counts, f"a scored measurement was counted as refused: {counts}"
     assert float(reward[envmod.REWARD_INDEX["quality"]]) == pytest.approx(
         0.75, abs=1e-6)
+
+
+def test_a_configuration_with_no_quality_channel_is_not_a_refusal(monkeypatch):
+    """NO CHANNEL IS NOT MISSING DATA. A target with no data generator has no
+    probe batch and therefore no gradient cosine to measure, for every plan of
+    every episode -- refusing there refuses the whole run and it measures
+    nothing. The refusal of dsnn-dfw.51 is for a probe batch that WAS drawn
+    and whose exact gradient came back identically zero.
+
+    Measured 2026-09-19, job 66664: the refusal reached the structural case
+    and seven tests in three modules failed on it -- every terminal of the
+    plan-log and reserved-slot environments carried the sentinel reward and
+    the record said `refused: quality-undefined:grad_cosine`."""
+    monkeypatch.setenv("ALPHAGRAD_QUALITY_METRIC", "grad_cosine")
+    envmod._WALK_UNDEFINED_WARNED.clear()
+    envmod.consume_refused_counts()
+    try:
+        reward = _run_terminal(_env_without_a_data_gen())
+        counts = envmod.consume_refused_counts()
+    finally:
+        envmod.consume_refused_counts()
+        envmod._WALK_UNDEFINED_WARNED.clear()
+    assert not counts, (
+        f"a configuration with no quality channel at all was counted as a "
+        f"refused measurement: {counts}")
+    assert float(reward[envmod.REWARD_INDEX["quality"]]) == 0.0, (
+        f"the quality slot of a target with no channel must read 0.0, got "
+        f"{float(reward[envmod.REWARD_INDEX['quality']])}")
 
 
 # ---------------------------------------------------------------------------
