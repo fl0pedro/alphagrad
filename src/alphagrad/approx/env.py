@@ -4806,18 +4806,34 @@ def _warn_cosine_is_now_grad_cosine() -> None:
     )
 
 
-def _grad_cosine_k() -> int:
+def _grad_cosine_k(config=None) -> int:
     """How many probe batches the gradient cosine averages over.
 
-    K=1 is the default because it is the value that keeps the channel at
-    EXACTLY ONE exact execution per terminal plan -- the same reference count
-    the Jacobian cosine paid -- and because the bake-off found K>1 buys
-    essentially no extra correlation on this target.
+    K=1 where it has always been 1: it keeps the channel at EXACTLY ONE exact
+    execution per terminal plan -- the same reference count the Jacobian
+    cosine paid -- and the bake-off found K>1 buys essentially no extra
+    correlation on the dense targets.
+
+    A GENERATOR MAY ASK FOR MORE, AND ONE HAS TO. On a sparse spiking target a
+    probe batch IS a step position, and at a step where nothing fired the exact
+    gradient is identically zero, the cosine is undefined and the measurement
+    is refused. 43 of the 99 legal step positions of the recording the RSNN_SHD
+    campaign drew are silent (probe 66655), so K=1 refuses 43 percent of every
+    measurement on that target. Such a generator declares `probe_batches` and
+    that number is the default here. ALPHAGRAD_GRAD_COSINE_K overrides both.
     """
+    _default = 1
+    if config is not None:
+        try:
+            _default = max(1, int(getattr(getattr(config, "data_gen", None),
+                                          "probe_batches", 1) or 1))
+        except (TypeError, ValueError):
+            _default = 1
     try:
-        return max(1, int(os.environ.get("ALPHAGRAD_GRAD_COSINE_K", "1")))
+        return max(1, int(os.environ.get("ALPHAGRAD_GRAD_COSINE_K",
+                                         str(_default))))
     except ValueError:
-        return 1
+        return _default
 
 
 
@@ -4923,18 +4939,34 @@ def _warn_cosine_is_now_grad_cosine() -> None:
     )
 
 
-def _grad_cosine_k() -> int:
+def _grad_cosine_k(config=None) -> int:
     """How many probe batches the gradient cosine averages over.
 
-    K=1 is the default because it is the value that keeps the channel at
-    EXACTLY ONE exact execution per terminal plan -- the same reference count
-    the Jacobian cosine paid -- and because the bake-off found K>1 buys
-    essentially no extra correlation on this target.
+    K=1 where it has always been 1: it keeps the channel at EXACTLY ONE exact
+    execution per terminal plan -- the same reference count the Jacobian
+    cosine paid -- and the bake-off found K>1 buys essentially no extra
+    correlation on the dense targets.
+
+    A GENERATOR MAY ASK FOR MORE, AND ONE HAS TO. On a sparse spiking target a
+    probe batch IS a step position, and at a step where nothing fired the exact
+    gradient is identically zero, the cosine is undefined and the measurement
+    is refused. 43 of the 99 legal step positions of the recording the RSNN_SHD
+    campaign drew are silent (probe 66655), so K=1 refuses 43 percent of every
+    measurement on that target. Such a generator declares `probe_batches` and
+    that number is the default here. ALPHAGRAD_GRAD_COSINE_K overrides both.
     """
+    _default = 1
+    if config is not None:
+        try:
+            _default = max(1, int(getattr(getattr(config, "data_gen", None),
+                                          "probe_batches", 1) or 1))
+        except (TypeError, ValueError):
+            _default = 1
     try:
-        return max(1, int(os.environ.get("ALPHAGRAD_GRAD_COSINE_K", "1")))
+        return max(1, int(os.environ.get("ALPHAGRAD_GRAD_COSINE_K",
+                                         str(_default))))
     except ValueError:
-        return 1
+        return _default
 
 
 
@@ -5625,6 +5657,33 @@ def _data_slots(config, data) -> tuple:
     return slots
 
 
+def _probe_seed(config, role: str = "train", episode: int | None = None,
+                index: int = 0) -> int:
+    """THE PRNG SEED OF ONE PROBE BATCH, and the only definition of it.
+
+    Two places need this number: :func:`_probe_batch`, which keys the batch
+    itself on it, and :func:`_grad_cosine_quality`, which keys the cosine's
+    EXACT REFERENCE on it. They used to compute it separately and the second
+    copy was short by the two terms below, so on a generator that redraws per
+    environment and per episode every row after the first was scored against
+    the FIRST row's exact gradient -- a gradient at another step of the
+    recording, which is an unrelated vector. Job 66642 read a quality median of
+    +0.0197 over [-0.2417, +1] on plans that were all exact; probe 66655
+    reproduced it on that job's own arguments, four rows in one process:
+    +1.000, -0.240, -0.174, -0.221 (dsnn-dfw.52).
+
+    On every generator that does NOT declare ``resample_per_env_episode`` this
+    is exactly ``_walk_seed(role, episode) + 104729 * index``, which is what
+    both call sites computed before, so nothing else moves by one bit.
+    """
+    seed = _walk_seed(role, episode) + 104729 * int(index)
+    if getattr(config.data_gen, "resample_per_env_episode", False):
+        _ep = walk_episode() if episode is None else int(episode)
+        seed += (_PROBE_EPISODE_STRIDE * int(_ep)
+                 + _PROBE_ENV_STRIDE * (current_env_slot() + 1))
+    return int(seed)
+
+
 def _probe_batch(config, base_args, role: str = "train",
                  episode: int | None = None, index: int = 0, draw=None):
     """The probe batch: real data from ``config.data_gen`` at ``_walk_seed``.
@@ -5660,18 +5719,14 @@ def _probe_batch(config, base_args, role: str = "train",
     # ``index`` draws a DIFFERENT batch for each K of the gradient
     # cosine. index=0 is bit-identical to the pre-index behaviour, so
     # the loss-drop walk's batch does not move.
-    _seed = _walk_seed(role, episode) + 104729 * int(index)
     # PER ENVIRONMENT AND PER EPISODE, when the generator asks for it (owner
     # ruling 2026-09-16). `_walk_seed` rotates per episode only behind
     # ALPHAGRAD_WALK_ROTATE, and never per environment, so a generator whose
     # DRAW is the quantity under study -- the recurrent SHD step position --
-    # says so with `resample_per_env_episode` and gets both folded in here.
-    # Absent on every other generator, and then this is the identity and the
-    # batch is the one batch per process it has always been.
-    if getattr(config.data_gen, "resample_per_env_episode", False):
-        _ep = walk_episode() if episode is None else int(episode)
-        _seed += (_PROBE_EPISODE_STRIDE * int(_ep)
-                  + _PROBE_ENV_STRIDE * (current_env_slot() + 1))
+    # says so with `resample_per_env_episode`. `_probe_seed` folds both in,
+    # and it is the ONE place that does: the cosine's reference is keyed on
+    # the same number.
+    _seed = _probe_seed(config, role, episode, index)
     _key = (id(config.data_gen), id(draw), _seed,
             tuple(getattr(a, "shape", ()) for a in base_args[:2]))
     hit = _PROBE_BATCH.get(_key)
@@ -5747,7 +5802,13 @@ def _adam_step(w, g, m, v, t, lr, b1, b2, eps):
 # cosine alone: two compiles per plan under a free order, where the reference
 # is one executable for the whole process.
 _COSINE_REF: dict = {}
-_COSINE_REF_MAX = 8
+# ONE ENTRY PER (environment row, episode, K). A generator that redraws per
+# environment gives 16 rows x K batches distinct keys in one process, and a cap
+# of 8 made every row after the eighth a miss that evicted the whole table. The
+# entry is one gradient (about 1 MB on RSNN_SHD), so a cap that holds an
+# episode's rows costs a few tens of megabytes and saves one reference
+# execution per plan.
+_COSINE_REF_MAX = 128
 _COSINE_REF_STATS = {"hits": 0, "misses": 0}
 
 
@@ -5841,7 +5902,10 @@ def _grad_cosine_quality(config, compiled_approx, ref_ex, ref_key, base_args,
             _ref_draw = _ref_oracle["draw"]
         _oracle_ref = (_ref_draw is not None and config.target_fun is not None
                        and bool(getattr(config, "scalar_target", False)))
-        _seed = _walk_seed("train", None) + 104729 * int(k)
+        # THE SAME SEED `_probe_batch` DREW THIS BATCH AT (dsnn-dfw.52). The
+        # reference is cached on it, and a seed that does not carry the
+        # environment row serves row 0's exact gradient to every other row.
+        _seed = _probe_seed(config, "train", None, k)
         try:
             out_a = compiled_approx(*a)
             if _oracle_ref:
@@ -5900,10 +5964,12 @@ def _grad_cosine_quality(config, compiled_approx, ref_ex, ref_key, base_args,
             print(
                 f"[measure] WARNING quality channel: the EXACT gradient is "
                 f"identically zero on all {_degenerate} probe batch(es), so "
-                f"the gradient cosine is undefined and the channel reads 0.0. "
-                f"On a spiking target this means the sampled step fired "
-                f"nothing; widen the probe (ALPHAGRAD_GRAD_COSINE_K) or raise "
-                f"the target's firing rate.", flush=True)
+                f"the gradient cosine is undefined and the measurement is "
+                f"REFUSED (missing data, counted, excluded from the update -- "
+                f"never scored 0.0, dsnn-dfw.51). On a spiking target this "
+                f"means the sampled steps fired nothing; widen the probe "
+                f"(ALPHAGRAD_GRAD_COSINE_K) or raise the target's firing "
+                f"rate.", flush=True)
         return None
     return float(np.mean(cos_all)), frob_all, cos_all
 
@@ -9633,19 +9699,36 @@ def _callback_measured(
         if is_terminal and _qmetric == "grad_cosine":
             _gc = _grad_cosine_quality(
                 config, compiled_approx, _ref_ex, paired_ref_key, list(args),
-                callback_device, _grad_cosine_k())
+                callback_device, _grad_cosine_k(config))
             if _gc is None:
+                # AN UNDEFINED COSINE IS A REFUSED MEASUREMENT, NOT A SCORE
+                # (owner ruling 2026-09-19, dsnn-dfw.51). It used to read 0.0,
+                # which under `--reward-mode lagrangian --quality-floor 0.90`
+                # is a full constraint violation: on RSNN_SHD bptt (job 66633)
+                # every measure actor printed the warning below and more than
+                # half the order-only plans were penalised for a step position
+                # that fired nothing. The taxonomy this file already applies to
+                # an OOM and to an untraceable plan applies here: the
+                # apparatus could not measure the plan, so the measurement is
+                # MISSING DATA -- counted, recorded, and excluded from the
+                # update -- and never the worst possible number.
                 if not _WALK_UNDEFINED_WARNED:
                     _WALK_UNDEFINED_WARNED.append(1)
                     print(
                         "[measure] WARNING quality channel: the GRADIENT "
                         "COSINE is UNDEFINED for this configuration (no "
-                        "data_gen, or the rev-exact reference failed to "
-                        "build or to execute on the probe batch). "
-                        "The channel reads 0.0 for every affected plan; ask "
-                        "for ALPHAGRAD_QUALITY_METRIC=jac_cosine to score at "
-                        "the calibration samples instead.", flush=True)
-                cosines.append(0.0)
+                        "data_gen, the exact gradient identically zero on "
+                        "every probe batch, or the rev-exact reference failed "
+                        "to build or to execute on the probe batch). "
+                        "Every affected measurement is REFUSED and excluded "
+                        "from the update; watch `refused/quality-undefined`. "
+                        "On a spiking target this means the sampled steps "
+                        "fired nothing: widen the probe "
+                        "(ALPHAGRAD_GRAD_COSINE_K) or raise the target's "
+                        "firing rate.", flush=True)
+                _tr = _truncated_reward()
+                _log_refused("quality-undefined:grad_cosine", _tr)
+                return _wire(tokens, eqn_ids, _tr)
             else:
                 _gc_q, _gc_frobs, _gc_cos = _gc
                 cosines.append(_gc_q)
