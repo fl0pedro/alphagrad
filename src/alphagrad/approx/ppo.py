@@ -13478,15 +13478,20 @@ def main():
     # TICKET dsnn-dfw.44. Under paired-log the archive is DISTRIBUTION-AWARE
     # and lives in log-ratio space; the reward-vector archive stays for
     # --cost-form absolute, where no reference and so no ratio exists.
-    _RATIO_ARCHIVE = getattr(args, "cost_form", "absolute") == "paired-log"
+    # The bands ride the plan-log drain, so with --plan-log off no plan has a
+    # point and the reward-vector archive is the only one that can be built.
+    _RATIO_ARCHIVE = (getattr(args, "cost_form", "absolute") == "paired-log"
+                      and _PLAN_LOG_PATH is not None)
+    if (getattr(args, "cost_form", "absolute") == "paired-log"
+            and _PLAN_LOG_PATH is None):
+        print("[pareto] --cost-form paired-log, but --plan-log is OFF: the "
+              "per-window ratio bands the distribution-aware archive is made "
+              "of ride the plan-log drain, so this run archives the "
+              "REWARD-VECTOR front instead, whose latency axis is floored at "
+              "the reference (ticket dsnn-dfw.44). Give --plan-log auto for "
+              "the band archive.", flush=True)
     if _RATIO_ARCHIVE:
         from alphagrad.approx.common.pareto_archive import RatioBandArchive
-        if _PLAN_LOG_PATH is None:
-            raise ValueError(
-                "--cost-form paired-log builds the distribution-aware Pareto "
-                "archive, whose points are the per-window ratio bands the "
-                "plan log carries; --plan-log is off, so no plan has a band. "
-                "Give --plan-log auto or a path.")
         pareto_archive = RatioBandArchive(
             obj_names=(args.cmp_type, args.mem_type),
             cap=64,
