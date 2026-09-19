@@ -260,3 +260,188 @@ class ParetoArchive:
             payload.update(extra)
         with open(path, "w") as f:
             json.dump(payload, f, indent=2)
+
+
+# TICKET dsnn-dfw.44. Points live in LOG-RATIO space against the paired
+# rev-exact reference: 0 is parity and LOWER IS BETTER. The coordinate is the
+# UNFLOORED log ratio. `env.paired_log_costs` floors the REWARD at the
+# reference (--paired-cost-floor reference), which maps every plan at or below
+# parity onto exactly 0; that is why round 1 archived a best of -0.0 while its
+# best measurement was 0.65x rev-exact. A point is a BAND, not a number: the
+# q05..q95 of the paired per-window ratios of its one measurement, widened so
+# it is never narrower than the run's instrument drift floor.
+class RatioBandArchive:
+
+    def __init__(self, obj_names, cap: int = 64, quality_floor=None):
+        self.obj_names = list(obj_names)
+        if not self.obj_names:
+            raise ValueError("RatioBandArchive needs at least one objective")
+        self.cap = int(cap)
+        if self.cap < 1:
+            raise ValueError(f"RatioBandArchive cap must be >= 1, got {cap!r}")
+        self.quality_floor = (None if quality_floor is None
+                              else float(quality_floor))
+        # In nats, from gate/g5/drift_floor_lat: the same reference
+        # re-measured once per candidate, so its spread is pure instrument
+        # drift and no band may be narrower than it.
+        self.drift_floor = 0.0
+        self.pts: list[np.ndarray] = []      # the medians ARE the coordinate
+        self.q05: list[np.ndarray] = []
+        self.q95: list[np.ndarray] = []
+        self.counts: list[int] = []          # measurements merged into a band
+        self.seqs: list = []
+        self.eps: list[int] = []
+        self.all_candidates: list[dict] = []
+        self._seen: set = set()
+        self._hv_ref: np.ndarray | None = None
+        self.n_merged = 0
+        self.n_dropped_cap = 0
+
+    def set_drift_floor(self, value) -> None:
+        if value is None:
+            return
+        v = float(value)
+        # A non-finite reading is no reading and leaves the last one standing.
+        if not np.isfinite(v):
+            return
+        if v < 0.0:
+            raise ValueError(f"drift floor must be >= 0, got {v!r}")
+        self.drift_floor = v
+
+    def _vec(self, dist, key) -> np.ndarray:
+        out = np.empty((len(self.obj_names),), dtype=np.float64)
+        for k, nm in enumerate(self.obj_names):
+            out[k] = float(dist[nm][key])
+        if not np.all(np.isfinite(out)):
+            raise ValueError(
+                f"RatioBandArchive: {key} is not finite over "
+                f"{self.obj_names}: {out.tolist()}")
+        return out
+
+    def band(self, i: int) -> tuple:
+        lo, hi = self.q05[i], self.q95[i]
+        extra = np.maximum(0.0, self.drift_floor - (hi - lo)) * 0.5
+        return lo - extra, hi + extra
+
+    def band_width(self, i: int) -> float:
+        lo, hi = self.band(i)
+        return float(np.sum(hi - lo))
+
+    def add(self, dist, seq, episode: int, quality=None) -> bool:
+        if dist is None:
+            raise ValueError(
+                "RatioBandArchive.add got no distribution: a plan with no "
+                "per-window ratios has no point (needs --cost-form "
+                "paired-log and a plan log)")
+        med = self._vec(dist, "median")
+        q05 = self._vec(dist, "q05")
+        q95 = self._vec(dist, "q95")
+        if np.any(q05 > med) or np.any(med > q95):
+            raise ValueError(
+                f"RatioBandArchive: q05 <= median <= q95 is violated: "
+                f"{q05.tolist()} {med.tolist()} {q95.tolist()}")
+        if (self.quality_floor is not None and quality is not None
+                and float(quality) < self.quality_floor):
+            return False
+        dominates: list[int] = []
+        for i in range(len(self.pts)):
+            lo, hi = self.band(i)
+            better = med < lo
+            worse = med > hi
+            if not better.any() and not worse.any():
+                # Inside the band everywhere: one more measurement of it.
+                self.counts[i] += 1
+                self.n_merged += 1
+                return False
+            if worse.any() and not better.any():
+                return False
+            if better.any() and not worse.any():
+                dominates.append(i)
+        _drop = set(dominates)
+        keep = [i for i in range(len(self.pts)) if i not in _drop]
+        self.pts = [self.pts[i] for i in keep] + [med]
+        self.q05 = [self.q05[i] for i in keep] + [q05]
+        self.q95 = [self.q95[i] for i in keep] + [q95]
+        self.counts = [self.counts[i] for i in keep] + [1]
+        self.seqs = [self.seqs[i] for i in keep] + [seq]
+        self.eps = [self.eps[i] for i in keep] + [int(episode)]
+        while len(self.pts) > self.cap:
+            widths = [self.band_width(i) for i in range(len(self.pts))]
+            drop = int(np.argmax(np.asarray(widths)))
+            for lst in (self.pts, self.q05, self.q95, self.counts,
+                        self.seqs, self.eps):
+                del lst[drop]
+            self.n_dropped_cap += 1
+        key = repr(seq)
+        if key not in self._seen:
+            self._seen.add(key)
+            self.all_candidates.append({
+                "episode": int(episode),
+                "obj": self._named(med),
+                "q05": self._named(q05),
+                "q95": self._named(q95),
+                "seq": seq,
+            })
+        return True
+
+    def _named(self, vec) -> dict:
+        return {nm: float(vec[k]) for k, nm in enumerate(self.obj_names)}
+
+    def add_many(self, solutions, episode: int) -> int:
+        return sum(int(self.add(d, s, episode, quality=q))
+                   for d, s, q in solutions)
+
+    def hypervolume(self) -> float:
+        if not self.pts:
+            return 0.0
+        # The sweep MAXIMISES, so minimisation medians enter negated.
+        pts = -np.stack(self.pts)
+        if self._hv_ref is None:
+            self._hv_ref = pts.min(axis=0) - 1.0
+        return hypervolume(pts, self._hv_ref)
+
+    def front(self) -> list:
+        out = []
+        for i in range(len(self.pts)):
+            lo, hi = self.band(i)
+            out.append({
+                "obj": self._named(self.pts[i]),
+                "q05": self._named(self.q05[i]),
+                "q95": self._named(self.q95[i]),
+                "band_lo": self._named(lo),
+                "band_hi": self._named(hi),
+                "n": int(self.counts[i]),
+                "episode": int(self.eps[i]),
+                "seq": self.seqs[i],
+            })
+        return out
+
+    def dump_front(self, path: str, extra: dict | None = None) -> None:
+        _hv = self.hypervolume()
+        payload = {
+            "objectives": list(self.obj_names),
+            "space": "log ratio against the paired rev-exact reference; "
+                     "0 is parity and lower is better",
+            "hypervolume": _hv if np.isfinite(_hv) else None,
+            "num_points": len(self.pts),
+            "cap": int(self.cap),
+            "drift_floor": float(self.drift_floor),
+            "merged_measurements": int(self.n_merged),
+            "dropped_at_cap": int(self.n_dropped_cap),
+            "front": self.front(),
+        }
+        if extra:
+            payload.update(extra)
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=2)
+
+    def dump_all_candidates(self, path: str, extra: dict | None = None) -> None:
+        payload = {
+            "objectives": list(self.obj_names),
+            "num_candidates": len(self.all_candidates),
+            "candidates": self.all_candidates,
+        }
+        if extra:
+            payload.update(extra)
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=2)
