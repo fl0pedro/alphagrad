@@ -71,7 +71,8 @@ ORACLE_ACTOR_NUM_CPUS = 4
 
 
 def make_ray_oracle_actor_factory(args_dict: dict,
-                                   num_cpus: int = ORACLE_ACTOR_NUM_CPUS):
+                                   num_cpus: int = ORACLE_ACTOR_NUM_CPUS,
+                                   core_ids=None):
     """A zero-arg callable returning a fresh Ray actor that runs the check.
 
     ONE ACTOR IS ONE PROCESS, ``num_gpus=0``: the check never touches a GPU
@@ -101,13 +102,20 @@ def make_ray_oracle_actor_factory(args_dict: dict,
             # Ray's num_cpus is a scheduling hint only. XLA:CPU sizes its
             # thread pool from the affinity mask at the first jax import, so
             # pin the mask here, the way the measure actors already do.
-            try:
+            # ABSOLUTE cpu ids from the node budget when the driver hands
+            # them: the trainer narrows its own mask before it starts the
+            # raylet, so the mask this process inherits is not the node.
+            if core_ids:
                 import os as _os
-                _avail = sorted(_os.sched_getaffinity(0))
-                if 0 < num_cpus < len(_avail):
-                    _os.sched_setaffinity(0, set(_avail[-num_cpus:]))
-            except (AttributeError, OSError, ValueError):
-                pass
+                _os.sched_setaffinity(0, {int(c) for c in core_ids})
+            else:
+                try:
+                    import os as _os
+                    _avail = sorted(_os.sched_getaffinity(0))
+                    if 0 < num_cpus < len(_avail):
+                        _os.sched_setaffinity(0, set(_avail[-num_cpus:]))
+                except (AttributeError, OSError, ValueError):
+                    pass
             self._args_dict = dict(args_dict)
             self._config = None       # built lazily, once, on first check()
 

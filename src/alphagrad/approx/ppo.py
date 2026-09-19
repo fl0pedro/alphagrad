@@ -25,6 +25,40 @@ import heapq
 import os
 import sys
 
+
+# THE JOB'S WHOLE AFFINITY MASK, read before the trainer narrows its own. The
+# raylet is started by this process and every Ray actor inherits the narrowed
+# mask, so a slice is handed to an actor as ABSOLUTE cpu ids taken from here,
+# never as an offset into whatever that actor happened to inherit.
+NODE_CPUS: tuple[int, ...] = tuple(sorted(os.sched_getaffinity(0)))
+
+
+def _pin_driver_cores() -> None:
+    # THE TRAINER'S OWN SLICE, taken BEFORE `import jax` below: that is the
+    # only moment at which XLA sizes its host thread pools to the mask.
+    # argparse has not run yet, so the value is read off sys.argv; the parser
+    # carries the same flag, so the budget the actors partition is the same
+    # number.
+    argv = sys.argv[1:]
+    n = None
+    for i, tok in enumerate(argv):
+        if tok == "--reserved-driver-cores" and i + 1 < len(argv):
+            n = int(argv[i + 1])
+        elif tok.startswith("--reserved-driver-cores="):
+            n = int(tok.split("=", 1)[1])
+    if n is None or n <= 0:
+        return
+    if n > len(NODE_CPUS):
+        raise ValueError(
+            f"--reserved-driver-cores {n} exceeds this job's "
+            f"{len(NODE_CPUS)}-wide affinity mask {NODE_CPUS!r}")
+    os.sched_setaffinity(0, set(NODE_CPUS[:n]))
+    print(f"[cores] trainer pinned to cpus {NODE_CPUS[0]}-{NODE_CPUS[n - 1]} "
+          f"({n} of {len(NODE_CPUS)} logical CPUs)", flush=True)
+
+
+_pin_driver_cores()
+
 # tqdm allocates a multiprocessing.RLock on first use (`TqdmDefaultWriteLock`)
 # for cross-process bar coordination. The RLock is backed by a named POSIX
 # semaphore on macOS / Linux; if the process is signal-killed (SIGTERM from
@@ -5294,6 +5328,22 @@ def make_argparser() -> argparse.ArgumentParser:
              "out. Exposed through MicroActionPolicy's contract, so the env "
              "and loss are unchanged.")
     p.add_argument(
+        "--reserved-driver-cores", type=int, default=0, metavar="N",
+        help="CPU cores reserved for the trainer process, taken as the first "
+             "N of the job's affinity mask BEFORE jax is imported, which is "
+             "the only moment XLA sizes its host thread pools. The timing "
+             "actors and the gradient oracle then take disjoint slices of the "
+             "rest, so no two processes hold the same core. 0 = no "
+             "reservation, the historical behaviour in which the trainer "
+             "keeps the whole mask and the actors are pinned inside it.")
+    p.add_argument(
+        "--cpu-cores-per-actor", type=int, default=0, metavar="N",
+        help="Cores per --ray-measure timing actor. A measure compile does "
+             "not need more than 4 logical CPUs (dsnn-dfw.30): the work is a "
+             "forked single-threaded ptxas, and halving 9 cores to 4 moved "
+             "the mean compile from 32.9 s to 30.3 s. 0 = the legacy auto "
+             "slice, #cores // --ray-measure.")
+    p.add_argument(
         "--ray-measure", type=int, default=0, metavar="N",
         help="Fan the env measurement callback out over N Ray actors "
              "(0 = off, in-process serial). Requires "
@@ -8100,6 +8150,31 @@ def main():
         _args_dict["num_cpu_workers"] = _n_actors
         _next_id = [0]
 
+        # ---- THE NODE'S CORE BUDGET (owner ruling Q3, 2026-09-18) ----------
+        # One layout, computed once, from the launcher's constants. With
+        # --reserved-driver-cores 0 nothing below applies and every process
+        # keeps the mask it inherits, which is the historical behaviour.
+        _layout = None
+        if int(getattr(args, "reserved_driver_cores", 0) or 0) > 0:
+            from alphagrad.approx.common.core_budget import (
+                core_ids as _core_ids, node_core_layout as _node_core_layout,
+                describe as _describe_layout)
+            from alphagrad.approx.common.grad_oracle_async import (
+                ORACLE_ACTOR_NUM_CPUS as _ORACLE_CPUS)
+            _layout = _node_core_layout(
+                len(NODE_CPUS), _n_actors,
+                trainer_cores=int(args.reserved_driver_cores),
+                cores_per_actor=int(getattr(args, "cpu_cores_per_actor", 0)
+                                    or 0) or 2,
+                oracle_cores=int(_ORACLE_CPUS))
+            print(f"[cores] {_describe_layout(_layout)}", flush=True)
+
+        def _actor_core_ids(slot: int):
+            if _layout is None:
+                return None
+            _b, _w = _layout.timing_actors[int(slot)]
+            return _core_ids(NODE_CPUS, _b, _w)
+
         def _spawn(slot: int | None = None):
             _next_id[0] += 1
             _slot = _next_id[0] - 1 if slot is None else int(slot)
@@ -8108,6 +8183,7 @@ def main():
             _slot = _slot % max(_n_actors, 1)
             return CpuApproximationActor.options(**_actor_opts(_slot)).remote(
                 _args_dict, variant=None, actor_id=_next_id[0],
+                core_ids=_actor_core_ids(_slot),
             )
 
         _actors = [_spawn(i) for i in range(_n_actors)]
@@ -8286,7 +8362,10 @@ def main():
             _GRAD_ORACLE = _AsyncGradOracle(
                 _grad_oracle_run_check,
                 timeout_s=float(args.grad_oracle_timeout),
-                actor_factory=_make_oracle_actor_factory(_oracle_args_dict),
+                actor_factory=_make_oracle_actor_factory(
+                    _oracle_args_dict,
+                    core_ids=(None if _layout is None else
+                              _core_ids(NODE_CPUS, *_layout.oracle))),
                 arg_resolver=_grad_oracle_resolve_args)
             print(f"[grad-oracle] asynchronous, one Ray CPU actor "
                   f"(num_cpus=4, num_gpus=0) built with the measurement "

@@ -114,8 +114,22 @@ class CpuApproximationActor:
         variant: str | None = None,
         actor_id: int = 0,
         seed: int = 0,
+        core_ids: Sequence[int] | None = None,
     ):
         self._actor_id = int(actor_id)
+
+        # AN EXPLICIT SLICE WINS (owner ruling Q3, 2026-09-18). The node budget
+        # is computed once in the driver from the launcher constants, so the
+        # trainer, the timing actors and the oracle hold disjoint cores; the
+        # legacy `npool // n_workers` arithmetic below cannot express that
+        # because it knows only its own kind of actor. ABSOLUTE cpu ids: the
+        # trainer has already narrowed its own mask when it starts the raylet,
+        # so what this process inherited is not the node.
+        if core_ids is not None:
+            _ids = {int(c) for c in core_ids}
+            if not _ids:
+                raise ValueError("core_ids must not be empty")
+            os.sched_setaffinity(0, _ids)
 
         # CPU-affinity pinning to a disjoint core SLICE per actor. The
         # approx-Jacobian exec scales ~linearly with cores, so each actor
@@ -127,6 +141,7 @@ class CpuApproximationActor:
         # 2026-06-06. (Setting affinity before the deferred jax import is
         # what makes XLA size the pool to the slice rather than all cores.)
         # Best-effort: skipped on platforms without sched_setaffinity.
+        _legacy_pin = core_ids is None
         try:
             import os as _os
             n_workers = max(int(args_dict.get("num_cpu_workers", 1) or 1), 1)
@@ -149,7 +164,7 @@ class CpuApproximationActor:
             # the 4 jobs' actors don't collide on the same cores. Else
             # use the single-job static slice (actor_id * per).
             base = (self._actor_id * per) % npool
-            if args_dict.get("cpu_cores_shared", False):
+            if _legacy_pin and args_dict.get("cpu_cores_shared", False):
                 try:
                     import socket
                     node_id = socket.gethostname()
@@ -169,7 +184,7 @@ class CpuApproximationActor:
                         f"claim failed ({_exc}); using static slice base={base}",
                         flush=True,
                     )
-            if 0 < per < ncores:
+            if _legacy_pin and 0 < per < ncores:
                 cores = {pool[(base + k) % npool] for k in range(per)}
                 _os.sched_setaffinity(0, cores)
         except (AttributeError, OSError, ValueError):
