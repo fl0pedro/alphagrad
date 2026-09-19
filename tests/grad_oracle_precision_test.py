@@ -195,3 +195,21 @@ def test_the_tolerance_env_override_reaches_the_help(monkeypatch):
     action = [a for a in make_argparser()._actions
               if "--grad-oracle" in (a.option_strings or ())][0]
     assert "2e-03" in action.help, action.help
+
+
+def test_the_cadence_constant_and_override(monkeypatch):
+    assert envmod.grad_oracle_cadence() == 50
+    monkeypatch.setenv("ALPHAGRAD_GRAD_ORACLE_CADENCE", "10")
+    assert envmod.grad_oracle_cadence() == 10
+    monkeypatch.setenv("ALPHAGRAD_GRAD_ORACLE_CADENCE", "invalid")
+    assert envmod.grad_oracle_cadence() == 50
+
+
+def test_the_grad_oracle_cadence_argument():
+    from alphagrad.approx.ppo import make_argparser
+
+    actions = [a for a in make_argparser()._actions
+               if "--grad-oracle-cadence" in (a.option_strings or ())]
+    assert len(actions) == 1
+    assert actions[0].default == 50
+    assert actions[0].type is int

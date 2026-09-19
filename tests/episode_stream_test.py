@@ -408,6 +408,15 @@ def test_a_history_that_asks_for_more_than_the_cap_raises_it_does_not_clamp(
     assert ES.LOG2_MAX_ENV in str(exc.value)
 
 
+def test_observed_length_within_cap_clamps_predictive_margin_to_cap():
+    """When the observed length fits within the cap (e.g. 23000 <= 32768),
+    the predictive margin (23000 * 1.5 = 34500 > 32768) must clamp to the cap
+    rather than raising EpisodeStreamCapReached."""
+    p = ES.BinPolicy(14, cap=15, margin=1.5)
+    p.record(23_000)
+    assert p.pick() == 15
+
+
 @pytest.mark.parametrize("length,want", [
     (0, 0), (1, 0), (2, 1), (3, 2), (4, 2), (5, 3), (1024, 10), (1025, 11),
 ])

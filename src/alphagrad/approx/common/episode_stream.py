@@ -195,14 +195,15 @@ SELECTION_RULE = (
 
 
 class EpisodeStreamCapReached(Exception):
-    """The bin hit `ALPHAGRAD_EPISODE_TOKENS_LOG2_MAX` and cannot grow."""
+    """The bin hit a hard cap and cannot grow."""
 
-    def __init__(self, log2, cap):
+    def __init__(self, log2, cap, env_name=None):
         self.log2 = int(log2)
         self.cap = int(cap)
+        self.env_name = env_name or LOG2_MAX_ENV
         super().__init__(
             f"episode token stream bin 2^{self.log2} overflowed and the cap "
-            f"{LOG2_MAX_ENV}={self.cap} forbids growing it. Either the "
+            f"{self.env_name}={self.cap} forbids growing it. Either the "
             f"deltas are far longer than the measurement said, or a stream "
             f"is not being reset per episode."
         )
@@ -832,10 +833,12 @@ class BinPolicy:
         """
         need = math.ceil(max(self.recent) * self.margin)
         want = log2_for_length(need)
-        if want > self.cap:
-            # A silent clamp here just moves the failure to the overflow
-            # that follows, and names the wrong cause in the log.
-            raise EpisodeStreamCapReached(want, self.cap)
+        if log2_for_length(max(self.recent)) > self.cap:
+            # The observed length itself exceeds the hard cap.
+            raise EpisodeStreamCapReached(want, self.cap, self.cap_env)
+        # If the observed length fits within the cap, but the predictive margin
+        # asks for more headroom than the cap allows, clamp to the cap.
+        want = min(want, self.cap)
         return max(want, self.floor)
 
     def pick(self) -> int:
@@ -875,7 +878,7 @@ class BinPolicy:
             n = max(n, log2_for_length(length))
         n = max(n, self.floor)
         if n > self.cap:
-            raise EpisodeStreamCapReached(n, self.cap)
+            raise EpisodeStreamCapReached(n, self.cap, self.cap_env)
         self.log2 = n
         return self.log2
 

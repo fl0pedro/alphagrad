@@ -806,7 +806,13 @@ def test_the_wave_arms_keep_their_own_env_but_run_the_campaign_stack(gen):
     SHARED_ENV (not args-only: `is_scratch` -- and the full-node Blackwell
     hardware and env-purity check that comes with it -- stays False), and
     their own 4-GPU hardware request."""
-    waves = [a for a in gen.ARMS if a["kind"] == "train" and not a.get("phase")]
+    # The THESIS arms (ticket dsnn-dfw.4) are a third family: they run the
+    # /Scratch stack like a campaign arm (`is_scratch` True) and they carry no
+    # phase, so they are excluded by name here and pinned in
+    # tests/gen_fq_launchers_thesis_test.py instead.
+    waves = [a for a in gen.ARMS
+             if a["kind"] == "train" and not a.get("phase")
+             and not a.get("thesis")]
     assert waves
     for a in waves:
         assert not gen.is_scratch(a), a["name"]
@@ -830,16 +836,25 @@ def test_no_rendered_launcher_of_any_kind_references_home_dsnn(gen):
     $HOME/dsnn (281 commits stale, and the export it lives on is read-only)
     while the 17 campaign arms already ran the /Scratch stack of finding 57.
     Every arm runs that stack now; this is the whole-fleet guard the
-    per-family tests above do not give."""
+    per-family tests above do not give.
+
+    The guard is about what a launcher RUNS, so it is applied to the
+    executable lines, exactly as the `uv run` check below it always was.  A
+    COMMENT may name a home path: the thesis arms' header says where the
+    nightly copy job puts the run data (/Users/assmuth/thesis-runs), which is
+    a fact the reader of the launcher needs and is not a thing this job does.
+    The stale checkout itself stays forbidden everywhere, comments included,
+    because naming it is how a launcher comes back to it."""
     for a in gen.ARMS:
         text = gen.render(a)
         assert "$HOME/dsnn" not in text, a["name"]
         assert "~/dsnn" not in text, a["name"]
-        assert "/Users/assmuth" not in text, a["name"]
+        assert "/Users/assmuth/dsnn" not in text, a["name"]
         for line in text.splitlines():
             if line.lstrip().startswith("#"):
                 continue
             assert "uv run" not in line, (a["name"], line)
+            assert "/Users/assmuth" not in line, (a["name"], line)
 
 
 # ------------------------------------------- 10. --dry-run writes outside

@@ -5097,6 +5097,12 @@ def make_argparser() -> argparse.ArgumentParser:
              "ALPHAGRAD_GRAD_ORACLE so the measure actors read the same value. "
              "off disables the check.")
     p.add_argument(
+        "--grad-oracle-cadence", type=int, default=50,
+        help="Episode cadence for checking the exact gradient against "
+             "jax.grad (default 50: runs on episode 0 and every 50 episodes). "
+             "Set 1 to check on every episode. Published as "
+             "ALPHAGRAD_GRAD_ORACLE_CADENCE so the measure actors read the same value.")
+    p.add_argument(
         "--fixed-order", choices=list(_FIXED_ORDER_CHOICES), default="markowitz",
         help="The elimination order the vertex head is pinned to (ticket "
              "dsnn-3qm.64; common/order.py is the one implementation, shared "
@@ -7408,6 +7414,9 @@ def main():
              f"{_env_grad_oracle_tol():.0e} refuses that order and the run "
              "continues)" if args.grad_oracle == "reference"
              else " (no check)"), flush=True)
+    os.environ["ALPHAGRAD_GRAD_ORACLE_CADENCE"] = str(int(args.grad_oracle_cadence))
+    print(f"[alphagrad] gradient oracle cadence (--grad-oracle-cadence) = "
+          f"{args.grad_oracle_cadence}", flush=True)
     print(f"[alphagrad] memory channel (reward slot 5, --mem-channel) = "
           f"{args.mem_channel}"
           + (" (XLA static temp bytes of the timed executable; the runtime "
@@ -7487,6 +7496,7 @@ def main():
         terminal_rewards_only=args.terminal_rewards_only,
         # STAGE 2: emit the per-step token DELTA, not the growing stream.
         delta_obs=True,
+        grad_oracle_cadence=int(args.grad_oracle_cadence),
     )
 
     # THE BASE STREAM, once, on the host. `len(base_tokens())` depends only on
