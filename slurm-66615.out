@@ -1,0 +1,128 @@
+HOST=pgi15-cpu1 JOB=66615
+ag=126a52d branch=agent/snnsweep gx=4701d95
+?? slurm-66615.out
+FF...............................................F..........F........... [ 56%]
+.............F.........................................                  [100%]
+=================================== FAILURES ===================================
+___________ test_the_core_matrix_is_five_arms_two_targets_five_seeds ___________
+
+gen = <module 'gen_fq_launchers' from '/Scratch/assmuth/mrg/s94/alphagrad/tools/gen_fq_launchers.py'>
+core = [{'cli': {'--advantage-norm': 'none', '--approx-add': 'lossless', '--approx-profile': 'all', '--auto-stop': None, ...}...d-matrix and no seed is dropped: the five seeds of an\narm are reported together or not at all.', 'gpus': 8, ...}, ...]
+
+    def test_the_core_matrix_is_five_arms_two_targets_five_seeds(gen, core):
+        assert gen.THESIS_SEEDS == SEEDS
+        assert gen.THESIS_ARMS == ARMS
+>       assert len(core) == len(ARMS) * len(TARGETS) * len(SEEDS) == 50
+E       AssertionError: assert 89 == ((5 * 2) * 5)
+E        +  where 89 = len([{'cli': {'--advantage-norm': 'none', '--approx-add': 'lossless', '--approx-profile': 'all', '--auto-stop': None, ...}...d-matrix and no seed is dropped: the five seeds of an\narm are reported together or not at all.', 'gpus': 8, ...}, ...])
+E        +  and   5 = len(('A', 'B', 'C', 'C_popart', 'condC'))
+E        +  and   2 = len(('nn256', 'tlm'))
+E        +  and   5 = len(('250197', '250198', '250199', '250200', '250201'))
+
+tests/gen_fq_launchers_thesis_test.py:161: AssertionError
+______ test_the_whole_matrix_is_the_core_fifty_and_the_recurrent_hundred _______
+
+gen = <module 'gen_fq_launchers' from '/Scratch/assmuth/mrg/s94/alphagrad/tools/gen_fq_launchers.py'>
+matrix = [{'cli': {'--advantage-norm': 'none', '--approx-add': 'lossless', '--approx-profile': 'all', '--auto-stop': None, ...}...d-matrix and no seed is dropped: the five seeds of an\narm are reported together or not at all.', 'gpus': 8, ...}, ...]
+core = [{'cli': {'--advantage-norm': 'none', '--approx-add': 'lossless', '--approx-profile': 'all', '--auto-stop': None, ...}...d-matrix and no seed is dropped: the five seeds of an\narm are reported together or not at all.', 'gpus': 8, ...}, ...]
+snn = [{'cli': {'--advantage-norm': 'none', '--approx-add': 'lossless', '--approx-profile': 'all', '--auto-stop': None, ...}...d-matrix and no seed is dropped: the five seeds of an\narm are reported together or not at all.', 'gpus': 8, ...}, ...]
+
+    def test_the_whole_matrix_is_the_core_fifty_and_the_recurrent_hundred(
+            gen, matrix, core, snn):
+        """One naming rule, one (arm, target, seed) triple per row, six targets.
+    
+        The recurrent rules are TARGETS and not a fourth coordinate, so the whole
+        matrix is still `THESIS_ARMS x THESIS_TARGETS x THESIS_SEEDS` and
+        `thesis_run_name` spells every row of it.
+        """
+        assert tuple(sorted(gen.THESIS_TARGETS)) == tuple(sorted(ALL_TARGETS))
+        assert len(gen.THESIS_TARGETS) == 6
+>       assert len(core) == 50 and len(snn) == 100
+E       AssertionError: assert (89 == 50)
+E        +  where 89 = len([{'cli': {'--advantage-norm': 'none', '--approx-add': 'lossless', '--approx-profile': 'all', '--auto-stop': None, ...}...d-matrix and no seed is dropped: the five seeds of an\narm are reported together or not at all.', 'gpus': 8, ...}, ...])
+
+tests/gen_fq_launchers_thesis_test.py:186: AssertionError
+________ test_every_order_only_job_is_a_cross_agent_per_node_singleton _________
+
+gen = <module 'gen_fq_launchers' from '/Scratch/assmuth/mrg/s94/alphagrad/tools/gen_fq_launchers.py'>
+rows = [{'cli': {'--advantage-norm': 'none', '--approx-add': 'lossless', '--approx-profile': 'none', '--auto-stop': None, ......oned run spans less than the fixed weights do, the\nconditioning is reported as not amortising this front.', ...}, ...]
+
+    def test_every_order_only_job_is_a_cross_agent_per_node_singleton(gen, rows):
+        """Orchestrator ruling 2026-09-18: `node-<node>`, not `thesis-<node>`.
+        Singleton serializes jobs that share a NAME, three agents submit to
+        pgi15-gpu14, and a name only one agent uses serializes nothing -- two
+        jobs of this user on one node and the epilog kills both."""
+        for a in rows:
+            text = gen.render(a)
+            assert a["job"] == f"node-{a['node']}", a["name"]
+            assert f"#SBATCH -J node-{a['node']}\n" in text, a["name"]
+            assert f"#SBATCH -J thesis-{a['node']}\n" not in text, a["name"]
+            assert "#SBATCH --dependency=singleton\n" in text, a["name"]
+            assert f"#SBATCH -w {a['node']}\n" in text, a["name"]
+            assert (f"#SBATCH -o {gen.CAMPAIGN_RUNS}/{a['name']}_%j.log\n"
+                    in text), a["name"]
+        # and the matrix keeps its own name, so this change moved no matrix row
+        for a in gen.thesis_arms():
+            if a.get("orderonly"):
+                continue
+>           assert a["job"] == f"thesis-{a['node']}", a["name"]
+E           AssertionError: orderonly_rsnn_bptt_l2m0_s250197
+E           assert 'node-pgi15-gpu14' == 'thesis-pgi15-gpu14'
+E             
+E             - thesis-pgi15-gpu14
+E             ? ^^ ---
+E             + node-pgi15-gpu14
+E             ? ^^^
+
+tests/gen_fq_launchers_orderonly_test.py:284: AssertionError
+_________ test_the_matrix_and_the_campaign_still_have_their_own_counts _________
+
+gen = <module 'gen_fq_launchers' from '/Scratch/assmuth/mrg/s94/alphagrad/tools/gen_fq_launchers.py'>
+
+    def test_the_matrix_and_the_campaign_still_have_their_own_counts(gen):
+        """The order-only rows are thesis arms -- they carry the singleton and the
+        target shape -- but they are not matrix coordinates, and the matrix plus
+        the three smoke runs must still be exactly what the rulings say: the 50
+        core rows of 2026-09-15 and the 100 recurrent rows of 2026-09-16."""
+        # dsnn-dfw.45 added a second order-only round (the recurrent target,
+        # `orderonly_rsnn`), excluded here exactly as `orderonly` (NN256) is.
+        matrix = [a for a in gen.thesis_arms()
+                  if not a.get("smoke") and not a.get("orderonly")
+                  and not a.get("orderonly_rsnn")]
+>       assert len(gen.thesis_core_arms()) == 50
+E       AssertionError: assert 89 == 50
+E        +  where 89 = len([{'cli': {'--advantage-norm': 'none', '--approx-add': 'lossless', '--approx-profile': 'all', '--auto-stop': None, ...}...d-matrix and no seed is dropped: the five seeds of an\narm are reported together or not at all.', 'gpus': 8, ...}, ...])
+E        +    where [{'cli': {'--advantage-norm': 'none', '--approx-add': 'lossless', '--approx-profile': 'all', '--auto-stop': None, ...}...d-matrix and no seed is dropped: the five seeds of an\narm are reported together or not at all.', 'gpus': 8, ...}, ...] = <function thesis_core_arms at 0x7214283e87c0>()
+E        +      where <function thesis_core_arms at 0x7214283e87c0> = <module 'gen_fq_launchers' from '/Scratch/assmuth/mrg/s94/alphagrad/tools/gen_fq_launchers.py'>.thesis_core_arms
+
+tests/gen_fq_launchers_orderonly_test.py:510: AssertionError
+_________ test_the_matrix_and_the_campaign_still_have_their_own_counts _________
+
+gen = <module 'gen_fq_launchers' from '/Scratch/assmuth/mrg/s94/alphagrad/tools/gen_fq_launchers.py'>
+
+    def test_the_matrix_and_the_campaign_still_have_their_own_counts(gen):
+        matrix = [a for a in gen.thesis_arms()
+                  if not a.get("smoke") and not a.get("orderonly")
+                  and not a.get("orderonly_rsnn")]
+>       assert len(gen.thesis_core_arms()) == 50
+E       AssertionError: assert 89 == 50
+E        +  where 89 = len([{'cli': {'--advantage-norm': 'none', '--approx-add': 'lossless', '--approx-profile': 'all', '--auto-stop': None, ...}...d-matrix and no seed is dropped: the five seeds of an\narm are reported together or not at all.', 'gpus': 8, ...}, ...])
+E        +    where [{'cli': {'--advantage-norm': 'none', '--approx-add': 'lossless', '--approx-profile': 'all', '--auto-stop': None, ...}...d-matrix and no seed is dropped: the five seeds of an\narm are reported together or not at all.', 'gpus': 8, ...}, ...] = <function thesis_core_arms at 0x7214283b0040>()
+E        +      where <function thesis_core_arms at 0x7214283b0040> = <module 'gen_fq_launchers' from '/Scratch/assmuth/mrg/s94/alphagrad/tools/gen_fq_launchers.py'>.thesis_core_arms
+
+tests/gen_fq_launchers_snnsweep_test.py:431: AssertionError
+=============================== warnings summary ===============================
+tests/gen_fq_launchers_thesis_test.py::test_ppo_argparse_accepts_every_thesis_command_line
+  /Scratch/assmuth/t57/stack/venv/lib/python3.13/site-packages/tensorflow_probability/python/internal/backend/jax/ops.py:684: DeprecationWarning: jax.core.pytype_aval_mappings is deprecated.
+    jax.core.pytype_aval_mappings[onp.ndarray])
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/gen_fq_launchers_thesis_test.py::test_the_core_matrix_is_five_arms_two_targets_five_seeds
+FAILED tests/gen_fq_launchers_thesis_test.py::test_the_whole_matrix_is_the_core_fifty_and_the_recurrent_hundred
+FAILED tests/gen_fq_launchers_orderonly_test.py::test_every_order_only_job_is_a_cross_agent_per_node_singleton
+FAILED tests/gen_fq_launchers_orderonly_test.py::test_the_matrix_and_the_campaign_still_have_their_own_counts
+FAILED tests/gen_fq_launchers_snnsweep_test.py::test_the_matrix_and_the_campaign_still_have_their_own_counts
+5 failed, 122 passed, 1 warning in 10.30s
+PYTEST rc=1
+ABORT: tests failed, NOT generating

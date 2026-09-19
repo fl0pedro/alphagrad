@@ -279,7 +279,7 @@ def test_every_order_only_job_is_a_cross_agent_per_node_singleton(gen, rows):
                 in text), a["name"]
     # and the matrix keeps its own name, so this change moved no matrix row
     for a in gen.thesis_arms():
-        if a.get("orderonly"):
+        if a.get("orderonly") or a.get("orderonly_rsnn"):
             continue
         assert a["job"] == f"thesis-{a['node']}", a["name"]
 
@@ -291,7 +291,10 @@ def test_the_hardware_lines_follow_the_node(gen, rows):
     GPU count."""
     assert gen.NODE_GRES_TYPE["pgi15-gpu13"] == "nvidia_geforce_rtx_4090"
     assert gen.NODE_GRES_TYPE["pgi15-gpu14"] == "nvidia_h100_80gb_hbm3"
-    assert gen.NODE_GPUS == {"pgi15-gpu13": 4, "pgi15-gpu14": 8}
+    # pgi15-gpu8 joined 2026-09-19 (ticket dsnn-dfw.45); this round never
+    # uses it, but the table it shares with gpu13/gpu14 now carries it too.
+    assert gen.NODE_GPUS == {"pgi15-gpu8": 4, "pgi15-gpu13": 4,
+                             "pgi15-gpu14": 8}
     assert gen.NODE_PARTITION == {"pgi15-gpu14": "pgi15-h100"}
     for a in rows:
         text = gen.render(a)
@@ -321,7 +324,9 @@ def test_the_node_whose_toolkit_is_outside_usr_local_puts_it_on_path(gen,
     which the measure-toolchain block does not search, so the arm puts it on
     PATH -- and the block still PROVES both versions, so a wrong path aborts
     72 instead of producing degraded numbers."""
-    assert set(gen.NODE_CUDA_BIN) == {"pgi15-gpu14"}
+    # pgi15-gpu8 joined 2026-09-19 (ticket dsnn-dfw.45); it carries the
+    # recurrent order-only rows, tested in gen_fq_launchers_snnsweep_test.py.
+    assert set(gen.NODE_CUDA_BIN) == {"pgi15-gpu14", "pgi15-gpu8"}
     bin_dir = gen.NODE_CUDA_BIN["pgi15-gpu14"]
     assert "12.9" in bin_dir and "13.2" not in bin_dir
     for a in rows:
@@ -473,7 +478,7 @@ def test_no_arm_that_existed_before_this_round_moved(gen):
     order-only row renders the hardware it always did, so a live campaign is
     not invalidated by a tuning round added beside it."""
     for a in gen.ARMS:
-        if a.get("orderonly"):
+        if a.get("orderonly") or a.get("orderonly_rsnn"):
             continue
         node, gpus = a["node"], a.get("gpus", 0)
         text = gen.render(a)
@@ -497,8 +502,11 @@ def test_the_matrix_and_the_campaign_still_have_their_own_counts(gen):
     target shape -- but they are not matrix coordinates, and the matrix plus
     the three smoke runs must still be exactly what the rulings say: the 50
     core rows of 2026-09-15 and the 100 recurrent rows of 2026-09-16."""
+    # dsnn-dfw.45 added a second order-only round (the recurrent target,
+    # `orderonly_rsnn`), excluded here exactly as `orderonly` (NN256) is.
     matrix = [a for a in gen.thesis_arms()
-              if not a.get("smoke") and not a.get("orderonly")]
+              if not a.get("smoke") and not a.get("orderonly")
+              and not a.get("orderonly_rsnn")]
     assert len(gen.thesis_core_arms()) == 50
     assert len(gen.thesis_snn_arms()) == 100
     assert len(matrix) == 150
@@ -512,6 +520,7 @@ def test_the_matrix_and_the_campaign_still_have_their_own_counts(gen):
     block = gen.thesis_block1_arms()
     assert len(block) == gen.THESIS_BLOCK1 == 34
     assert not any(a.get("orderonly") for a in block)
+    assert not any(a.get("orderonly_rsnn") for a in block)
 
 
 def test_the_target_node_switch_does_not_move_the_tuning_rows(gen):

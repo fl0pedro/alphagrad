@@ -549,9 +549,14 @@ _TOOLCHAIN_CPU_NOTE = (
     ' toolkit required on this node"')
 
 
-def _toolchain_block(kind: str) -> str:
+def _toolchain_block(kind: str, node: str) -> str:
+    """The block wants @WANT@ replaced with THIS NODE's matched release, not
+    the venv's own 12.9 always: NODE_CUDA_WANT (defined beside NODE_CUDA_BIN,
+    below) names the nodes whose matched pair is a different release, and the
+    default is CUDA_WANT for every node it does not name."""
     on_fault = _TOOLCHAIN_CPU_NOTE if kind == "cpu" else _TOOLCHAIN_ABORT
-    return (TOOLCHAIN_BLOCK.replace("@WANT@", CUDA_WANT)
+    want = NODE_CUDA_WANT.get(node, CUDA_WANT)
+    return (TOOLCHAIN_BLOCK.replace("@WANT@", want)
             .replace("@ON_FAULT@", on_fault).rstrip())
 
 # ---------------------------------------------------------------------------
@@ -2288,23 +2293,37 @@ assert blackwell_gres(CAMPAIGN_GPUS) == CAMPAIGN_GRES, (
 # that existed before this section moves by one byte.
 #
 # `sinfo -N -o "%n %c %m %G %P"`, 2026-09-18.  Memory is the SLURM limit, not
-# the hardware: a --mem above it is never scheduled at all.
+# the hardware: a --mem above it is never scheduled at all.  pgi15-gpu8
+# joined 2026-09-19 (ticket dsnn-dfw.45, owner ruling): 64 CPUs, 370000 MB
+# (sinfo), the same 92 percent headroom as gpu13's 700G of 750000.
 # ---------------------------------------------------------------------------
 NODE_GRES_TYPE = {
+    "pgi15-gpu8": "nvidia_rtx_6000_ada_generation",
     "pgi15-gpu13": "nvidia_geforce_rtx_4090",
     "pgi15-gpu14": "nvidia_h100_80gb_hbm3",
 }
-NODE_GPUS = {"pgi15-gpu13": 4, "pgi15-gpu14": 8}
-NODE_CPUS = {"pgi15-gpu13": 64, "pgi15-gpu14": 128}
-NODE_MEM = {"pgi15-gpu13": "700G", "pgi15-gpu14": "1000G"}
+NODE_GPUS = {"pgi15-gpu8": 4, "pgi15-gpu13": 4, "pgi15-gpu14": 8}
+NODE_CPUS = {"pgi15-gpu8": 64, "pgi15-gpu13": 64, "pgi15-gpu14": 128}
+NODE_MEM = {"pgi15-gpu8": "340G", "pgi15-gpu13": "700G", "pgi15-gpu14": "1000G"}
 #: pgi15-gpu14 is the only node of the `pgi15-h100` partition; every other
 #: node here is in `pgi15`.
 NODE_PARTITION = {"pgi15-gpu14": "pgi15-h100"}
 #: A node whose matched CUDA pair is OUTSIDE /usr/local, which is all the
 #: measure-toolchain block searches.  The arm puts it on PATH and the block
 #: still proves the two versions, so a wrong path aborts 72 (finding 03).
+#: pgi15-gpu8's matched pair IS inside /usr/local (the block finds it on its
+#: own), but the row still names it here, explicitly, since it is the one
+#: fact job 66542 measured (owner ruling 2026-09-19).
 NODE_CUDA_BIN = {
     "pgi15-gpu14": "/opt/nvidia/hpc_sdk/Linux_x86_64/26.5/cuda/12.9/bin",
+    "pgi15-gpu8": "/usr/local/cuda-12/bin",
+}
+#: THE WANTED RELEASE, BY NODE (ticket dsnn-dfw.45).  The venv's own ptxas is
+#: 12.9.86 (CUDA_WANT); pgi15-gpu8's matched pair is 12.8 (job 66542: "toolchain
+#: gate OK on pgi15-gpu8: ptxas 12.8.93 ... nvlink 12.8.93").  A node not named
+#: here wants CUDA_WANT, unchanged.
+NODE_CUDA_WANT = {
+    "pgi15-gpu8": "12.8",
 }
 
 
@@ -2767,17 +2786,25 @@ def thesis_arms() -> list[dict]:
 
 
 def thesis_block1_arms() -> list[dict]:
-    # The order-only tuning rows (ticket dsnn-dfw.29) are thesis arms but not
-    # matrix coordinates: block 1 is the 34 runs of the matrix the owner
-    # authorised on 2026-09-16 and nothing else.
+    # The order-only tuning rows (tickets dsnn-dfw.29 and dsnn-dfw.45) are
+    # thesis arms but not matrix coordinates: block 1 is the 34 runs of the
+    # matrix the owner authorised on 2026-09-16 and nothing else.
     return [a for a in thesis_arms()
             if not a.get("held") and not a.get("smoke")
-            and not a.get("orderonly")]
+            and not a.get("orderonly") and not a.get("orderonly_rsnn")]
 
 
 def thesis_snn_arms() -> list[dict]:
-    """The 100 rows of the recurrent target, in generation order."""
-    return [a for a in thesis_arms() if a.get("thesis_rule")]
+    """The 100 rows of the recurrent target, in generation order.
+
+    The order-only recurrent rows (ticket dsnn-dfw.45) carry a
+    `thesis_rule` too -- that is what a reader wants from them -- but they
+    are a tuning round, not a matrix coordinate, so they are excluded here
+    exactly as the NN256 order-only rows are excluded from
+    `thesis_core_arms` below.
+    """
+    return [a for a in thesis_arms()
+            if a.get("thesis_rule") and not a.get("orderonly_rsnn")]
 
 
 def thesis_core_arms() -> list[dict]:
@@ -3040,10 +3067,9 @@ ORDERONLY_WEIGHTS = (("2", "0"), ("1.5", "0.5"), ("1", "1"),
 #: node, and the whole command line under it for one episode, before it was
 #: listed: gpu13 finds the matched pair at /usr/local/cuda-12, gpu14 needs
 #: NODE_CUDA_BIN (jobs 66341 and 66342, both "toolchain gate OK" and TRAINER
-#: exited 0).  OUT: pgi15-gpu8, -gpu9, -gpu11 and -gpu12 carry CUDA 12.8 alone
-#: against the venv's 12.9 ptxas, with no matched pair anywhere on the node
-#: and no nvlink in the venv to point PATH at (finding 03: a 12.8 nvlink
-#: refuses 12.9 cubins and every measurement degrades SILENTLY).
+#: exited 0).  OUT: pgi15-gpu9, -gpu11 and -gpu12 still carry no matched CUDA
+#: pair (finding 03).  pgi15-gpu8 is cleared as of 2026-09-19 (job 66542;
+#: see NODE_CUDA_WANT) and carries the dsnn-dfw.45 recurrent-target rows.
 #:
 #: pgi15-gpu16 held seed 250197 until 2026-09-18 19:10, when another group
 #: took gpu15, gpu16, gpu17 and gpu18 on a three-day reservation.  No
@@ -3227,6 +3253,265 @@ del _seed, _lc, _lm
 
 def orderonly_arms() -> list[dict]:
     return [a for a in ARMS if a.get("orderonly")]
+
+
+# ---------------------------------------------------------------------------
+# ORDER-ONLY SCALARIZATION TUNING ON THE RECURRENT TARGET (ticket dsnn-dfw.45,
+# owner rulings 2026-09-19).  The section above, on rsnn_bptt and rsnn_rtrl
+# instead of nn256: the same --approx-profile none, the same --fixed-order
+# free, the same C form, the same five weight pairs, the same three seeds and
+# the same one preference-conditioned row per seed.  The recurrent target
+# adds --temporal-rule (bptt or rtrl); nothing else about the arm moves.
+#
+# THE NODE IS THE RULE, not the seed: latency and memory here compare a
+# scalarization weight WITHIN one rule, so all three seeds of one rule share
+# one GPU model and the rule itself is the thing that must not straddle two.
+# bptt runs on pgi15-gpu14 (H100, the same node round 1 cleared).  rtrl runs
+# on pgi15-gpu8 (RTX 6000 Ada), cleared 2026-09-19: a matched 12.8 pair at
+# /usr/local/cuda-12, proven by job 66542 (NODE_CUDA_WANT, NODE_CUDA_BIN).
+#
+# rsnn_tbptt, the NO-TEMPORAL-EDGE REFERENCE, is not swept: one weight, (2, 0),
+# at the three seeds, three rows total.  It is not a sixth rule beside bptt
+# and rtrl -- it is the baseline every temporal rule is read against -- and it
+# is queued on pgi15-gpu8, after the rtrl rows (owner ruling: gpu13 is taken
+# by the dsnn-dfw.44 run today).
+# ---------------------------------------------------------------------------
+ORDERONLY_RSNN_RULES = ("bptt", "rtrl")
+#: ONE NODE PER RULE (not per seed: the round above puts the seed on one
+#: node because it spans three GPU models per seed; here every seed of one
+#: rule already shares a node, so the rule is the axis that must not split).
+ORDERONLY_RSNN_NODES = {"bptt": "pgi15-gpu14", "rtrl": "pgi15-gpu8"}
+ORDERONLY_RSNN_TBPTT_NODE = "pgi15-gpu8"
+ORDERONLY_RSNN_TBPTT_WEIGHTS = ("2", "0")
+
+_ORDERONLY_RSNN_HEAD = f"""ORDER-ONLY SCALARIZATION TUNING ON THE RECURRENT
+TARGET (ticket dsnn-dfw.45) under the owner's rulings of 2026-09-19.  The
+same order-only arm as the NN256 round (dsnn-dfw.29): --approx-profile
+{ORDERONLY_PROFILE} with --fixed-order {THESIS_ORDER}, the C form, on
+RSNN_SHD instead of NN256, with --temporal-rule naming the recurrent rule
+this row measures.  No approximation is applied, the grad cosine is 1 on
+every plan, and the objective is the pure scalarization
+
+    --lambda-cmp * paired-log latency + --lambda-mem * paired-log temp memory
+
+--episodes {THESIS_EPISODES} with --auto-stop, --checkpoint-every
+{THESIS_CHECKPOINT_EVERY}, --pareto-dump-every {THESIS_PARETO_DUMP_EVERY},
+--plan-log {THESIS_PLAN_LOG}, no XLA environment.
+
+THE NODE IS THE RULE.  bptt and rtrl each carry one GPU model for all three
+seeds and all five weights of that rule, so the weight comparison is within
+a node and the rule comparison (dsnn-dfw.45's actual question, pace and
+front shape under bptt versus rtrl) is the one that crosses two GPU models --
+which the ticket accepts, because the two rules were never going to share a
+node (finding 03 leaves no cleared Blackwell node for a third GPU model)."""
+
+_ORDERONLY_RSNN_PREDICTION = """REGISTERED BEFORE THE RUN, NEVER EDITED AFTER
+(ticket dsnn-dfw.45): as in the NN256 round, the five weights trace a front on
+each rule -- (2, 0) lowest paired latency ratio, (0, 2) lowest paired memory
+ratio, the three mixed weights between them -- and the preference-conditioned
+run's front spans at least the latency range the five fixed weights span.
+rtrl's carried Jacobian is a matrix over the whole prefix and bptt's carried
+adjoint is a vector over the suffix, so rtrl is predicted the slower pace and
+the larger carried-state memory of the two."""
+
+_ORDERONLY_RSNN_FALSIFIER = """If every weight lands on the same terminal plan
+within a rule, the scalarization weight is not what decides that rule and the
+result is reported as that, with no weight declared the winner.  If rtrl is
+not slower or does not carry more memory than bptt, the carried-Jacobian
+prediction above is wrong and is reported as such, not quietly dropped."""
+
+_ORDERONLY_RSNN_WHAT = {
+    "bptt": """TEMPORAL RULE bptt: THE FUTURE FEEDS IN, exactly as in the
+thesis matrix's recurrent block -- an edge from the next state to the loss
+carries the adjoint dL(>t)/ds_t from a detached backward pass over the
+suffix.""",
+    "rtrl": """TEMPORAL RULE rtrl: THE PAST FEEDS IN -- an edge from the
+weights to the carried state carries the influence matrix ds(t-1)/dW from a
+detached pass over the prefix, so eliminating that vertex is one real-time
+recurrent-learning step.""",
+}
+
+_ORDERONLY_RSNN_TBPTT_WHAT = """rsnn_tbptt, THE NO-TEMPORAL-EDGE REFERENCE
+(ticket dsnn-dfw.45): no given edge crosses the step boundary, the carried
+state is a constant, and the credit is truncated and spatial only.  Three
+seeds at the (2, 0) weight alone -- it is the baseline bptt and rtrl are read
+against, not a third swept rule -- queued on pgi15-gpu8 after the rtrl rows."""
+
+
+def orderonly_rsnn_run_name(rule: str, lam_cmp: str, lam_mem: str,
+                            seed: str) -> str:
+    """`orderonly_rsnn_<rule>_l<X>m<Y>_s<seed>` (owner ruling 2026-09-19)."""
+    if rule not in ORDERONLY_RSNN_RULES:
+        raise CampaignRowError(
+            f"rule {rule!r} is not one of the order-only recurrent rules "
+            f"{ORDERONLY_RSNN_RULES}")
+    if (lam_cmp, lam_mem) not in ORDERONLY_WEIGHTS:
+        raise CampaignRowError(
+            f"({lam_cmp!r}, {lam_mem!r}) is not one of the five ruled weight "
+            f"pairs {ORDERONLY_WEIGHTS}")
+    if seed not in ORDERONLY_SEEDS:
+        raise CampaignRowError(
+            f"seed {seed!r} is not one of {ORDERONLY_SEEDS}")
+    return f"orderonly_rsnn_{rule}_l{lam_cmp}m{lam_mem}_s{seed}"
+
+
+def orderonly_rsnn_pref_run_name(rule: str, seed: str) -> str:
+    """`orderonly_rsnn_<rule>_pref_s<seed>` (owner ruling 2026-09-19)."""
+    if rule not in ORDERONLY_RSNN_RULES:
+        raise CampaignRowError(
+            f"rule {rule!r} is not one of the order-only recurrent rules "
+            f"{ORDERONLY_RSNN_RULES}")
+    if seed not in ORDERONLY_SEEDS:
+        raise CampaignRowError(
+            f"seed {seed!r} is not one of {ORDERONLY_SEEDS}")
+    return f"orderonly_rsnn_{rule}_pref_s{seed}"
+
+
+def orderonly_rsnn_node(rule: str) -> str:
+    """THE NODE OF A RULE.  Every weight and every seed of one rule runs on
+    one GPU model, so the rule comparison alone crosses two models."""
+    if rule not in ORDERONLY_RSNN_RULES:
+        raise CampaignRowError(
+            f"rule {rule!r} is not one of the order-only recurrent rules "
+            f"{ORDERONLY_RSNN_RULES}")
+    return ORDERONLY_RSNN_NODES[rule]
+
+
+def orderonly_rsnn_arm(*, rule: str, seed: str, lam_cmp: str | None = None,
+                       lam_mem: str | None = None, pref: bool = False) -> dict:
+    """One dsnn-dfw.45 order-only row on the recurrent target -> one
+    `arm(...)`.  Returns the arm.  Mirrors `orderonly_arm` exactly, on
+    `rsnn_<rule>` instead of `nn256` and the rule's own node."""
+    node = orderonly_rsnn_node(rule)
+    target = f"rsnn_{rule}"
+    if pref:
+        _require(lam_cmp is None and lam_mem is None,
+                 "the preference-conditioned row sweeps no weight: the "
+                 "Dirichlet preference over (latency, memory) IS the weight, "
+                 "and a fixed pair beside it would say two different things")
+        name = orderonly_rsnn_pref_run_name(rule, seed)
+        arm_name = ORDERONLY_PREF_ARM
+    else:
+        _require(lam_cmp is not None and lam_mem is not None,
+                 "a fixed-weight row needs both --lambda-cmp and --lambda-mem")
+        name = orderonly_rsnn_run_name(rule, lam_cmp, lam_mem, seed)
+        arm_name = ORDERONLY_ARM
+    cli = thesis_cli(arm=arm_name, target=target, seed=seed, node=node,
+                     name=name, episodes=THESIS_EPISODES,
+                     checkpoint_every=THESIS_CHECKPOINT_EVERY,
+                     auto_stop=True)
+    cli["--approx-profile"] = ORDERONLY_PROFILE
+    if not pref:
+        cli["--lambda-cmp"] = lam_cmp
+        cli["--lambda-mem"] = lam_mem
+    gpus = node_gpu_count(node)
+    what = (f"THE PREFERENCE-CONDITIONED ROW at seed {seed}, rule {rule}: one "
+            f"run over a Dirichlet preference on (latency, memory), against "
+            f"the five fixed weights of the same rule and seed."
+            if pref else
+            f"WEIGHT (--lambda-cmp {lam_cmp}, --lambda-mem {lam_mem}) at seed "
+            f"{seed}, rule {rule}, one of the five ruled pairs.")
+    a = dict(
+        name=name, job=orderonly_job_name(node), kind="train",
+        runtime="scratch",
+        node=node, time=THESIS_TIME, gpus=gpus, singleton=True, thesis=True,
+        orderonly_rsnn=True, thesis_arm=arm_name, thesis_target=target,
+        thesis_rule=thesis_temporal_rule(target),
+        thesis_seed=seed, orderonly_weights=(None if pref
+                                             else (lam_cmp, lam_mem)),
+        env=dict(THESIS_TARGET_ENV[target]),
+        required_flags=ORDERONLY_REQUIRED_FLAGS,
+        required_flags_file=" ".join(THESIS_FLAGS_FILES),
+        cli=cli,
+        purpose=_ORDERONLY_RSNN_HEAD + "\n\n" + _ORDERONLY_RSNN_WHAT[rule]
+                + "\n\n" + what,
+        prediction=_ORDERONLY_RSNN_PREDICTION,
+        falsifier=_ORDERONLY_RSNN_FALSIFIER,
+    )
+    if node in NODE_CUDA_BIN:
+        a["cuda_bin"] = NODE_CUDA_BIN[node]
+    arm_(**a)
+    return a
+
+
+def orderonly_rsnn_submission_order(
+        rule: str) -> list[tuple[str, str | None, str | None]]:
+    """(seed, lambda_cmp, lambda_mem) for one rule, in submission order; the
+    pair is None on the preference-conditioned row.  Seed-major, exactly as
+    `orderonly_submission_order` above."""
+    order: list[tuple[str, str | None, str | None]] = []
+    for s in ORDERONLY_SEEDS:
+        for lc, lm in ORDERONLY_WEIGHTS:
+            order.append((s, lc, lm))
+        order.append((s, None, None))
+    return order
+
+
+#: The 18 runs of one rule: five weights x three seeds, plus one
+#: preference-conditioned run per seed.  36 total over the two rules.
+ORDERONLY_RSNN_RUNS_PER_RULE = len(ORDERONLY_SEEDS) * (len(ORDERONLY_WEIGHTS)
+                                                       + 1)
+
+for _rule in ORDERONLY_RSNN_RULES:
+    for _seed, _lc, _lm in orderonly_rsnn_submission_order(_rule):
+        orderonly_rsnn_arm(rule=_rule, seed=_seed, lam_cmp=_lc, lam_mem=_lm,
+                          pref=_lc is None)
+del _rule, _seed, _lc, _lm
+
+
+def orderonly_rsnn_arm_name(seed: str) -> str:
+    """`orderonly_rsnn_tbptt_l2m0_s<seed>`.  Named like the swept rows (the
+    weight in the name) so the same `fq_orderonly_*` glob that preflights and
+    queues bptt and rtrl by node also finds the reference rows."""
+    lam_cmp, lam_mem = ORDERONLY_RSNN_TBPTT_WEIGHTS
+    if seed not in ORDERONLY_SEEDS:
+        raise CampaignRowError(
+            f"seed {seed!r} is not one of {ORDERONLY_SEEDS}")
+    return f"orderonly_rsnn_tbptt_l{lam_cmp}m{lam_mem}_s{seed}"
+
+
+def orderonly_rsnn_tbptt_arm(*, seed: str) -> dict:
+    """One rsnn_tbptt reference row -> one `arm(...)`.  Returns the arm."""
+    node = ORDERONLY_RSNN_TBPTT_NODE
+    target = "rsnn_tbptt"
+    lam_cmp, lam_mem = ORDERONLY_RSNN_TBPTT_WEIGHTS
+    name = orderonly_rsnn_arm_name(seed)
+    cli = thesis_cli(arm=ORDERONLY_ARM, target=target, seed=seed, node=node,
+                     name=name, episodes=THESIS_EPISODES,
+                     checkpoint_every=THESIS_CHECKPOINT_EVERY,
+                     auto_stop=True)
+    cli["--approx-profile"] = ORDERONLY_PROFILE
+    cli["--lambda-cmp"] = lam_cmp
+    cli["--lambda-mem"] = lam_mem
+    gpus = node_gpu_count(node)
+    a = dict(
+        name=name, job=orderonly_job_name(node), kind="train",
+        runtime="scratch",
+        node=node, time=THESIS_TIME, gpus=gpus, singleton=True, thesis=True,
+        orderonly_rsnn=True, thesis_arm=ORDERONLY_ARM, thesis_target=target,
+        thesis_rule=thesis_temporal_rule(target),
+        thesis_seed=seed, orderonly_weights=(lam_cmp, lam_mem),
+        env=dict(THESIS_TARGET_ENV[target]),
+        required_flags=ORDERONLY_REQUIRED_FLAGS,
+        required_flags_file=" ".join(THESIS_FLAGS_FILES),
+        cli=cli,
+        purpose=_ORDERONLY_RSNN_HEAD + "\n\n" + _ORDERONLY_RSNN_TBPTT_WHAT,
+        prediction=_ORDERONLY_RSNN_PREDICTION,
+        falsifier=_ORDERONLY_RSNN_FALSIFIER,
+    )
+    if node in NODE_CUDA_BIN:
+        a["cuda_bin"] = NODE_CUDA_BIN[node]
+    arm_(**a)
+    return a
+
+
+for _seed in ORDERONLY_SEEDS:
+    orderonly_rsnn_tbptt_arm(seed=_seed)
+del _seed
+
+
+def orderonly_rsnn_arms() -> list[dict]:
+    return [a for a in ARMS if a.get("orderonly_rsnn")]
 
 
 # ---------------------------------------------------------------------------
@@ -3733,7 +4018,7 @@ def render(a: dict) -> str:
         L.append("export PYTHONDONTWRITEBYTECODE=1")
         L.append(f"cd {CAMPAIGN_STACK}/alphagrad")
         L.append("")
-        L.append(_toolchain_block(kind))
+        L.append(_toolchain_block(kind, a["node"]))
         L.append("")
         L.append('echo "HOST=$(hostname) JOB=$SLURM_JOB_ID"')
         L.append(f'echo "ag=$(git -C {ag_repo} rev-parse --short HEAD)'
@@ -3781,7 +4066,7 @@ def render(a: dict) -> str:
         L.append("")
         L.append(f'export PATH="{a["cuda_bin"]}:$PATH"')
     L.append("")
-    L.append(_toolchain_block(kind))
+    L.append(_toolchain_block(kind, a["node"]))
     L.append("")
 
     # --- pre-flight
