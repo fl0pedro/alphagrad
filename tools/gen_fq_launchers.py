@@ -2189,6 +2189,37 @@ THESIS_NODE_GPUS = {"pgi15-gpu15": 4, "pgi15-gpu16": 4, "pgi15-gpu17": 4,
                     "pgi15-gpu18": 4, "pgi15-gpu19": 8, "pgi15-gpu20": 8}
 #: --ray-measure by node size: every GPU the trainer does not hold.
 THESIS_RAY_MEASURE = {4: "3", 8: "7"}
+#: THE NODE'S CORE BUDGET, per node type, on 64 logical CPUs (owner ruling Q3,
+#: 2026-09-18; the measurement is dsnn-dfw.30 and the probe dsnn-dfw.40).  The
+#: trainer had no slice of its own and its host work ran on the same cores as
+#: the timing actors, which is what made the candidate latency bimodal.  A
+#: timing actor needs 2 logical CPUs: the timing is one second on the GPU.
+#: Everything the budget does not name stays spare.
+THESIS_CORE_BUDGET_CPUS = 64
+THESIS_CORE_BUDGET = {
+    8: {"trainer": 8, "per_actor": 2, "oracle": 4},
+    4: {"trainer": 8, "per_actor": 2, "oracle": 4},
+}
+
+
+def thesis_core_layout(gpus: int):
+    """The disjoint per-node layout of ``THESIS_CORE_BUDGET[gpus]``."""
+    from alphagrad.approx.common.core_budget import node_core_layout
+    if gpus not in THESIS_CORE_BUDGET:
+        raise ValueError(
+            f"no core budget for a {gpus}-GPU node; the budget covers "
+            f"{sorted(THESIS_CORE_BUDGET)} GPUs")
+    b = THESIS_CORE_BUDGET[gpus]
+    return node_core_layout(
+        THESIS_CORE_BUDGET_CPUS, int(THESIS_RAY_MEASURE[gpus]),
+        trainer_cores=b["trainer"], cores_per_actor=b["per_actor"],
+        oracle_cores=b["oracle"])
+
+
+# The budget must fit and be disjoint on every node type, checked at import so
+# a launcher can never be generated from a budget that oversubscribes a node.
+for _budget_gpus in sorted(THESIS_CORE_BUDGET):
+    thesis_core_layout(_budget_gpus)
 #: -c and --mem by node size.  The 8-GPU values are the campaign's.
 BLACKWELL_CPUS = {4: 64, 8: CAMPAIGN_CPUS}
 BLACKWELL_MEM = {4: "400G", 8: CAMPAIGN_MEM}
@@ -2509,6 +2540,9 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
         # --- the measurement, sized by the node
         "--ray-measure": THESIS_RAY_MEASURE[gpus],
         "--ray-measure-timeout": CAMPAIGN_RAY_MEASURE_TIMEOUT,
+        # --- the node's core budget, disjoint by construction
+        "--reserved-driver-cores": str(THESIS_CORE_BUDGET[gpus]["trainer"]),
+        "--cpu-cores-per-actor": str(THESIS_CORE_BUDGET[gpus]["per_actor"]),
         "--measure-pipeline": CAMPAIGN_MEASURE_PIPELINE,
         "--rollout-shards": CAMPAIGN_ROLLOUT_SHARDS,
         "--tokenize-where": CAMPAIGN_TOKENIZE_WHERE,

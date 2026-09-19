@@ -331,7 +331,8 @@ def test_the_arms_differ_only_where_the_matrix_says_they_do(gen, matrix):
     `test_the_nodes_and_the_actors_per_node_size` is what pins it, per arm,
     against that node's own size.
     """
-    node_derived = {"--ray-measure"}
+    node_derived = {"--ray-measure", "--cpu-cores-per-actor",
+                    "--reserved-driver-cores"}
     allowed_between_arms = {
         "--name", "--face-none-bias", "--reward-mode", "--quality-floor",
         "--advantage-norm", "--no-symlog", "--symlog-channels",
@@ -451,6 +452,28 @@ def test_the_nodes_and_the_actors_per_node_size(gen, matrix, smoke):
         assert f"#SBATCH -c {gen.BLACKWELL_CPUS[gpus]}\n" in text, a["name"]
         assert f"#SBATCH --mem={gen.BLACKWELL_MEM[gpus]}\n" in text, a["name"]
         assert "#SBATCH -p pgi15\n" in text, a["name"]
+
+
+def test_the_core_budget_is_the_ruling_and_is_disjoint(gen, matrix, smoke):
+    """The node's 64 logical CPUs, per node type (owner ruling Q3,
+    2026-09-18): the trainer, the timing actors and the gradient oracle hold
+    DISJOINT slices, and no arm carries a budget the node cannot hold."""
+    from alphagrad.approx.common.core_budget import check_disjoint
+    assert gen.THESIS_CORE_BUDGET_CPUS == 64
+    assert gen.THESIS_CORE_BUDGET == {
+        8: {"trainer": 8, "per_actor": 2, "oracle": 4},
+        4: {"trainer": 8, "per_actor": 2, "oracle": 4},
+    }
+    for gpus in (4, 8):
+        lay = gen.thesis_core_layout(gpus)
+        check_disjoint(lay)
+        assert len(lay.timing_actors) == int(gen.THESIS_RAY_MEASURE[gpus])
+    for a in matrix + smoke:
+        gpus = gen.THESIS_NODE_GPUS[a["node"]]
+        b = gen.THESIS_CORE_BUDGET[gpus]
+        cli = _cli(gen, a)
+        assert cli["--reserved-driver-cores"] == str(b["trainer"]), a["name"]
+        assert cli["--cpu-cores-per-actor"] == str(b["per_actor"]), a["name"]
 
 
 def test_the_first_block_spreads_over_every_released_node(gen):
