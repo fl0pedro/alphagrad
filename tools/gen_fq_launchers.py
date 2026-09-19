@@ -2586,10 +2586,11 @@ leave the identity".""",
 than a weighted channel; lambda is ascended once per episode on the measured
 mean violation, eta """ + DUAL_ETA + """, clipped to [""" + DUAL_LAMBDA_MIN
          + ", " + THESIS_DUAL_LAMBDA_MAX + """], started at """
-         + THESIS_LAMBDA_Q + """.  The cap is """ + THESIS_DUAL_LAMBDA_MAX
-         + """ and not 32 (owner 2026-09-19) so the multiplier can dominate
-the skip-all plan: that plan takes about 17 nats of memory gain plus its
-latency gain, against a penalty of lambda times a violation of about 0.9.""",
+         + THESIS_LAMBDA_Q + """.
+THE CAP IS """ + THESIS_DUAL_LAMBDA_MAX + """ AND NOT 32 (owner 2026-09-19),
+so the multiplier can dominate the skip-all plan: that plan takes about 17
+nats of memory gain plus its latency gain, against a penalty of lambda times
+a violation of about 0.9.""",
     "C_popart": """ARM C with PopArt: the same dual with per-channel
 debiased-EMA normalisation of the value targets and sigma-scaled advantages.
 --no-symlog AND --symlog-channels none ride with it (ppo.py checks the two
