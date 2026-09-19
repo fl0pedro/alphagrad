@@ -2842,7 +2842,8 @@ def thesis_block1_arms() -> list[dict]:
     return [a for a in thesis_arms()
             if not a.get("held") and not a.get("smoke")
             and not a.get("orderonly") and not a.get("orderonly_rsnn")
-            and not a.get("orderonly_final")]
+            and not a.get("orderonly_final")
+            and not a.get("orderonly_tlm_final")]
 
 
 def thesis_snn_arms() -> list[dict]:
@@ -2863,7 +2864,8 @@ def thesis_core_arms() -> list[dict]:
     smoke, the order-only tuning rows and the order-only baseline."""
     return [a for a in thesis_arms()
             if not a.get("smoke") and not a.get("thesis_rule")
-            and not a.get("orderonly") and not a.get("orderonly_final")]
+            and not a.get("orderonly") and not a.get("orderonly_final")
+            and not a.get("orderonly_tlm_final")]
 
 
 # Target-pinned nodes (owner ruling 2026-09-17: "max 4* 2 tlm 2 nn256"):
@@ -3432,6 +3434,108 @@ del _seed
 
 def orderonly_final_arms() -> list[dict]:
     return [a for a in ARMS if a.get("orderonly_final")]
+
+
+# ---------------------------------------------------------------------------
+# ONE ORDER-ONLY FINAL ROW ON TLM (owner: "run a TLM run for 1k episodes",
+# 2026-09-19 evening).  The order-only arm's shape -- --approx-profile
+# {ORDERONLY_PROFILE} with --fixed-order {THESIS_ORDER}, the C form -- on
+# --example TransformerLM --dataset wikitext2 (the fq_C_tlm row's target
+# flags; the ALPHAGRAD_TLM_* triple is SHARED_ENV, not per-target, so it
+# exports here exactly as it does on every scratch-kind row), at
+# --lambda-cmp 1 --lambda-mem 1: memory is a live objective on TLM (the
+# orchestrator's assumption; the owner may move the weight later), unlike
+# the NN256 baseline's latency-only (2, 0).
+#
+# A FINAL ROW, like the NN256 baseline above: THESIS_FINAL_AUTO_STOP (no
+# --auto-stop, the full thousand episodes), the four block settings
+# (--paired-cost-floor {THESIS_PAIRED_COST_FLOOR}, --mem-channel
+# {THESIS_MEM_CHANNEL}, --lag-max {THESIS_DUAL_LAMBDA_MAX}), wandb online
+# (WANDB_MODE, unchanged for a thesis-kind row), on pgi15-gpu15 -- a
+# Blackwell node, final rows run on Blackwell only (AGENTS.md).
+#
+# ONE ROW, ONE NAME, no seed sweep and no node table: the owner named the
+# exact row (orderonly_tlm_final_l1m1_s250197), not a family.
+# ---------------------------------------------------------------------------
+ORDERONLY_TLM_FINAL_NAME = "orderonly_tlm_final_l1m1_s250197"
+ORDERONLY_TLM_FINAL_SEED = "250197"
+ORDERONLY_TLM_FINAL_WEIGHTS = ("1", "1")
+ORDERONLY_TLM_FINAL_NODE = "pgi15-gpu15"
+
+_ORDERONLY_TLM_FINAL_HEAD = f"""ONE ORDER-ONLY FINAL ROW ON TLM (epic
+dsnn-dfw, owner: "run a TLM run for 1k episodes", 2026-09-19 evening).  The
+order-only arm -- --approx-profile {ORDERONLY_PROFILE} with --fixed-order
+{THESIS_ORDER}, the C form, so the policy chooses THE ELIMINATION ORDER and
+nothing else -- on --example TransformerLM --dataset wikitext2, at the
+weight pair (--lambda-cmp {ORDERONLY_TLM_FINAL_WEIGHTS[0]}, --lambda-mem
+{ORDERONLY_TLM_FINAL_WEIGHTS[1]}): memory is a live objective on this
+target, unlike the NN256 baseline's latency-only (2, 0) -- the orchestrator's
+assumption; the owner may move the weight later.
+
+--episodes {THESIS_EPISODES} WITHOUT --auto-stop (a final row runs the full
+thousand), --checkpoint-every {THESIS_CHECKPOINT_EVERY}, --pareto-dump-every
+{THESIS_PARETO_DUMP_EVERY}, --plan-log {THESIS_PLAN_LOG}, the four block
+settings of 2026-09-19 (--paired-cost-floor {THESIS_PAIRED_COST_FLOOR},
+--mem-channel {THESIS_MEM_CHANNEL}, --lag-max {THESIS_DUAL_LAMBDA_MAX}),
+wandb online, on pgi15-gpu15 (Blackwell, a final node)."""
+
+_ORDERONLY_TLM_FINAL_PREDICTION = """REGISTERED BEFORE THE RUN, NEVER EDITED
+AFTER: at roughly 64 s/episode this row completes about 1000 episodes in 18
+hours; the terminal plan's paired latency and memory ratios both improve
+over the C arm's own matrix row (arm C on tlm, --approx-profile all), since
+order alone with no approximation should never cost more than order-plus-
+approximation search does at convergence."""
+
+_ORDERONLY_TLM_FINAL_FALSIFIER = """If the run does not reach 1000 episodes
+in the allotted time, or the terminal plan's ratios are not better than the
+matrix C-arm row's, that is reported as it stands; no number here is
+adjusted after the fact."""
+
+
+def orderonly_tlm_final_arm() -> dict:
+    """The one TLM order-only final row -> one `arm(...)`.  Returns it."""
+    node = ORDERONLY_TLM_FINAL_NODE
+    _require(node in THESIS_NODES_ALL,
+             f"node {node!r} is not one of the six Blackwell nodes "
+             f"{THESIS_NODES_ALL}; this is a FINAL row and final rows run "
+             f"on Blackwell only (AGENTS.md)")
+    lam_cmp, lam_mem = ORDERONLY_TLM_FINAL_WEIGHTS
+    name = ORDERONLY_TLM_FINAL_NAME
+    cli = thesis_cli(arm=ORDERONLY_ARM, target="tlm",
+                     seed=ORDERONLY_TLM_FINAL_SEED, node=node, name=name,
+                     episodes=THESIS_EPISODES,
+                     checkpoint_every=THESIS_CHECKPOINT_EVERY,
+                     auto_stop=THESIS_FINAL_AUTO_STOP)
+    cli["--approx-profile"] = ORDERONLY_PROFILE
+    cli["--lambda-cmp"] = lam_cmp
+    cli["--lambda-mem"] = lam_mem
+    gpus = node_gpu_count(node)
+    a = dict(
+        name=name, job=orderonly_job_name(node), kind="train",
+        runtime="scratch",
+        node=node, time=THESIS_TIME, gpus=gpus, singleton=True, thesis=True,
+        orderonly_tlm_final=True, thesis_arm=ORDERONLY_ARM,
+        thesis_target="tlm", thesis_seed=ORDERONLY_TLM_FINAL_SEED,
+        orderonly_weights=(lam_cmp, lam_mem),
+        env=dict(THESIS_TARGET_ENV["tlm"]),
+        required_flags=ORDERONLY_REQUIRED_FLAGS,
+        required_flags_file=" ".join(THESIS_FLAGS_FILES),
+        cli=cli,
+        purpose=_ORDERONLY_TLM_FINAL_HEAD,
+        prediction=_ORDERONLY_TLM_FINAL_PREDICTION,
+        falsifier=_ORDERONLY_TLM_FINAL_FALSIFIER,
+    )
+    if node in NODE_CUDA_BIN:
+        a["cuda_bin"] = NODE_CUDA_BIN[node]
+    arm_(**a)
+    return a
+
+
+orderonly_tlm_final_arm()
+
+
+def orderonly_tlm_final_arms() -> list[dict]:
+    return [a for a in ARMS if a.get("orderonly_tlm_final")]
 
 
 # ---------------------------------------------------------------------------

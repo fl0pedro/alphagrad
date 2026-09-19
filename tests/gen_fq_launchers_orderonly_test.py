@@ -510,20 +510,23 @@ def test_the_matrix_and_the_campaign_still_have_their_own_counts(gen):
     the three smoke runs must still be exactly what the rulings say: the 50
     core rows of 2026-09-15 and the 100 recurrent rows of 2026-09-16."""
     # dsnn-dfw.45 added a second order-only round (the recurrent target,
-    # `orderonly_rsnn`), excluded here exactly as `orderonly` (NN256) is, and
-    # the 2026-09-19 ruling added the five-seed BASELINE (`orderonly_final`),
-    # excluded the same way: it is a final row of the order-only arm, not a
-    # matrix coordinate.
+    # `orderonly_rsnn`), excluded here exactly as `orderonly` (NN256) is, the
+    # 2026-09-19 ruling added the five-seed BASELINE (`orderonly_final`),
+    # excluded the same way, and the same evening added the one-row TLM
+    # order-only final (`orderonly_tlm_final`, owner: "run a TLM run for 1k
+    # episodes") -- also a final row, not a matrix coordinate.
     matrix = [a for a in gen.thesis_arms()
               if not a.get("smoke") and not a.get("orderonly")
               and not a.get("orderonly_rsnn")
-              and not a.get("orderonly_final")]
+              and not a.get("orderonly_final")
+              and not a.get("orderonly_tlm_final")]
     assert len(gen.thesis_core_arms()) == 50
     assert len(gen.thesis_snn_arms()) == 100
     assert len(matrix) == 150
     assert len(gen.thesis_smoke_arms()) == 3
     assert len(gen.orderonly_arms()) == N_RUNS
     assert len(gen.orderonly_final_arms()) == FINAL_N_RUNS
+    assert len(gen.orderonly_tlm_final_arms()) == 1
     assert all(a.get("thesis") for a in gen.orderonly_arms())
     # the matrix rows never carry --approx-profile none
     assert {_cli(gen, a)["--approx-profile"] for a in matrix} == {"all"}
@@ -685,3 +688,99 @@ def test_the_target_node_switch_does_not_move_the_baseline(gen):
         del os.environ["THESIS_TARGET_NODES"]
     for a in mod.orderonly_final_arms():
         assert a["node"] == FINAL_NODES[FINAL_SEEDS.index(a["thesis_seed"])]
+
+
+# ===============  ONE ORDER-ONLY FINAL ROW ON TLM (2026-09-19 evening)  ====
+# owner: "run a TLM run for 1k episodes".  One named row, not a family: the
+# order-only arm's shape on TransformerLM, at (--lambda-cmp 1, --lambda-mem
+# 1), a final row (no --auto-stop) on pgi15-gpu15.
+
+TLM_FINAL_NAME = "orderonly_tlm_final_l1m1_s250197"
+TLM_FINAL_SEED = "250197"
+TLM_FINAL_WEIGHTS = ("1", "1")
+TLM_FINAL_NODE = "pgi15-gpu15"
+
+
+@pytest.fixture(scope="module")
+def tlm_final_row(gen):
+    arms = gen.orderonly_tlm_final_arms()
+    assert len(arms) == 1, "the generator emits more or fewer than one row"
+    return arms[0]
+
+
+def test_the_tlm_final_row_is_named_and_shaped_as_ruled(gen, tlm_final_row):
+    a = tlm_final_row
+    assert a["name"] == TLM_FINAL_NAME == gen.ORDERONLY_TLM_FINAL_NAME
+    assert gen.ORDERONLY_TLM_FINAL_SEED == TLM_FINAL_SEED
+    assert gen.ORDERONLY_TLM_FINAL_WEIGHTS == TLM_FINAL_WEIGHTS
+    assert gen.ORDERONLY_TLM_FINAL_NODE == TLM_FINAL_NODE
+    cli = _cli(gen, a)
+    assert cli["--example"] == "TransformerLM", a["name"]
+    assert cli["--dataset"] == "wikitext2", a["name"]
+    assert cli["--approx-profile"] == PROFILE, a["name"]
+    assert cli["--fixed-order"] == ORDER, a["name"]
+    lc, lm = TLM_FINAL_WEIGHTS
+    assert cli["--lambda-cmp"] == lc and cli["--lambda-mem"] == lm, a["name"]
+    assert a["thesis_arm"] == gen.ORDERONLY_ARM == "C", a["name"]
+    assert a["thesis_target"] == "tlm", a["name"]
+    assert a["thesis_seed"] == TLM_FINAL_SEED, a["name"]
+    assert a["orderonly_weights"] == (lc, lm), a["name"]
+    assert "--preference-conditioned" not in cli, a["name"]
+    assert cli["--reward-mode"] == "lagrangian", a["name"]
+    assert cli["--quality-floor"] == TAU, a["name"]
+
+
+def test_the_tlm_final_row_carries_the_tlm_env_and_the_block_settings(
+        gen, tlm_final_row):
+    a = tlm_final_row
+    text = gen.render(a)
+    assert "export ALPHAGRAD_TLM_SEQ=" in text, a["name"]
+    assert "export ALPHAGRAD_TLM_DMODEL=" in text, a["name"]
+    assert "export ALPHAGRAD_TLM_VOCAB=" in text, a["name"]
+    cli = _cli(gen, a)
+    assert cli["--episodes"] == EPISODES, a["name"]
+    assert cli["--checkpoint-every"] == CHECKPOINT_EVERY, a["name"]
+    assert cli["--pareto-dump-every"] == PARETO_DUMP_EVERY, a["name"]
+    assert cli["--plan-log"] == "auto", a["name"]
+    assert "--auto-stop" not in cli, a["name"]
+    assert cli["--paired-cost-floor"] == gen.THESIS_PAIRED_COST_FLOOR \
+        == "byte", a["name"]
+    assert cli["--mem-channel"] == gen.THESIS_MEM_CHANNEL == "watermark", \
+        a["name"]
+    assert cli["--lag-max"] == gen.THESIS_DUAL_LAMBDA_MAX == "64", a["name"]
+    assert f"--wandb {gen.WANDB_MODE}" in text and gen.WANDB_MODE == "online"
+    assert f"--wandb-project {gen.WANDB_PROJECT}" in text, a["name"]
+
+
+def test_the_tlm_final_row_is_on_gpu15_with_the_singleton(gen, tlm_final_row):
+    a = tlm_final_row
+    node = TLM_FINAL_NODE
+    assert node in gen.THESIS_NODES_ALL, a["name"]
+    assert a["node"] == node, a["name"]
+    gpus = gen.THESIS_NODE_GPUS[node]
+    assert a["gpus"] == gpus, a["name"]
+    cli = _cli(gen, a)
+    assert cli["--ray-measure"] == gen.THESIS_RAY_MEASURE[gpus] \
+        == str(gpus - 1), a["name"]
+    text = gen.render(a)
+    assert f"#SBATCH -w {node}\n" in text, a["name"]
+    assert f"#SBATCH -J node-{node}\n" in text, a["name"]
+    assert "#SBATCH --dependency=singleton\n" in text, a["name"]
+    assert a["job"] == gen.orderonly_job_name(node) == f"node-{node}"
+    assert f"#SBATCH --gres={gen.blackwell_gres(gpus)}\n" in text, a["name"]
+    assert gen._bash_n(text) is None, a["name"]
+
+
+def test_the_tlm_final_row_is_not_a_matrix_row_and_not_a_tuning_row(
+        gen, tlm_final_row, rows, final_rows):
+    a = tlm_final_row
+    assert a["name"] not in {r["name"] for r in rows}
+    assert a["name"] not in {r["name"] for r in final_rows}
+    assert not a.get("orderonly") and not a.get("orderonly_final") \
+        and not a.get("orderonly_rsnn"), a["name"]
+    assert a["name"] not in {r["name"] for r in gen.thesis_core_arms()}
+    assert len(gen.thesis_core_arms()) == 50
+    assert not any(a2.get("orderonly_tlm_final")
+                  for a2 in gen.thesis_block1_arms())
+    assert len(gen.thesis_block1_arms()) == gen.THESIS_BLOCK1 == 34
+    assert a["name"] in {r["name"] for r in gen.thesis_arms()}
