@@ -432,9 +432,12 @@ def test_the_nn256_order_only_round_did_not_move(gen):
 
 
 def test_the_matrix_and_the_campaign_still_have_their_own_counts(gen):
+    # `orderonly_final`, the five-seed order-only baseline of 2026-09-19, is
+    # excluded here exactly as the two tuning rounds are.
     matrix = [a for a in gen.thesis_arms()
               if not a.get("smoke") and not a.get("orderonly")
-              and not a.get("orderonly_rsnn")]
+              and not a.get("orderonly_rsnn")
+              and not a.get("orderonly_final")]
     assert len(gen.thesis_core_arms()) == 50
     assert len(gen.thesis_snn_arms()) == 100
     assert len(matrix) == 150

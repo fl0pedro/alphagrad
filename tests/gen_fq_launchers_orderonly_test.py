@@ -510,15 +510,20 @@ def test_the_matrix_and_the_campaign_still_have_their_own_counts(gen):
     the three smoke runs must still be exactly what the rulings say: the 50
     core rows of 2026-09-15 and the 100 recurrent rows of 2026-09-16."""
     # dsnn-dfw.45 added a second order-only round (the recurrent target,
-    # `orderonly_rsnn`), excluded here exactly as `orderonly` (NN256) is.
+    # `orderonly_rsnn`), excluded here exactly as `orderonly` (NN256) is, and
+    # the 2026-09-19 ruling added the five-seed BASELINE (`orderonly_final`),
+    # excluded the same way: it is a final row of the order-only arm, not a
+    # matrix coordinate.
     matrix = [a for a in gen.thesis_arms()
               if not a.get("smoke") and not a.get("orderonly")
-              and not a.get("orderonly_rsnn")]
+              and not a.get("orderonly_rsnn")
+              and not a.get("orderonly_final")]
     assert len(gen.thesis_core_arms()) == 50
     assert len(gen.thesis_snn_arms()) == 100
     assert len(matrix) == 150
     assert len(gen.thesis_smoke_arms()) == 3
     assert len(gen.orderonly_arms()) == N_RUNS
+    assert len(gen.orderonly_final_arms()) == FINAL_N_RUNS
     assert all(a.get("thesis") for a in gen.orderonly_arms())
     # the matrix rows never carry --approx-profile none
     assert {_cli(gen, a)["--approx-profile"] for a in matrix} == {"all"}
@@ -662,3 +667,21 @@ def test_the_baseline_is_not_a_matrix_row_and_not_a_tuning_row(
     assert len(gen.thesis_block1_arms()) == gen.THESIS_BLOCK1 == 34
     # it IS a thesis arm, so every sweep over thesis arms reaches it
     assert names <= {a["name"] for a in gen.thesis_arms()}
+
+
+def test_the_target_node_switch_does_not_move_the_baseline(gen):
+    """THESIS_TARGET_NODES=1 pins the MATRIX to target-specific nodes. The
+    baseline's node is its seed, exactly as the tuning round's is, and that
+    switch must not touch it: moving a seed would put two seeds on one GPU
+    model and leave another model unmeasured."""
+    import importlib.util as _ilu
+
+    os.environ["THESIS_TARGET_NODES"] = "1"
+    try:
+        spec = _ilu.spec_from_file_location("gen_fq_launchers_tgt_fin", _GEN)
+        mod = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    finally:
+        del os.environ["THESIS_TARGET_NODES"]
+    for a in mod.orderonly_final_arms():
+        assert a["node"] == FINAL_NODES[FINAL_SEEDS.index(a["thesis_seed"])]
