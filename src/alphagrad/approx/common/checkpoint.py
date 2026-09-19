@@ -407,6 +407,13 @@ def pareto_archive_to_json(archive) -> dict:
             "hi": [[float(x) for x in p] for p in archive.hi],
             "samples": [[[float(x) for x in w] for w in s]
                         for s in archive.samples],
+            # The MEMBER PLANS of every point. A resumed run without these
+            # would keep the band and forget which plans earned it.
+            "members": [[{"key": str(m["key"]), "seq": m["seq"],
+                          "windows": int(m["windows"]), "n": int(m["n"]),
+                          "first_episode": int(m["first_episode"]),
+                          "last_episode": int(m["last_episode"])}
+                         for m in ms] for ms in archive.members],
             "counts": [int(c) for c in archive.counts],
             "seqs": list(archive.seqs),
             "eps": [int(e) for e in archive.eps],
@@ -452,6 +459,11 @@ def pareto_archive_from_json(archive, d: dict) -> None:
         archive.hi = [np.asarray(p, dtype=np.float64) for p in d["hi"]]
         archive.samples = [[np.asarray(w, dtype=np.float64) for w in s]
                            for s in d["samples"]]
+        archive.members = [[{"key": str(m["key"]), "seq": m["seq"],
+                             "windows": int(m["windows"]), "n": int(m["n"]),
+                             "first_episode": int(m["first_episode"]),
+                             "last_episode": int(m["last_episode"])}
+                            for m in ms] for ms in d["members"]]
         archive.counts = [int(c) for c in d["counts"]]
         archive.seqs = list(d["seqs"])
         archive.eps = [int(e) for e in d["eps"]]

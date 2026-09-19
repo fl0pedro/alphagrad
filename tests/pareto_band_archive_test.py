@@ -197,6 +197,95 @@ def test_dump_front_writes_the_bands(tmp_path):
     assert row["windows"]["latency"] == 20
 
 
+# ---- the member plans of a point ---------------------------------------
+
+def test_a_merge_keeps_both_plans_as_members():
+    a = _arch()
+    a.add(_d(FLAT), ["A"], 0)
+    a.add(_d(FLAT * 0.5), ["B"], 3)
+    assert a.counts == [2]
+    assert [m["seq"] for m in a.members[0]] == [["A"], ["B"]]
+    assert [m["windows"] for m in a.members[0]] == [20, 20]
+    assert [m["first_episode"] for m in a.members[0]] == [0, 3]
+
+
+def test_the_representative_is_the_member_with_most_windows():
+    a = _arch()
+    a.add(_d(FLAT), ["A"], 0)
+    a.add(_d(FLAT * 0.5), ["B"], 1)
+    # a tie goes to the earlier member, so A still represents the point
+    assert a.seqs[0] == ["A"]
+    a.add(_d(FLAT * 0.5), ["B"], 2)
+    # B now carries 40 of the 60 pooled windows and takes over
+    assert a.seqs[0] == ["B"]
+    b = [m for m in a.members[0] if m["seq"] == ["B"]][0]
+    assert b["windows"] == 40 and b["n"] == 2 and b["last_episode"] == 2
+
+
+def test_a_member_carries_the_face_actions_not_only_the_order():
+    a = _arch()
+    plan = {"seq": [[1, ["diag(0)"]], [2, []]],
+            "faces": [{"k": 0, "f": [1], "rows": [[[3, 0]]], "skips": [0]}]}
+    a.add(_d(FLAT), plan, 0)
+    a.add(_d(FLAT * 0.5), ["other"], 1)
+    assert a.members[0][0]["seq"] == plan
+    assert a.members[0][0]["seq"]["faces"][0]["rows"] == [[[3, 0]]]
+    assert a.front()[0]["members"][0]["seq"] == plan
+
+
+def test_members_ride_the_front_and_the_dump(tmp_path):
+    a = _arch()
+    a.add(_d(FLAT), ["A"], 0)
+    a.add(_d(FLAT * 0.5), ["B"], 1)
+    row = a.front()[0]
+    assert row["num_members"] == 2
+    assert [m["seq"] for m in row["members"]] == [["A"], ["B"]]
+    p = tmp_path / "f.json"
+    a.dump_front(str(p))
+    doc = json.loads(p.read_text())
+    assert doc["front"][0]["num_members"] == 2
+    assert doc["front"][0]["members"][1]["seq"] == ["B"]
+
+
+def test_the_member_list_is_bounded_by_the_window_budget():
+    a = _arch(pool_cap=30)
+    a.add(_d(FLAT), ["A"], 0)          # 20 windows pooled
+    a.add(_d(FLAT * 0.5), ["B"], 1)    # 10 more, the pool is now full
+    assert a.samples[0][0].size == 30
+    assert [m["windows"] for m in a.members[0]] == [20, 10]
+    a.add(_d(FLAT * 0.5), ["C"], 2)    # contributes nothing, not a member
+    assert [m["seq"] for m in a.members[0]] == [["A"], ["B"]]
+    assert a.counts == [3]
+    a.add(_d(FLAT * 0.5), ["B"], 3)    # already a member, still counted
+    assert [m["n"] for m in a.members[0]] == [1, 2]
+
+
+def test_members_survive_the_checkpoint_round_trip():
+    from alphagrad.approx.common import checkpoint as ckpt
+    a = _arch()
+    a.add(_d(FLAT), [[1, ["diag(0)"]]], 0)
+    a.add(_d(FLAT * 0.5), [[2, []]], 1)
+    a.add(_d(FLAT * 0.5), [[2, []]], 2)
+    doc = json.loads(json.dumps(ckpt.pareto_archive_to_json(a)))
+    b = _arch()
+    ckpt.pareto_archive_from_json(b, doc)
+    assert b.counts == a.counts
+    assert [m["seq"] for m in b.members[0]] == [[[1, ["diag(0)"]]], [[2, []]]]
+    assert [m["windows"] for m in b.members[0]] == [20, 40]
+    assert b.seqs == a.seqs == [[[2, []]]]
+    # a restored archive keeps merging into the members it was given
+    b.add(_d(FLAT * 0.5), [[2, []]], 3)
+    assert [m["n"] for m in b.members[0]] == [1, 3]
+
+
+def test_a_dropped_point_takes_its_members_with_it():
+    a = _arch(cap=1)
+    a.add(_d(FLAT), ["A"], 0)
+    a.add(_d(FLAT - 9.0), ["B"], 1)
+    assert len(a.members) == 1
+    assert [m["seq"] for m in a.members[0]] == [["B"]]
+
+
 # ---- the env side -------------------------------------------------------
 
 def test_the_pair_partner_is_the_reference_median():

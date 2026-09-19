@@ -335,6 +335,14 @@ class RatioBandArchive:
         self.hi: list[np.ndarray] = []
         self.samples: list[list] = []         # pooled windows, per objective
         self.counts: list[int] = []           # measurements pooled into a point
+        # THE MEMBER PLANS of each point (owner ruling 2026-09-19). A point is
+        # a band, and several plans can measure inside it; before this the
+        # merged plans were anonymous and the point kept the plan that founded
+        # it. A member is the FULL plan -- order and per-face approximation
+        # actions, the shape `_decode_arch` hands in -- with the windows it
+        # contributed and the episodes it was seen in. `seqs` is derived: it
+        # is the REPRESENTATIVE, the member with the most pooled windows.
+        self.members: list[list] = []
         self.seqs: list = []
         self.eps: list[int] = []
         self.all_candidates: list[dict] = []
@@ -342,6 +350,38 @@ class RatioBandArchive:
         self._hv_ref: np.ndarray | None = None
         self.n_merged = 0
         self.n_dropped_cap = 0
+
+    def _record_member(self, i: int, seq, contributed: int, episode: int):
+        """Credit ``seq`` with the windows it just put into point ``i``.
+
+        A plan becomes a member only when its windows actually entered the
+        pool, so the member list is bounded by the same ``pool_cap`` budget
+        the sample is. Once the pool is full a plan already on the list still
+        has its measurement counted, and a new plan is not recorded.
+        """
+        key = repr(seq)
+        for m in self.members[i]:
+            if m["key"] == key:
+                m["windows"] += int(contributed)
+                m["n"] += 1
+                m["last_episode"] = int(episode)
+                self._set_representative(i)
+                return
+        if int(contributed) > 0:
+            self.members[i].append({
+                "key": key, "seq": seq, "windows": int(contributed), "n": 1,
+                "first_episode": int(episode), "last_episode": int(episode)})
+            self._set_representative(i)
+
+    def _set_representative(self, i: int) -> None:
+        ms = self.members[i]
+        best = 0
+        for j in range(1, len(ms)):
+            if (ms[j]["windows"] > ms[best]["windows"]
+                    or (ms[j]["windows"] == ms[best]["windows"]
+                        and ms[j]["first_episode"] < ms[best]["first_episode"])):
+                best = j
+        self.seqs[i] = ms[best]["seq"]
 
     def _windows(self, dist) -> list:
         out = []
@@ -391,12 +431,17 @@ class RatioBandArchive:
             if not better.any() and not worse.any():
                 # Inside the band everywhere: POOL the windows into the point
                 # and re-fit, so a point that is measured again knows more.
+                _before = int(self.samples[i][0].size)
                 self.samples[i] = [
                     np.concatenate([self.samples[i][k], w[k]])[:self.pool_cap]
                     for k in range(len(self.obj_names))]
                 self.pts[i], self.lo[i], self.hi[i] = self._fit(self.samples[i])
                 self.counts[i] += 1
                 self.n_merged += 1
+                # The plan that landed here is a MEMBER of this point, not an
+                # anonymous count. The objective-0 pool is the budget.
+                self._record_member(
+                    i, seq, int(self.samples[i][0].size) - _before, episode)
                 return False
             if worse.any() and not better.any():
                 return False
@@ -410,13 +455,17 @@ class RatioBandArchive:
         self.samples = [self.samples[i] for i in keep] + [
             [x[:self.pool_cap] for x in w]]
         self.counts = [self.counts[i] for i in keep] + [1]
+        self.members = [self.members[i] for i in keep] + [[{
+            "key": repr(seq), "seq": seq,
+            "windows": int(min(w[0].size, self.pool_cap)), "n": 1,
+            "first_episode": int(episode), "last_episode": int(episode)}]]
         self.seqs = [self.seqs[i] for i in keep] + [seq]
         self.eps = [self.eps[i] for i in keep] + [int(episode)]
         while len(self.pts) > self.cap:
             widths = [self.band_width(i) for i in range(len(self.pts))]
             drop = int(np.argmax(np.asarray(widths)))
             for lst in (self.pts, self.lo, self.hi, self.samples,
-                        self.counts, self.seqs, self.eps):
+                        self.counts, self.members, self.seqs, self.eps):
                 del lst[drop]
             self.n_dropped_cap += 1
         key = repr(seq)
@@ -458,7 +507,18 @@ class RatioBandArchive:
                 "windows": {nm: int(self.samples[i][k].size)
                             for k, nm in enumerate(self.obj_names)},
                 "episode": int(self.eps[i]),
+                # The REPRESENTATIVE, then every plan that measured inside
+                # this band, best supported first.
                 "seq": self.seqs[i],
+                "num_members": len(self.members[i]),
+                "members": [
+                    {"seq": m["seq"], "windows": int(m["windows"]),
+                     "n": int(m["n"]),
+                     "first_episode": int(m["first_episode"]),
+                     "last_episode": int(m["last_episode"])}
+                    for m in sorted(self.members[i],
+                                    key=lambda m: (-m["windows"],
+                                                   m["first_episode"]))],
             })
         return out
 

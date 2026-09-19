@@ -7201,11 +7201,26 @@ def _dump_pareto(archive, args, ep, *, final=False):
         # archive's minimisation convention, so rank by objective 0.
         _pts = [list(map(float, p)) for p in archive.pts]
         _order = sorted(range(len(_pts)), key=lambda i: _pts[i][0])
+        # A band point can have several MEMBER PLANS. `seq` is the
+        # representative (most pooled windows); `members` is every plan that
+        # measured inside the band, so a replay can try the others.
+        _mem = getattr(archive, "members", None)
+
+        def _members_of(i):
+            if not _mem:
+                return None
+            return [{"seq": m["seq"], "windows": int(m["windows"]),
+                     "n": int(m["n"])}
+                    for m in sorted(_mem[i], key=lambda m: (-m["windows"],
+                                                            m["first_episode"]))]
+
         _doc = {
             "best_overall": {"seq": archive.seqs[_order[0]],
-                             "obj": _pts[_order[0]]},
+                             "obj": _pts[_order[0]],
+                             "members": _members_of(_order[0])},
             "best_per_channel": {
-                f"rank{r}": {"seq": archive.seqs[i], "obj": _pts[i]}
+                f"rank{r}": {"seq": archive.seqs[i], "obj": _pts[i],
+                             "members": _members_of(i)}
                 for r, i in enumerate(_order)
             },
             "_provenance": {"source": "ParetoArchive.dump", "episode": int(ep),
@@ -14883,6 +14898,8 @@ def main():
                     log_dict["pareto/band_width_max"] = float(max(_bw))
                     log_dict["pareto/pooled_windows_max"] = int(max(
                         s[0].size for s in pareto_archive.samples))
+                    log_dict["pareto/members_max"] = int(max(
+                        len(m) for m in pareto_archive.members))
             else:
                 _AS_ADMITTED = int(pareto_archive.add_many(
                     ((all_rets[i], _decode_arch(i)) for i in elig_idx), ep
