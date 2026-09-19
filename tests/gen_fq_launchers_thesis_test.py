@@ -114,7 +114,8 @@ def matrix(gen):
     """
     arms = [a for a in gen.thesis_arms()
             if not a.get("smoke") and not a.get("orderonly")
-            and not a.get("orderonly_rsnn")]
+            and not a.get("orderonly_rsnn")
+            and not a.get("orderonly_final")]
     assert arms, "the generator emits no thesis arm"
     return arms
 
@@ -504,10 +505,17 @@ def test_a_thesis_arm_with_an_unlisted_env_key_is_refused_at_render(gen):
 # ----------------------------------------------- 4. the singleton scheduling
 
 def test_every_thesis_job_is_a_per_node_singleton(gen, matrix, smoke):
+    """THE NAME IS `node-<node>` (ticket dsnn-dfw.65).  Singleton serializes
+    only jobs that SHARE a name and several agents submit to these nodes, so
+    the matrix's old `thesis-<node>` serialized the matrix against itself and
+    let an order-only row hold the same node -- the epilog then kills both."""
     for a in matrix + smoke:
         text = gen.render(a)
-        assert a["job"] == f"thesis-{a['node']}", a["name"]
-        assert f"#SBATCH -J thesis-{a['node']}\n" in text, a["name"]
+        assert a["job"] == f"node-{a['node']}", a["name"]
+        assert f"#SBATCH -J node-{a['node']}\n" in text, a["name"]
+        assert f"#SBATCH -J thesis-{a['node']}\n" not in text, a["name"]
+        assert gen.thesis_job_name(a["node"]) \
+            == gen.orderonly_job_name(a["node"]), a["name"]
         assert "#SBATCH --dependency=singleton\n" in text, a["name"]
         assert f"#SBATCH -w {a['node']}\n" in text, a["name"]
         # the RUN's identity is --name and the log file, never -J
@@ -517,7 +525,7 @@ def test_every_thesis_job_is_a_per_node_singleton(gen, matrix, smoke):
     for a in matrix + smoke:
         by_node.setdefault(a["node"], set()).add(a["job"])
     for node, jobs in by_node.items():
-        assert jobs == {f"thesis-{node}"}, (node, jobs)
+        assert jobs == {f"node-{node}"}, (node, jobs)
     # and no campaign or wave arm gained a singleton dependency
     for a in gen.ARMS:
         if a.get("thesis"):
@@ -907,7 +915,7 @@ def test_the_recurrent_scheduling_matches_the_rest_of_the_matrix(gen, snn):
         assert a["node"] in gen.THESIS_NODES, a["name"]
         gpus = gen.THESIS_NODE_GPUS[a["node"]]
         assert a["gpus"] == gpus, a["name"]
-        assert a["job"] == f"thesis-{a['node']}", a["name"]
+        assert a["job"] == f"node-{a['node']}", a["name"]
         cli = _cli(gen, a)
         assert cli["--ray-measure"] == gen.THESIS_RAY_MEASURE[gpus], a["name"]
         assert cli["--ray-measure"] == str(gpus - 1), a["name"]

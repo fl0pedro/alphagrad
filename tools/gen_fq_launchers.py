@@ -2393,7 +2393,7 @@ def node_partition(node: str) -> str:
 
 
 def thesis_job_name(node: str) -> str:
-    """THE PER-NODE SINGLETON NAME (owner ruling 2026-09-16).
+    """THE CROSS-AGENT PER-NODE SINGLETON NAME (ticket dsnn-dfw.65).
 
     Every thesis job carries `--dependency=singleton` and a job NAME that is
     the node it is pinned to, so Slurm runs exactly one of our jobs on that
@@ -2404,12 +2404,20 @@ def thesis_job_name(node: str) -> str:
     (memory note `pgi15-epilog-kills-sibling-jobs`; seven of eight sweep64
     shards died that way on 2026-09-13).  A singleton queue cannot produce
     that state, and it needs no babysitting.
+
+    THE NAME IS `node-<node>`, NOT `thesis-<node>` (owner 2026-09-19, ticket
+    dsnn-dfw.65).  Singleton serializes only jobs that SHARE a name, and
+    several agents submit to these nodes: a name only the matrix uses
+    serializes the matrix against itself and nothing else, so a matrix row
+    and an order-only row could hold one node together and the epilog would
+    kill both.  `node-<node>` is the one name every job of ours carries, so
+    `thesis_job_name` and `orderonly_job_name` now return the same string.
     """
     if node not in THESIS_NODE_GPUS and node not in NODE_GPUS:
         raise CampaignRowError(
             f"node {node!r} is not a GPU node this generator knows "
             f"({sorted(set(THESIS_NODE_GPUS) | set(NODE_GPUS))})")
-    return f"thesis-{node}"
+    return f"node-{node}"
 
 
 # ---------------------------------------------------------------------------
@@ -2833,7 +2841,8 @@ def thesis_block1_arms() -> list[dict]:
     # matrix the owner authorised on 2026-09-16 and nothing else.
     return [a for a in thesis_arms()
             if not a.get("held") and not a.get("smoke")
-            and not a.get("orderonly") and not a.get("orderonly_rsnn")]
+            and not a.get("orderonly") and not a.get("orderonly_rsnn")
+            and not a.get("orderonly_final")]
 
 
 def thesis_snn_arms() -> list[dict]:
@@ -2851,10 +2860,10 @@ def thesis_snn_arms() -> list[dict]:
 
 def thesis_core_arms() -> list[dict]:
     """The 50 NN256/TLM rows: the matrix without the recurrent target, the
-    smoke and the order-only tuning rows."""
+    smoke, the order-only tuning rows and the order-only baseline."""
     return [a for a in thesis_arms()
             if not a.get("smoke") and not a.get("thesis_rule")
-            and not a.get("orderonly")]
+            and not a.get("orderonly") and not a.get("orderonly_final")]
 
 
 # Target-pinned nodes (owner ruling 2026-09-17: "max 4* 2 tlm 2 nn256"):
@@ -3187,12 +3196,13 @@ def orderonly_job_name(node: str) -> str:
     """THE CROSS-AGENT SINGLETON NAME (orchestrator ruling 2026-09-18).
 
     Slurm's `--dependency=singleton` serializes jobs of one user that share a
-    NAME, and `thesis-<node>` is the thesis matrix's name.  Three agents now
-    submit to pgi15-gpu14, so a name that only one of them uses serializes
-    nothing: two jobs of this user would land on the node together and the
-    node epilog would kill both (memory note pgi15-epilog-kills-sibling-jobs).
-    `node-<node>` is the name EVERY agent uses, so one job of ours runs on a
-    node at a time whoever submitted it.
+    NAME.  Three agents now submit to pgi15-gpu14, so a name that only one of
+    them uses serializes nothing: two jobs of this user would land on the node
+    together and the node epilog would kill both (memory note
+    pgi15-epilog-kills-sibling-jobs).  `node-<node>` is the name EVERY agent
+    uses, so one job of ours runs on a node at a time whoever submitted it.
+    STE: `thesis_job_name` returns this same string since ticket dsnn-dfw.65;
+    the matrix's old `thesis-<node>` served the matrix against itself alone.
     """
     if node not in THESIS_NODE_GPUS and node not in NODE_GPUS:
         raise CampaignRowError(
@@ -3295,6 +3305,133 @@ del _seed, _lc, _lm
 
 def orderonly_arms() -> list[dict]:
     return [a for a in ARMS if a.get("orderonly")]
+
+
+# ---------------------------------------------------------------------------
+# THE 5-SEED ORDER-ONLY BASELINE ON NN256 (owner ruling 2026-09-19, the epic's
+# block plan).  THE FINAL row of the order-only arm; the round above is its
+# tuning.  The same arm -- --approx-profile none with --fixed-order free, the
+# C form, the weight pair (2, 0) -- at FIVE seeds instead of three, on the
+# Blackwell nodes, and WITHOUT --auto-stop, because a final row runs its full
+# thousand episodes (THESIS_FINAL_AUTO_STOP).
+#
+# THE WEIGHT IS (2, 0), THE LATENCY-ONLY SCALARIZATION.  Round 1 has not
+# reported, and the baseline the epic asks for is the latency arm: (2, 0)
+# weights the paired-log latency alone, which is the quantity this arm exists
+# to move.  When round 1 names a different pair the owner moves
+# ORDERONLY_FINAL_WEIGHTS and regenerates.
+#
+# THE NODE IS THE SEED, one Blackwell node each, in seed order.  A seed's
+# numbers may never straddle two GPU models (AGENTS.md), and five seeds on
+# five nodes is one node per seed exactly.  pgi15-gpu19 stays out: it is the
+# campaign's node.  gres, CPUs and memory come from the generator's own
+# Blackwell tables, and pgi15-gpu20 carries eight GPUs, so its row measures
+# with seven Ray actors while the four 4-GPU rows measure with three.
+# ---------------------------------------------------------------------------
+ORDERONLY_FINAL_SEEDS = THESIS_SEEDS
+#: (--lambda-cmp, --lambda-mem) of the baseline: one of the five ruled pairs.
+ORDERONLY_FINAL_WEIGHTS = ("2", "0")
+ORDERONLY_FINAL_NODES = ("pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu17",
+                         "pgi15-gpu18", "pgi15-gpu20")
+
+_ORDERONLY_FINAL_HEAD = f"""THE 5-SEED ORDER-ONLY BASELINE ON NN256 (epic
+dsnn-dfw, owner ruling 2026-09-19).  A FINAL row, not a tuning row: the
+order-only arm of ticket dsnn-dfw.29 -- --approx-profile {ORDERONLY_PROFILE}
+with --fixed-order {THESIS_ORDER}, the C form, so the policy chooses THE
+ELIMINATION ORDER and nothing else -- at the weight pair
+(--lambda-cmp {ORDERONLY_FINAL_WEIGHTS[0]},
+--lambda-mem {ORDERONLY_FINAL_WEIGHTS[1]}), the latency-only scalarization,
+across all five matrix seeds.
+
+--episodes {THESIS_EPISODES} WITHOUT --auto-stop, --checkpoint-every
+{THESIS_CHECKPOINT_EVERY}, --pareto-dump-every {THESIS_PARETO_DUMP_EVERY},
+--plan-log {THESIS_PLAN_LOG}, the four block settings of 2026-09-19
+(--paired-cost-floor {THESIS_PAIRED_COST_FLOOR}, --mem-channel
+{THESIS_MEM_CHANNEL}, --lag-max {THESIS_DUAL_LAMBDA_MAX}), wandb online.
+
+ONE SEED PER BLACKWELL NODE, in seed order, with the cross-agent per-node
+singleton name: latency and memory are not comparable across GPU models, so
+a seed is measured on one node and the seed spread carries the model
+variation.  The three-seed round on the mixed nodes is the TUNING this row is
+the baseline for; it is not this row, and the two are not pooled."""
+
+_ORDERONLY_FINAL_PREDICTION = """REGISTERED BEFORE THE RUN, NEVER EDITED
+AFTER: the five seeds agree -- the median terminal paired latency ratio of
+the five is below 1.0 and the seed-to-seed spread of that median is smaller
+than the gap between the (2, 0) and (0, 2) weights of the tuning round.  The
+memory channel, weighted 0 here, is reported and not optimised."""
+
+_ORDERONLY_FINAL_FALSIFIER = """If the five seeds disagree -- any two seeds'
+terminal latency ratios not overlapping within their own per-seed spread --
+the order-only arm is reported as seed-dependent at this weight, and no
+single baseline number is quoted for it."""
+
+
+def orderonly_final_run_name(seed: str) -> str:
+    """`orderonly_nn256_final_l<X>m<Y>_s<seed>` (owner ruling 2026-09-19)."""
+    if seed not in ORDERONLY_FINAL_SEEDS:
+        raise CampaignRowError(
+            f"seed {seed!r} is not one of {ORDERONLY_FINAL_SEEDS}")
+    lam_cmp, lam_mem = ORDERONLY_FINAL_WEIGHTS
+    return f"orderonly_nn256_final_l{lam_cmp}m{lam_mem}_s{seed}"
+
+
+def orderonly_final_node(seed: str) -> str:
+    """THE NODE OF A SEED: one Blackwell node each, in seed order."""
+    if seed not in ORDERONLY_FINAL_SEEDS:
+        raise CampaignRowError(
+            f"seed {seed!r} is not one of {ORDERONLY_FINAL_SEEDS}")
+    return ORDERONLY_FINAL_NODES[ORDERONLY_FINAL_SEEDS.index(seed)]
+
+
+def orderonly_final_arm(*, seed: str) -> dict:
+    """One 5-seed order-only baseline row -> one `arm(...)`.  Returns it."""
+    node = orderonly_final_node(seed)
+    _require(node in THESIS_NODES_ALL,
+             f"node {node!r} is not one of the six Blackwell nodes "
+             f"{THESIS_NODES_ALL}; the baseline is a FINAL row and final rows "
+             f"run on Blackwell only (AGENTS.md)")
+    lam_cmp, lam_mem = ORDERONLY_FINAL_WEIGHTS
+    name = orderonly_final_run_name(seed)
+    cli = thesis_cli(arm=ORDERONLY_ARM, target=ORDERONLY_TARGET, seed=seed,
+                     node=node, name=name, episodes=THESIS_EPISODES,
+                     checkpoint_every=THESIS_CHECKPOINT_EVERY,
+                     auto_stop=THESIS_FINAL_AUTO_STOP)
+    cli["--approx-profile"] = ORDERONLY_PROFILE
+    cli["--lambda-cmp"] = lam_cmp
+    cli["--lambda-mem"] = lam_mem
+    gpus = node_gpu_count(node)
+    a = dict(
+        name=name, job=orderonly_job_name(node), kind="train",
+        runtime="scratch",
+        node=node, time=THESIS_TIME, gpus=gpus, singleton=True, thesis=True,
+        orderonly_final=True, thesis_arm=ORDERONLY_ARM,
+        thesis_target=ORDERONLY_TARGET, thesis_seed=seed,
+        orderonly_weights=(lam_cmp, lam_mem),
+        env=dict(THESIS_TARGET_ENV[ORDERONLY_TARGET]),
+        required_flags=ORDERONLY_REQUIRED_FLAGS,
+        required_flags_file=" ".join(THESIS_FLAGS_FILES),
+        cli=cli,
+        purpose=_ORDERONLY_FINAL_HEAD + f"\n\nSEED {seed} ON {node}.",
+        prediction=_ORDERONLY_FINAL_PREDICTION,
+        falsifier=_ORDERONLY_FINAL_FALSIFIER,
+    )
+    if node in NODE_CUDA_BIN:
+        a["cuda_bin"] = NODE_CUDA_BIN[node]
+    arm_(**a)
+    return a
+
+
+#: The five runs of the baseline: one weight pair, five seeds, five nodes.
+ORDERONLY_FINAL_RUNS = len(ORDERONLY_FINAL_SEEDS)
+
+for _seed in ORDERONLY_FINAL_SEEDS:
+    orderonly_final_arm(seed=_seed)
+del _seed
+
+
+def orderonly_final_arms() -> list[dict]:
+    return [a for a in ARMS if a.get("orderonly_final")]
 
 
 # ---------------------------------------------------------------------------
