@@ -141,7 +141,9 @@ def test_every_row_is_the_c_form(gen, rows):
         assert cli["--quality-floor"] == TAU, a["name"]
         assert cli["--lag-eta"] == gen.DUAL_ETA, a["name"]
         assert cli["--lag-min"] == gen.DUAL_LAMBDA_MIN, a["name"]
-        assert cli["--lag-max"] == gen.DUAL_LAMBDA_MAX, a["name"]
+        # THE CAP IS 64 ON A THESIS ROW (owner 2026-09-19), not the
+        # campaign's 32; --lag-init and --lag-min do not move with it.
+        assert cli["--lag-max"] == gen.THESIS_DUAL_LAMBDA_MAX == "64", a["name"]
         assert cli["--lag-init"] == gen.THESIS_LAMBDA_Q, a["name"]
         assert cli["--face-none-bias"] == "2", a["name"]
         assert cli["--advantage-norm"] == "none", a["name"]
@@ -182,13 +184,17 @@ def test_the_run_shape_is_the_matrix_row(gen, rows):
         cli = _cli(gen, a)
         assert cli["--episodes"] == EPISODES, a["name"]
         assert cli["--checkpoint-every"] == CHECKPOINT_EVERY, a["name"]
+        # A TUNING ROW KEEPS --auto-stop (owner 2026-09-19); only the FINAL
+        # rows drop it.
         assert "--auto-stop" in cli and cli["--auto-stop"] is None, a["name"]
         assert cli["--pareto-dump-every"] == PARETO_DUMP_EVERY, a["name"]
         assert cli["--plan-log"] == "auto", a["name"]
         assert cli["--seed"] == a["thesis_seed"], a["name"]
         assert cli["--cost-form"] == "paired-log", a["name"]
-        assert cli["--mem-channel"] == "temp", a["name"]
-        assert cli["--paired-cost-floor"] == "reference", a["name"]
+        assert cli["--mem-channel"] == gen.THESIS_MEM_CHANNEL == "watermark", \
+            a["name"]
+        assert cli["--paired-cost-floor"] == gen.THESIS_PAIRED_COST_FLOOR \
+            == "byte", a["name"]
         assert cli["--rewards"] == "cmp mem acc", a["name"]
         assert cli["--discount"] == "1.0" and cli["--gae-lambda"] == "1.0"
         assert "--terminal-rewards-only" in cli, a["name"]
@@ -277,11 +283,12 @@ def test_every_order_only_job_is_a_cross_agent_per_node_singleton(gen, rows):
         assert f"#SBATCH -w {a['node']}\n" in text, a["name"]
         assert (f"#SBATCH -o {gen.CAMPAIGN_RUNS}/{a['name']}_%j.log\n"
                 in text), a["name"]
-    # and the matrix keeps its own name, so this change moved no matrix row
+    # SINCE TICKET dsnn-dfw.65 the matrix carries the SAME name: a name only
+    # the matrix used serialized the matrix against itself and let an
+    # order-only row hold the same node.  Every thesis job of ours now shares
+    # one name per node, which is what singleton needs to serialize them.
     for a in gen.thesis_arms():
-        if a.get("orderonly") or a.get("orderonly_rsnn"):
-            continue
-        assert a["job"] == f"thesis-{a['node']}", a["name"]
+        assert a["job"] == f"node-{a['node']}", a["name"]
 
 
 def test_the_hardware_lines_follow_the_node(gen, rows):
@@ -503,15 +510,20 @@ def test_the_matrix_and_the_campaign_still_have_their_own_counts(gen):
     the three smoke runs must still be exactly what the rulings say: the 50
     core rows of 2026-09-15 and the 100 recurrent rows of 2026-09-16."""
     # dsnn-dfw.45 added a second order-only round (the recurrent target,
-    # `orderonly_rsnn`), excluded here exactly as `orderonly` (NN256) is.
+    # `orderonly_rsnn`), excluded here exactly as `orderonly` (NN256) is, and
+    # the 2026-09-19 ruling added the five-seed BASELINE (`orderonly_final`),
+    # excluded the same way: it is a final row of the order-only arm, not a
+    # matrix coordinate.
     matrix = [a for a in gen.thesis_arms()
               if not a.get("smoke") and not a.get("orderonly")
-              and not a.get("orderonly_rsnn")]
+              and not a.get("orderonly_rsnn")
+              and not a.get("orderonly_final")]
     assert len(gen.thesis_core_arms()) == 50
     assert len(gen.thesis_snn_arms()) == 100
     assert len(matrix) == 150
     assert len(gen.thesis_smoke_arms()) == 3
     assert len(gen.orderonly_arms()) == N_RUNS
+    assert len(gen.orderonly_final_arms()) == FINAL_N_RUNS
     assert all(a.get("thesis") for a in gen.orderonly_arms())
     # the matrix rows never carry --approx-profile none
     assert {_cli(gen, a)["--approx-profile"] for a in matrix} == {"all"}
@@ -539,3 +551,137 @@ def test_the_target_node_switch_does_not_move_the_tuning_rows(gen):
         del os.environ["THESIS_TARGET_NODES"]
     for a in mod.orderonly_arms():
         assert a["node"] == NODES[SEEDS.index(a["thesis_seed"])], a["name"]
+
+
+# =========  THE 5-SEED ORDER-ONLY BASELINE ON NN256 (owner 2026-09-19)  =====
+# The FINAL row of this arm: the same order-only arm at the latency-only
+# weight, five seeds, one Blackwell node each, NO --auto-stop, and the four
+# block settings of 2026-09-19.  The owner's numbers are typed here as they
+# are for the tuning round above.
+
+FINAL_SEEDS = ("250197", "250198", "250199", "250200", "250201")
+FINAL_WEIGHTS = ("2", "0")
+FINAL_NODES = ("pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu17", "pgi15-gpu18",
+               "pgi15-gpu20")
+FINAL_N_RUNS = 5
+
+
+@pytest.fixture(scope="module")
+def final_rows(gen):
+    arms = gen.orderonly_final_arms()
+    assert arms, "the generator emits no order-only baseline arm"
+    return arms
+
+
+def test_the_baseline_is_five_rows_named_for_the_weight_and_the_seed(
+        gen, final_rows):
+    assert len(final_rows) == FINAL_N_RUNS == gen.ORDERONLY_FINAL_RUNS
+    assert gen.ORDERONLY_FINAL_SEEDS == FINAL_SEEDS
+    assert gen.ORDERONLY_FINAL_WEIGHTS == FINAL_WEIGHTS
+    lc, lm = FINAL_WEIGHTS
+    want = {f"orderonly_nn256_final_l{lc}m{lm}_s{s}" for s in FINAL_SEEDS}
+    assert {a["name"] for a in final_rows} == want
+    for s in FINAL_SEEDS:
+        assert gen.orderonly_final_run_name(s) in want
+    with pytest.raises(gen.CampaignRowError):
+        gen.orderonly_final_run_name("999999")
+
+
+def test_the_baseline_is_the_order_only_arm_at_the_latency_weight(
+        gen, final_rows):
+    lc, lm = FINAL_WEIGHTS
+    for a in final_rows:
+        cli = _cli(gen, a)
+        assert cli["--approx-profile"] == PROFILE, a["name"]
+        assert cli["--fixed-order"] == ORDER, a["name"]
+        assert cli["--lambda-cmp"] == lc and cli["--lambda-mem"] == lm
+        assert cli["--reward-mode"] == "lagrangian", a["name"]
+        assert cli["--quality-floor"] == TAU, a["name"]
+        assert a["thesis_arm"] == gen.ORDERONLY_ARM == "C", a["name"]
+        assert a["thesis_target"] == "nn256", a["name"]
+        assert a["env"] == {"ALPHAGRAD_NN_HIDDEN": "256"}, a["name"]
+        assert "--preference-conditioned" not in cli, a["name"]
+
+
+def test_the_baseline_is_a_final_row_with_the_four_block_settings(
+        gen, final_rows):
+    """A FINAL row: the full thousand episodes, no --auto-stop, and the four
+    settings of 2026-09-19 exactly as the A/B/C arms carry them."""
+    for a in final_rows:
+        cli = _cli(gen, a)
+        assert cli["--episodes"] == EPISODES, a["name"]
+        assert cli["--checkpoint-every"] == CHECKPOINT_EVERY, a["name"]
+        assert cli["--pareto-dump-every"] == PARETO_DUMP_EVERY, a["name"]
+        assert cli["--plan-log"] == "auto", a["name"]
+        assert "--auto-stop" not in cli, a["name"]
+        assert cli["--paired-cost-floor"] == gen.THESIS_PAIRED_COST_FLOOR \
+            == "byte", a["name"]
+        assert cli["--mem-channel"] == gen.THESIS_MEM_CHANNEL == "watermark", \
+            a["name"]
+        assert cli["--lag-max"] == gen.THESIS_DUAL_LAMBDA_MAX == "64", a["name"]
+        assert cli["--lag-min"] == gen.DUAL_LAMBDA_MIN == "12", a["name"]
+        assert cli["--lag-init"] == gen.THESIS_LAMBDA_Q == "16", a["name"]
+        text = gen.render(a)
+        assert f"--wandb {gen.WANDB_MODE}" in text and gen.WANDB_MODE == "online"
+        assert f"--wandb-project {gen.WANDB_PROJECT}" in text, a["name"]
+
+
+def test_the_baseline_runs_one_seed_per_blackwell_node(gen, final_rows):
+    """Latency and memory are not comparable across GPU models, so a seed is
+    measured on ONE node; five seeds on five Blackwell nodes is one each."""
+    seen = {}
+    for a in final_rows:
+        node = a["node"]
+        assert node == FINAL_NODES[FINAL_SEEDS.index(a["thesis_seed"])]
+        assert node in gen.THESIS_NODES_ALL, a["name"]
+        assert node != "pgi15-gpu19", a["name"]
+        seen.setdefault(node, []).append(a["name"])
+        gpus = gen.THESIS_NODE_GPUS[node]
+        assert a["gpus"] == gpus, a["name"]
+        cli = _cli(gen, a)
+        assert cli["--ray-measure"] == gen.THESIS_RAY_MEASURE[gpus] \
+            == str(gpus - 1), a["name"]
+        text = gen.render(a)
+        assert f"#SBATCH -w {node}\n" in text, a["name"]
+        assert f"#SBATCH -J node-{node}\n" in text, a["name"]
+        assert "#SBATCH --dependency=singleton\n" in text, a["name"]
+        assert a["job"] == gen.orderonly_job_name(node) == f"node-{node}"
+        assert f"#SBATCH --gres={gen.blackwell_gres(gpus)}\n" in text, a["name"]
+    assert sorted(seen) == sorted(FINAL_NODES)
+    assert all(len(v) == 1 for v in seen.values()), seen
+    with pytest.raises(gen.CampaignRowError):
+        gen.orderonly_final_node("999999")
+
+
+def test_the_baseline_is_not_a_matrix_row_and_not_a_tuning_row(
+        gen, final_rows, rows):
+    """It is its own kind: out of the 50 core rows, out of block 1, and out
+    of the three-seed tuning round it is the baseline for."""
+    names = {a["name"] for a in final_rows}
+    assert not (names & {a["name"] for a in rows})
+    assert not any(a.get("orderonly") for a in final_rows)
+    assert not any(a.get("orderonly_rsnn") for a in final_rows)
+    assert not (names & {a["name"] for a in gen.thesis_core_arms()})
+    assert len(gen.thesis_core_arms()) == 50
+    assert not any(a.get("orderonly_final") for a in gen.thesis_block1_arms())
+    assert len(gen.thesis_block1_arms()) == gen.THESIS_BLOCK1 == 34
+    # it IS a thesis arm, so every sweep over thesis arms reaches it
+    assert names <= {a["name"] for a in gen.thesis_arms()}
+
+
+def test_the_target_node_switch_does_not_move_the_baseline(gen):
+    """THESIS_TARGET_NODES=1 pins the MATRIX to target-specific nodes. The
+    baseline's node is its seed, exactly as the tuning round's is, and that
+    switch must not touch it: moving a seed would put two seeds on one GPU
+    model and leave another model unmeasured."""
+    import importlib.util as _ilu
+
+    os.environ["THESIS_TARGET_NODES"] = "1"
+    try:
+        spec = _ilu.spec_from_file_location("gen_fq_launchers_tgt_fin", _GEN)
+        mod = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    finally:
+        del os.environ["THESIS_TARGET_NODES"]
+    for a in mod.orderonly_final_arms():
+        assert a["node"] == FINAL_NODES[FINAL_SEEDS.index(a["thesis_seed"])]

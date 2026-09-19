@@ -182,7 +182,9 @@ def test_every_row_is_the_c_form(gen, rows):
         assert cli["--quality-floor"] == TAU, a["name"]
         assert cli["--lag-eta"] == gen.DUAL_ETA, a["name"]
         assert cli["--lag-min"] == gen.DUAL_LAMBDA_MIN, a["name"]
-        assert cli["--lag-max"] == gen.DUAL_LAMBDA_MAX, a["name"]
+        # THE CAP IS 64 ON A THESIS ROW (owner 2026-09-19), not the
+        # campaign's 32; --lag-init and --lag-min do not move with it.
+        assert cli["--lag-max"] == gen.THESIS_DUAL_LAMBDA_MAX == "64", a["name"]
         assert cli["--lag-init"] == gen.THESIS_LAMBDA_Q, a["name"]
         assert cli["--face-none-bias"] == "2", a["name"]
         assert cli["--advantage-norm"] == "none", a["name"]
@@ -218,12 +220,17 @@ def test_the_run_shape_is_the_matrix_row(gen, rows):
         cli = _cli(gen, a)
         assert cli["--episodes"] == EPISODES, a["name"]
         assert cli["--checkpoint-every"] == CHECKPOINT_EVERY, a["name"]
+        # A TUNING ROW KEEPS --auto-stop (owner 2026-09-19); only the FINAL
+        # rows drop it.
         assert "--auto-stop" in cli and cli["--auto-stop"] is None, a["name"]
         assert cli["--pareto-dump-every"] == PARETO_DUMP_EVERY, a["name"]
         assert cli["--plan-log"] == "auto", a["name"]
         assert cli["--seed"] == a["thesis_seed"], a["name"]
         assert cli["--cost-form"] == "paired-log", a["name"]
-        assert cli["--mem-channel"] == "temp", a["name"]
+        assert cli["--mem-channel"] == gen.THESIS_MEM_CHANNEL == "watermark", \
+            a["name"]
+        assert cli["--paired-cost-floor"] == gen.THESIS_PAIRED_COST_FLOOR \
+            == "byte", a["name"]
         assert cli["--grad-oracle-cadence"] == "50", a["name"]
         text = gen.render(a)
         assert f"--wandb {gen.WANDB_MODE}" in text, a["name"]
@@ -425,9 +432,12 @@ def test_the_nn256_order_only_round_did_not_move(gen):
 
 
 def test_the_matrix_and_the_campaign_still_have_their_own_counts(gen):
+    # `orderonly_final`, the five-seed order-only baseline of 2026-09-19, is
+    # excluded here exactly as the two tuning rounds are.
     matrix = [a for a in gen.thesis_arms()
               if not a.get("smoke") and not a.get("orderonly")
-              and not a.get("orderonly_rsnn")]
+              and not a.get("orderonly_rsnn")
+              and not a.get("orderonly_final")]
     assert len(gen.thesis_core_arms()) == 50
     assert len(gen.thesis_snn_arms()) == 100
     assert len(matrix) == 150

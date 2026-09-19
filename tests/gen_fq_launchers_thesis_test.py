@@ -65,7 +65,13 @@ TAU = "0.90"
 LAMBDA_Q = "16"
 DUAL_ETA = "2.0"
 DUAL_MIN = "12"
-DUAL_MAX = "32"
+#: THE BLOCK SETTINGS (owner rulings 2026-09-19): the cap is 64, the floor is
+#: byte, the memory channel is watermark, and a FINAL row carries no
+#: --auto-stop.  The tuning rows keep --auto-stop; their own test modules pin
+#: that.
+DUAL_MAX = "64"
+PAIRED_COST_FLOOR = "byte"
+MEM_CHANNEL = "watermark"
 ORDER = "free"
 GRAD_ORACLE_CADENCE = "50"
 
@@ -108,7 +114,8 @@ def matrix(gen):
     """
     arms = [a for a in gen.thesis_arms()
             if not a.get("smoke") and not a.get("orderonly")
-            and not a.get("orderonly_rsnn")]
+            and not a.get("orderonly_rsnn")
+            and not a.get("orderonly_final")]
     assert arms, "the generator emits no thesis arm"
     return arms
 
@@ -264,7 +271,11 @@ def test_every_arm_carries_the_shared_thesis_flags(gen, matrix):
         assert cli["--grad-oracle-cadence"] == GRAD_ORACLE_CADENCE, a["name"]
         assert cli["--pareto-dump-every"] == PARETO_DUMP_EVERY, a["name"]
         assert cli["--plan-log"] == "auto", a["name"]
-        assert "--auto-stop" in cli and cli["--auto-stop"] is None, a["name"]
+        # A FINAL ROW RUNS ITS FULL THOUSAND EPISODES (owner 2026-09-19):
+        # --auto-stop is absent, and the absence is asserted rather than
+        # trusted.
+        assert "--auto-stop" not in cli, a["name"]
+        assert gen.THESIS_FINAL_AUTO_STOP is False
         assert cli["--seed"] == a["thesis_seed"], a["name"]
         # the search space: the order is FREE in every arm
         assert cli["--fixed-order"] == ORDER, a["name"]
@@ -272,9 +283,11 @@ def test_every_arm_carries_the_shared_thesis_flags(gen, matrix):
         assert cli["--approx-add"] == gen.APPROX_ADD == "lossless", a["name"]
         # the reward stack the campaign settled
         assert cli["--cost-form"] == "paired-log", a["name"]
-        assert cli["--mem-channel"] == "temp", a["name"]
+        assert cli["--mem-channel"] == MEM_CHANNEL, a["name"]
+        assert gen.THESIS_MEM_CHANNEL == MEM_CHANNEL
         assert cli["--quality-metric"] == "grad_cosine", a["name"]
-        assert cli["--paired-cost-floor"] == "reference", a["name"]
+        assert cli["--paired-cost-floor"] == PAIRED_COST_FLOOR, a["name"]
+        assert gen.THESIS_PAIRED_COST_FLOOR == PAIRED_COST_FLOOR
         assert cli["--rewards"] == "cmp mem acc", a["name"]
         assert cli["--lambda-cmp"] == "1" and cli["--lambda-mem"] == "1"
         assert cli["--discount"] == "1.0" and cli["--gae-lambda"] == "1.0"
@@ -366,7 +379,11 @@ def test_the_three_c_arms_are_the_lagrangian_dual(gen, matrix):
         assert cli["--quality-floor"] == TAU, a["name"]
         assert cli["--lag-eta"] == DUAL_ETA, a["name"]
         assert cli["--lag-min"] == DUAL_MIN, a["name"]
+        # THE CAP IS 64 (owner 2026-09-19) so the multiplier can dominate the
+        # skip-all plan; --lag-init and --lag-min do not move with it.
         assert cli["--lag-max"] == DUAL_MAX, a["name"]
+        assert gen.THESIS_DUAL_LAMBDA_MAX == DUAL_MAX
+        assert gen.DUAL_LAMBDA_MIN == DUAL_MIN
         assert cli["--lag-init"] == LAMBDA_Q, a["name"]
         assert cli["--face-none-bias"] == "2", a["name"]
 
@@ -488,10 +505,17 @@ def test_a_thesis_arm_with_an_unlisted_env_key_is_refused_at_render(gen):
 # ----------------------------------------------- 4. the singleton scheduling
 
 def test_every_thesis_job_is_a_per_node_singleton(gen, matrix, smoke):
+    """THE NAME IS `node-<node>` (ticket dsnn-dfw.65).  Singleton serializes
+    only jobs that SHARE a name and several agents submit to these nodes, so
+    the matrix's old `thesis-<node>` serialized the matrix against itself and
+    let an order-only row hold the same node -- the epilog then kills both."""
     for a in matrix + smoke:
         text = gen.render(a)
-        assert a["job"] == f"thesis-{a['node']}", a["name"]
-        assert f"#SBATCH -J thesis-{a['node']}\n" in text, a["name"]
+        assert a["job"] == f"node-{a['node']}", a["name"]
+        assert f"#SBATCH -J node-{a['node']}\n" in text, a["name"]
+        assert f"#SBATCH -J thesis-{a['node']}\n" not in text, a["name"]
+        assert gen.thesis_job_name(a["node"]) \
+            == gen.orderonly_job_name(a["node"]), a["name"]
         assert "#SBATCH --dependency=singleton\n" in text, a["name"]
         assert f"#SBATCH -w {a['node']}\n" in text, a["name"]
         # the RUN's identity is --name and the log file, never -J
@@ -501,7 +525,7 @@ def test_every_thesis_job_is_a_per_node_singleton(gen, matrix, smoke):
     for a in matrix + smoke:
         by_node.setdefault(a["node"], set()).add(a["job"])
     for node, jobs in by_node.items():
-        assert jobs == {f"thesis-{node}"}, (node, jobs)
+        assert jobs == {f"node-{node}"}, (node, jobs)
     # and no campaign or wave arm gained a singleton dependency
     for a in gen.ARMS:
         if a.get("thesis"):
@@ -753,8 +777,12 @@ def test_target_nodes_routing(monkeypatch):
     spec = importlib.util.spec_from_file_location("gen_fq_launchers_tgt", _GEN)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    # The order-only tuning rows and the order-only BASELINE (the five
+    # Blackwell rows of 2026-09-19) pin their own node by seed; the target
+    # switch pins the MATRIX and must not reach either of them.
     matrix = [a for a in mod.thesis_arms()
-              if not a.get("smoke") and not a.get("orderonly")]
+              if not a.get("smoke") and not a.get("orderonly")
+              and not a.get("orderonly_final")]
     for a in matrix:
         if a["thesis_target"] == "tlm":
             assert a["node"] in ("pgi15-gpu19", "pgi15-gpu16"), a["name"]
@@ -891,7 +919,7 @@ def test_the_recurrent_scheduling_matches_the_rest_of_the_matrix(gen, snn):
         assert a["node"] in gen.THESIS_NODES, a["name"]
         gpus = gen.THESIS_NODE_GPUS[a["node"]]
         assert a["gpus"] == gpus, a["name"]
-        assert a["job"] == f"thesis-{a['node']}", a["name"]
+        assert a["job"] == f"node-{a['node']}", a["name"]
         cli = _cli(gen, a)
         assert cli["--ray-measure"] == gen.THESIS_RAY_MEASURE[gpus], a["name"]
         assert cli["--ray-measure"] == str(gpus - 1), a["name"]
