@@ -896,12 +896,17 @@ def test_the_recurrent_scheduling_matches_the_rest_of_the_matrix(gen, snn):
         text = gen.render(a)
         assert "#SBATCH --dependency=singleton\n" in text, a["name"]
         assert f"#SBATCH -w {a['node']}\n" in text, a["name"]
-    # 100 rows round-robin over the four released nodes is 25 each
+    # 100 rows round-robin over the released nodes: every node carries its
+    # share and no node carries two more than another. The node count is
+    # THESIS_NODES', which grew from four to six when gpu17 and gpu19 were
+    # released, so the share is derived and not typed.
     counts = {}
     for a in snn:
         counts[a["node"]] = counts.get(a["node"], 0) + 1
     assert set(counts) == set(gen.THESIS_NODES)
-    assert set(counts.values()) == {25}, counts
+    _n = len(gen.THESIS_NODES)
+    assert sum(counts.values()) == 100
+    assert set(counts.values()) <= {100 // _n, -(-100 // _n)}, counts
 
 
 def test_every_recurrent_row_is_generated_and_held_never_submitted(gen, snn):
