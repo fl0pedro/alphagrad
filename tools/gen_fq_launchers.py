@@ -2244,23 +2244,47 @@ THESIS_MEM_CHANNEL = "watermark"
 THESIS_FINAL_AUTO_STOP = False
 
 # ---------------------------------------------------------------------------
-# THE HARDWARE.  Four Blackwell nodes we may use (dsnn-dfw.69): pgi15-gpu17
-# has no matched CUDA 12.9 ptxas or nvlink (job 66740 aborted 72) and
-# pgi15-gpu19 belongs to another group.  Neither is ever a node source in
-# this table, the default assignment every thesis row below uses.  pgi15-gpu20 carries eight
-# GPUs; the other three carry four, so the measurement fan-out is per node:
-# one GPU for the trainer and every other GPU a measure actor.
+# THE HARDWARE.  Five Blackwell nodes we may use (dsnn-dfw.69, owner ruling
+# 2026-09-20).  pgi15-gpu17 has no matched CUDA 12.9 ptxas or nvlink (job
+# 66740 aborted 72) and is never a node source in this table, the default
+# assignment every thesis row below uses.  pgi15-gpu19 is ours again: it was
+# held for another group on 2026-09-16 and released on 2026-09-20.
+# pgi15-gpu19 and pgi15-gpu20 carry eight GPUs, 128 CPUs and 1.5T; the other
+# three carry four, 64 and 770G.  The measurement fan-out follows the ROW'S
+# PROFILE, not the node (see THESIS_UNIFORM_GPUS): one GPU for the trainer
+# and every other GPU of the profile a measure actor.
 #
 # THESIS_NODES is an alias of THESIS_NODES_ALL: every node this table names
 # is a node we may use, so nothing is held back from it.
 # ---------------------------------------------------------------------------
 THESIS_NODES_ALL = ("pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu18",
-                    "pgi15-gpu20")
+                    "pgi15-gpu19", "pgi15-gpu20")
 THESIS_NODES = THESIS_NODES_ALL
 THESIS_NODE_GPUS = {"pgi15-gpu15": 4, "pgi15-gpu16": 4, "pgi15-gpu17": 4,
                     "pgi15-gpu18": 4, "pgi15-gpu19": 8, "pgi15-gpu20": 8}
 #: --ray-measure by node size: every GPU the trainer does not hold.
 THESIS_RAY_MEASURE = {4: "3", 8: "7"}
+#: THE UNIFORM ROW PROFILE, BY TARGET (owner ruling 2026-09-20).  A target
+#: named here renders the SAME hardware profile on every Blackwell node: the
+#: gres count, -c, --mem, --ray-measure and the core budget come from this
+#: number, not from the node's GPU count.  NN256 is here because its five
+#: seeds are one distribution: a seed that lands on an 8-GPU node used to
+#: render 8 GPUs, 128 CPUs and --ray-measure 7 while its four siblings ran 4,
+#: 64 and 3, and latency measured under two fan-outs is not comparable.  A
+#: target NOT named here (TLM, the recurrent rules) still takes the node.
+THESIS_UNIFORM_GPUS = {"nn256": 4}
+
+
+def thesis_row_gpus(target: str, node: str) -> int:
+    """THE ROW'S GPU PROFILE: uniform by target on Blackwell, else the node.
+
+    The non-Blackwell tuning nodes (pgi15-gpu13, -gpu14, -gpu8) keep the
+    node's own count: they carry the order-only tuning round, which is read
+    within one node and never pooled with the Blackwell rows.
+    """
+    if target in THESIS_UNIFORM_GPUS and node in THESIS_NODE_GPUS:
+        return THESIS_UNIFORM_GPUS[target]
+    return node_gpu_count(node)
 #: THE NODE'S CORE BUDGET, per node type, on 64 logical CPUs (owner ruling Q3,
 #: 2026-09-18; the measurement is dsnn-dfw.30 and the probe dsnn-dfw.40).  The
 #: trainer had no slice of its own and its host work ran on the same cores as
@@ -2667,7 +2691,7 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
     changes on purpose (episodes, checkpoint interval, auto-stop).
     """
     bias, form, advantage_norm, conditioned = THESIS_ARM_SPEC[arm]
-    gpus = node_gpu_count(node)
+    gpus = thesis_row_gpus(target, node)
     cli: dict = {
         "--name": name,
         "--seed": seed,
@@ -2752,8 +2776,8 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
     _require(node in THESIS_NODES,
              f"node {node!r} is not one of the permitted thesis nodes "
              f"{THESIS_NODES} (dsnn-dfw.69: pgi15-gpu17 has no matched CUDA "
-             f"12.9 ptxas and pgi15-gpu19 belongs to another group; neither "
-             f"is ever a node source).")
+             f"12.9 ptxas and is never a node source; pgi15-gpu19 was "
+             f"released back to us on 2026-09-20).")
     name = name or thesis_run_name(arm, target, seed)
     _require(arm in THESIS_ARM_SPEC, f"arm {arm!r} is not one of {THESIS_ARMS}")
     _require(target in THESIS_TARGET_CLI,
@@ -2769,7 +2793,7 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
                      grad_oracle_cadence=grad_oracle_cadence)
     if extra_cli:
         cli.update(extra_cli)
-    gpus = node_gpu_count(node)
+    gpus = thesis_row_gpus(target, node)
     a = dict(
         name=name, job=thesis_job_name(node), kind="train", runtime="scratch",
         node=node, time=time, gpus=gpus, singleton=True, thesis=True,
@@ -2833,12 +2857,22 @@ def thesis_arms() -> list[dict]:
     return [a for a in ARMS if a.get("thesis")]
 
 
+def thesis_pair_arms() -> list[dict]:
+    """The paired launchers: two half rows of one arm inside one sbatch.
+
+    A pair is not a matrix coordinate -- its two halves are, and they are
+    still rows of `thesis_core_arms` -- so it is excluded from every count
+    of the matrix and listed here instead.
+    """
+    return [a for a in ARMS if a.get("paired")]
+
+
 def thesis_block1_arms() -> list[dict]:
     # The order-only tuning rows (tickets dsnn-dfw.29 and dsnn-dfw.45) are
     # thesis arms but not matrix coordinates: block 1 is the 34 runs of the
     # matrix the owner authorised on 2026-09-16 and nothing else.
     return [a for a in thesis_arms()
-            if not a.get("held") and not a.get("smoke")
+            if not a.get("held") and not a.get("smoke") and not a.get("paired")
             and not a.get("orderonly") and not a.get("orderonly_rsnn")
             and not a.get("orderonly_final")
             and not a.get("orderonly_tlm_final")]
@@ -2854,7 +2888,8 @@ def thesis_snn_arms() -> list[dict]:
     `thesis_core_arms` below.
     """
     return [a for a in thesis_arms()
-            if a.get("thesis_rule") and not a.get("orderonly_rsnn")]
+            if a.get("thesis_rule") and not a.get("orderonly_rsnn")
+            and not a.get("paired")]
 
 
 def thesis_core_arms() -> list[dict]:
@@ -2863,7 +2898,7 @@ def thesis_core_arms() -> list[dict]:
     return [a for a in thesis_arms()
             if not a.get("smoke") and not a.get("thesis_rule")
             and not a.get("orderonly") and not a.get("orderonly_final")
-            and not a.get("orderonly_tlm_final")]
+            and not a.get("orderonly_tlm_final") and not a.get("paired")]
 
 
 # Target-pinned nodes (owner ruling 2026-09-17: "max 4* 2 tlm 2 nn256").
@@ -2890,17 +2925,142 @@ THESIS_TARGET_NODES = {
 }
 _USE_TARGET_NODES = os.environ.get("THESIS_TARGET_NODES", "0") == "1"
 
+# ---------------------------------------------------------------------------
+# THE SEVEN SLOTS (owner ruling 2026-09-20).  An NN256 row occupies four
+# Blackwell GPUs wherever it runs, so a 4-GPU node holds ONE row and an
+# 8-GPU node holds TWO.  The slot ring is therefore three whole nodes plus
+# two halves on each of the two 8-GPU nodes: seven places, not five.
+#
+# A HALF IS NOT A JOB.  `/etc/slurm/epilog_reset_node.sh` kills every process
+# of this user on a node the moment ANY job of theirs on it ends, so two jobs
+# of ours on one node kill each other (memory note
+# pgi15-epilog-kills-sibling-jobs).  Two halves of one node are therefore
+# rendered into ONE sbatch by `thesis_pair_arm`, and the two rows that make
+# it up keep their own record and their own wandb run while their launcher
+# files become stubs that refuse (exit 74) and name the pair.
+# ---------------------------------------------------------------------------
+def thesis_slots() -> tuple[tuple[str, int | None], ...]:
+    """(node, half) for every place an NN256 row can run, in node order.
+
+    `half` is None on a node the row fills whole, else the index of the
+    half (0 = the low GPUs and the low cores, 1 = the high ones).
+    """
+    per = THESIS_UNIFORM_GPUS["nn256"]
+    slots: list[tuple[str, int | None]] = []
+    for node in THESIS_NODES:
+        gpus = THESIS_NODE_GPUS[node]
+        if gpus % per:
+            raise CampaignRowError(
+                f"node {node!r} carries {gpus} GPUs, which is not a whole "
+                f"number of {per}-GPU halves; the slot ring cannot split it")
+        if gpus == per:
+            slots.append((node, None))
+        else:
+            slots.extend((node, h) for h in range(gpus // per))
+    return tuple(slots)
+
+
+THESIS_SLOTS = thesis_slots()
+#: The letter a half is called by in a paired launcher, by half index.
+_PAIR_TAGS = ("A", "B")
+
+
+def thesis_pair_name(arm: str, target: str, seeds: tuple[str, str]) -> str:
+    """`<arm>_<target>_s<seedA>_s<seedB>_pair`, the paired launcher's file."""
+    return f"{arm}_{target}_s{seeds[0]}_s{seeds[1]}_pair"
+
+
+def thesis_pair_arm(rows: list[dict]) -> dict:
+    """Two half rows of ONE node and ONE arm -> one paired `arm(...)`.
+
+    The halves keep their own `--name` (their wandb run is the matrix's own
+    coordinate), their own GPUs, their own cores, their own RAY_TMPDIR and
+    their own log file.  The job exits with the WORSE of the two trainer
+    codes, so a half that crashes cannot be hidden by a sibling that did not.
+    """
+    _require(len(rows) == 2, f"a pair is two rows, not {len(rows)}")
+    a, b = sorted(rows, key=lambda r: r["half"])
+    node = a["node"]
+    arm_name, target = a["thesis_arm"], a["thesis_target"]
+    _require(b["node"] == node and b["thesis_arm"] == arm_name
+             and b["thesis_target"] == target,
+             "a pair is two seeds of ONE arm on ONE node")
+    _require(a["thesis_seed"] != b["thesis_seed"],
+             "a pair is two DIFFERENT seeds")
+    _require(bool(a.get("held")) == bool(b.get("held")),
+             f"{a['name']} and {b['name']} disagree about being held; a "
+             f"paired job releases or holds both halves at once")
+    gpus = THESIS_NODE_GPUS[node]
+    per = THESIS_UNIFORM_GPUS[target]
+    cpus = node_cpus(node, gpus)
+    per_cpus = cpus // (gpus // per)
+    halves = []
+    for r in (a, b):
+        h = r["half"]
+        halves.append(dict(
+            name=r["name"], seed=r["thesis_seed"], half=h,
+            devices=",".join(str(h * per + d) for d in range(per)),
+            cores=f"{h * per_cpus}-{(h + 1) * per_cpus - 1}",
+            cli=r["cli"],
+        ))
+    name = thesis_pair_name(arm_name, target,
+                            (a["thesis_seed"], b["thesis_seed"]))
+    for r in (a, b):
+        r["paired_into"] = name
+    p = dict(
+        name=name, job=thesis_job_name(node), kind="train", runtime="scratch",
+        node=node, time=a["time"], gpus=gpus, singleton=True, thesis=True,
+        paired=True, halves=halves,
+        thesis_arm=arm_name, thesis_target=target,
+        thesis_rule=thesis_temporal_rule(target),
+        env=dict(a["env"]),
+        required_flags=a["required_flags"],
+        required_flags_file=a["required_flags_file"],
+        # The preflight reads ONE command line (the two differ in --seed and
+        # --name alone); the ARGS arrays are rendered from `halves`.
+        cli=a["cli"],
+        purpose=a["purpose"] + f"\n\nPAIRED ON {node}: seeds "
+                f"{a['thesis_seed']} and {b['thesis_seed']} of arm "
+                f"{arm_name} run CONCURRENTLY inside this one job, each on "
+                f"{per} of the node's {gpus} GPUs and {per_cpus} of its "
+                f"{cpus} cores.  One job, because the node epilog kills a "
+                f"sibling job of this user on the same node.",
+        prediction=a["prediction"], falsifier=a["falsifier"],
+    )
+    if a.get("held"):
+        p["held"] = a["held"]
+    arm_(**p)
+    return p
+
+
 # --- the 50 runs of the matrix ----------------------------------------------
+_HALVES: dict[tuple[str, str], list[dict]] = {}
+_SLOT = 0
 for _i, (_arm, _target, _seed) in enumerate(thesis_submission_order()):
-    _node = (THESIS_TARGET_ARM_NODES.get((_target, _arm), THESIS_TARGET_NODES.get(_target, "pgi15-gpu16"))
-             if _USE_TARGET_NODES
-             else THESIS_NODES[_i % len(THESIS_NODES)])
-    thesis_arm(
+    _half = None
+    if _USE_TARGET_NODES:
+        _node = THESIS_TARGET_ARM_NODES.get(
+            (_target, _arm), THESIS_TARGET_NODES.get(_target, "pgi15-gpu16"))
+    elif _target in THESIS_UNIFORM_GPUS:
+        _node, _half = THESIS_SLOTS[_SLOT % len(THESIS_SLOTS)]
+        _SLOT += 1
+    else:
+        _node = THESIS_NODES[_i % len(THESIS_NODES)]
+    _row = thesis_arm(
         arm=_arm, target=_target, seed=_seed,
         node=_node,
         held=None if _i < THESIS_BLOCK1 else _THESIS_HELD,
     )
-del _i, _arm, _target, _seed, _node
+    if _half is not None:
+        _row["half"] = _half
+        _HALVES.setdefault((_arm, _node), []).append(_row)
+# A slot that no sibling joined stays a whole single-node job of four GPUs on
+# an 8-GPU node: legal, one job on the node, the same profile as every other
+# NN256 row.  Only a node that carries TWO rows of one arm becomes a pair.
+for _rows in _HALVES.values():
+    if len(_rows) == 2:
+        thesis_pair_arm(_rows)
+del _i, _arm, _target, _seed, _node, _half, _row, _rows, _HALVES, _SLOT
 
 
 # ---------------------------------------------------------------------------
@@ -3251,7 +3411,7 @@ def orderonly_arm(*, seed: str, lam_cmp: str | None = None,
     if not pref:
         cli["--lambda-cmp"] = lam_cmp
         cli["--lambda-mem"] = lam_mem
-    gpus = node_gpu_count(node)
+    gpus = thesis_row_gpus(ORDERONLY_TARGET, node)
     what = (f"THE PREFERENCE-CONDITIONED ROW at seed {seed}: one run over a "
             f"Dirichlet preference on (latency, memory), against the five "
             f"fixed weights of the same seed on the same node."
@@ -3323,20 +3483,20 @@ def orderonly_arms() -> list[dict]:
 # to move.  When round 1 names a different pair the owner moves
 # ORDERONLY_FINAL_WEIGHTS and regenerates.
 #
-# THE NODE IS THE SEED, round-robin over the four cleared Blackwell nodes in
+# THE NODE IS THE SEED, round-robin over the five cleared Blackwell nodes in
 # seed order.  A seed's numbers may never straddle two GPU models (AGENTS.md).
-# pgi15-gpu19 stays out: it is the campaign's node.  pgi15-gpu17 stays out
-# too (dsnn-dfw.69: job 66740 aborted 72 -- /usr/local/cuda-12.9 on gpu17 has
-# no bin/ptxas or nvlink).  Five seeds over four nodes means one node
-# repeats; gres, CPUs and memory come from the generator's own Blackwell
-# tables, and pgi15-gpu20 carries eight GPUs, so its row measures with seven
-# Ray actors while the three 4-GPU rows measure with three.
+# pgi15-gpu17 stays out (dsnn-dfw.69: job 66740 aborted 72 -- /usr/local/
+# cuda-12.9 on gpu17 has no bin/ptxas or nvlink); pgi15-gpu19 came back to us
+# on 2026-09-20, so five seeds now sit on five nodes and no node repeats.
+# EVERY seed renders the SAME profile -- 4 GPUs, 64 CPUs, 400G and
+# --ray-measure 3 -- on all five nodes (THESIS_UNIFORM_GPUS), so the seed
+# spread carries the node variation and nothing else; the 8-GPU nodes hold
+# the row on four of their GPUs.
 # ---------------------------------------------------------------------------
 ORDERONLY_FINAL_SEEDS = THESIS_SEEDS
 #: (--lambda-cmp, --lambda-mem) of the baseline: one of the five ruled pairs.
 ORDERONLY_FINAL_WEIGHTS = ("2", "0")
-ORDERONLY_FINAL_NODES = ("pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu18",
-                         "pgi15-gpu20")
+ORDERONLY_FINAL_NODES = THESIS_NODES_ALL
 
 _ORDERONLY_FINAL_HEAD = f"""THE 5-SEED ORDER-ONLY BASELINE ON NN256 (epic
 dsnn-dfw, owner ruling 2026-09-19).  A FINAL row, not a tuning row: the
@@ -3381,7 +3541,7 @@ def orderonly_final_run_name(seed: str) -> str:
 
 
 def orderonly_final_node(seed: str) -> str:
-    """THE NODE OF A SEED: round-robin over the four cleared Blackwell
+    """THE NODE OF A SEED: round-robin over the five cleared Blackwell
     nodes, in seed order (dsnn-dfw.69: pgi15-gpu17 excluded)."""
     if seed not in ORDERONLY_FINAL_SEEDS:
         raise CampaignRowError(
@@ -3394,7 +3554,7 @@ def orderonly_final_arm(*, seed: str) -> dict:
     """One 5-seed order-only baseline row -> one `arm(...)`.  Returns it."""
     node = orderonly_final_node(seed)
     _require(node in THESIS_NODES_ALL,
-             f"node {node!r} is not one of the six Blackwell nodes "
+             f"node {node!r} is not one of the cleared Blackwell nodes "
              f"{THESIS_NODES_ALL}; the baseline is a FINAL row and final rows "
              f"run on Blackwell only (AGENTS.md)")
     lam_cmp, lam_mem = ORDERONLY_FINAL_WEIGHTS
@@ -3406,7 +3566,7 @@ def orderonly_final_arm(*, seed: str) -> dict:
     cli["--approx-profile"] = ORDERONLY_PROFILE
     cli["--lambda-cmp"] = lam_cmp
     cli["--lambda-mem"] = lam_mem
-    gpus = node_gpu_count(node)
+    gpus = thesis_row_gpus(ORDERONLY_TARGET, node)
     a = dict(
         name=name, job=orderonly_job_name(node), kind="train",
         runtime="scratch",
@@ -3500,7 +3660,7 @@ def orderonly_tlm_final_arm() -> dict:
     """The one TLM order-only final row -> one `arm(...)`.  Returns it."""
     node = ORDERONLY_TLM_FINAL_NODE
     _require(node in THESIS_NODES_ALL,
-             f"node {node!r} is not one of the six Blackwell nodes "
+             f"node {node!r} is not one of the cleared Blackwell nodes "
              f"{THESIS_NODES_ALL}; this is a FINAL row and final rows run "
              f"on Blackwell only (AGENTS.md)")
     lam_cmp, lam_mem = ORDERONLY_TLM_FINAL_WEIGHTS
@@ -3513,7 +3673,7 @@ def orderonly_tlm_final_arm() -> dict:
     cli["--approx-profile"] = ORDERONLY_PROFILE
     cli["--lambda-cmp"] = lam_cmp
     cli["--lambda-mem"] = lam_mem
-    gpus = node_gpu_count(node)
+    gpus = thesis_row_gpus("tlm", node)
     a = dict(
         name=name, job=orderonly_job_name(node), kind="train",
         runtime="scratch",
@@ -3691,7 +3851,7 @@ def orderonly_rsnn_arm(*, rule: str, seed: str, lam_cmp: str | None = None,
     if not pref:
         cli["--lambda-cmp"] = lam_cmp
         cli["--lambda-mem"] = lam_mem
-    gpus = node_gpu_count(node)
+    gpus = thesis_row_gpus(target, node)
     what = (f"THE PREFERENCE-CONDITIONED ROW at seed {seed}, rule {rule}: one "
             f"run over a Dirichlet preference on (latency, memory), against "
             f"the five fixed weights of the same rule and seed."
@@ -3770,7 +3930,7 @@ def orderonly_rsnn_tbptt_arm(*, seed: str) -> dict:
     cli["--approx-profile"] = ORDERONLY_PROFILE
     cli["--lambda-cmp"] = lam_cmp
     cli["--lambda-mem"] = lam_mem
-    gpus = node_gpu_count(node)
+    gpus = thesis_row_gpus(target, node)
     a = dict(
         name=name, job=orderonly_job_name(node), kind="train",
         runtime="scratch",
@@ -4298,6 +4458,21 @@ def render(a: dict) -> str:
         L.append("fi")
         L.append("")
 
+    if a.get("paired_into"):
+        # THIS ROW IS HALF OF A PAIRED JOB (owner ruling 2026-09-20).  Its
+        # record, its command line and its header are unchanged and still
+        # generated -- that is what a reader reads -- but the run itself
+        # happens inside the paired launcher, and submitting BOTH would put
+        # two of our jobs on one node, where the epilog kills them both.
+        # 74 = submitted alone; the paired launcher is named in the message.
+        L.append("# HALF OF A PAIRED JOB.  74 = submitted on its own.")
+        L.append(f'echo "ABORT(74): {a["name"]} runs as one half of'
+                 f' fq_{a["paired_into"]}.sbatch -- submit THAT launcher.'
+                 ' Two jobs of ours on one node kill each other (the node'
+                 ' epilog), so this row has no job of its own."')
+        L.append("exit 74")
+        return "\n".join(L) + "\n"
+
     if kind == "cpu" and not a.get("needs_tool"):
         L.append("export RAY_TMPDIR=/tmp/ray_$SLURM_JOB_ID")
         L.extend(_stack_exists_check())
@@ -4478,22 +4653,28 @@ def render(a: dict) -> str:
                  ' meaningless for this whole run"')
         L.append("fi")
         L.append("")
-    L.append("ARGS=(")
-    for flag, val in _merge_cli(a.get("cli", {})):
-        L.append(f"  {flag}" + (f" {val}" if val is not None else ""))
-    L.append(f"  {WANDB}")
-    L.append(")")
-    L.append("")
+    halves = a.get("halves") or []
+    tags = [_PAIR_TAGS[h["half"]] for h in halves]
+    arrays = [f"ARGS_{t}" for t in tags] if halves else ["ARGS"]
+    for arr, src in zip(arrays, [h["cli"] for h in halves] or [a.get("cli", {})]):
+        L.append(f"{arr}=(")
+        for flag, val in _merge_cli(src):
+            L.append(f"  {flag}" + (f" {val}" if val is not None else ""))
+        L.append(f"  {WANDB}")
+        L.append(")")
+        L.append("")
     L.append("# Layer 2: run the EXACT token list through ppo.py's own argparse.")
     L.append("# This catches a bad CHOICE value (a --face-read typo, an")
     L.append("# --advantage-norm value valid on the ray surface but not this one)")
     L.append("# that a name-only grep cannot see.  JAX_PLATFORMS=cpu so it does")
     L.append("# not touch a GPU.")
-    L.append(f"JAX_PLATFORMS=cpu {py} -c \\")
-    L.append("\"import sys; from alphagrad.approx.ppo import make_argparser;\\")
-    L.append(" make_argparser().parse_args(sys.argv[1:]);\\")
-    L.append(" print('[preflight] argparse accepted the command line')\" \\")
-    L.append('  "${ARGS[@]}" || { echo "ABORT(65): argparse rejected it"; exit 65; }')
+    for arr in arrays:
+        L.append(f"JAX_PLATFORMS=cpu {py} -c \\")
+        L.append("\"import sys; from alphagrad.approx.ppo import make_argparser;\\")
+        L.append(" make_argparser().parse_args(sys.argv[1:]);\\")
+        L.append(" print('[preflight] argparse accepted the command line')\" \\")
+        L.append(f'  "${{{arr}[@]}}" ||'
+                 ' { echo "ABORT(65): argparse rejected it"; exit 65; }')
     L.append("")
     L.append("# FQ_PREFLIGHT_ONLY=1 stops here.  This is how a launcher is")
     L.append("# validated without consuming a node -- every guard above has run")
@@ -4508,6 +4689,44 @@ def render(a: dict) -> str:
              f' gx=$(git -C {gx_repo} rev-parse --short HEAD)"')
     L.append("nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader")
     L.append("")
+    if halves:
+        # TWO TRAINERS, ONE JOB (owner ruling 2026-09-20).  The node epilog
+        # kills a sibling job of this user on the same node, so the second
+        # seed cannot be a second sbatch.  Each half gets its own GPUs, its
+        # own cores, its own Ray temp directory, its own log file and its own
+        # wandb run (its --name is the matrix coordinate, unchanged), and the
+        # job exits with the WORSE of the two trainer codes.
+        for tag, h in zip(tags, halves):
+            L.append(f"# --- half {tag}: seed {h['seed']},"
+                     f" GPUs {h['devices']}, cores {h['cores']}")
+            L.append("(")
+            L.append(f"  export CUDA_VISIBLE_DEVICES={h['devices']}")
+            L.append("  export RAY_TMPDIR=/tmp/ray_${SLURM_JOB_ID}"
+                     f"_s{h['seed']}")
+            L.append(f'  echo "[half {tag}] seed {h["seed"]}'
+                     f' CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES'
+                     f' cores {h["cores"]} RAY_TMPDIR=$RAY_TMPDIR"')
+            L.append("  nvidia-smi --query-gpu=index,name,memory.total"
+                     " --format=csv,noheader")
+            L.append(f"  taskset -c {h['cores']} {py} \\")
+            L.append(f'    src/alphagrad/approx/ppo.py "${{ARGS_{tag}[@]}}"')
+            L.append(f") > {CAMPAIGN_RUNS}/{h['name']}"
+                     f"_${{SLURM_JOB_ID}}_s{h['seed']}.log 2>&1 &")
+            L.append(f"PID_{tag}=$!")
+            L.append("")
+        for tag, h in zip(tags, halves):
+            L.append(f'wait "$PID_{tag}"')
+            L.append(f"STATUS_{tag}=$?")
+            L.append(f'echo "TRAINER half {tag} (seed {h["seed"]},'
+                     f' {h["name"]}) exited with $STATUS_{tag}"')
+        L.append(f"TRAINER_STATUS=$STATUS_{tags[0]}")
+        for tag in tags[1:]:
+            L.append(f'if [ "$STATUS_{tag}" -gt "$TRAINER_STATUS" ]; then')
+            L.append(f"  TRAINER_STATUS=$STATUS_{tag}")
+            L.append("fi")
+        L.append('echo "TRAINER exited with $TRAINER_STATUS"')
+        L.append('exit "$TRAINER_STATUS"')
+        return "\n".join(L) + "\n"
     if scratch:
         # All GPUs of the node are visible: the trainer takes device 0
         # (--gpus 0, the ppo.py default) and the --ray-measure actor device 1
