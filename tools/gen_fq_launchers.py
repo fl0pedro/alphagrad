@@ -3526,7 +3526,7 @@ del (_sweepl_tag, _sweepl_overrides, _sweepl_seed, _sweepl_node,
 SWEEPL2_TARGET = "nn256"
 SWEEPL2_ARM = "C"
 SWEEPL2_SEEDS = THESIS_SEEDS[:3]
-SWEEPL2_EPISODES = "300"
+SWEEPL2_EPISODES = "100"
 #: dual tag -> the cli overrides that differ from arm C's own rung-1
 #: defaults.  CENTER overrides nothing: it IS arm C's own dual constants
 #: (--lag-eta 2.0, --lag-max 64, --lag-init 16, --quality-floor 0.90).
@@ -3552,7 +3552,7 @@ NN256 at the normalized init, entropy floor 0.05.
 PURPOSE: does the actor respond to the dual within 300 episodes, and is the
 update budget the bottleneck rather than the dual's constants.
 
-READ-OUT: the feasible fraction at q >= 0.9 over episodes 250-299 from the
+READ-OUT: the feasible fraction at q >= 0.9 over episodes 80-99 from the
 plan log, the mean q over the same window, the multiplier's trajectory
 against its cap, the latency reward of the feasible plans, and how many
 feasible plans run faster than the reference."""
