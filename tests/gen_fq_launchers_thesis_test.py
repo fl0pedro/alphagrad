@@ -134,7 +134,7 @@ def matrix(gen):
             and not a.get("orderonly_rsnn")
             and not a.get("orderonly_final")
             and not a.get("orderonly_tlm_final")
-            and not a.get("paired")]
+            and not a.get("paired") and not a.get("sweepl")]
     assert arms, "the generator emits no thesis arm"
     return arms
 
@@ -324,7 +324,9 @@ def test_every_arm_carries_the_shared_thesis_flags(gen, matrix):
         assert cli["--scale-face-head"] == "0.1", a["name"]
         assert cli["--face-logit-clamp"] == "15", a["name"]
         assert cli["--face-entropy-weight"] == "0.05", a["name"]
-        assert cli["--face-entropy-floor"] == "0.3", a["name"]
+        # dsnn-dfw.78: 0.3 is an always-on igniter at identity-like init;
+        # matrix rows use 0.05 (SEC-12 finding 2026-08-25).
+        assert cli["--face-entropy-floor"] == "0.05", a["name"]
         assert cli["--face-entropy-floor-weight"] == "10.0", a["name"]
         # the measurement protocol
         assert cli["--measure-pipeline"] == "1", a["name"]
@@ -957,7 +959,7 @@ def test_target_nodes_routing(monkeypatch):
     matrix = [a for a in mod.thesis_arms()
               if not a.get("smoke") and not a.get("orderonly")
               and not a.get("orderonly_final")
-              and not a.get("orderonly_tlm_final")]
+              and not a.get("orderonly_tlm_final") and not a.get("sweepl")]
     for a in matrix:
         if a["thesis_target"] == "tlm":
             assert a["node"] in ("pgi15-gpu20", "pgi15-gpu16"), a["name"]

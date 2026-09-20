@@ -2243,6 +2243,14 @@ THESIS_MEM_CHANNEL = "watermark"
 #: auto_stop=True and keeps it.  The smoke rows pass auto_stop=False already.
 THESIS_FINAL_AUTO_STOP = False
 
+#: THE FACE-ENTROPY FLOOR (dsnn-dfw.78, SEC-12 finding 2026-08-25). ppo.py's
+#: own --face-entropy-floor help records that 0.3 is an always-on igniter at
+#: an identity-like init (H is 0.03-0.06 there) and that v64+ uses 0.05.
+#: MATRIX ROWS ONLY, unlike (a)-(d) above: the order-only tuning rows and the
+#: smoke keep 0.3 (`thesis_cli`'s own default) because they sit outside the
+#: thesis matrix.
+THESIS_FACE_ENTROPY_FLOOR = "0.05"
+
 # ---------------------------------------------------------------------------
 # THE HARDWARE.  Five Blackwell nodes we may use (dsnn-dfw.69, owner ruling
 # 2026-09-20).  pgi15-gpu17 has no matched CUDA 12.9 ptxas or nvlink (job
@@ -2746,7 +2754,8 @@ def thesis_run_name(arm: str, target: str, seed: str) -> str:
 def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
                episodes: str, checkpoint_every: str,
                auto_stop: bool, grad_oracle_cadence: str = "50",
-               matrix_row: bool = False) -> dict:
+               matrix_row: bool = False,
+               face_entropy_floor: str = "0.3") -> dict:
     """The `cli` override dict of one thesis run.
 
     Everything the owner fixed is HERE, once, so the block and the smoke
@@ -2775,7 +2784,7 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
         "--scale-face-head": SCALE_FACE_HEAD_MVP,
         "--face-logit-clamp": FACE_LOGIT_CLAMP_MVP,
         "--face-entropy-weight": "0.05",
-        "--face-entropy-floor": "0.3",
+        "--face-entropy-floor": face_entropy_floor,
         "--face-entropy-floor-weight": "10.0",
         # --- the reward
         "--rewards": "cmp mem acc",
@@ -2840,7 +2849,8 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
                what: str | None = None,
                prediction: str | None = None, held: str | None = None,
                time: str = THESIS_TIME, extra_cli: dict | None = None,
-               grad_oracle_cadence: str = "50") -> dict:
+               grad_oracle_cadence: str = "50",
+               face_entropy_floor: str = THESIS_FACE_ENTROPY_FLOOR) -> dict:
     """One thesis run -> one `arm(...)`.  Returns the arm."""
     _require(node in THESIS_NODES,
              f"node {node!r} is not one of the permitted thesis nodes "
@@ -2865,7 +2875,8 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
                      episodes=episodes, checkpoint_every=checkpoint_every,
                      auto_stop=auto_stop,
                      grad_oracle_cadence=grad_oracle_cadence,
-                     matrix_row=True)
+                     matrix_row=True,
+                     face_entropy_floor=face_entropy_floor)
     if extra_cli:
         cli.update(extra_cli)
     gpus = thesis_row_gpus(target, node)
@@ -2949,7 +2960,7 @@ def thesis_pair_arms() -> list[dict]:
     still rows of `thesis_core_arms` -- so it is excluded from every count
     of the matrix and listed here instead.
     """
-    return [a for a in ARMS if a.get("paired")]
+    return [a for a in ARMS if a.get("paired") and not a.get("sweepl")]
 
 
 def thesis_block1_arms() -> list[dict]:
@@ -2959,6 +2970,7 @@ def thesis_block1_arms() -> list[dict]:
     return [a for a in thesis_arms()
             if not a.get("held") and not a.get("smoke") and not a.get("paired")
             and not a.get("orderonly") and not a.get("orderonly_rsnn")
+            and not a.get("sweepl")
             and not a.get("orderonly_final")
             and not a.get("orderonly_tlm_final")]
 
@@ -2983,7 +2995,8 @@ def thesis_core_arms() -> list[dict]:
     return [a for a in thesis_arms()
             if not a.get("smoke") and not a.get("thesis_rule")
             and not a.get("orderonly") and not a.get("orderonly_final")
-            and not a.get("orderonly_tlm_final") and not a.get("paired")]
+            and not a.get("orderonly_tlm_final") and not a.get("paired")
+            and not a.get("sweepl")]
 
 
 # Target-pinned nodes (owner ruling 2026-09-17: "max 4* 2 tlm 2 nn256").
@@ -3280,6 +3293,7 @@ reported as it stands."""
 thesis_arm(
     arm="C", target="tlm", seed=THESIS_SEEDS[0], node=THESIS_SMOKE_NODE,
     name="smoke_C_tlm", episodes=THESIS_SMOKE_EPISODES,
+    face_entropy_floor="0.3",  # dsnn-dfw.78: smoke is outside the thesis matrix
     checkpoint_every=THESIS_SMOKE_CHECKPOINT_EVERY, auto_stop=False,
     grad_oracle_cadence="10",
     time="04:00:00", what=_SMOKE_WHAT, prediction=_SMOKE_PREDICTION,
@@ -3290,6 +3304,7 @@ ARMS[-1]["falsifier"] = _SMOKE_FALSIFIER
 thesis_arm(
     arm="C", target="tlm", seed=THESIS_SEEDS[0], node=THESIS_SMOKE_NODE,
     name="smoke_C_tlm", episodes=THESIS_SMOKE_EPISODES,
+    face_entropy_floor="0.3",  # dsnn-dfw.78: smoke is outside the thesis matrix
     checkpoint_every=THESIS_SMOKE_CHECKPOINT_EVERY, auto_stop=False,
     grad_oracle_cadence="10",
     time="04:00:00", what=_SMOKE_WHAT, prediction=_SMOKE_PREDICTION,
@@ -3305,6 +3320,7 @@ ARMS[-1]["name"] = "smoke_C_tlm_resume"
 thesis_arm(
     arm="condC", target="nn256", seed=THESIS_SEEDS[0], node=THESIS_SMOKE_NODE,
     name="smoke_condC_nn256", episodes=THESIS_SMOKE_NN_EPISODES,
+    face_entropy_floor="0.3",  # dsnn-dfw.78: smoke is outside the thesis matrix
     checkpoint_every=THESIS_SMOKE_CHECKPOINT_EVERY, auto_stop=False,
     time="04:00:00", what=_SMOKE_WHAT, prediction=_SMOKE_PREDICTION,
 )
@@ -3314,6 +3330,186 @@ ARMS[-1]["falsifier"] = _SMOKE_FALSIFIER
 
 def thesis_smoke_arms() -> list[dict]:
     return [a for a in ARMS if a.get("smoke")]
+
+
+# ================  LAGRANGIAN DUAL SWEEP, ROUND 1  ================
+# Owner ruling 2026-09-20 (epic dsnn-dfw, same day as .78's floor fix).  A
+# short one-factor-at-a-time probe of the Lagrangian dual's four knobs
+# around arm C's own rung-1 center on NN256, before any of them is retuned
+# for the matrix.  100 episodes, no --auto-stop.  NOT a matrix coordinate:
+# `thesis_core_arms` and `thesis_block1_arms` exclude every row this section
+# marks `sweepl=True`, the same way they exclude the order-only rounds.
+#
+# GRID ARITHMETIC (report this, do not silently fix it): one factor at a
+# time around a shared center over the value sets below gives 2 + 1 + 2 + 2
+# = 7 non-center configurations plus the center itself, 8 distinct
+# configurations, not 9 -- lag-max names only ONE non-center value (256), so
+# it contributes 1, not 2.  8 configurations x 3 seeds = 24 rows, not 27.
+# The 24 rows below are exactly the 8 configurations the stated value sets
+# admit; no config was invented to reach 9.
+SWEEPL_TARGET = "nn256"
+SWEEPL_ARM = "C"
+SWEEPL_SEEDS = THESIS_SEEDS[:3]
+SWEEPL_EPISODES = "100"
+#: THE CENTER, read off arm C's own constants so the sweep and the matrix
+#: cannot silently disagree about what "unperturbed" means.
+SWEEPL_CENTER: dict[str, str] = {
+    "--lag-eta": DUAL_ETA,
+    "--lag-max": THESIS_DUAL_LAMBDA_MAX,
+    "--lag-init": THESIS_LAMBDA_Q,
+    "--quality-floor": THESIS_TAU,
+}
+#: One factor at a time.  Each tuple includes the center value so a reader
+#: sees the whole probed range; `sweepl_configs` skips the center value when
+#: it walks a factor, else the center would render twice.
+SWEEPL_GRID: dict[str, tuple[str, ...]] = {
+    "--lag-eta": ("0.5", "2.0", "8.0"),
+    "--lag-max": ("64", "256"),
+    "--lag-init": ("8", "16", "40"),
+    "--quality-floor": ("0.85", "0.90", "0.95"),
+}
+SWEEPL_TAG = {
+    "--lag-eta": "eta", "--lag-max": "lagmax",
+    "--lag-init": "laginit", "--quality-floor": "qfloor",
+}
+
+_SWEEPL_WHAT = """A ONE-FACTOR-AT-A-TIME PROBE of the Lagrangian dual around
+arm C's own rung-1 center on NN256 (--lag-eta 2.0, --lag-max 64, --lag-init
+16, --quality-floor 0.90), 100 episodes, no --auto-stop: short enough to read
+before any of the four is retuned for the matrix.
+
+READ-OUT: the fraction of plans above the quality floor at episodes 80-100,
+and the multiplier's distance from its cap (lambda / lag-max) at the same
+window.  The paired latency ratio of the feasible plans among those (the
+ones that cleared the quality floor) is the tie-breaker between
+configurations that tie on the first number."""
+
+_SWEEPL_LAGMIN_NOTE = """
+
+LAG-INIT 8 IS BELOW THE MATRIX'S --lag-min 12: this row sets --lag-min 8 too,
+so the initial multiplier is not clamped above its own starting point before
+the first update (dsnn-dfw epic, 2026-09-20 sweep ruling)."""
+
+
+def sweepl_configs() -> list[tuple[str, dict[str, str]]]:
+    """(tag, cli overrides) for the 8 distinct configurations: the center,
+    then one perturbation per grid value that is not already the center."""
+    configs: list[tuple[str, dict[str, str]]] = [
+        ("center", dict(SWEEPL_CENTER))]
+    for flag, values in SWEEPL_GRID.items():
+        for v in values:
+            if v == SWEEPL_CENTER[flag]:
+                continue
+            cli = dict(SWEEPL_CENTER)
+            cli[flag] = v
+            if flag == "--lag-init" and v == "8":
+                cli["--lag-min"] = "8"
+            configs.append((f"{SWEEPL_TAG[flag]}_{v}", cli))
+    return configs
+
+
+def sweepl_row_name(tag: str, seed: str) -> str:
+    return (f"sweepL_nn256_center_s{seed}" if tag == "center"
+            else f"sweepL_nn256_{tag}_s{seed}")
+
+
+def sweepl_pair_name(tag: str, seeds: tuple[str, str]) -> str:
+    return f"sweepL_nn256_{tag}_s{seeds[0]}_s{seeds[1]}_pair"
+
+
+def sweepl_pair_arm(rows: list[dict]) -> dict:
+    """Two half rows of ONE sweep configuration, one 8-GPU node -> one paired
+    `arm(...)`.  A copy of `thesis_pair_arm`'s body under a sweep-shaped
+    name: that function names a pair by arm+target alone, which two sweep
+    configurations of arm C on NN256 would collide on.  Carries `paired=True`
+    (so the generic per-row NN256 checks skip it, exactly like a matrix pair)
+    and `sweepl=True` (so `thesis_pair_arms` -- matrix pairs only -- excludes
+    it); half rows point back at it through `sweepl_paired_into`, never the
+    matrix's own `paired_into`, so the two pairing records cannot cross.
+    """
+    _require(len(rows) == 2, f"a sweep pair is two rows, not {len(rows)}")
+    a, b = sorted(rows, key=lambda r: r["half"])
+    node = a["node"]
+    tag = a["sweepl_tag"]
+    _require(b["node"] == node and b["sweepl_tag"] == tag,
+             "a sweep pair is two seeds of ONE configuration on ONE node")
+    _require(a["thesis_seed"] != b["thesis_seed"],
+             "a sweep pair is two DIFFERENT seeds")
+    gpus = THESIS_NODE_GPUS[node]
+    per = THESIS_UNIFORM_GPUS[SWEEPL_TARGET]
+    cpus = node_cpus(node, gpus)
+    per_cpus = cpus // (gpus // per)
+    halves = []
+    for r in (a, b):
+        h = r["half"]
+        halves.append(dict(
+            name=r["name"], seed=r["thesis_seed"], half=h,
+            devices=",".join(str(h * per + d) for d in range(per)),
+            cores=f"{h * per_cpus}-{(h + 1) * per_cpus - 1}",
+            cli=r["cli"],
+        ))
+    name = sweepl_pair_name(tag, (a["thesis_seed"], b["thesis_seed"]))
+    for r in (a, b):
+        r["sweepl_paired_into"] = name
+    p = dict(
+        name=name, job=thesis_job_name(node), kind="train", runtime="scratch",
+        node=node, time=a["time"], gpus=gpus, singleton=True, thesis=True,
+        sweepl=True, paired=True, halves=halves,
+        thesis_arm=SWEEPL_ARM, thesis_target=SWEEPL_TARGET,
+        env=dict(a["env"]),
+        required_flags=a["required_flags"],
+        required_flags_file=a["required_flags_file"],
+        cli=a["cli"],
+        purpose=a["purpose"] + f"\n\nPAIRED ON {node}: seeds "
+                f"{a['thesis_seed']} and {b['thesis_seed']} of sweep "
+                f"configuration {tag} run CONCURRENTLY, each on {per} of "
+                f"the node's {gpus} GPUs and {per_cpus} of its {cpus} cores.",
+        prediction=a["prediction"], falsifier=a["falsifier"],
+    )
+    arm_(**p)
+    return p
+
+
+def sweepl_arms() -> list[dict]:
+    return [a for a in ARMS if a.get("sweepl")]
+
+
+def sweepl_single_arms() -> list[dict]:
+    return [a for a in ARMS if a.get("sweepl") and not a.get("paired")]
+
+
+_SWEEPL_HALVES: dict[tuple[str, str], list[dict]] = {}
+_sweepl_slot = 0
+for _sweepl_tag, _sweepl_overrides in sweepl_configs():
+    for _sweepl_seed in SWEEPL_SEEDS:
+        _sweepl_node, _sweepl_half = THESIS_SLOTS[
+            _sweepl_slot % len(THESIS_SLOTS)]
+        _sweepl_slot += 1
+        _sweepl_what = _SWEEPL_WHAT + (
+            _SWEEPL_LAGMIN_NOTE if "--lag-min" in _sweepl_overrides else "")
+        thesis_arm(
+            arm=SWEEPL_ARM, target=SWEEPL_TARGET, seed=_sweepl_seed,
+            node=_sweepl_node,
+            name=sweepl_row_name(_sweepl_tag, _sweepl_seed),
+            episodes=SWEEPL_EPISODES, what=_sweepl_what,
+            extra_cli=dict(_sweepl_overrides),
+        )
+        ARMS[-1]["sweepl"] = True
+        ARMS[-1]["sweepl_tag"] = _sweepl_tag
+        if _sweepl_half is not None:
+            _sweepl_row = ARMS[-1]
+            _sweepl_row["half"] = _sweepl_half
+            _SWEEPL_HALVES.setdefault(
+                (_sweepl_tag, _sweepl_node), []).append(_sweepl_row)
+_sweepl_row: dict = {}
+_sweepl_rows: list[dict] = []
+for _sweepl_rows in _SWEEPL_HALVES.values():
+    if len(_sweepl_rows) == 2:
+        sweepl_pair_arm(_sweepl_rows)
+del (_sweepl_tag, _sweepl_overrides, _sweepl_seed, _sweepl_node,
+     _sweepl_half, _sweepl_what, _sweepl_row, _sweepl_rows, _sweepl_slot,
+     _SWEEPL_HALVES)
+
 
 
 # ================  ORDER-ONLY SCALARIZATION TUNING, ROUND 1  ================
