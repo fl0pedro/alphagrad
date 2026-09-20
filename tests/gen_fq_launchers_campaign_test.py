@@ -532,8 +532,10 @@ def test_no_flag_knobs_are_exported_and_named_in_the_todo_header(gen, campaign):
 
 # ------------------------------------------------- 5. the hardware / stack
 
-def test_one_eight_gpu_blackwell_job_per_node_on_gpu19_gpu20(gen, campaign):
-    assert gen.CAMPAIGN_NODES == ("pgi15-gpu19", "pgi15-gpu20")
+def test_one_eight_gpu_blackwell_job_per_node_on_gpu20(gen, campaign):
+    # pgi15-gpu19 belongs to another group (dsnn-dfw.69): gpu20 is the only
+    # 8-GPU node we may use, so every campaign row runs there now.
+    assert gen.CAMPAIGN_NODES == ("pgi15-gpu20",)
     assert gen.CAMPAIGN_GPUS == 8 and gen.CAMPAIGN_CPUS == 128
     for a in campaign:
         text = gen.render(a)
@@ -546,7 +548,8 @@ def test_one_eight_gpu_blackwell_job_per_node_on_gpu19_gpu20(gen, campaign):
         assert f"#SBATCH -w {a['node']}\n" in text
         assert f"#SBATCH -D {gen.CAMPAIGN_STACK}/alphagrad\n" in text
         assert f"#SBATCH -o {gen.CAMPAIGN_RUNS}/" in text
-        for bad in ("pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu17", "pgi15-gpu18"):
+        for bad in ("pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu17", "pgi15-gpu18",
+                    "pgi15-gpu19"):
             assert bad not in text, (a["name"], bad)
         # the /Scratch stack of finding 57: no home, no uv
         for line in text.splitlines():
@@ -560,9 +563,9 @@ def test_one_eight_gpu_blackwell_job_per_node_on_gpu19_gpu20(gen, campaign):
         assert "ABORT(66)" in text
         assert 'src/alphagrad/approx/ppo.py "${ARGS[@]}"' in text
         assert "CUDA_VISIBLE_DEVICES=0,1,2,3" not in text, a["name"]
-    # both nodes are used, and phase 1 alternates them
+    # one node, so phase 1 runs every tag on it
     p1 = [a for a in campaign if a["phase"] == 1]
-    assert [a["node"] for a in p1] == [gen.CAMPAIGN_NODES[i % 2] for i in range(6)]
+    assert [a["node"] for a in p1] == [gen.CAMPAIGN_NODES[0]] * 6
     assert {a["node"] for a in campaign} == set(gen.CAMPAIGN_NODES)
 
 
@@ -631,6 +634,7 @@ def test_campaign_arm_raises_on_a_row_outside_the_rulings(gen):
               what="x", prediction="x", falsifier="x")
     bad = [
         dict(ok, node="pgi15-gpu17"),
+        dict(ok, node="pgi15-gpu19"),
         dict(ok, node="pgi15-gpu15"),
         dict(ok, approx_add="lossy"),
         dict(ok, approx_add="learned2"),

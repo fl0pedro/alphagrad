@@ -564,8 +564,9 @@ def test_the_target_node_switch_does_not_move_the_tuning_rows(gen):
 
 FINAL_SEEDS = ("250197", "250198", "250199", "250200", "250201")
 FINAL_WEIGHTS = ("2", "0")
-FINAL_NODES = ("pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu17", "pgi15-gpu18",
-               "pgi15-gpu20")
+#: pgi15-gpu17 excluded (dsnn-dfw.69: job 66740 aborted 72, no matched CUDA
+#: 12.9 ptxas); five seeds round-robin over these four nodes.
+FINAL_NODES = ("pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu18", "pgi15-gpu20")
 FINAL_N_RUNS = 5
 
 
@@ -631,13 +632,17 @@ def test_the_baseline_is_a_final_row_with_the_four_block_settings(
 
 def test_the_baseline_runs_one_seed_per_blackwell_node(gen, final_rows):
     """Latency and memory are not comparable across GPU models, so a seed is
-    measured on ONE node; five seeds on five Blackwell nodes is one each."""
+    measured on ONE node; five seeds round-robin over the four cleared
+    Blackwell nodes (pgi15-gpu17 excluded, dsnn-dfw.69), so one node carries
+    two seeds and the other three carry one each."""
     seen = {}
     for a in final_rows:
         node = a["node"]
-        assert node == FINAL_NODES[FINAL_SEEDS.index(a["thesis_seed"])]
+        i = FINAL_SEEDS.index(a["thesis_seed"])
+        assert node == FINAL_NODES[i % len(FINAL_NODES)]
         assert node in gen.THESIS_NODES_ALL, a["name"]
         assert node != "pgi15-gpu19", a["name"]
+        assert node != "pgi15-gpu17", a["name"]
         seen.setdefault(node, []).append(a["name"])
         gpus = gen.THESIS_NODE_GPUS[node]
         assert a["gpus"] == gpus, a["name"]
@@ -651,7 +656,8 @@ def test_the_baseline_runs_one_seed_per_blackwell_node(gen, final_rows):
         assert a["job"] == gen.orderonly_job_name(node) == f"node-{node}"
         assert f"#SBATCH --gres={gen.blackwell_gres(gpus)}\n" in text, a["name"]
     assert sorted(seen) == sorted(FINAL_NODES)
-    assert all(len(v) == 1 for v in seen.values()), seen
+    counts = sorted(len(v) for v in seen.values())
+    assert counts == [1, 1, 1, 2], seen
     with pytest.raises(gen.CampaignRowError):
         gen.orderonly_final_node("999999")
 
@@ -687,7 +693,8 @@ def test_the_target_node_switch_does_not_move_the_baseline(gen):
     finally:
         del os.environ["THESIS_TARGET_NODES"]
     for a in mod.orderonly_final_arms():
-        assert a["node"] == FINAL_NODES[FINAL_SEEDS.index(a["thesis_seed"])]
+        i = FINAL_SEEDS.index(a["thesis_seed"])
+        assert a["node"] == FINAL_NODES[i % len(FINAL_NODES)]
 
 
 # ===============  ONE ORDER-ONLY FINAL ROW ON TLM (2026-09-19 evening)  ====
