@@ -91,6 +91,12 @@ PAIRED_COST_FLOOR = "byte"
 MEM_CHANNEL = "watermark"
 ORDER = "free"
 GRAD_ORACLE_CADENCE = "50"
+#: THE ACTOR UPDATE BUDGET (owner ruling 2026-09-20): a matrix row runs at
+#: --ppo-epochs 2 --minibatches 8, not today's --ppo-epochs 1 --minibatches 4
+#: (the order-only tuning rows and the smoke keep the old pair; their own
+#: test modules pin that).
+PPO_EPOCHS = "2"
+MINIBATCHES = "8"
 
 _PLACEHOLDER = re.compile(r"\$\{([A-Z0-9_]+):\?[^}]*\}")
 _EXPORT = re.compile(r"^\s*export\s+([A-Za-z_][A-Za-z0-9_]*)=", re.M)
@@ -321,6 +327,13 @@ def test_every_arm_carries_the_shared_thesis_flags(gen, matrix):
         assert cli["--lambda-cmp"] == "1" and cli["--lambda-mem"] == "1"
         assert cli["--discount"] == "1.0" and cli["--gae-lambda"] == "1.0"
         assert "--terminal-rewards-only" in cli, a["name"]
+        # the actor's update budget (owner ruling 2026-09-20, sweep rounds
+        # 2-3): today's SHARED_CLI defaults (1, 4) do not meet the
+        # Lagrangian constraint; 2, 8 does.
+        assert cli["--ppo-epochs"] == PPO_EPOCHS, a["name"]
+        assert cli["--minibatches"] == MINIBATCHES, a["name"]
+        assert gen.THESIS_PPO_EPOCHS == PPO_EPOCHS
+        assert gen.THESIS_MINIBATCHES == MINIBATCHES
         # the face head at init
         assert cli["--scale-face-head"] == "0.1", a["name"]
         assert cli["--face-logit-clamp"] == "15", a["name"]
@@ -801,6 +814,10 @@ def test_the_smoke_is_the_three_runs_the_owner_asked_for(gen, smoke):
         assert cli["--checkpoint-every"] == "10", a["name"]
         assert cli["--pareto-dump-every"] == PARETO_DUMP_EVERY, a["name"]
         assert cli["--plan-log"] == "auto", a["name"]
+        # the smoke is outside the thesis matrix (owner ruling 2026-09-20):
+        # it keeps today's update budget, not THESIS_PPO_EPOCHS/MINIBATCHES.
+        assert cli["--ppo-epochs"] == "1", a["name"]
+        assert cli["--minibatches"] == "4", a["name"]
 
     first, resume, cond = smoke
     assert _cli(gen, first)["--episodes"] == "20"

@@ -2251,6 +2251,19 @@ THESIS_FINAL_AUTO_STOP = False
 #: thesis matrix.
 THESIS_FACE_ENTROPY_FLOOR = "0.05"
 
+#: THE ACTOR UPDATE BUDGET (owner ruling 2026-09-20, epic dsnn-dfw, sweep
+#: rounds 2-3).  At today's SHARED_CLI defaults (--ppo-epochs 1,
+#: --minibatches 4) the Lagrangian constraint is not met; --ppo-epochs 2
+#: --minibatches 8 holds it (feasible 0.90-0.96 on six seeds).  MATRIX ROWS
+#: ONLY, the same split as THESIS_FACE_ENTROPY_FLOOR above: the order-only
+#: tuning rows and the smoke keep today's budget (`thesis_cli`'s own
+#: defaults, --ppo-epochs 1 --minibatches 4) because they sit outside the
+#: thesis matrix.  The sweep sections (sweepl, sweepl2, sweepl3) set their
+#: own budget explicitly per row, frozen so this change cannot silently
+#: move their meaning; they are unaffected.
+THESIS_PPO_EPOCHS = "2"
+THESIS_MINIBATCHES = "8"
+
 # ---------------------------------------------------------------------------
 # THE HARDWARE.  Five Blackwell nodes we may use (dsnn-dfw.69, owner ruling
 # 2026-09-20).  pgi15-gpu17 has no matched CUDA 12.9 ptxas or nvlink (job
@@ -2755,7 +2768,8 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
                episodes: str, checkpoint_every: str,
                auto_stop: bool, grad_oracle_cadence: str = "50",
                matrix_row: bool = False,
-               face_entropy_floor: str = "0.3") -> dict:
+               face_entropy_floor: str = "0.3",
+               ppo_epochs: str = "1", minibatches: str = "4") -> dict:
     """The `cli` override dict of one thesis run.
 
     Everything the owner fixed is HERE, once, so the block and the smoke
@@ -2802,6 +2816,12 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
         "--cpu-cores-per-actor": str(THESIS_CORE_BUDGET[gpus]["per_actor"]),
         "--measure-pipeline": CAMPAIGN_MEASURE_PIPELINE,
         "--rollout-shards": CAMPAIGN_ROLLOUT_SHARDS,
+        # --- the actor's update budget (owner ruling 2026-09-20).  A matrix
+        # row (through `thesis_arm`) gets THESIS_PPO_EPOCHS/THESIS_MINIBATCHES;
+        # a direct `thesis_cli` caller (order-only) keeps this function's own
+        # defaults, today's SHARED_CLI values, unless it says otherwise.
+        "--ppo-epochs": ppo_epochs,
+        "--minibatches": minibatches,
         "--tokenize-where": CAMPAIGN_TOKENIZE_WHERE,
         "--face-wire-faces": CAMPAIGN_FACE_WIRE_FACES,
         # --- the gate inputs (G1's table is resolved from --fixed-order)
@@ -2850,7 +2870,9 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
                prediction: str | None = None, held: str | None = None,
                time: str = THESIS_TIME, extra_cli: dict | None = None,
                grad_oracle_cadence: str = "50",
-               face_entropy_floor: str = THESIS_FACE_ENTROPY_FLOOR) -> dict:
+               face_entropy_floor: str = THESIS_FACE_ENTROPY_FLOOR,
+               ppo_epochs: str = THESIS_PPO_EPOCHS,
+               minibatches: str = THESIS_MINIBATCHES) -> dict:
     """One thesis run -> one `arm(...)`.  Returns the arm."""
     _require(node in THESIS_NODES,
              f"node {node!r} is not one of the permitted thesis nodes "
@@ -2876,7 +2898,8 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
                      auto_stop=auto_stop,
                      grad_oracle_cadence=grad_oracle_cadence,
                      matrix_row=True,
-                     face_entropy_floor=face_entropy_floor)
+                     face_entropy_floor=face_entropy_floor,
+                     ppo_epochs=ppo_epochs, minibatches=minibatches)
     if extra_cli:
         cli.update(extra_cli)
     gpus = thesis_row_gpus(target, node)
@@ -3295,7 +3318,9 @@ reported as it stands."""
 thesis_arm(
     arm="C", target="tlm", seed=THESIS_SEEDS[0], node=THESIS_SMOKE_NODE,
     name="smoke_C_tlm", episodes=THESIS_SMOKE_EPISODES,
-    face_entropy_floor="0.3",  # dsnn-dfw.78: smoke is outside the thesis matrix
+    # dsnn-dfw.78 and owner ruling 2026-09-20: smoke is outside the thesis
+    # matrix, on both the entropy floor and the update budget.
+    face_entropy_floor="0.3", ppo_epochs="1", minibatches="4",
     checkpoint_every=THESIS_SMOKE_CHECKPOINT_EVERY, auto_stop=False,
     grad_oracle_cadence="10",
     time="04:00:00", what=_SMOKE_WHAT, prediction=_SMOKE_PREDICTION,
@@ -3306,7 +3331,9 @@ ARMS[-1]["falsifier"] = _SMOKE_FALSIFIER
 thesis_arm(
     arm="C", target="tlm", seed=THESIS_SEEDS[0], node=THESIS_SMOKE_NODE,
     name="smoke_C_tlm", episodes=THESIS_SMOKE_EPISODES,
-    face_entropy_floor="0.3",  # dsnn-dfw.78: smoke is outside the thesis matrix
+    # dsnn-dfw.78 and owner ruling 2026-09-20: smoke is outside the thesis
+    # matrix, on both the entropy floor and the update budget.
+    face_entropy_floor="0.3", ppo_epochs="1", minibatches="4",
     checkpoint_every=THESIS_SMOKE_CHECKPOINT_EVERY, auto_stop=False,
     grad_oracle_cadence="10",
     time="04:00:00", what=_SMOKE_WHAT, prediction=_SMOKE_PREDICTION,
@@ -3322,7 +3349,9 @@ ARMS[-1]["name"] = "smoke_C_tlm_resume"
 thesis_arm(
     arm="condC", target="nn256", seed=THESIS_SEEDS[0], node=THESIS_SMOKE_NODE,
     name="smoke_condC_nn256", episodes=THESIS_SMOKE_NN_EPISODES,
-    face_entropy_floor="0.3",  # dsnn-dfw.78: smoke is outside the thesis matrix
+    # dsnn-dfw.78 and owner ruling 2026-09-20: smoke is outside the thesis
+    # matrix, on both the entropy floor and the update budget.
+    face_entropy_floor="0.3", ppo_epochs="1", minibatches="4",
     checkpoint_every=THESIS_SMOKE_CHECKPOINT_EVERY, auto_stop=False,
     time="04:00:00", what=_SMOKE_WHAT, prediction=_SMOKE_PREDICTION,
 )
@@ -3360,6 +3389,15 @@ SWEEPL_CENTER: dict[str, str] = {
     "--lag-max": THESIS_DUAL_LAMBDA_MAX,
     "--lag-init": THESIS_LAMBDA_Q,
     "--quality-floor": THESIS_TAU,
+}
+#: ROUND 1 RAN AT TODAY'S UPDATE BUDGET (--ppo-epochs 1, --minibatches 4),
+#: before the owner's 2026-09-20 ruling raised the matrix's own budget to
+#: THESIS_PPO_EPOCHS/THESIS_MINIBATCHES.  Named here and merged into every
+#: row's overrides so the round's recorded meaning is frozen and does not
+#: drift when `thesis_arm`'s own default budget changes.
+SWEEPL_TODAY_BUDGET: dict[str, str] = {
+    "--ppo-epochs": "1",
+    "--minibatches": "4",
 }
 #: One factor at a time.  Each tuple includes the center value so a reader
 #: sees the whole probed range; `sweepl_configs` skips the center value when
@@ -3494,7 +3532,7 @@ for _sweepl_tag, _sweepl_overrides in sweepl_configs():
             node=_sweepl_node,
             name=sweepl_row_name(_sweepl_tag, _sweepl_seed),
             episodes=SWEEPL_EPISODES, what=_sweepl_what,
-            extra_cli=dict(_sweepl_overrides),
+            extra_cli=dict(_sweepl_overrides, **SWEEPL_TODAY_BUDGET),
         )
         ARMS[-1]["sweepl"] = True
         ARMS[-1]["sweepl_tag"] = _sweepl_tag
@@ -3536,10 +3574,12 @@ SWEEPL2_DUAL: dict[str, dict[str, str]] = {
     "cap256": {"--lag-max": "256"},
 }
 #: budget tag -> the cli overrides that differ from today's update budget
-#: (--ppo-epochs 1, --minibatches 4, the SHARED_CLI defaults).  B1 overrides
-#: nothing; it IS today's budget.
+#: (--ppo-epochs 1, --minibatches 4, the SHARED_CLI defaults).  B1 states
+#: that budget EXPLICITLY (owner ruling 2026-09-20 later raised the matrix's
+#: own default to THESIS_PPO_EPOCHS/THESIS_MINIBATCHES; this round is frozen
+#: for comparison, not left to inherit whatever the ambient default is).
 SWEEPL2_BUDGET: dict[str, dict[str, str]] = {
-    "b1": {},
+    "b1": {"--ppo-epochs": "1", "--minibatches": "4"},
     "b4": {"--ppo-epochs": "2", "--minibatches": "8"},
 }
 
