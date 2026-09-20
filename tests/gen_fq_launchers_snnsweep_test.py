@@ -437,7 +437,8 @@ def test_the_matrix_and_the_campaign_still_have_their_own_counts(gen):
     matrix = [a for a in gen.thesis_arms()
               if not a.get("smoke") and not a.get("orderonly")
               and not a.get("orderonly_rsnn")
-              and not a.get("orderonly_final")]
+              and not a.get("orderonly_final")
+              and not a.get("orderonly_tlm_final")]
     assert len(gen.thesis_core_arms()) == 50
     assert len(gen.thesis_snn_arms()) == 100
     assert len(matrix) == 150
