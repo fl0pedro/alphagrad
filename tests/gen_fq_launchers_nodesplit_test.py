@@ -21,6 +21,8 @@ from __future__ import annotations
 import importlib.util
 import os
 import re
+import subprocess
+import sys
 
 import pytest
 
@@ -240,19 +242,52 @@ def test_the_pair_exits_with_the_worse_of_the_two_trainer_codes(gen):
                 % (tag, h["seed"], re.escape(h["name"]), tag), text), p["name"]
 
 
-def test_the_paired_launcher_prints_nvidia_smi_inside_each_half(gen):
+def test_the_paired_launcher_dumps_jax_devices_inside_each_half(gen):
     """The evidence that a half really sees four GPUs and not eight is in the
-    log of the job itself, per half, after CUDA_VISIBLE_DEVICES is set."""
-    q = ("  nvidia-smi --query-gpu=index,name,memory.total"
-         " --format=csv,noheader")
+    log of the job itself, per half, after CUDA_VISIBLE_DEVICES is set.
+
+    It must be JAX's device list and NOT `nvidia-smi`.  nvidia-smi asks the
+    driver and enumerates the whole node whatever the mask says, so both
+    halves printed the same eight lines and the mask was never evidenced;
+    jax.devices() reads CUDA_VISIBLE_DEVICES, which is the thing under test.
+    """
     for p in gen.thesis_pair_arms():
         text = gen.render(p)
-        assert text.count(q) == 2, p["name"]
+        # the old call is gone from the halves
+        assert "  nvidia-smi" not in text, p["name"]
         for tag, h in zip(("A", "B"), p["halves"]):
+            # the echo still names the half and its mask
             assert (f'  echo "[half {tag}] seed {h["seed"]}'
                     f' CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES'
                     f' cores {h["cores"]} RAY_TMPDIR=$RAY_TMPDIR"') in text, \
                 p["name"]
+            dump = (f"import jax; print('[half {tag}] jax devices: ' + "
+                    "', '.join(str(d.id) + ':' + d.platform + ':' + "
+                    "d.device_kind for d in jax.devices()))")
+            assert text.count(f'-c "{dump}"') == 1, p["name"]
+            # under the mask: inside the half's subshell, after the export
+            i_exp = text.index(f"  export CUDA_VISIBLE_DEVICES={h['devices']}")
+            i_dump = text.index(dump)
+            i_run = text.index(f"  taskset -c {h['cores']}")
+            assert i_exp < i_dump < i_run, p["name"]
+
+
+def test_the_half_device_dump_runs_on_a_node_with_no_gpu(gen):
+    """CPU-SAFE.  The dump is the line a CPU test job runs too, so it must
+    print a device list rather than raise when no GPU is visible.  Run the
+    real snippet here, in a child with CUDA_VISIBLE_DEVICES empty."""
+    p = gen.thesis_pair_arms()[0]
+    text = gen.render(p)
+    snippet = [ln for ln in text.splitlines() if "jax devices: " in ln][0]
+    code = snippet.split(' -c "', 1)[1].rstrip('"')
+    env = dict(os.environ)
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    env["JAX_PLATFORMS"] = "cpu"
+    r = subprocess.run([sys.executable, "-c", code], env=env,
+                       capture_output=True, text=True, timeout=600)
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert "[half A] jax devices: " in r.stdout, r.stdout
+    assert ":cpu:" in r.stdout, r.stdout
 
 
 def test_a_pair_holds_or_releases_both_halves_together(gen):

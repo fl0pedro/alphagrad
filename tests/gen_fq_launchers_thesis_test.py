@@ -21,6 +21,13 @@ rather than on 150 files:
      NO auto-stop, its resume twin, and a condC run on NN256.
   7. `thesis_arm` RAISES on a row outside the rulings.
   8. ppo.py's own argparse accepts every thesis command line.
+  8b. RUNG 1 OF THE LADDER (owner ruling 2026-09-20): arms C and C_popart on
+     NN256, five seeds each, state the face-head init as a PLAN --
+     `--face-init-approx-per-plan 3 --face-init-skips-per-plan 0.3` -- instead
+     of `--face-none-bias 2`.  No other arm, no other target and no other
+     round (the order-only tuning rows are arm C on NN256 too) moves.
+  8c. THE LONG CONDITIONED ROWS (owner ruling 2026-09-20): condC on NN256,
+     five seeds, renders --episodes 2000.  Every other row keeps 1000.
   9. THE RECURRENT BLOCK: --example RSNN_SHD --dataset shd crossed with four
      temporal rules (tbptt, bptt, rtrl, window2), the same five arms and the
      same five seeds = 100 further runs, named `<arm>_rsnn_<rule>_s<seed>`,
@@ -59,7 +66,17 @@ ALL_TARGETS = TARGETS + RSNN_TARGETS
 RSNN_EXAMPLE = "RSNN_SHD"
 RSNN_DATASET = "shd"
 EPISODES = "1000"
+#: THE LONG CONDITIONED ROWS (owner ruling 2026-09-20): condC on NN256, five
+#: seeds, runs twice the episodes.  No other coordinate moves.
+LONG_EPISODES = "2000"
+LONG_EPISODES_ARMS = ("condC",)
+LONG_EPISODES_TARGET = "nn256"
 CHECKPOINT_EVERY = "50"
+
+
+def _is_long_episodes(a) -> bool:
+    return (a["thesis_target"] == LONG_EPISODES_TARGET
+            and a["thesis_arm"] in LONG_EPISODES_ARMS)
 PARETO_DUMP_EVERY = "10"
 TAU = "0.90"
 LAMBDA_Q = "16"
@@ -276,7 +293,8 @@ def test_every_arm_carries_the_shared_thesis_flags(gen, matrix):
     for a in matrix:
         cli = _cli(gen, a)
         # the run
-        assert cli["--episodes"] == EPISODES, a["name"]
+        assert cli["--episodes"] == (LONG_EPISODES if _is_long_episodes(a)
+                                     else EPISODES), a["name"]
         assert cli["--checkpoint-every"] == CHECKPOINT_EVERY, a["name"]
         assert cli["--grad-oracle-cadence"] == GRAD_ORACLE_CADENCE, a["name"]
         assert cli["--pareto-dump-every"] == PARETO_DUMP_EVERY, a["name"]
@@ -395,7 +413,141 @@ def test_the_three_c_arms_are_the_lagrangian_dual(gen, matrix):
         assert gen.THESIS_DUAL_LAMBDA_MAX == DUAL_MAX
         assert gen.DUAL_LAMBDA_MIN == DUAL_MIN
         assert cli["--lag-init"] == LAMBDA_Q, a["name"]
-        assert cli["--face-none-bias"] == "2", a["name"]
+        if _is_rung1(a):
+            # rung 1 states the plan instead of the bias; the two are
+            # mutually exclusive and ppo.py refuses both at once
+            assert "--face-none-bias" not in cli, a["name"]
+        else:
+            assert cli["--face-none-bias"] == "2", a["name"]
+
+
+# ------------------------------------------------- 2b. rung 1: normalized init
+
+#: The owner's rung-1 numbers, typed here on purpose (2026-09-20).
+RUNG1_ARMS = ("C", "C_popart")
+RUNG1_TARGET = "nn256"
+RUNG1_A = "3"
+RUNG1_KAPPA = "0.3"
+
+
+def _is_rung1(a) -> bool:
+    return (a["thesis_target"] == RUNG1_TARGET
+            and a["thesis_arm"] in RUNG1_ARMS)
+
+
+def test_rung1_is_c_and_c_popart_on_nn256_and_nothing_else(gen, matrix):
+    """THE ROWS.  dsnn-dfw.74 is an NN256 C/C_popart defect, so rung 1 is
+    those ten rows -- five seeds each -- and no other arm and no other
+    target moves, or the ladder's first step is not a controlled one."""
+    seen = set()
+    for a in matrix:
+        cli = _cli(gen, a)
+        normalized = "--face-init-approx-per-plan" in cli
+        assert normalized == _is_rung1(a), a["name"]
+        if normalized:
+            seen.add((a["thesis_arm"], a["thesis_target"], a["thesis_seed"]))
+    assert seen == {(arm, RUNG1_TARGET, s)
+                    for arm in RUNG1_ARMS for s in SEEDS}
+
+
+def test_rung1_asks_for_three_approximations_and_a_third_of_a_skip(gen,
+                                                                   matrix):
+    for a in matrix:
+        if not _is_rung1(a):
+            continue
+        cli = _cli(gen, a)
+        assert cli["--face-init-approx-per-plan"] == RUNG1_A, a["name"]
+        assert cli["--face-init-skips-per-plan"] == RUNG1_KAPPA, a["name"]
+        assert "--face-none-bias" not in cli, a["name"]
+        assert "--face-skip-bias" not in cli, a["name"]
+        assert gen.RUNG1_APPROX_PER_PLAN == RUNG1_A
+        assert gen.RUNG1_SKIPS_PER_PLAN == RUNG1_KAPPA
+        # and the rendered command line carries both
+        text = gen.render(a)
+        assert f"--face-init-approx-per-plan {RUNG1_A}" in text, a["name"]
+        assert f"--face-init-skips-per-plan {RUNG1_KAPPA}" in text, a["name"]
+
+
+def test_the_conditioned_nn256_rows_run_two_thousand_episodes(gen, matrix):
+    """Owner ruling 2026-09-20. The conditioning has to amortise over the
+    whole weight span, so those five rows get twice the budget; every other
+    coordinate, condC on TLM and on the four recurrent targets included,
+    keeps the thousand."""
+    long_rows = set()
+    for a in matrix:
+        cli = _cli(gen, a)
+        is_long = cli["--episodes"] == LONG_EPISODES
+        assert is_long == _is_long_episodes(a), (a["name"], cli["--episodes"])
+        if not is_long:
+            assert cli["--episodes"] == EPISODES, a["name"]
+        else:
+            long_rows.add((a["thesis_arm"], a["thesis_target"],
+                           a["thesis_seed"]))
+            # the rendered file says so, in the command line and in the header
+            text = gen.render(a)
+            assert f"--episodes {LONG_EPISODES}" in text, a["name"]
+            assert f"THIS ROW RUNS {LONG_EPISODES} EPISODES" in text, a["name"]
+    assert long_rows == {(arm, LONG_EPISODES_TARGET, s)
+                         for arm in LONG_EPISODES_ARMS for s in SEEDS}
+    assert gen.THESIS_EPISODES_LONG == LONG_EPISODES
+    assert gen.THESIS_EPISODES == EPISODES
+
+
+def test_the_long_budget_does_not_reach_a_row_that_names_its_own(gen, smoke):
+    """The smoke rows pass an episode count of their own -- 20, its resume
+    twin, and 5 for the condC NN256 smoke.  A default that overrode them
+    would turn a 5-episode smoke into a 2000-episode run on a node."""
+    for a in smoke:
+        cli = _cli(gen, a)
+        assert cli["--episodes"] != LONG_EPISODES, a["name"]
+        assert f"THIS ROW RUNS {LONG_EPISODES} EPISODES" not in gen.render(a)
+
+
+def test_only_a_rung1_launcher_greps_for_the_two_new_flags(gen, matrix):
+    """Layer 1 of a launcher greps ppo.py for every flag its own command
+    line uses, so a rung-1 row must name the two; and NO other row may,
+    because that list is rendered into the file and a running comparison's
+    launcher does not change for a guard its row does not need."""
+    for a in matrix:
+        text = gen.render(a)
+        line = [ln for ln in text.splitlines()
+                if ln.startswith("for F in --quality-metric")][0]
+        greps = set(line[len("for F in "):].rstrip("; do").split())
+        for flag in ("--face-init-approx-per-plan",
+                     "--face-init-skips-per-plan"):
+            assert (flag in greps) == _is_rung1(a), (a["name"], flag)
+
+
+def test_only_a_matrix_coordinate_can_be_a_rung1_row(gen):
+    """The order-only tuning rounds are arm C on NN256 too and they build
+    their command line with the same `thesis_cli`.  They are a different
+    round with its own record, so they must keep --face-none-bias 2; a
+    launcher that moved under them would invalidate that comparison."""
+    for arm in RUNG1_ARMS:
+        assert gen.rung1_row(arm, RUNG1_TARGET, True)
+        assert not gen.rung1_row(arm, RUNG1_TARGET, False)
+    # and the default of thesis_cli is the safe one
+    cli = gen.thesis_cli(arm="C", target=RUNG1_TARGET, seed=SEEDS[0],
+                         node=gen.THESIS_NODES[0], name="x",
+                         episodes="1", checkpoint_every="1", auto_stop=False)
+    assert "--face-none-bias" in cli
+    assert "--face-init-approx-per-plan" not in cli
+
+
+def test_rung1_keeps_the_four_gpu_profile_and_the_paired_slots(gen, matrix):
+    """The init is the ONLY thing rung 1 changes.  The uniform NN256
+    hardware profile (dsnn-dfw.69) and the paired 8-GPU slots are what make
+    the five seeds one distribution; a row that moved off them would not be
+    comparable with the seeds beside it."""
+    rows = [a for a in matrix if _is_rung1(a)]
+    assert len(rows) == len(RUNG1_ARMS) * len(SEEDS), len(rows)
+    for a in rows:
+        assert a["gpus"] == 4, a["name"]
+        cli = _cli(gen, a)
+        assert cli["--ray-measure"] == "3", a["name"]
+    paired_halves = {h["name"] for p in gen.thesis_pair_arms()
+                     for h in p["halves"]}
+    assert paired_halves, "the paired slots are gone"
 
 
 def test_c_is_not_conditioned_and_condc_is(gen, matrix):
@@ -445,6 +597,14 @@ def test_the_arms_differ_only_where_the_matrix_says_they_do(gen, matrix):
         "--advantage-norm", "--no-symlog", "--symlog-channels",
         "--preference-conditioned", "--lag-eta", "--lag-init", "--lag-min",
         "--lag-max",
+        # rung 1 (owner 2026-09-20): the face-head init of the NN256 C rows
+        # is stated as a plan, not as a bias.  It is the same coordinate as
+        # --face-none-bias, expressed in the other of the two ways.
+        "--face-init-approx-per-plan", "--face-init-skips-per-plan",
+        # and the conditioned NN256 rows run twice the episodes (owner
+        # 2026-09-20); `test_the_conditioned_nn256_rows_run_two_thousand_
+        # episodes` is what pins which rows that is.
+        "--episodes",
     }
     by_key = {(a["thesis_arm"], a["thesis_target"], a["thesis_seed"]): a
               for a in matrix}
@@ -889,18 +1049,36 @@ def test_every_recurrent_row_carries_the_nn256_and_tlm_flags_unchanged(
     --ray-measure is excluded because it is the node's GPU count minus one
     and the rows are spread over nodes of two sizes;
     `test_the_nodes_and_the_actors_per_node_size` pins it per row.
+
+    The face-head init is excluded against the NN256 twin ONLY, and only for
+    the two rung-1 arms: rung 1 (owner 2026-09-20) states those rows' init
+    as a plan rather than as a bias, and the recurrent rows are not on the
+    ladder.  It is the same coordinate, written the other of the two ways,
+    and `test_rung1_is_c_and_c_popart_on_nn256_and_nothing_else` is what
+    pins which rows moved.
     """
     node_derived = {"--ray-measure"}
+    face_init = {"--face-none-bias", "--face-init-approx-per-plan",
+                 "--face-init-skips-per-plan"}
     target_keys = {"--name", "--example", "--dataset", "--temporal-rule"}
     by_key = {(a["thesis_arm"], a["thesis_target"], a["thesis_seed"]): a
               for a in core}
     for a in snn:
         cli = _cli(gen, a)
         for t in TARGETS:
-            ref = _cli(gen, by_key[(a["thesis_arm"], t, a["thesis_seed"])])
+            twin = by_key[(a["thesis_arm"], t, a["thesis_seed"])]
+            ref = _cli(gen, twin)
             diff = {k for k in set(ref) | set(cli)
                     if ref.get(k, _MISSING) != cli.get(k, _MISSING)}
             diff -= node_derived
+            if _is_rung1(twin):
+                assert diff & face_init == face_init, (a["name"], t)
+                diff -= face_init
+            if _is_long_episodes(twin):
+                # the NN256 twin runs the long budget; the recurrent row is
+                # not on that ruling
+                assert "--episodes" in diff, (a["name"], t)
+                diff -= {"--episodes"}
             assert diff == target_keys, (a["name"], t, sorted(diff))
 
 

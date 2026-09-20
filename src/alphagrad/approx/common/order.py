@@ -97,3 +97,60 @@ def fixed_order_for_env(kind: str, env) -> np.ndarray | None:
     cfg = env.config
     return fixed_order_table(kind, cfg.jaxpr, cfg.argnums, env.consts,
                              env.args, env.valid_vertices)
+
+
+#: The name of the order :func:`reference_order_face_count` counts on, printed
+#: beside the number so a reader never has to guess which walk produced it.
+REFERENCE_ORDER_NAME = "reverse (the paired rev-exact reference order)"
+
+
+def face_count_on_order(jaxpr, argnums, consts, args, order) -> int:
+    """How many LIVE FACES a plan that follows ``order`` offers in total.
+
+    One elimination walk, counting ``graphax.faces_of`` at every step on the
+    live graph the previous steps left -- the same enumeration
+    ``env._face_transforms_for_order`` and ``landscape_map.face_inventory``
+    ride, so this number is the number of face DECISIONS the face head makes
+    over one episode, not a bound.
+
+    The count is a property of the ORDER, never of the graph alone:
+    eliminating a vertex rewires its neighbours, so vertex k's face count
+    depends on the k-1 before it (tools/faces_per_vertex.py).
+    """
+    from graphax import faces_of
+    from graphax.incremental import IncrementalJaxpr
+
+    ij = IncrementalJaxpr(jaxpr, tuple(argnums), list(consts), list(args),
+                          track_faces=False)
+    total = 0
+    for v in order:
+        v = int(v)
+        total += len(faces_of(ij.graph, ij.tgraph, v, jaxpr))
+        ij.eliminate(v, (), None)
+    return int(total)
+
+
+def reference_order_face_count(env) -> tuple[int, str, np.ndarray]:
+    """``(F, order_name, order)`` for the REVERSE-MODE REFERENCE ORDER.
+
+    F is the live-face count the normalized face-head init
+    (``--face-init-approx-per-plan`` / ``--face-init-skips-per-plan``)
+    normalizes by, under the owner's ruling of 2026-09-20.
+
+    THE ORDER IS THE PAIRED REFERENCE'S OWN. ``env.py`` measures every
+    candidate against rev-exact -- ``sorted(o_list, reverse=True)``, the
+    reverse order over the same vertex set the candidate eliminated, no rule
+    and no face action -- and a complete plan eliminates every valid vertex,
+    so :func:`reverse_order` over ``env.valid_vertices`` IS that order. The
+    reward the policy chases is a ratio against this walk, so the init's
+    normalizer and the reward's denominator name the same plan.
+
+    Under ``--fixed-order free`` the policy samples a DIFFERENT order every
+    episode and every environment, each with its own face count; F is the
+    reference's count, not any sampled plan's, and it is computed once.
+    """
+    cfg = env.config
+    order = reverse_order(env.valid_vertices)
+    F = face_count_on_order(cfg.jaxpr, cfg.argnums, env.consts, env.args,
+                            order)
+    return F, REFERENCE_ORDER_NAME, order
