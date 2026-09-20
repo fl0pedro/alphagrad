@@ -6409,6 +6409,38 @@ def make_argparser() -> argparse.ArgumentParser:
              "(ticket dsnn-3qm.44: args only; a set var is refused at "
              "startup).")
     p.add_argument(
+        "--face-skip-bias", type=float, default=None,
+        help="SKIP-only override of --face-none-bias's -B: when set, the "
+             "face's SKIP logit gets -Bs instead of -B, independent of the "
+             "none bias (which keeps its +B on the OP_NONE logits either "
+             "way). None (default) = off = the SKIP logit still gets -B, "
+             "bit-identical to the head before this flag existed. Coupling: "
+             "with --face-skip-bias unset, E[K]/E[A] ~ 1/(S*k) = 1/9 at "
+             "S=3, k=3 (one skip logit per face vs. S*k non-none slot "
+             "logits sharing the same -B/+B pull); setting it decouples "
+             "the two (common/agent_factory.apply_face_none_bias).")
+    p.add_argument(
+        "--face-init-approx-per-plan", type=float, default=None,
+        help="Derive --face-none-bias's B from a target expected "
+             "approximations/plan `a` instead of setting B directly: "
+             "B = ln(F*S*k/a - k) from the live-face count F of the built "
+             "target, S=3 slots/face, k=3 non-none ops/slot "
+             "(common/agent_factory.derive_face_none_bias). None (default) "
+             "= off. Conflicts with --face-none-bias/--face-skip-bias "
+             "(refuses). NOT WIRED TO A LIVE F: F is the length of a walk "
+             "over one elimination order, not a jaxpr property, and under "
+             "--fixed-order free no order exists at agent-init time "
+             "(agent_factory.resolve_face_init_bias); this flag therefore "
+             "always refuses today rather than guess an order's count.")
+    p.add_argument(
+        "--face-init-skips-per-plan", type=float, default=None,
+        help="Derive the skip bias Bs from a target expected skips/plan "
+             "`kappa`: Bs = ln(F/kappa - 1) from the live-face count F of "
+             "the built target (common/agent_factory.derive_face_skip_bias)"
+             ". None (default) = off. Same conflicts and same F-not-known "
+             "refusal as --face-init-approx-per-plan "
+             "(agent_factory.resolve_face_init_bias).")
+    p.add_argument(
         "--pin-rules-to-exact",
         action="store_true",
         help="Stage C: pin the axis-pair / factor heads to exact-AD "
@@ -9654,9 +9686,17 @@ def main():
           flush=True)
     # Identity-init parity with the factory path (az): ppo.main predates
     # build_and_init_agent and does not route through it.
-    from alphagrad.approx.common.agent_factory import apply_face_none_bias
-    agent = apply_face_none_bias(
-        agent, float(getattr(args, "face_none_bias", 0.0) or 0.0))
+    from alphagrad.approx.common.agent_factory import (
+        apply_face_none_bias, resolve_face_init_bias)
+    _derived_B, _derived_Bs = resolve_face_init_bias(args)
+    if _derived_B is None:
+        _face_none_bias = float(getattr(args, "face_none_bias", 0.0) or 0.0)
+        _face_skip_bias = getattr(args, "face_skip_bias", None)
+        _face_skip_bias = (None if _face_skip_bias is None
+                            else float(_face_skip_bias))
+    else:
+        _face_none_bias, _face_skip_bias = _derived_B, _derived_Bs
+    agent = apply_face_none_bias(agent, _face_none_bias, _face_skip_bias)
     # ------------------------------------------- KL-TO-REFERENCE TRUST REGION
     # THE FROZEN REFERENCE POLICY, snapshotted HERE and never again: after
     # _build_agent + apply_init_scheme + apply_face_none_bias, i.e. exactly
