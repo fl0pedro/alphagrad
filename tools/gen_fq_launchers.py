@@ -2243,6 +2243,14 @@ THESIS_MEM_CHANNEL = "watermark"
 #: auto_stop=True and keeps it.  The smoke rows pass auto_stop=False already.
 THESIS_FINAL_AUTO_STOP = False
 
+#: THE FACE-ENTROPY FLOOR (dsnn-dfw.78, SEC-12 finding 2026-08-25). ppo.py's
+#: own --face-entropy-floor help records that 0.3 is an always-on igniter at
+#: an identity-like init (H is 0.03-0.06 there) and that v64+ uses 0.05.
+#: MATRIX ROWS ONLY, unlike (a)-(d) above: the order-only tuning rows and the
+#: smoke keep 0.3 (`thesis_cli`'s own default) because they sit outside the
+#: thesis matrix.
+THESIS_FACE_ENTROPY_FLOOR = "0.05"
+
 # ---------------------------------------------------------------------------
 # THE HARDWARE.  Five Blackwell nodes we may use (dsnn-dfw.69, owner ruling
 # 2026-09-20).  pgi15-gpu17 has no matched CUDA 12.9 ptxas or nvlink (job
@@ -2746,7 +2754,8 @@ def thesis_run_name(arm: str, target: str, seed: str) -> str:
 def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
                episodes: str, checkpoint_every: str,
                auto_stop: bool, grad_oracle_cadence: str = "50",
-               matrix_row: bool = False) -> dict:
+               matrix_row: bool = False,
+               face_entropy_floor: str = "0.3") -> dict:
     """The `cli` override dict of one thesis run.
 
     Everything the owner fixed is HERE, once, so the block and the smoke
@@ -2775,7 +2784,7 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
         "--scale-face-head": SCALE_FACE_HEAD_MVP,
         "--face-logit-clamp": FACE_LOGIT_CLAMP_MVP,
         "--face-entropy-weight": "0.05",
-        "--face-entropy-floor": "0.3",
+        "--face-entropy-floor": face_entropy_floor,
         "--face-entropy-floor-weight": "10.0",
         # --- the reward
         "--rewards": "cmp mem acc",
@@ -2840,7 +2849,8 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
                what: str | None = None,
                prediction: str | None = None, held: str | None = None,
                time: str = THESIS_TIME, extra_cli: dict | None = None,
-               grad_oracle_cadence: str = "50") -> dict:
+               grad_oracle_cadence: str = "50",
+               face_entropy_floor: str = THESIS_FACE_ENTROPY_FLOOR) -> dict:
     """One thesis run -> one `arm(...)`.  Returns the arm."""
     _require(node in THESIS_NODES,
              f"node {node!r} is not one of the permitted thesis nodes "
@@ -2865,7 +2875,8 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
                      episodes=episodes, checkpoint_every=checkpoint_every,
                      auto_stop=auto_stop,
                      grad_oracle_cadence=grad_oracle_cadence,
-                     matrix_row=True)
+                     matrix_row=True,
+                     face_entropy_floor=face_entropy_floor)
     if extra_cli:
         cli.update(extra_cli)
     gpus = thesis_row_gpus(target, node)
@@ -3280,6 +3291,7 @@ reported as it stands."""
 thesis_arm(
     arm="C", target="tlm", seed=THESIS_SEEDS[0], node=THESIS_SMOKE_NODE,
     name="smoke_C_tlm", episodes=THESIS_SMOKE_EPISODES,
+    face_entropy_floor="0.3",  # dsnn-dfw.78: smoke is outside the thesis matrix
     checkpoint_every=THESIS_SMOKE_CHECKPOINT_EVERY, auto_stop=False,
     grad_oracle_cadence="10",
     time="04:00:00", what=_SMOKE_WHAT, prediction=_SMOKE_PREDICTION,
@@ -3290,6 +3302,7 @@ ARMS[-1]["falsifier"] = _SMOKE_FALSIFIER
 thesis_arm(
     arm="C", target="tlm", seed=THESIS_SEEDS[0], node=THESIS_SMOKE_NODE,
     name="smoke_C_tlm", episodes=THESIS_SMOKE_EPISODES,
+    face_entropy_floor="0.3",  # dsnn-dfw.78: smoke is outside the thesis matrix
     checkpoint_every=THESIS_SMOKE_CHECKPOINT_EVERY, auto_stop=False,
     grad_oracle_cadence="10",
     time="04:00:00", what=_SMOKE_WHAT, prediction=_SMOKE_PREDICTION,
@@ -3305,6 +3318,7 @@ ARMS[-1]["name"] = "smoke_C_tlm_resume"
 thesis_arm(
     arm="condC", target="nn256", seed=THESIS_SEEDS[0], node=THESIS_SMOKE_NODE,
     name="smoke_condC_nn256", episodes=THESIS_SMOKE_NN_EPISODES,
+    face_entropy_floor="0.3",  # dsnn-dfw.78: smoke is outside the thesis matrix
     checkpoint_every=THESIS_SMOKE_CHECKPOINT_EVERY, auto_stop=False,
     time="04:00:00", what=_SMOKE_WHAT, prediction=_SMOKE_PREDICTION,
 )
