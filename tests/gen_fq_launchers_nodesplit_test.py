@@ -1,0 +1,283 @@
+"""Ticket dsnn-dfw.69, owner ruling 2026-09-20 -- ONE PROFILE FOR NN256, AND
+TWO SEEDS PER 8-GPU NODE INSIDE ONE JOB.
+
+Two facts are pinned here.
+
+1. THE PROFILE IS THE ROW'S, NOT THE NODE'S.  A NN256 row used to take the
+   size of whatever node the round robin gave it: on pgi15-gpu20 it rendered
+   8 GPUs, 128 CPUs and --ray-measure 7 while its four sibling seeds rendered
+   4, 64 and 3.  Latency measured under two fan-outs is not one distribution,
+   so every NN256 row now renders the 4-GPU profile on every Blackwell node.
+
+2. TWO ROWS ON ONE NODE ARE ONE SBATCH.  `/etc/slurm/epilog_reset_node.sh`
+   kills every process of this user on a node when ANY job of theirs on it
+   ends, so the second half of an 8-GPU node cannot be a second job.  The
+   paired launcher runs both seeds concurrently inside one job, on disjoint
+   GPUs and disjoint cores, and exits with the WORSE of the two trainer
+   codes -- a half that crashed may not be hidden by a half that did not.
+"""
+from __future__ import annotations
+
+import importlib.util
+import os
+import re
+
+import pytest
+
+_ALPHAGRAD = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_GEN = os.path.join(_ALPHAGRAD, "tools", "gen_fq_launchers.py")
+
+#: The owner's numbers, typed here on purpose.
+NODES = ("pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu18", "pgi15-gpu19",
+         "pgi15-gpu20")
+EIGHT_GPU = ("pgi15-gpu19", "pgi15-gpu20")
+NN256_GPUS = 4
+NN256_CPUS = 64
+NN256_MEM = "400G"
+NN256_ACTORS = "3"
+
+
+@pytest.fixture(scope="module")
+def gen():
+    spec = importlib.util.spec_from_file_location("gen_fq_launchers", _GEN)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _nn256_rows(gen):
+    """Every generated NN256 row on a Blackwell node: the matrix's own rows,
+    the smoke's NN256 row and the five-seed order-only baseline."""
+    return [a for a in gen.ARMS
+            if a.get("thesis_target") == "nn256"
+            and a.get("node") in gen.THESIS_NODE_GPUS]
+
+
+# --------------------------------------------------- 1. the uniform profile
+
+def test_the_node_list_is_the_five_cleared_blackwell_nodes(gen):
+    assert gen.THESIS_NODES == gen.THESIS_NODES_ALL == NODES
+    assert "pgi15-gpu17" not in gen.THESIS_NODES
+    assert gen.ORDERONLY_FINAL_NODES == NODES
+    for n in EIGHT_GPU:
+        assert gen.THESIS_NODE_GPUS[n] == 8
+
+
+def test_no_row_of_the_generator_targets_gpu17(gen):
+    """gpu17 has no matched CUDA 12.9 ptxas or nvlink (job 66740 aborted 72).
+    The whole generator, not one table: the arm record AND the rendered
+    `#SBATCH -w` line."""
+    offenders = [a["name"] for a in gen.ARMS if a.get("node") == "pgi15-gpu17"]
+    assert not offenders, offenders
+    for a in gen.ARMS:
+        assert "#SBATCH -w pgi15-gpu17\n" not in gen.render(a), a["name"]
+
+
+def test_every_nn256_row_renders_the_four_gpu_profile_on_every_node(gen):
+    rows = _nn256_rows(gen)
+    assert len(rows) >= 30, len(rows)
+    seen_nodes = set()
+    for a in rows:
+        node = a["node"]
+        seen_nodes.add(node)
+        assert gen.thesis_row_gpus("nn256", node) == NN256_GPUS, a["name"]
+        assert a["gpus"] == NN256_GPUS, a["name"]
+        cli = dict(gen._merge_cli(a.get("cli", {})))
+        assert cli["--ray-measure"] == NN256_ACTORS, a["name"]
+        b = gen.THESIS_CORE_BUDGET[NN256_GPUS]
+        assert cli["--reserved-driver-cores"] == str(b["trainer"]), a["name"]
+        assert cli["--cpu-cores-per-actor"] == str(b["per_actor"]), a["name"]
+        text = gen.render(a)
+        assert f"#SBATCH --gres={gen.blackwell_gres(NN256_GPUS)}\n" in text, \
+            a["name"]
+        assert f"#SBATCH -c {NN256_CPUS}\n" in text, a["name"]
+        assert f"#SBATCH --mem={NN256_MEM}\n" in text, a["name"]
+    # the profile is pinned ON EVERY NODE, so every node must carry one
+    assert seen_nodes == set(NODES), sorted(seen_nodes)
+
+
+def test_a_tlm_row_still_takes_the_node(gen):
+    """The uniform profile is per TARGET, not a blanket rule: TLM keeps the
+    node's own size, so an 8-GPU node still measures a TLM row with seven."""
+    assert gen.THESIS_UNIFORM_GPUS == {"nn256": NN256_GPUS}
+    for a in gen.ARMS:
+        if a.get("thesis_target") != "tlm" or a.get("node") not in NODES:
+            continue
+        gpus = gen.THESIS_NODE_GPUS[a["node"]]
+        assert a["gpus"] == gpus, a["name"]
+        cli = dict(gen._merge_cli(a.get("cli", {})))
+        assert cli["--ray-measure"] == gen.THESIS_RAY_MEASURE[gpus], a["name"]
+
+
+# ------------------------------------------------------------- 2. the slots
+
+def test_the_slot_ring_is_three_whole_nodes_and_two_halves_each(gen):
+    assert gen.THESIS_SLOTS == (
+        ("pgi15-gpu15", None), ("pgi15-gpu16", None), ("pgi15-gpu18", None),
+        ("pgi15-gpu19", 0), ("pgi15-gpu19", 1),
+        ("pgi15-gpu20", 0), ("pgi15-gpu20", 1))
+    assert len(gen.THESIS_SLOTS) == 7
+
+
+def test_every_half_row_names_the_pair_it_runs_inside(gen):
+    halves = [a for a in gen.ARMS if a.get("paired_into")]
+    assert halves
+    pairs = {p["name"]: p for p in gen.thesis_pair_arms()}
+    for a in halves:
+        assert a["paired_into"] in pairs, a["name"]
+        assert a["node"] in EIGHT_GPU, a["name"]
+        # the file is still the readable record of the row, and it refuses
+        text = gen.render(a)
+        assert f"ABORT(74): {a['name']} runs as one half" in text, a["name"]
+        assert 'if [ "${FQ_RELEASE_HALF:-0}" != "1" ]; then' in text, a["name"]
+        assert "  exit 74" in text, a["name"]
+    # every half of a pair points at it and no row points at two
+    for p in pairs.values():
+        pointing = {a["name"] for a in halves if a["paired_into"] == p["name"]}
+        assert pointing == {h["name"] for h in p["halves"]}, p["name"]
+
+
+# ---------------------------------------------------- 3. the paired launcher
+
+def test_a_pair_is_two_seeds_of_one_arm_on_one_eight_gpu_node(gen):
+    pairs = gen.thesis_pair_arms()
+    assert pairs, "the generator emits no paired launcher"
+    for p in pairs:
+        assert p["node"] in EIGHT_GPU, p["name"]
+        assert p["gpus"] == gen.THESIS_NODE_GPUS[p["node"]] == 8, p["name"]
+        assert p["thesis_target"] == "nn256", p["name"]
+        assert len(p["halves"]) == 2, p["name"]
+        seeds = [h["seed"] for h in p["halves"]]
+        assert len(set(seeds)) == 2, p["name"]
+        assert p["name"] == gen.thesis_pair_name(
+            p["thesis_arm"], p["thesis_target"], tuple(seeds)), p["name"]
+        assert p["job"] == f"node-{p['node']}", p["name"]
+        assert p["singleton"], p["name"]
+    # a pair is NOT a matrix coordinate; its two halves are
+    core = {a["name"] for a in gen.thesis_core_arms()}
+    for p in pairs:
+        assert p["name"] not in core, p["name"]
+        for h in p["halves"]:
+            assert h["name"] in core, h["name"]
+
+
+def test_the_paired_launcher_asks_for_the_whole_node(gen):
+    for p in gen.thesis_pair_arms():
+        text = gen.render(p)
+        assert f"#SBATCH -w {p['node']}\n" in text, p["name"]
+        assert f"#SBATCH --gres={gen.blackwell_gres(8)}\n" in text, p["name"]
+        assert f"#SBATCH -c {gen.BLACKWELL_CPUS[8]}\n" in text, p["name"]
+        assert f"#SBATCH --mem={gen.BLACKWELL_MEM[8]}\n" in text, p["name"]
+        assert f"#SBATCH -J node-{p['node']}\n" in text, p["name"]
+        assert "#SBATCH --dependency=singleton\n" in text, p["name"]
+
+
+def test_the_two_halves_hold_disjoint_gpus_and_disjoint_cores(gen):
+    for p in gen.thesis_pair_arms():
+        text = gen.render(p)
+        devices, cores = [], []
+        for h in p["halves"]:
+            d = [int(x) for x in h["devices"].split(",")]
+            lo, hi = (int(x) for x in h["cores"].split("-"))
+            assert len(d) == NN256_GPUS, p["name"]
+            assert hi - lo + 1 == NN256_CPUS, p["name"]
+            devices.append(set(d))
+            cores.append(set(range(lo, hi + 1)))
+            assert f"  export CUDA_VISIBLE_DEVICES={h['devices']}" in text, \
+                p["name"]
+            assert f"  taskset -c {h['cores']} " in text, p["name"]
+        assert not devices[0] & devices[1], p["name"]
+        assert not cores[0] & cores[1], p["name"]
+        assert devices[0] | devices[1] == set(range(8)), p["name"]
+        assert len(cores[0] | cores[1]) == gen.BLACKWELL_CPUS[8], p["name"]
+        assert sorted(devices[0]) == [0, 1, 2, 3], p["name"]
+        assert sorted(devices[1]) == [4, 5, 6, 7], p["name"]
+
+
+def test_each_half_gets_its_own_ray_dir_log_file_and_wandb_run(gen):
+    for p in gen.thesis_pair_arms():
+        text = gen.render(p)
+        rays, logs, names = set(), set(), set()
+        for tag, h in zip(("A", "B"), p["halves"]):
+            ray = "/tmp/ray_${SLURM_JOB_ID}_s%s" % h["seed"]
+            assert f"  export RAY_TMPDIR={ray}" in text, p["name"]
+            rays.add(ray)
+            log = (f"> {gen.CAMPAIGN_RUNS}/{h['name']}"
+                   f"_${{SLURM_JOB_ID}}_s{h['seed']}.log 2>&1 &")
+            assert log in text, p["name"]
+            logs.add(log)
+            # the wandb run is the half's own --name, the matrix coordinate
+            cli = dict(gen._merge_cli(h["cli"]))
+            assert cli["--name"] == h["name"], p["name"]
+            assert cli["--seed"] == h["seed"], p["name"]
+            names.add(cli["--name"])
+            assert f"ARGS_{tag}=(" in text, p["name"]
+        assert len(rays) == len(logs) == len(names) == 2, p["name"]
+        # both command lines are dry-parsed before either trainer starts
+        assert text.count('"${ARGS_A[@]}" ||') == 1, p["name"]
+        assert text.count('"${ARGS_B[@]}" ||') == 1, p["name"]
+
+
+def test_the_pair_exits_with_the_worse_of_the_two_trainer_codes(gen):
+    """A half that crashed may not be hidden by a half that did not: the job
+    exits with the larger of the two captured codes (ticket dsnn-dfw.68 made
+    a single launcher exit with its trainer's code; this is the same rule for
+    two)."""
+    for p in gen.thesis_pair_arms():
+        text = gen.render(p)
+        assert 'wait "$PID_A"' in text and "STATUS_A=$?" in text, p["name"]
+        assert 'wait "$PID_B"' in text and "STATUS_B=$?" in text, p["name"]
+        assert "TRAINER_STATUS=$STATUS_A" in text, p["name"]
+        assert ('if [ "$STATUS_B" -gt "$TRAINER_STATUS" ]; then\n'
+                "  TRAINER_STATUS=$STATUS_B\nfi\n") in text, p["name"]
+        tail = text.rstrip("\n").splitlines()[-1]
+        assert tail == 'exit "$TRAINER_STATUS"', (p["name"], tail)
+        # and each half's own code reaches the log by name
+        for tag, h in zip(("A", "B"), p["halves"]):
+            assert re.search(
+                r'echo "TRAINER half %s \(seed %s, %s\) exited with \$STATUS_%s"'
+                % (tag, h["seed"], re.escape(h["name"]), tag), text), p["name"]
+
+
+def test_the_paired_launcher_prints_nvidia_smi_inside_each_half(gen):
+    """The evidence that a half really sees four GPUs and not eight is in the
+    log of the job itself, per half, after CUDA_VISIBLE_DEVICES is set."""
+    q = ("  nvidia-smi --query-gpu=index,name,memory.total"
+         " --format=csv,noheader")
+    for p in gen.thesis_pair_arms():
+        text = gen.render(p)
+        assert text.count(q) == 2, p["name"]
+        for tag, h in zip(("A", "B"), p["halves"]):
+            assert (f'  echo "[half {tag}] seed {h["seed"]}'
+                    f' CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES'
+                    f' cores {h["cores"]} RAY_TMPDIR=$RAY_TMPDIR"') in text, \
+                p["name"]
+
+
+def test_a_pair_holds_or_releases_both_halves_together(gen):
+    """One job cannot be half held: a pair whose halves disagreed would
+    either start a held run or hold a released one."""
+    for p in gen.thesis_pair_arms():
+        halves = {a["name"]: a for a in gen.ARMS if a.get("paired_into")}
+        held = {bool(halves[h["name"]].get("held")) for h in p["halves"]}
+        assert len(held) == 1, p["name"]
+        assert bool(p.get("held")) == held.pop(), p["name"]
+
+
+def test_thesis_pair_arm_refuses_a_mismatched_pair(gen):
+    n0 = len(gen.ARMS)
+    p = gen.thesis_pair_arms()[0]
+    halves = {a["name"]: a for a in gen.ARMS if a.get("paired_into")}
+    rows = [halves[h["name"]] for h in p["halves"]]
+    try:
+        with pytest.raises(gen.CampaignRowError):
+            gen.thesis_pair_arm(rows[:1])
+        other = dict(rows[1], thesis_arm="__not_the_same_arm__")
+        with pytest.raises(gen.CampaignRowError):
+            gen.thesis_pair_arm([rows[0], other])
+        other = dict(rows[1], thesis_seed=rows[0]["thesis_seed"])
+        with pytest.raises(gen.CampaignRowError):
+            gen.thesis_pair_arm([rows[0], other])
+    finally:
+        del gen.ARMS[n0:]
+    assert len(gen.ARMS) == n0

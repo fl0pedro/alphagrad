@@ -3046,17 +3046,22 @@ for _i, (_arm, _target, _seed) in enumerate(thesis_submission_order()):
         _SLOT += 1
     else:
         _node = THESIS_NODES[_i % len(THESIS_NODES)]
-    _row = thesis_arm(
+    thesis_arm(
         arm=_arm, target=_target, seed=_seed,
         node=_node,
         held=None if _i < THESIS_BLOCK1 else _THESIS_HELD,
     )
     if _half is not None:
+        # ARMS[-1], not the dict `thesis_arm` returns: `arm(**kw)` re-packs
+        # its keywords, so the returned dict is a COPY and a `paired_into`
+        # written on it would never reach the renderer.
+        _row = ARMS[-1]
         _row["half"] = _half
         _HALVES.setdefault((_arm, _node), []).append(_row)
 # A slot that no sibling joined stays a whole single-node job of four GPUs on
 # an 8-GPU node: legal, one job on the node, the same profile as every other
 # NN256 row.  Only a node that carries TWO rows of one arm becomes a pair.
+_rows: list[dict] = []
 for _rows in _HALVES.values():
     if len(_rows) == 2:
         thesis_pair_arm(_rows)
@@ -4425,6 +4430,16 @@ def render(a: dict) -> str:
         L.append("#")
         L.append("# *** HELD -- NOT TO BE SUBMITTED UNTIL THE OWNER RELEASES IT ***")
         L.append(_wrap_comment(a["held"], "#   "))
+    if a.get("paired_into"):
+        L.append("#")
+        L.append("# *** ONE HALF OF A PAIRED JOB -- SUBMIT"
+                 f" fq_{a['paired_into']}.sbatch ***")
+        L.append(_wrap_comment(
+            f"This row shares its node with the other seed of its arm and "
+            f"the two run CONCURRENTLY inside one sbatch, because the node "
+            f"epilog kills a sibling job of this user on the same node. The "
+            f"file below is the readable record of the row and the command "
+            f"line the pair runs; submitting it alone aborts 74.", "#   "))
     if scratch and NO_FLAG_ENV:
         # The departure from "args only", stated where the owner reads.
         L.append("#")
@@ -4459,19 +4474,21 @@ def render(a: dict) -> str:
         L.append("")
 
     if a.get("paired_into"):
-        # THIS ROW IS HALF OF A PAIRED JOB (owner ruling 2026-09-20).  Its
-        # record, its command line and its header are unchanged and still
-        # generated -- that is what a reader reads -- but the run itself
-        # happens inside the paired launcher, and submitting BOTH would put
-        # two of our jobs on one node, where the epilog kills them both.
-        # 74 = submitted alone; the paired launcher is named in the message.
-        L.append("# HALF OF A PAIRED JOB.  74 = submitted on its own.")
-        L.append(f'echo "ABORT(74): {a["name"]} runs as one half of'
-                 f' fq_{a["paired_into"]}.sbatch -- submit THAT launcher.'
-                 ' Two jobs of ours on one node kill each other (the node'
-                 ' epilog), so this row has no job of its own."')
-        L.append("exit 74")
-        return "\n".join(L) + "\n"
+        # THIS ROW IS HALF OF A PAIRED JOB (owner ruling 2026-09-20).  The
+        # whole launcher is still generated, unchanged, because it is the
+        # readable record of the row AND the file the paired launcher's
+        # command line is diffed against.  It may not be SUBMITTED: its run
+        # happens inside the pair, and two jobs of ours on one node kill
+        # each other through the node epilog.  74 = submitted on its own.
+        L.append("# HALF OF A PAIRED JOB (see the header).  74 = submitted"
+                 " on its own.")
+        L.append('if [ "${FQ_RELEASE_HALF:-0}" != "1" ]; then')
+        L.append(f'  echo "ABORT(74): {a["name"]} runs as one half of'
+                 f' fq_{a["paired_into"]}.sbatch -- submit THAT launcher,'
+                 ' not this one"')
+        L.append("  exit 74")
+        L.append("fi")
+        L.append("")
 
     if kind == "cpu" and not a.get("needs_tool"):
         L.append("export RAY_TMPDIR=/tmp/ray_$SLURM_JOB_ID")
