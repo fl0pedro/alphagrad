@@ -50,7 +50,8 @@ def _nn256_rows(gen):
     the smoke's NN256 row and the five-seed order-only baseline."""
     return [a for a in gen.ARMS
             if a.get("thesis_target") == "nn256"
-            and a.get("node") in gen.THESIS_NODE_GPUS]
+            and a.get("node") in gen.THESIS_NODE_GPUS
+            and not a.get("paired")]
 
 
 # --------------------------------------------------- 1. the uniform profile

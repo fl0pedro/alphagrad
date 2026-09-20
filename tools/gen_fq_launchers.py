@@ -3036,6 +3036,7 @@ def thesis_pair_arm(rows: list[dict]) -> dict:
 # --- the 50 runs of the matrix ----------------------------------------------
 _HALVES: dict[tuple[str, str], list[dict]] = {}
 _SLOT = 0
+_row: dict = {}
 for _i, (_arm, _target, _seed) in enumerate(thesis_submission_order()):
     _half = None
     if _USE_TARGET_NODES:
