@@ -143,8 +143,10 @@ def test_derive_face_none_bias_f11_and_f118_reference_values():
 
 
 def test_derive_face_none_bias_rejects_undefined_log():
-    # a beyond the F*S*K/(K+1) ceiling: F*S*K/a - K <= 0.
-    ceiling = 11.0 * S * K / (K + 1)
+    # a at/beyond the F*S ceiling: F*S*K/a - K <= 0 there.
+    ceiling = 11.0 * S
+    with pytest.raises(ValueError, match="unreachable"):
+        derive_face_none_bias(11.0, S, K, ceiling)
     with pytest.raises(ValueError, match="unreachable"):
         derive_face_none_bias(11.0, S, K, ceiling + 1.0)
     with pytest.raises(ValueError, match="must be > 0"):

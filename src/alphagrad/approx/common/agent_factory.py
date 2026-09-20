@@ -151,9 +151,9 @@ def derive_face_none_bias(F: float, S: int, k: int, a: float) -> float:
     """B = ln(F*S*k/a - k), the none-logit bias whose expected requested
     approximations per plan is ``a`` (--face-init-approx-per-plan), given
     ``F`` live faces, ``S`` slots/face and ``k`` non-none ops/slot. Raises
-    when ``a`` makes the log undefined (a <= 0, or F*S*k/a <= k -- the
-    argument asks for at least as many approximations as there are ops to
-    reject, which no finite bias can produce)."""
+    when ``a`` makes the log undefined (a <= 0, or a >= F*S -- more
+    approximations than there are slots to hold them, one non-none pick
+    per slot being the ceiling no finite bias can exceed)."""
     F, a = float(F), float(a)
     if a <= 0.0:
         raise ValueError(
@@ -163,9 +163,9 @@ def derive_face_none_bias(F: float, S: int, k: int, a: float) -> float:
         raise ValueError(
             f"--face-init-approx-per-plan {a!r} is unreachable at F={F:g} "
             f"faces, S={S} slots, k={k} ops: F*S*k/a - k = {x:g} <= 0, so "
-            "ln(x) is undefined. a must be < F*S*k/(k+1) "
-            f"(={F * S * k / (k + 1):g} here); a this small asks for more "
-            "approximations than the head can even offer.")
+            f"ln(x) is undefined. a must be < F*S (={F * S:g} here); a "
+            "this large asks for more approximations than there are "
+            "slots to offer them in.")
     import math
     return math.log(x)
 
