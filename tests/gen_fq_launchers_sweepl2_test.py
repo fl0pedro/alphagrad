@@ -65,7 +65,7 @@ def test_every_row_is_arm_c_on_nn256_at_the_rung1_init(gen):
         assert "--face-none-bias" not in cli, a["name"]
         assert cli["--face-entropy-floor"] == \
             gen.THESIS_FACE_ENTROPY_FLOOR == "0.05", a["name"]
-        assert cli["--episodes"] == "300", a["name"]
+        assert cli["--episodes"] == "100", a["name"]
         assert "--auto-stop" not in cli, a["name"]
         assert cli["--checkpoint-every"] == gen.THESIS_CHECKPOINT_EVERY \
             == "50", a["name"]
