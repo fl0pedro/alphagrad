@@ -2960,7 +2960,8 @@ def thesis_pair_arms() -> list[dict]:
     still rows of `thesis_core_arms` -- so it is excluded from every count
     of the matrix and listed here instead.
     """
-    return [a for a in ARMS if a.get("paired") and not a.get("sweepl")]
+    return [a for a in ARMS if a.get("paired") and not a.get("sweepl")
+            and not a.get("sweepl2")]
 
 
 def thesis_block1_arms() -> list[dict]:
@@ -2970,7 +2971,7 @@ def thesis_block1_arms() -> list[dict]:
     return [a for a in thesis_arms()
             if not a.get("held") and not a.get("smoke") and not a.get("paired")
             and not a.get("orderonly") and not a.get("orderonly_rsnn")
-            and not a.get("sweepl")
+            and not a.get("sweepl") and not a.get("sweepl2")
             and not a.get("orderonly_final")
             and not a.get("orderonly_tlm_final")]
 
@@ -2996,7 +2997,7 @@ def thesis_core_arms() -> list[dict]:
             if not a.get("smoke") and not a.get("thesis_rule")
             and not a.get("orderonly") and not a.get("orderonly_final")
             and not a.get("orderonly_tlm_final") and not a.get("paired")
-            and not a.get("sweepl")]
+            and not a.get("sweepl") and not a.get("sweepl2")]
 
 
 # Target-pinned nodes (owner ruling 2026-09-17: "max 4* 2 tlm 2 nn256").
@@ -3510,6 +3511,161 @@ del (_sweepl_tag, _sweepl_overrides, _sweepl_seed, _sweepl_node,
      _sweepl_half, _sweepl_what, _sweepl_row, _sweepl_rows, _sweepl_slot,
      _SWEEPL_HALVES)
 
+
+# ================  LAGRANGIAN DUAL SWEEP, ROUND 2  ================
+# Owner ruling 2026-09-20, after round 1's read-out (no configuration left
+# the center seeds' own band within 100 episodes; a multiplier of 94 moves
+# the feasible fraction no more than 33 does).  Round 2 asks whether the
+# actor responds to the dual given more time and a bigger update, not
+# whether the dual's constants matter: two finalists, the rung-1 CENTER and
+# CAP256 (--lag-max 256, else center), each at today's PPO update budget
+# and a larger one, 300 episodes, no --auto-stop.  NOT a matrix coordinate:
+# `thesis_core_arms`, `thesis_block1_arms` and `thesis_pair_arms` exclude
+# every row this section marks `sweepl2=True`, the same way they exclude
+# round 1's `sweepl=True` rows.
+SWEEPL2_TARGET = "nn256"
+SWEEPL2_ARM = "C"
+SWEEPL2_SEEDS = THESIS_SEEDS[:3]
+SWEEPL2_EPISODES = "300"
+#: dual tag -> the cli overrides that differ from arm C's own rung-1
+#: defaults.  CENTER overrides nothing: it IS arm C's own dual constants
+#: (--lag-eta 2.0, --lag-max 64, --lag-init 16, --quality-floor 0.90).
+SWEEPL2_DUAL: dict[str, dict[str, str]] = {
+    "center": {},
+    "cap256": {"--lag-max": "256"},
+}
+#: budget tag -> the cli overrides that differ from today's update budget
+#: (--ppo-epochs 1, --minibatches 4, the SHARED_CLI defaults).  B1 overrides
+#: nothing; it IS today's budget.
+SWEEPL2_BUDGET: dict[str, dict[str, str]] = {
+    "b1": {},
+    "b4": {"--ppo-epochs": "2", "--minibatches": "8"},
+}
+
+_SWEEPL2_WHAT = """SWEEP ROUND 2 (owner ruling 2026-09-20, after round 1): the
+two finalists -- the rung-1 CENTER (--lag-eta 2.0, --lag-max 64, --lag-init
+16, --quality-floor 0.90) and CAP256 (--lag-max 256, else center) -- each at
+today's PPO update budget (--ppo-epochs 1, --minibatches 4) and a larger one
+(--ppo-epochs 2, --minibatches 8), 300 episodes, no --auto-stop, arm C on
+NN256 at the normalized init, entropy floor 0.05.
+
+PURPOSE: does the actor respond to the dual within 300 episodes, and is the
+update budget the bottleneck rather than the dual's constants.
+
+READ-OUT: the feasible fraction at q >= 0.9 over episodes 250-299 from the
+plan log, the mean q over the same window, the multiplier's trajectory
+against its cap, the latency reward of the feasible plans, and how many
+feasible plans run faster than the reference."""
+
+
+def sweepl2_configs() -> list[tuple[str, dict[str, str]]]:
+    """(tag, cli overrides) for the 4 distinct configurations: dual x
+    budget, tagged `<dual>_<budget>`."""
+    configs: list[tuple[str, dict[str, str]]] = []
+    for dual, dual_cli in SWEEPL2_DUAL.items():
+        for budget, budget_cli in SWEEPL2_BUDGET.items():
+            cli = dict(dual_cli)
+            cli.update(budget_cli)
+            configs.append((f"{dual}_{budget}", cli))
+    return configs
+
+
+def sweepl2_row_name(tag: str, seed: str) -> str:
+    return f"sweepL2_nn256_{tag}_s{seed}"
+
+
+def sweepl2_pair_name(tag: str, seeds: tuple[str, str]) -> str:
+    return f"sweepL2_nn256_{tag}_s{seeds[0]}_s{seeds[1]}_pair"
+
+
+def sweepl2_pair_arm(rows: list[dict]) -> dict:
+    """Two half rows of ONE sweep-round-2 configuration, one 8-GPU node ->
+    one paired `arm(...)`.  A copy of `sweepl_pair_arm`'s body under round
+    2's own name: half rows point back at it through `sweepl2_paired_into`,
+    never round 1's `sweepl_paired_into` or the matrix's `paired_into`, so
+    the three pairing records cannot cross.
+    """
+    _require(len(rows) == 2, f"a sweep pair is two rows, not {len(rows)}")
+    a, b = sorted(rows, key=lambda r: r["half"])
+    node = a["node"]
+    tag = a["sweepl2_tag"]
+    _require(b["node"] == node and b["sweepl2_tag"] == tag,
+             "a sweep pair is two seeds of ONE configuration on ONE node")
+    _require(a["thesis_seed"] != b["thesis_seed"],
+             "a sweep pair is two DIFFERENT seeds")
+    gpus = THESIS_NODE_GPUS[node]
+    per = THESIS_UNIFORM_GPUS[SWEEPL2_TARGET]
+    cpus = node_cpus(node, gpus)
+    per_cpus = cpus // (gpus // per)
+    halves = []
+    for r in (a, b):
+        h = r["half"]
+        halves.append(dict(
+            name=r["name"], seed=r["thesis_seed"], half=h,
+            devices=",".join(str(h * per + d) for d in range(per)),
+            cores=f"{h * per_cpus}-{(h + 1) * per_cpus - 1}",
+            cli=r["cli"],
+        ))
+    name = sweepl2_pair_name(tag, (a["thesis_seed"], b["thesis_seed"]))
+    for r in (a, b):
+        r["sweepl2_paired_into"] = name
+    p = dict(
+        name=name, job=thesis_job_name(node), kind="train", runtime="scratch",
+        node=node, time=a["time"], gpus=gpus, singleton=True, thesis=True,
+        sweepl2=True, paired=True, halves=halves,
+        thesis_arm=SWEEPL2_ARM, thesis_target=SWEEPL2_TARGET,
+        env=dict(a["env"]),
+        required_flags=a["required_flags"],
+        required_flags_file=a["required_flags_file"],
+        cli=a["cli"],
+        purpose=a["purpose"] + f"\n\nPAIRED ON {node}: seeds "
+                f"{a['thesis_seed']} and {b['thesis_seed']} of sweep round "
+                f"2 configuration {tag} run CONCURRENTLY, each on {per} of "
+                f"the node's {gpus} GPUs and {per_cpus} of its {cpus} "
+                "cores.",
+        prediction=a["prediction"], falsifier=a["falsifier"],
+    )
+    arm_(**p)
+    return p
+
+
+def sweepl2_arms() -> list[dict]:
+    return [a for a in ARMS if a.get("sweepl2")]
+
+
+def sweepl2_single_arms() -> list[dict]:
+    return [a for a in ARMS if a.get("sweepl2") and not a.get("paired")]
+
+
+_SWEEPL2_HALVES: dict[tuple[str, str], list[dict]] = {}
+_sweepl2_slot = 0
+for _sweepl2_tag, _sweepl2_overrides in sweepl2_configs():
+    for _sweepl2_seed in SWEEPL2_SEEDS:
+        _sweepl2_node, _sweepl2_half = THESIS_SLOTS[
+            _sweepl2_slot % len(THESIS_SLOTS)]
+        _sweepl2_slot += 1
+        thesis_arm(
+            arm=SWEEPL2_ARM, target=SWEEPL2_TARGET, seed=_sweepl2_seed,
+            node=_sweepl2_node,
+            name=sweepl2_row_name(_sweepl2_tag, _sweepl2_seed),
+            episodes=SWEEPL2_EPISODES, what=_SWEEPL2_WHAT,
+            extra_cli=dict(_sweepl2_overrides),
+        )
+        ARMS[-1]["sweepl2"] = True
+        ARMS[-1]["sweepl2_tag"] = _sweepl2_tag
+        if _sweepl2_half is not None:
+            _sweepl2_row = ARMS[-1]
+            _sweepl2_row["half"] = _sweepl2_half
+            _SWEEPL2_HALVES.setdefault(
+                (_sweepl2_tag, _sweepl2_node), []).append(_sweepl2_row)
+_sweepl2_row: dict = {}
+_sweepl2_rows: list[dict] = []
+for _sweepl2_rows in _SWEEPL2_HALVES.values():
+    if len(_sweepl2_rows) == 2:
+        sweepl2_pair_arm(_sweepl2_rows)
+del (_sweepl2_tag, _sweepl2_overrides, _sweepl2_seed, _sweepl2_node,
+     _sweepl2_half, _sweepl2_row, _sweepl2_rows, _sweepl2_slot,
+     _SWEEPL2_HALVES)
 
 
 # ================  ORDER-ONLY SCALARIZATION TUNING, ROUND 1  ================

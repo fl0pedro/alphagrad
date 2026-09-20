@@ -53,7 +53,8 @@ def _nn256_rows(gen):
     return [a for a in gen.ARMS
             if a.get("thesis_target") == "nn256"
             and a.get("node") in gen.THESIS_NODE_GPUS
-            and not a.get("paired") and not a.get("sweepl")]
+            and not a.get("paired") and not a.get("sweepl")
+              and not a.get("sweepl2")]
 
 
 # --------------------------------------------------- 1. the uniform profile
