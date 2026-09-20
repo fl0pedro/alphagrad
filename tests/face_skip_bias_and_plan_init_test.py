@@ -16,13 +16,14 @@ from target per-plan counts. Pins here:
    (a, kappa).
 4. REFUSALS. --face-init-approx-per-plan / --face-init-skips-per-plan
    conflict with --face-none-bias / --face-skip-bias; an argument that
-   makes the log undefined raises; F is NOT available at agent-init in
-   this codebase (tools/faces_per_vertex.py: a plan's live-face count is
-   the length of a walk over one elimination order, not a jaxpr property,
-   and --fixed-order free produces that order from the policy's own
-   rollout, after the agent already exists) -- resolve_face_init_bias(args)
-   (no F passed) always refuses when either flag is set, and so does the
-   real ppo.py / agent_factory.build_and_init_agent path.
+   makes the log undefined raises; and a caller with NO F still refuses --
+   a plan's live-face count is the length of a walk over one elimination
+   order, not a jaxpr property (tools/faces_per_vertex.py), so
+   resolve_face_init_bias(args) with F=None may not guess one, and neither
+   may agent_factory.build_and_init_agent, which is reached by trainers
+   that build the agent before any env exists. Which F ppo.main passes --
+   the reverse-mode reference order's count, owner ruling 2026-09-20 -- is
+   pinned in tests/face_init_reference_order_test.py.
 5. FLAGS OFF -> INERT. The plan-init flags at their None default never
    call resolve_face_init_bias's F-dependent branches; build_and_init_agent
    is unchanged bit for bit from before this ticket.
@@ -191,10 +192,12 @@ def test_resolve_refuses_undefined_log_even_with_f_given():
 
 
 def test_resolve_refuses_when_f_is_not_known():
-    """THE dsnn-dfw.74 escape hatch: no caller in this codebase has an F to
-    pass (see the module docstring / resolve_face_init_bias's docstring for
-    the exact order-of-construction reason), so the default F=None must
-    raise -- not silently derive from a guessed number."""
+    """A caller with no F still gets the refusal, unchanged. ppo.main now
+    passes one (the reverse reference order's count, owner ruling
+    2026-09-20, pinned in face_init_reference_order_test.py), but
+    build_and_init_agent is reached by trainers that build the agent before
+    any env exists: the default F=None must raise there rather than
+    silently derive from a guessed number."""
     ns = _ns(face_init_approx_per_plan=2.0)
     with pytest.raises(ValueError, match="not known"):
         resolve_face_init_bias(ns)
@@ -215,8 +218,8 @@ def test_ppo_main_inline_path_calls_resolve_before_building():
     import inspect
     from alphagrad.approx import ppo
     main_src = inspect.getsource(ppo.main)
-    assert "resolve_face_init_bias(args)" in main_src
-    assert main_src.index("resolve_face_init_bias(args)") \
+    assert "resolve_face_init_bias(args, F=_face_ref_F)" in main_src
+    assert main_src.index("resolve_face_init_bias(args, F=_face_ref_F)") \
         < main_src.index("apply_face_none_bias(agent")
 
 

@@ -2536,6 +2536,59 @@ THESIS_ARM_SPEC = {
     "condC": ("2", "L", "none", True),
 }
 
+# ---------------------------------------------------------------------------
+# RUNG 1 OF THE LADDER: THE NORMALIZED FACE-HEAD INIT (owner ruling
+# 2026-09-20).  Arms C and C_popart on NN256 stop setting the none-bias
+# directly and state the PLAN they want instead: `a` requested approximations
+# and `kappa` requested skips per plan at init.  ppo.py derives
+# B = ln(F*S*k/a - k) and Bs = ln(F/kappa - 1) from F, the live-face count of
+# the REVERSE-MODE REFERENCE ORDER -- the same walk the paired cost measures
+# against -- and prints every input as a [face-init] block.
+#
+# WHY THESE ROWS AND NO OTHERS.  dsnn-dfw.74: every C and C_popart seed on
+# NN256 started at quality ~0 with ten of eleven faces approximated, so the
+# constraint was violated everywhere from episode 0, the multiplier saturated
+# and the policy collapsed.  --face-none-bias 2 is what put the initial plan
+# there.  Asking for THREE approximations per plan instead of a bias number
+# is the change under test; every other arm and every other target keeps its
+# recorded bias, or the comparison is not about this.
+# ---------------------------------------------------------------------------
+RUNG1_ARMS = ("C", "C_popart")
+RUNG1_TARGET = "nn256"
+RUNG1_APPROX_PER_PLAN = "3"
+RUNG1_SKIPS_PER_PLAN = "0.3"
+
+#: THE LONG CONDITIONED ROWS (owner ruling 2026-09-20).  The
+#: preference-conditioned NN256 rows run TWICE the episodes of every other
+#: row: the conditioning has to amortise over the whole weight span before
+#: its front can be compared with the fixed-weight fronts, and a thousand
+#: episodes is the budget one weighting gets.  Only condC on NN256 moves.
+LONG_EPISODES_ARMS = ("condC",)
+LONG_EPISODES_TARGET = "nn256"
+THESIS_EPISODES_LONG = "2000"
+
+
+def thesis_row_episodes(arm: str, target: str) -> str:
+    """How many episodes the (arm, target) row runs when its caller does
+    not name a number of its own (the smoke rows do)."""
+    if target == LONG_EPISODES_TARGET and arm in LONG_EPISODES_ARMS:
+        return THESIS_EPISODES_LONG
+    return THESIS_EPISODES
+
+
+def rung1_row(arm: str, target: str, matrix_row: bool = True) -> bool:
+    """Is this (arm, target) a rung-1 row, i.e. normalized-init instead of
+    a raw --face-none-bias?
+
+    ONLY A MATRIX COORDINATE CAN BE ONE.  The order-only tuning rounds
+    (dsnn-dfw.29 and .45) are also arm C on NN256 and they also go through
+    `thesis_cli`, but they run --approx-profile none and are a DIFFERENT
+    round with its own record; moving their init would change a launcher
+    under a comparison that is not this one.  `matrix_row` is False for
+    them, and False is the default so a new caller has to ask.
+    """
+    return (matrix_row and target == RUNG1_TARGET and arm in RUNG1_ARMS)
+
 THESIS_FLAGS_FILES = REQUIRED_FLAGS_FILES + [
     # --checkpoint-every and --resume live in common/checkpoint.py and
     # --auto-stop in common/auto_stop.py; both install their arguments on
@@ -2559,6 +2612,15 @@ THESIS_REQUIRED_FLAGS = REQUIRED_FLAGS + [
     # fails at layer 2 instead, by value, which is the right message.
     "--temporal-rule",
 ]
+#: Rung 1's two flags, added to the list a RUNG-1 ROW greps for and to no
+#: other row's.  A tree without them would otherwise reach argparse and
+#: abort 65 with a dump; named here that row aborts 64 saying which flag the
+#: tree is short of.  Per row rather than in the shared list because the
+#: shared list is rendered into every thesis launcher, and a running
+#: comparison's launcher may not change for a guard its own row does not
+#: need.
+RUNG1_REQUIRED_FLAGS = ["--face-init-approx-per-plan",
+                        "--face-init-skips-per-plan"]
 
 THESIS_HEAD = f"""THE THESIS MATRIX (epic dsnn-dfw, ticket dsnn-dfw.4) under
 the owner's rulings of 2026-09-15 and 2026-09-16.  Data collection, not a
@@ -2683,7 +2745,8 @@ def thesis_run_name(arm: str, target: str, seed: str) -> str:
 
 def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
                episodes: str, checkpoint_every: str,
-               auto_stop: bool, grad_oracle_cadence: str = "50") -> dict:
+               auto_stop: bool, grad_oracle_cadence: str = "50",
+               matrix_row: bool = False) -> dict:
     """The `cli` override dict of one thesis run.
 
     Everything the owner fixed is HERE, once, so the block and the smoke
@@ -2701,8 +2764,14 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
         "--approx-profile": THESIS_PROFILE,
         "--fixed-order": THESIS_ORDER,
         "--approx-add": APPROX_ADD,
-        # --- the face head at init
-        "--face-none-bias": bias,
+        # --- the face head at init.  A rung-1 row states the PLAN it wants
+        #     and lets ppo.py derive B and Bs from the reference order's
+        #     face count; every other row keeps its recorded bias.  The two
+        #     ways are mutually exclusive: ppo.py refuses both at once.
+        **({"--face-init-approx-per-plan": RUNG1_APPROX_PER_PLAN,
+            "--face-init-skips-per-plan": RUNG1_SKIPS_PER_PLAN}
+           if rung1_row(arm, target, matrix_row)
+           else {"--face-none-bias": bias}),
         "--scale-face-head": SCALE_FACE_HEAD_MVP,
         "--face-logit-clamp": FACE_LOGIT_CLAMP_MVP,
         "--face-entropy-weight": "0.05",
@@ -2765,7 +2834,7 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
 
 
 def thesis_arm(*, arm: str, target: str, seed: str, node: str,
-               name: str | None = None, episodes: str = THESIS_EPISODES,
+               name: str | None = None, episodes: str | None = None,
                checkpoint_every: str = THESIS_CHECKPOINT_EVERY,
                auto_stop: bool = THESIS_FINAL_AUTO_STOP,
                what: str | None = None,
@@ -2787,10 +2856,16 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
     # helper, and a run on an unruled seed is not part of the matrix.
     _require(seed in THESIS_SEEDS,
              f"seed {seed!r} is not one of {THESIS_SEEDS}")
+    # A row that names no episode count gets the matrix's, which is 1000 for
+    # every coordinate but the long conditioned NN256 rows.  The smoke rows
+    # name their own and are unaffected.
+    episodes = thesis_row_episodes(arm, target) if episodes is None \
+        else episodes
     cli = thesis_cli(arm=arm, target=target, seed=seed, node=node, name=name,
                      episodes=episodes, checkpoint_every=checkpoint_every,
                      auto_stop=auto_stop,
-                     grad_oracle_cadence=grad_oracle_cadence)
+                     grad_oracle_cadence=grad_oracle_cadence,
+                     matrix_row=True)
     if extra_cli:
         cli.update(extra_cli)
     gpus = thesis_row_gpus(target, node)
@@ -2803,11 +2878,21 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
         # passed in, so the two cannot disagree.
         thesis_rule=thesis_temporal_rule(target),
         env=dict(THESIS_TARGET_ENV[target]),
-        required_flags=THESIS_REQUIRED_FLAGS,
+        required_flags=(THESIS_REQUIRED_FLAGS + RUNG1_REQUIRED_FLAGS
+                        if rung1_row(arm, target) else THESIS_REQUIRED_FLAGS),
         required_flags_file=" ".join(THESIS_FLAGS_FILES),
         cli=cli,
         purpose=THESIS_HEAD + f"\n\nARM {arm} ON {target.upper()}, SEED "
-                              f"{seed}: " + (what or _THESIS_ARM_WHAT[arm]),
+                              f"{seed}: " + (what or _THESIS_ARM_WHAT[arm])
+                + (f"\n\nTHIS ROW RUNS {THESIS_EPISODES_LONG} EPISODES, not "
+                   f"{THESIS_EPISODES} (owner ruling 2026-09-20): the "
+                   "conditioning has to amortise over the whole weight span "
+                   "before its front can be compared with the fixed-weight "
+                   "fronts, and the shared budget is what one weighting "
+                   "gets."
+                   if cli["--episodes"] == THESIS_EPISODES_LONG
+                   and target == LONG_EPISODES_TARGET
+                   and arm in LONG_EPISODES_ARMS else ""),
         prediction=prediction or _THESIS_ARM_PREDICTION[arm],
         falsifier=_THESIS_FALSIFIER,
     )
@@ -4724,8 +4809,19 @@ def render(a: dict) -> str:
             L.append(f'  echo "[half {tag}] seed {h["seed"]}'
                      f' CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES'
                      f' cores {h["cores"]} RAY_TMPDIR=$RAY_TMPDIR"')
-            L.append("  nvidia-smi --query-gpu=index,name,memory.total"
-                     " --format=csv,noheader")
+            # WHAT THIS HALF ACTUALLY SEES.  `nvidia-smi` stood here and was
+            # evidence of nothing: it talks to the driver and enumerates
+            # every GPU of the node whatever CUDA_VISIBLE_DEVICES says, so
+            # both halves printed the same eight lines and a half wired to
+            # the wrong devices would have looked healthy.  JAX reads the
+            # mask, so jax.devices() IS the half's device list.  On a node
+            # with no GPU it returns the CPU device and the line still
+            # prints, which is what makes this safe in a CPU test.
+            _dev_dump = (
+                f"import jax; print('[half {tag}] jax devices: ' + "
+                "', '.join(str(d.id) + ':' + d.platform + ':' + "
+                "d.device_kind for d in jax.devices()))")
+            L.append(f'  {py} -c "{_dev_dump}"')
             L.append(f"  taskset -c {h['cores']} {py} \\")
             L.append(f'    src/alphagrad/approx/ppo.py "${{ARGS_{tag}[@]}}"')
             L.append(f") > {CAMPAIGN_RUNS}/{h['name']}"

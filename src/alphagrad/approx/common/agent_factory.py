@@ -209,23 +209,22 @@ def resolve_face_init_bias(args, F: float | None = None):
     makes the closed form's log undefined, or if ``F`` -- the live-face
     count of the built target -- is not known at this call site.
 
-    F is NOT a graph property computable ahead of time: eliminating a
-    vertex rewires its neighbours, so a plan's total live-face count is the
-    length of a walk over one ELIMINATION ORDER, not a property of the
-    jaxpr alone (tools/faces_per_vertex.py: "the unrolling's length is not
-    a property of the graph alone ... vertex k's face count depends on the
-    k-1 before it"). ``build_and_init_agent`` / ``ppo.main``'s inline copy
-    call this BEFORE any order exists: under --fixed-order free (the
-    dsnn-dfw.74 rows this flag exists for) the order is the sequence of
-    actions the policy itself samples during rollout, produced by code
-    that runs AFTER the agent (hence after this call) and differs per
-    episode and per environment -- there is no single F for "the built
-    target" to read here. A static order (--fixed-order reverse/markowitz,
-    common/order.py) does exist before init, but it is a property of that
-    CHOSEN ORDER, not of the target; treating its count as F would pick one
-    arbitrary order's number and label it the target's, which is the guess
-    this function must refuse rather than make. Callers therefore pass no
-    F today, and this refuses unconditionally whenever either flag is set."""
+    WHICH F (owner ruling 2026-09-20). F is NOT a graph property: eliminating
+    a vertex rewires its neighbours, so a plan's total live-face count is the
+    length of a walk over one ELIMINATION ORDER, not a property of the jaxpr
+    alone (tools/faces_per_vertex.py: "the unrolling's length is not a
+    property of the graph alone ... vertex k's face count depends on the k-1
+    before it"), and under --fixed-order free every episode samples its own
+    order with its own count. The ruling names ONE order: the REVERSE-MODE
+    REFERENCE ORDER, the same walk the paired cost measures every candidate
+    against (env.py's rev-exact, ``sorted(o_list, reverse=True)``). The
+    normalizer and the reward's denominator are then the same plan.
+    ``common/order.reference_order_face_count(env)`` computes it, once, and
+    ``ppo.main`` passes the result here.
+
+    A caller with no env still passes no F -- ``build_and_init_agent`` is
+    reached by trainers that build the agent before any env -- and this
+    refuses rather than guess an order's count."""
     a = getattr(args, "face_init_approx_per_plan", None)
     kappa = getattr(args, "face_init_skips_per_plan", None)
     if a is None and kappa is None:
@@ -259,12 +258,88 @@ def resolve_face_init_bias(args, F: float | None = None):
         B = float(_nb)
     if Bs is None:
         Bs = B
-    e_a, e_k = expected_face_counts(F, _S, _k, B, Bs)
-    print(f"[factory] face-head init from plan targets: F={F:g} faces, "
-          f"--face-init-approx-per-plan={a!r} -> B={B:g}, "
-          f"--face-init-skips-per-plan={kappa!r} -> Bs={Bs:g}, "
-          f"E[A]={e_a:g}, E[K]={e_k:g}", flush=True)
     return B, Bs
+
+
+#: The one stdout prefix of the start block. Every line of the block carries
+#: it, so `grep FACE_INIT_TAG` on a run's log returns the whole block and
+#: nothing else.
+FACE_INIT_TAG = "[face-init]"
+
+
+def face_init_start_block(args, F, order_name: str, B, Bs, order=None):
+    """``(lines, config)`` -- THE START BLOCK: every input to the two bias
+    formulas, printed once, and the same numbers as a wandb-config dict.
+
+    A run whose face head starts biased cannot be read without these: B and
+    Bs are logits, and what they MEAN is the expected requested
+    approximations and skips per plan, which depend on F. The block carries
+    F and the order it was counted on, S, k, the two targets a and kappa,
+    the resolved B and Bs, and E[A]/E[K] -- for the derived path
+    (--face-init-approx-per-plan/--face-init-skips-per-plan) and for the raw
+    path (--face-none-bias/--face-skip-bias) alike, so the two are read off
+    the same lines.
+
+    ``F`` is ``None`` when no order was counted (no bias is in play); the
+    block then states that and E[A]/E[K] are not defined.
+    """
+    from alphagrad.approx.unified_face_head import (
+        FACE_SLOTS as _S, NUM_APPROX_OPS as _NOPS)
+    _k = _NOPS - 1
+    a = getattr(args, "face_init_approx_per_plan", None)
+    kappa = getattr(args, "face_init_skips_per_plan", None)
+    derived = a is not None or kappa is not None
+    path = ("derived (--face-init-approx-per-plan/--face-init-skips-per-plan)"
+            if derived else "raw (--face-none-bias/--face-skip-bias)")
+    _B = 0.0 if B is None else float(B)
+    _Bs = _B if Bs is None else float(Bs)
+    e_a = e_k = None
+    if F is not None:
+        e_a, e_k = expected_face_counts(float(F), _S, _k, _B, _Bs)
+    L = [
+        f"{FACE_INIT_TAG} FACE-HEAD INIT -- every input to the bias formulas",
+        f"{FACE_INIT_TAG} path: {path}",
+        (f"{FACE_INIT_TAG} F = {F} live faces on the {order_name}"
+         if F is not None else
+         f"{FACE_INIT_TAG} F = not counted (no face-head bias is set)"),
+        f"{FACE_INIT_TAG} S = {_S} slots/face, k = {_k} non-none ops/slot",
+        (f"{FACE_INIT_TAG} --face-init-approx-per-plan a = "
+         f"{'unset' if a is None else f'{float(a):g}'}, "
+         f"--face-init-skips-per-plan kappa = "
+         f"{'unset' if kappa is None else f'{float(kappa):g}'}"),
+        (f"{FACE_INIT_TAG} B  = "
+         + ("ln(F*S*k/a - k)" if a is not None else "--face-none-bias")
+         + f" = {_B:.6f}   (the +B on each slot's OP_NONE logit)"),
+        (f"{FACE_INIT_TAG} Bs = "
+         + ("ln(F/kappa - 1)" if kappa is not None else
+            "--face-skip-bias" if getattr(args, "face_skip_bias", None)
+            is not None else "B (unset: SKIP gets -B)")
+         + f" = {_Bs:.6f}   (the -Bs on the face's SKIP logit)"),
+        (f"{FACE_INIT_TAG} E[A] = F*S*k/(exp(B)+k) = "
+         + ("not defined without F" if e_a is None else f"{e_a:.6f}")
+         + " requested approximations/plan"),
+        (f"{FACE_INIT_TAG} E[K] = F/(1+exp(Bs)) = "
+         + ("not defined without F" if e_k is None else f"{e_k:.6f}")
+         + " requested skips/plan"),
+    ]
+    if order is not None:
+        _o = [int(v) for v in order]
+        L.append(f"{FACE_INIT_TAG} the order: {len(_o)} vertices, "
+                 f"{_o[:6]} ... {_o[-3:]}")
+    cfg = {
+        "face_init_path": "derived" if derived else "raw",
+        "face_init_F": None if F is None else int(F),
+        "face_init_order": None if F is None else str(order_name),
+        "face_init_slots_S": int(_S),
+        "face_init_ops_k": int(_k),
+        "face_init_a": None if a is None else float(a),
+        "face_init_kappa": None if kappa is None else float(kappa),
+        "face_init_B": _B,
+        "face_init_Bs": _Bs,
+        "face_init_expected_approx_per_plan": e_a,
+        "face_init_expected_skips_per_plan": e_k,
+    }
+    return L, cfg
 
 
 def build_and_init_agent(args, total_v: int, num_factors: int, max_rules: int,

@@ -6427,18 +6427,24 @@ def make_argparser() -> argparse.ArgumentParser:
              "target, S=3 slots/face, k=3 non-none ops/slot "
              "(common/agent_factory.derive_face_none_bias). None (default) "
              "= off. Conflicts with --face-none-bias/--face-skip-bias "
-             "(refuses). NOT WIRED TO A LIVE F: F is the length of a walk "
-             "over one elimination order, not a jaxpr property, and under "
-             "--fixed-order free no order exists at agent-init time "
-             "(agent_factory.resolve_face_init_bias); this flag therefore "
-             "always refuses today rather than guess an order's count.")
+             "(refuses). F IS THE REVERSE-MODE REFERENCE ORDER'S FACE "
+             "COUNT (owner ruling 2026-09-20): the count of live faces on "
+             "the rev-exact walk the paired cost measures every candidate "
+             "against, computed once at start from the built env "
+             "(common/order.reference_order_face_count). It is NOT any "
+             "sampled plan's count -- under --fixed-order free each episode "
+             "walks its own order with its own face count. The start block "
+             "tagged [face-init] prints F, the order, S, k, a, kappa, B, "
+             "Bs, E[A] and E[K], and the same keys go into the wandb "
+             "config.")
     p.add_argument(
         "--face-init-skips-per-plan", type=float, default=None,
         help="Derive the skip bias Bs from a target expected skips/plan "
              "`kappa`: Bs = ln(F/kappa - 1) from the live-face count F of "
              "the built target (common/agent_factory.derive_face_skip_bias)"
-             ". None (default) = off. Same conflicts and same F-not-known "
-             "refusal as --face-init-approx-per-plan "
+             ". None (default) = off. Same conflicts and the same F -- the "
+             "reverse-mode reference order's face count -- as "
+             "--face-init-approx-per-plan "
              "(agent_factory.resolve_face_init_bias).")
     p.add_argument(
         "--pin-rules-to-exact",
@@ -9413,6 +9419,33 @@ def main():
               f"{fixed_order_table[-3:].tolist()}; only approximations are "
               "learned", flush=True)
         fixed_order_table = jnp.asarray(fixed_order_table, dtype=jnp.int32)
+
+    # F_ref: THE REFERENCE ORDER'S LIVE-FACE COUNT (owner ruling 2026-09-20),
+    # counted HERE -- beside the order tables, on the env, before the agent
+    # exists -- because the face-head init needs it and nothing later may
+    # change it. The order is the REVERSE order, i.e. the rev-exact reference
+    # every candidate's cost is a ratio against, so the init's normalizer and
+    # the reward's denominator describe the same plan. One elimination walk.
+    #
+    # Counted ONLY when the face head starts biased. With every one of the
+    # four flags off no bias is applied at all, so there is nothing to
+    # normalize and nothing to recompute from a block -- and a run that asked
+    # for none does not pay a walk over the whole graph to be told so.
+    _face_bias_in_play = (
+        float(getattr(args, "face_none_bias", 0.0) or 0.0) != 0.0
+        or getattr(args, "face_skip_bias", None) is not None
+        or getattr(args, "face_init_approx_per_plan", None) is not None
+        or getattr(args, "face_init_skips_per_plan", None) is not None)
+    _face_ref_F: int | None = None
+    _face_ref_order_name: str | None = None
+    _face_ref_order = None
+    _face_init_cfg: dict = {}
+    if _face_bias_in_play:
+        from alphagrad.approx.common.order import (
+            reference_order_face_count as _ref_face_count)
+        _face_ref_F, _face_ref_order_name, _face_ref_order = \
+            _ref_face_count(env)
+
     pair_valid_mask = build_pair_valid_mask(
         closed_jaxpr.jaxpr,
         total_v,
@@ -9687,8 +9720,13 @@ def main():
     # Identity-init parity with the factory path (az): ppo.main predates
     # build_and_init_agent and does not route through it.
     from alphagrad.approx.common.agent_factory import (
-        apply_face_none_bias, resolve_face_init_bias)
-    _derived_B, _derived_Bs = resolve_face_init_bias(args)
+        apply_face_none_bias, face_init_start_block, resolve_face_init_bias)
+    # F_ref was counted beside the order tables above, on the env, before this
+    # agent existed. It is the ONE order the owner's ruling names -- the
+    # paired rev-exact reference -- and it is None only when no face-head
+    # bias is set at all, in which case the flags that need it are unset too
+    # and this refuses nothing.
+    _derived_B, _derived_Bs = resolve_face_init_bias(args, F=_face_ref_F)
     if _derived_B is None:
         _face_none_bias = float(getattr(args, "face_none_bias", 0.0) or 0.0)
         _face_skip_bias = getattr(args, "face_skip_bias", None)
@@ -9696,6 +9734,14 @@ def main():
                             else float(_face_skip_bias))
     else:
         _face_none_bias, _face_skip_bias = _derived_B, _derived_Bs
+    if _face_bias_in_play:
+        # ONE BLOCK, at start, on stdout and on the run: B and Bs are logits
+        # and mean nothing without F, S, k and the targets they came from.
+        # The wandb half is merged into the run config at wandb.init below.
+        _face_init_lines, _face_init_cfg = face_init_start_block(
+            args, _face_ref_F, _face_ref_order_name, _face_none_bias,
+            _face_skip_bias, order=_face_ref_order)
+        print("\n".join(_face_init_lines), flush=True)
     agent = apply_face_none_bias(agent, _face_none_bias, _face_skip_bias)
     # ------------------------------------------- KL-TO-REFERENCE TRUST REGION
     # THE FROZEN REFERENCE POLICY, snapshotted HERE and never again: after
@@ -13491,6 +13537,12 @@ def main():
     # the policy heads, not the reward.
     _wandb_config["quality_metric_resolved"] = _QUALITY_METRIC
     _wandb_config["mem_channel"] = str(args.mem_channel)
+    # THE FACE-HEAD INIT BLOCK, ON THE RUN ITSELF. `vars(args)` above carries
+    # the flags; these are the DERIVED quantities a reader needs to recompute
+    # the biases -- F, the order it was counted on, S, k, B, Bs, E[A], E[K].
+    # Empty when no face-head bias is set, which is the state where there is
+    # nothing to recompute.
+    _wandb_config.update(_face_init_cfg)
     # THE OPERATOR PAIR, ON THE RUN ITSELF. A result read without it cannot
     # be interpreted: with the two reads equal the PPO ratio is 1 at epoch 0
     # and the run is on-policy, and with them different it is not.
