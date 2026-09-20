@@ -116,9 +116,18 @@ def matrix(gen):
             if not a.get("smoke") and not a.get("orderonly")
             and not a.get("orderonly_rsnn")
             and not a.get("orderonly_final")
-            and not a.get("orderonly_tlm_final")]
+            and not a.get("orderonly_tlm_final")
+            and not a.get("paired")]
     assert arms, "the generator emits no thesis arm"
     return arms
+
+
+@pytest.fixture(scope="module")
+def pairs(gen):
+    """The paired launchers (owner ruling 2026-09-20): two NN256 seeds of
+    one arm inside ONE sbatch on an 8-GPU node.  Not matrix coordinates --
+    their two halves are, and both halves are rows of `core`."""
+    return gen.thesis_pair_arms()
 
 
 @pytest.fixture(scope="module")
@@ -536,18 +545,20 @@ def test_every_thesis_job_is_a_per_node_singleton(gen, matrix, smoke):
 
 def test_the_nodes_and_the_actors_per_node_size(gen, matrix, smoke):
     assert gen.THESIS_NODES_ALL == (
-        "pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu18", "pgi15-gpu20")
-    # pgi15-gpu17 has no matched CUDA 12.9 ptxas (dsnn-dfw.69); pgi15-gpu19
-    # belongs to another group.  Neither is ever a node source.
+        "pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu18", "pgi15-gpu19",
+        "pgi15-gpu20")
+    # pgi15-gpu17 has no matched CUDA 12.9 ptxas (dsnn-dfw.69) and is never a
+    # node source.  pgi15-gpu19 came back to us on 2026-09-20.
     assert "pgi15-gpu17" not in gen.THESIS_NODES_ALL
-    assert "pgi15-gpu19" not in gen.THESIS_NODES_ALL
     assert gen.THESIS_NODES == gen.THESIS_NODES_ALL
     assert set(gen.THESIS_NODES) <= set(gen.THESIS_NODES_ALL)
     assert gen.THESIS_RAY_MEASURE == {4: "3", 8: "7"}
     used = {a["node"] for a in matrix}
     assert used == set(gen.THESIS_NODES), sorted(used)
     for a in matrix + smoke:
-        gpus = gen.THESIS_NODE_GPUS[a["node"]]
+        # THE ROW'S PROFILE, not the node's size: an NN256 row is four GPUs
+        # on every Blackwell node (owner ruling 2026-09-20).
+        gpus = gen.thesis_row_gpus(a["thesis_target"], a["node"])
         assert a["gpus"] == gpus, a["name"]
         cli = _cli(gen, a)
         # ONE PPO GPU, every other GPU a measure actor
@@ -576,7 +587,7 @@ def test_the_core_budget_is_the_ruling_and_is_disjoint(gen, matrix, smoke):
         check_disjoint(lay)
         assert len(lay.timing_actors) == int(gen.THESIS_RAY_MEASURE[gpus])
     for a in matrix + smoke:
-        gpus = gen.THESIS_NODE_GPUS[a["node"]]
+        gpus = gen.thesis_row_gpus(a["thesis_target"], a["node"])
         b = gen.THESIS_CORE_BUDGET[gpus]
         cli = _cli(gen, a)
         assert cli["--reserved-driver-cores"] == str(b["trainer"]), a["name"]

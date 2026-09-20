@@ -64,7 +64,10 @@ def test_every_launcher_names_lossless_once_and_no_other_value(gen):
             train += 1
             val = dict(gen._merge_cli(a.get("cli", {})))["--approx-add"]
             assert val == gen.APPROX_ADD, (a["name"], val)
-            assert text.count("  --approx-add lossless\n") == 1, a["name"]
+            # ONE occurrence per rendered ARGS array.  A paired launcher
+            # (owner ruling 2026-09-20) carries one array per half.
+            n_arrays = len(a.get("halves") or [None])
+            assert text.count("  --approx-add lossless\n") == n_arrays, a["name"]
             assert gen.cli_tokens(a).count("--approx-add") == 1, a["name"]
         elif a.get("needs_tool"):
             # the landscape arm passes it to the tool it invokes

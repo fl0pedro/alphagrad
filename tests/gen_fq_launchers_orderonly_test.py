@@ -519,7 +519,8 @@ def test_the_matrix_and_the_campaign_still_have_their_own_counts(gen):
               if not a.get("smoke") and not a.get("orderonly")
               and not a.get("orderonly_rsnn")
               and not a.get("orderonly_final")
-              and not a.get("orderonly_tlm_final")]
+              and not a.get("orderonly_tlm_final")
+              and not a.get("paired")]
     assert len(gen.thesis_core_arms()) == 50
     assert len(gen.thesis_snn_arms()) == 100
     assert len(matrix) == 150
@@ -565,8 +566,10 @@ def test_the_target_node_switch_does_not_move_the_tuning_rows(gen):
 FINAL_SEEDS = ("250197", "250198", "250199", "250200", "250201")
 FINAL_WEIGHTS = ("2", "0")
 #: pgi15-gpu17 excluded (dsnn-dfw.69: job 66740 aborted 72, no matched CUDA
-#: 12.9 ptxas); five seeds round-robin over these four nodes.
-FINAL_NODES = ("pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu18", "pgi15-gpu20")
+#: 12.9 ptxas); pgi15-gpu19 released back to us 2026-09-20, so five seeds
+#: now sit one per node over these five nodes.
+FINAL_NODES = ("pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu18", "pgi15-gpu19",
+               "pgi15-gpu20")
 FINAL_N_RUNS = 5
 
 
@@ -632,19 +635,23 @@ def test_the_baseline_is_a_final_row_with_the_four_block_settings(
 
 def test_the_baseline_runs_one_seed_per_blackwell_node(gen, final_rows):
     """Latency and memory are not comparable across GPU models, so a seed is
-    measured on ONE node; five seeds round-robin over the four cleared
-    Blackwell nodes (pgi15-gpu17 excluded, dsnn-dfw.69), so one node carries
-    two seeds and the other three carry one each."""
+    measured on ONE node; five seeds over the five cleared Blackwell nodes
+    (pgi15-gpu17 excluded, dsnn-dfw.69), one seed each.
+
+    EVERY seed renders the SAME profile -- 4 GPUs, --ray-measure 3 -- even on
+    the two 8-GPU nodes (owner ruling 2026-09-20): a baseline whose fifth
+    seed measured with seven actors while the others measured with three was
+    not five samples of one distribution."""
     seen = {}
     for a in final_rows:
         node = a["node"]
         i = FINAL_SEEDS.index(a["thesis_seed"])
         assert node == FINAL_NODES[i % len(FINAL_NODES)]
         assert node in gen.THESIS_NODES_ALL, a["name"]
-        assert node != "pgi15-gpu19", a["name"]
         assert node != "pgi15-gpu17", a["name"]
         seen.setdefault(node, []).append(a["name"])
-        gpus = gen.THESIS_NODE_GPUS[node]
+        gpus = gen.thesis_row_gpus(a["thesis_target"], node)
+        assert gpus == 4, a["name"]
         assert a["gpus"] == gpus, a["name"]
         cli = _cli(gen, a)
         assert cli["--ray-measure"] == gen.THESIS_RAY_MEASURE[gpus] \
@@ -657,7 +664,7 @@ def test_the_baseline_runs_one_seed_per_blackwell_node(gen, final_rows):
         assert f"#SBATCH --gres={gen.blackwell_gres(gpus)}\n" in text, a["name"]
     assert sorted(seen) == sorted(FINAL_NODES)
     counts = sorted(len(v) for v in seen.values())
-    assert counts == [1, 1, 1, 2], seen
+    assert counts == [1, 1, 1, 1, 1], seen
     with pytest.raises(gen.CampaignRowError):
         gen.orderonly_final_node("999999")
 

@@ -1,11 +1,17 @@
 """Ticket dsnn-dfw.69 follow-up -- no rendered launcher may target
-pgi15-gpu17 (no matched CUDA 12.9 ptxas or nvlink, job 66740 aborted 72) or
-pgi15-gpu19 (belongs to another group), anywhere in the generator.
+pgi15-gpu17 (no matched CUDA 12.9 ptxas or nvlink, job 66740 aborted 72)
+anywhere in the generator.
 
 The rule is for the whole generator, not one constant: THESIS_NODES_ALL,
 CAMPAIGN_NODES, and the four wave tuning rows that used to pin
 pgi15-gpu17 (w1c, w2c, w3c, w4c) are all node sources, and every one of
-them must stay off both forbidden nodes for every arm the generator emits.
+them must stay off the forbidden node for every arm the generator emits.
+
+pgi15-gpu19 WAS forbidden here (it was held for another group on
+2026-09-16) and is not any more: the owner released it back to us on
+2026-09-20 and the thesis matrix uses it again.  It is named in
+`RELEASED` so the change is a deliberate edit of this file, not a silent
+one.
 """
 from __future__ import annotations
 
@@ -15,7 +21,9 @@ import os
 _ALPHAGRAD = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _GEN = os.path.join(_ALPHAGRAD, "tools", "gen_fq_launchers.py")
 
-FORBIDDEN = ("pgi15-gpu17", "pgi15-gpu19")
+FORBIDDEN = ("pgi15-gpu17",)
+#: Released back to us on 2026-09-20 and expected to CARRY rows again.
+RELEASED = ("pgi15-gpu19",)
 
 
 def _gen():
@@ -46,3 +54,14 @@ def test_no_rendered_sbatch_line_names_a_forbidden_node():
             assert f"#SBATCH -w {node}\n" not in text, (a["name"], node)
         checked += 1
     assert checked == len(gen.ARMS)
+
+
+def test_the_released_node_carries_rows_again():
+    """pgi15-gpu19 is not merely allowed, it is USED: a node that is back in
+    the list but that no row targets would be the same outage under a
+    different name."""
+    gen = _gen()
+    for node in RELEASED:
+        assert node in gen.THESIS_NODES, node
+        rows = [a["name"] for a in gen.ARMS if a.get("node") == node]
+        assert rows, f"{node} is released but carries no row"
