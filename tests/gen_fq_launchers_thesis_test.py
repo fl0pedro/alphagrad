@@ -535,9 +535,11 @@ def test_every_thesis_job_is_a_per_node_singleton(gen, matrix, smoke):
 
 def test_the_nodes_and_the_actors_per_node_size(gen, matrix, smoke):
     assert gen.THESIS_NODES_ALL == (
-        "pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu17", "pgi15-gpu18",
-        "pgi15-gpu19", "pgi15-gpu20")
-    # all six nodes released
+        "pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu18", "pgi15-gpu20")
+    # pgi15-gpu17 has no matched CUDA 12.9 ptxas (dsnn-dfw.69); pgi15-gpu19
+    # belongs to another group.  Neither is ever a node source.
+    assert "pgi15-gpu17" not in gen.THESIS_NODES_ALL
+    assert "pgi15-gpu19" not in gen.THESIS_NODES_ALL
     assert gen.THESIS_NODES == gen.THESIS_NODES_ALL
     assert set(gen.THESIS_NODES) <= set(gen.THESIS_NODES_ALL)
     assert gen.THESIS_RAY_MEASURE == {4: "3", 8: "7"}
@@ -702,8 +704,8 @@ def test_thesis_arm_raises_on_a_row_outside_the_rulings(gen):
         ({"target": "rsnn"}, "is not one of"),
         ({"target": "rsnn_window3"}, "is not one of"),
         ({"seed": "42"}, "is not one of"),
-        ({"node": "pgi15-gpu14"}, "released"),
-        ({"node": "pgi15-cpu1"}, "released"),
+        ({"node": "pgi15-gpu14"}, "permitted"),
+        ({"node": "pgi15-cpu1"}, "permitted"),
     ):
         with pytest.raises(gen.CampaignRowError) as e:
             gen.thesis_arm(**{**ok, **bad, "name": "throwaway_bad"})
@@ -785,13 +787,13 @@ def test_target_nodes_routing(monkeypatch):
               and not a.get("orderonly_final")]
     for a in matrix:
         if a["thesis_target"] == "tlm":
-            assert a["node"] in ("pgi15-gpu19", "pgi15-gpu16"), a["name"]
-            expected_gpus = 8 if a["node"] == "pgi15-gpu19" else 4
-            expected_actors = "7" if a["node"] == "pgi15-gpu19" else "3"
+            assert a["node"] in ("pgi15-gpu20", "pgi15-gpu16"), a["name"]
+            expected_gpus = 8 if a["node"] == "pgi15-gpu20" else 4
+            expected_actors = "7" if a["node"] == "pgi15-gpu20" else "3"
             assert a["gpus"] == expected_gpus, a["name"]
             assert _cli(mod, a)["--ray-measure"] == expected_actors, a["name"]
         elif a["thesis_target"] == "nn256":
-            assert a["node"] in ("pgi15-gpu18", "pgi15-gpu17"), a["name"]
+            assert a["node"] in ("pgi15-gpu18", "pgi15-gpu15"), a["name"]
             assert a["gpus"] == 4, a["name"]
             assert _cli(mod, a)["--ray-measure"] == "3", a["name"]
 

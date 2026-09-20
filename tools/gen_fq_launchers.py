@@ -1065,7 +1065,7 @@ launcher no longer passes it.)"""
 for _n, _bias, _lam, _node in [
     ("w1a_bias6_lam170", 6, 170, "pgi15-gpu15"),
     ("w1b_bias5_lam170", 5, 170, "pgi15-gpu16"),
-    ("w1c_bias4_lam170", 4, 170, "pgi15-gpu17"),
+    ("w1c_bias4_lam170", 4, 170, "pgi15-gpu18"),
     ("w1d_bias5_lam16", 5, 16, "pgi15-gpu18"),
 ]:
     arm(
@@ -1147,7 +1147,7 @@ for _n, _rev, _extra_cli, _node, _what in [
      "over a session and per-actor offsets are systematic at ~1.3%"),
     ("w2b_order_free", "0", {}, "pgi15-gpu16",
      "UNPINNED order + approximations -- both levers"),
-    ("w2c_order_free_exact", "0", {"--exact": None}, "pgi15-gpu17",
+    ("w2c_order_free_exact", "0", {"--exact": None}, "pgi15-gpu18",
      "UNPINNED order, EXACT only -- isolates the order axis from the "
      "approximation axis entirely.  THE DECISIVE ARM OF THIS WAVE"),
     ("w2d_order_free_edgemem", "0", {"--face-edge-mem": None}, "pgi15-gpu18",
@@ -1243,7 +1243,7 @@ for _n, _lam, _kl, _node, _what in [
     ("w3a_lam_star", "${W1_LAM:?export W1_LAM to wave 1 winning lambda-acc}",
      "0", "pgi15-gpu15", "the wave-1 winner, re-run as the IN-BATTERY control"),
     ("w3b_lam130", "130", "0", "pgi15-gpu16", "lambda_acc = 130"),
-    ("w3c_lam400", "400", "0", "pgi15-gpu17", "lambda_acc = 400"),
+    ("w3c_lam400", "400", "0", "pgi15-gpu18", "lambda_acc = 400"),
     ("w3d_kl_ref", "${W1_LAM:?export W1_LAM to wave 1 winning lambda-acc}",
      "0.1", "pgi15-gpu18",
      "the wave-1 winner PLUS a KL trust region to the frozen identity-init "
@@ -1318,7 +1318,7 @@ for _n, _read, _node, _what in [
      "the INCUMBENT: what R1-R3 and every wave-1/2/3 arm ran"),
     ("w4b_read_chunkmean", "chunk-mean", "pgi15-gpu16",
      "the shipped DEFAULT, and the read the information-loss dossier indicts"),
-    ("w4c_read_ownspan", "own-span-mean", "pgi15-gpu17",
+    ("w4c_read_ownspan", "own-span-mean", "pgi15-gpu18",
      "the documented MINIMAL FIX: pool face f's OWN span only"),
     ("w4d_read_ownspan_seed2", "own-span-mean", "pgi15-gpu18",
      "w4c at a second seed -- the read-point effect sizes the dossier predicts "
@@ -1493,13 +1493,15 @@ FIXED_ORDERS = ("markowitz", "reverse", "free")
 
 # ---------------------------------------------------------------------------
 # THE CAMPAIGN HARDWARE (owner ruling 2026-09-13).  One sbatch per node, all
-# eight Blackwell GPUs of the node, on pgi15-gpu19 / pgi15-gpu20.  The trainer
-# takes device 0 (--gpus 0, the ppo.py default) and the --ray-measure actor
-# device 1 (ppo.py pins idx + 1 through RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_
-# DEVICES); holding the node is what makes the timed executions mean anything
-# (co-residency measured CV 0.0000% -> 49.7%).
+# eight Blackwell GPUs of the node.  pgi15-gpu19 belongs to another group
+# (dsnn-dfw.69): pgi15-gpu20 is the only 8-GPU node we may use, so every
+# campaign row now runs there.  The trainer takes device 0 (--gpus 0, the
+# ppo.py default) and the --ray-measure actor device 1 (ppo.py pins idx + 1
+# through RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES); holding the node is
+# what makes the timed executions mean anything (co-residency measured CV
+# 0.0000% -> 49.7%).
 # ---------------------------------------------------------------------------
-CAMPAIGN_NODES = ("pgi15-gpu19", "pgi15-gpu20")
+CAMPAIGN_NODES = ("pgi15-gpu20",)
 CAMPAIGN_GPUS = 8
 CAMPAIGN_GRES = ("gpu:nvidia_rtx_pro_6000_blackwell_max-q_workstation_edition"
                  f":{CAMPAIGN_GPUS}")
@@ -2025,7 +2027,7 @@ for _i, (_tag, _prof, _order, _what, _pred, _fals, _dep) in enumerate(PHASE1_TAB
 for _tag, _rewards, _node, _what in (
     ("a", "cmp acc", CAMPAIGN_NODES[0],
      "LATENCY + QUALITY only (--rewards cmp acc): the memory head is off."),
-    ("b", "mem acc", CAMPAIGN_NODES[1],
+    ("b", "mem acc", CAMPAIGN_NODES[0],
      "MEMORY + QUALITY only (--rewards mem acc): the latency head is off."),
 ):
     campaign_arm(
@@ -2049,7 +2051,7 @@ for _tag, _form, _node, _what in (
     ("a", "P0", CAMPAIGN_NODES[0],
      "P0: --preference-conditioned with RAW quality (3-D front; the Dirichlet "
      "preference over the three heads drives the advantage weighting)."),
-    ("b", "P1", CAMPAIGN_NODES[1],
+    ("b", "P1", CAMPAIGN_NODES[0],
      f"P1: --preference-conditioned --quality-floor {QUALITY_FLOOR_TAU} (2-D "
      "front; slot 6 is the hinge -max(0, tau - q), so the third weight "
      "prices violations only)."),
@@ -2242,21 +2244,18 @@ THESIS_MEM_CHANNEL = "watermark"
 THESIS_FINAL_AUTO_STOP = False
 
 # ---------------------------------------------------------------------------
-# THE HARDWARE.  Six Blackwell nodes (owner: "all six Blackwell nodes with a
-# per-node singleton dependency").  Two of them carry eight GPUs and four
-# carry four, so the measurement fan-out is per node: one GPU for the trainer
-# and every other GPU a measure actor.
+# THE HARDWARE.  Four Blackwell nodes we may use (dsnn-dfw.69): pgi15-gpu17
+# has no matched CUDA 12.9 ptxas or nvlink (job 66740 aborted 72) and
+# pgi15-gpu19 belongs to another group.  Neither is ever a node source in
+# this table, the default assignment every thesis row below uses.  pgi15-gpu20 carries eight
+# GPUs; the other three carry four, so the measurement fan-out is per node:
+# one GPU for the trainer and every other GPU a measure actor.
 #
-# THESIS_NODES is the subset RELEASED TO THIS AGENT.  It changed twice on
-# 2026-09-16.  In the morning the owner held `pgi15-gpu17` and `pgi15-gpu19`
-# for other agents.  In the evening the SNN agent finished and `pgi15-gpu19`
-# came back, while `pgi15-gpu17` stayed out because another agent may still
-# take it.  So the released set is five of the six.  When the owner releases
-# gpu17 as well, set THESIS_NODES = THESIS_NODES_ALL and regenerate: the node
-# is part of the launcher, so this is a regeneration, never an edit in place.
+# THESIS_NODES is an alias of THESIS_NODES_ALL: every node this table names
+# is a node we may use, so nothing is held back from it.
 # ---------------------------------------------------------------------------
-THESIS_NODES_ALL = ("pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu17",
-                    "pgi15-gpu18", "pgi15-gpu19", "pgi15-gpu20")
+THESIS_NODES_ALL = ("pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu18",
+                    "pgi15-gpu20")
 THESIS_NODES = THESIS_NODES_ALL
 THESIS_NODE_GPUS = {"pgi15-gpu15": 4, "pgi15-gpu16": 4, "pgi15-gpu17": 4,
                     "pgi15-gpu18": 4, "pgi15-gpu19": 8, "pgi15-gpu20": 8}
@@ -2751,11 +2750,10 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
                grad_oracle_cadence: str = "50") -> dict:
     """One thesis run -> one `arm(...)`.  Returns the arm."""
     _require(node in THESIS_NODES,
-             f"node {node!r} is not one of the released thesis nodes "
-             f"{THESIS_NODES}. THESIS_NODES_ALL is the matrix's own list of "
-             f"six Blackwell nodes and THESIS_NODES is the subset released to "
-             f"this agent: on 2026-09-16 pgi15-gpu17 stayed out because "
-             f"another agent may still take it.")
+             f"node {node!r} is not one of the permitted thesis nodes "
+             f"{THESIS_NODES} (dsnn-dfw.69: pgi15-gpu17 has no matched CUDA "
+             f"12.9 ptxas and pgi15-gpu19 belongs to another group; neither "
+             f"is ever a node source).")
     name = name or thesis_run_name(arm, target, seed)
     _require(arm in THESIS_ARM_SPEC, f"arm {arm!r} is not one of {THESIS_ARMS}")
     _require(target in THESIS_TARGET_CLI,
@@ -2866,24 +2864,26 @@ def thesis_core_arms() -> list[dict]:
             and not a.get("orderonly") and not a.get("orderonly_final")]
 
 
-# Target-pinned nodes (owner ruling 2026-09-17: "max 4* 2 tlm 2 nn256"):
-# 2 nodes for TLM (pgi15-gpu19 [8 GPUs, 7 Ray actors], pgi15-gpu16 [4 GPUs, 3 Ray actors]),
-# 2 nodes for NN256 (pgi15-gpu18 [4 GPUs, 3 Ray actors], pgi15-gpu17 [4 GPUs, 3 Ray actors]).
+# Target-pinned nodes (owner ruling 2026-09-17: "max 4* 2 tlm 2 nn256").
+# pgi15-gpu19 and pgi15-gpu17 are gone (dsnn-dfw.69: another group's node,
+# and no matched CUDA 12.9 ptxas): 2 nodes for TLM (pgi15-gpu20 [8 GPUs, 7
+# Ray actors], pgi15-gpu16 [4 GPUs, 3 Ray actors]), 2 nodes for NN256
+# (pgi15-gpu18 [4 GPUs, 3 Ray actors], pgi15-gpu15 [4 GPUs, 3 Ray actors]).
 # Activated via THESIS_TARGET_NODES=1.
 THESIS_TARGET_ARM_NODES = {
-    ("tlm", "C"): "pgi15-gpu19",
+    ("tlm", "C"): "pgi15-gpu20",
     ("tlm", "C_popart"): "pgi15-gpu16",
-    ("tlm", "condC"): "pgi15-gpu19",
+    ("tlm", "condC"): "pgi15-gpu20",
     ("tlm", "A"): "pgi15-gpu16",
-    ("tlm", "B"): "pgi15-gpu19",
+    ("tlm", "B"): "pgi15-gpu20",
     ("nn256", "C"): "pgi15-gpu18",
-    ("nn256", "C_popart"): "pgi15-gpu17",
+    ("nn256", "C_popart"): "pgi15-gpu15",
     ("nn256", "condC"): "pgi15-gpu18",
-    ("nn256", "A"): "pgi15-gpu17",
+    ("nn256", "A"): "pgi15-gpu15",
     ("nn256", "B"): "pgi15-gpu18",
 }
 THESIS_TARGET_NODES = {
-    "tlm": "pgi15-gpu19",
+    "tlm": "pgi15-gpu20",
     "nn256": "pgi15-gpu18",
 }
 _USE_TARGET_NODES = os.environ.get("THESIS_TARGET_NODES", "0") == "1"
