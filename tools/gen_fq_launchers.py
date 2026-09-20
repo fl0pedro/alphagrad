@@ -3321,18 +3321,20 @@ def orderonly_arms() -> list[dict]:
 # to move.  When round 1 names a different pair the owner moves
 # ORDERONLY_FINAL_WEIGHTS and regenerates.
 #
-# THE NODE IS THE SEED, one Blackwell node each, in seed order.  A seed's
-# numbers may never straddle two GPU models (AGENTS.md), and five seeds on
-# five nodes is one node per seed exactly.  pgi15-gpu19 stays out: it is the
-# campaign's node.  gres, CPUs and memory come from the generator's own
-# Blackwell tables, and pgi15-gpu20 carries eight GPUs, so its row measures
-# with seven Ray actors while the four 4-GPU rows measure with three.
+# THE NODE IS THE SEED, round-robin over the four cleared Blackwell nodes in
+# seed order.  A seed's numbers may never straddle two GPU models (AGENTS.md).
+# pgi15-gpu19 stays out: it is the campaign's node.  pgi15-gpu17 stays out
+# too (dsnn-dfw.69: job 66740 aborted 72 -- /usr/local/cuda-12.9 on gpu17 has
+# no bin/ptxas or nvlink).  Five seeds over four nodes means one node
+# repeats; gres, CPUs and memory come from the generator's own Blackwell
+# tables, and pgi15-gpu20 carries eight GPUs, so its row measures with seven
+# Ray actors while the three 4-GPU rows measure with three.
 # ---------------------------------------------------------------------------
 ORDERONLY_FINAL_SEEDS = THESIS_SEEDS
 #: (--lambda-cmp, --lambda-mem) of the baseline: one of the five ruled pairs.
 ORDERONLY_FINAL_WEIGHTS = ("2", "0")
-ORDERONLY_FINAL_NODES = ("pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu17",
-                         "pgi15-gpu18", "pgi15-gpu20")
+ORDERONLY_FINAL_NODES = ("pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu18",
+                         "pgi15-gpu20")
 
 _ORDERONLY_FINAL_HEAD = f"""THE 5-SEED ORDER-ONLY BASELINE ON NN256 (epic
 dsnn-dfw, owner ruling 2026-09-19).  A FINAL row, not a tuning row: the
@@ -3377,11 +3379,13 @@ def orderonly_final_run_name(seed: str) -> str:
 
 
 def orderonly_final_node(seed: str) -> str:
-    """THE NODE OF A SEED: one Blackwell node each, in seed order."""
+    """THE NODE OF A SEED: round-robin over the four cleared Blackwell
+    nodes, in seed order (dsnn-dfw.69: pgi15-gpu17 excluded)."""
     if seed not in ORDERONLY_FINAL_SEEDS:
         raise CampaignRowError(
             f"seed {seed!r} is not one of {ORDERONLY_FINAL_SEEDS}")
-    return ORDERONLY_FINAL_NODES[ORDERONLY_FINAL_SEEDS.index(seed)]
+    i = ORDERONLY_FINAL_SEEDS.index(seed)
+    return ORDERONLY_FINAL_NODES[i % len(ORDERONLY_FINAL_NODES)]
 
 
 def orderonly_final_arm(*, seed: str) -> dict:
