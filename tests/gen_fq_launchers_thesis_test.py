@@ -135,7 +135,7 @@ def matrix(gen):
             and not a.get("orderonly_final")
             and not a.get("orderonly_tlm_final")
             and not a.get("paired") and not a.get("sweepl")
-              and not a.get("sweepl2")]
+              and not a.get("sweepl2") and not a.get("sweepl3")]
     assert arms, "the generator emits no thesis arm"
     return arms
 
@@ -961,7 +961,7 @@ def test_target_nodes_routing(monkeypatch):
               if not a.get("smoke") and not a.get("orderonly")
               and not a.get("orderonly_final")
               and not a.get("orderonly_tlm_final") and not a.get("sweepl")
-              and not a.get("sweepl2")]
+              and not a.get("sweepl2") and not a.get("sweepl3")]
     for a in matrix:
         if a["thesis_target"] == "tlm":
             assert a["node"] in ("pgi15-gpu20", "pgi15-gpu16"), a["name"]
