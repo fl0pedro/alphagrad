@@ -4412,7 +4412,9 @@ def render(a: dict) -> str:
     else:
         L.append(f"CUDA_VISIBLE_DEVICES=0,1,2,3 {py} \\")
     L.append('  src/alphagrad/approx/ppo.py "${ARGS[@]}"')
-    L.append('echo "TRAINER exited with $?"')
+    L.append("TRAINER_STATUS=$?")
+    L.append('echo "TRAINER exited with $TRAINER_STATUS"')
+    L.append('exit "$TRAINER_STATUS"')
     return "\n".join(L) + "\n"
 
 
