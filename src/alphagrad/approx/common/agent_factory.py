@@ -105,31 +105,166 @@ def refuse_removed_env_knobs(environ=None) -> None:
                 f"fallback). Unset it and pass {flag} instead.")
 
 
-def apply_face_none_bias(agent, bias: float):
+def apply_face_none_bias(agent, bias: float, skip_bias: float | None = None):
     """IDENTITY-INIT for the face head (--face-none-bias B, default 0 =
     off): +B on each slot's OP_NONE logit, -B on SKIP.
     Called by build_and_init_agent AND by ppo.main's inline init path
     (which predates the factory and does not route through it -- the
-    v54 PPO arm shipped without the bias until this was split out)."""
+    v54 PPO arm shipped without the bias until this was split out).
+
+    ``skip_bias`` (--face-skip-bias Bs, default None): when given, the SKIP
+    logit gets -Bs instead of -B, independent of the none bias, which keeps
+    its +B on the OP_NONE logits regardless. None (default) reproduces the
+    old coupled behaviour bit for bit -- SKIP gets -B, same as before this
+    parameter existed."""
     _nb = float(bias or 0.0)
+    _skb = _nb if skip_bias is None else float(skip_bias)
     _fpp = getattr(agent, "face_path_policy", None)
-    if _nb == 0.0 or _fpp is None or getattr(_fpp, "head", None) is None:
+    if (_nb == 0.0 and _skb == 0.0) or _fpp is None \
+            or getattr(_fpp, "head", None) is None:
         return agent
     import equinox as _eqx
     from alphagrad.approx.unified_face_head import (
         FACE_SLOTS as _FS, OP_NONE as _NONE, O_SKIP as _SKIP,
-        S_OP as _SOP, slot_base as _sb)
+        S_OP as _SOP, slot_base as _slot_base)
     _bias = _fpp.head.proj.layers[-1].bias
     for _s in range(_FS):
-        _bias = _bias.at[_sb(_s) + _SOP + _NONE].add(_nb)
-    _bias = _bias.at[_SKIP].add(-_nb)
+        _bias = _bias.at[_slot_base(_s) + _SOP + _NONE].add(_nb)
+    _bias = _bias.at[_SKIP].add(-_skb)
     agent = _eqx.tree_at(
         lambda a: a.face_path_policy.head.proj.layers[-1].bias,
         agent, _bias)
-    print(f"[factory] face-head IDENTITY INIT: OP_NONE bias +{_nb}, "
-          f"SKIP bias -{_nb} (trainable; P(approx/face) ~ "
-          f"{3 * 2.718 ** (-_nb):.3f})", flush=True)
+    if skip_bias is None:
+        print(f"[factory] face-head IDENTITY INIT: OP_NONE bias +{_nb}, "
+              f"SKIP bias -{_nb} (trainable; P(approx/face) ~ "
+              f"{3 * 2.718 ** (-_nb):.3f})", flush=True)
+    else:
+        print(f"[factory] face-head IDENTITY INIT: OP_NONE bias +{_nb}, "
+              f"SKIP bias -{_skb} (--face-skip-bias, independent of "
+              f"OP_NONE; trainable; P(approx/face) ~ "
+              f"{3 * 2.718 ** (-_nb):.3f}, P(skip) ~ "
+              f"{1.0 / (1.0 + 2.718 ** _skb):.3f})", flush=True)
     return agent
+
+
+def derive_face_none_bias(F: float, S: int, k: int, a: float) -> float:
+    """B = ln(F*S*k/a - k), the none-logit bias whose expected requested
+    approximations per plan is ``a`` (--face-init-approx-per-plan), given
+    ``F`` live faces, ``S`` slots/face and ``k`` non-none ops/slot. Raises
+    when ``a`` makes the log undefined (a <= 0, or a >= F*S -- more
+    approximations than there are slots to hold them, one non-none pick
+    per slot being the ceiling no finite bias can exceed)."""
+    F, a = float(F), float(a)
+    if a <= 0.0:
+        raise ValueError(
+            f"--face-init-approx-per-plan {a!r} must be > 0.")
+    x = F * S * k / a - k
+    if x <= 0.0:
+        raise ValueError(
+            f"--face-init-approx-per-plan {a!r} is unreachable at F={F:g} "
+            f"faces, S={S} slots, k={k} ops: F*S*k/a - k = {x:g} <= 0, so "
+            f"ln(x) is undefined. a must be < F*S (={F * S:g} here); a "
+            "this large asks for more approximations than there are "
+            "slots to offer them in.")
+    import math
+    return math.log(x)
+
+
+def derive_face_skip_bias(F: float, kappa: float) -> float:
+    """Bs = ln(F/kappa - 1), the skip-logit bias whose expected skips per
+    plan is ``kappa`` (--face-init-skips-per-plan), given ``F`` live faces.
+    Raises when ``kappa`` makes the log undefined (kappa <= 0, or kappa >= F
+    -- more skips than there are faces)."""
+    F, kappa = float(F), float(kappa)
+    if kappa <= 0.0:
+        raise ValueError(
+            f"--face-init-skips-per-plan {kappa!r} must be > 0.")
+    x = F / kappa - 1.0
+    if x <= 0.0:
+        raise ValueError(
+            f"--face-init-skips-per-plan {kappa!r} is unreachable at "
+            f"F={F:g} faces: F/kappa - 1 = {x:g} <= 0, so ln(x) is "
+            f"undefined. kappa must be < F (={F:g} here).")
+    import math
+    return math.log(x)
+
+
+def expected_face_counts(F: float, S: int, k: int, B: float,
+                         Bs: float) -> tuple[float, float]:
+    """``(E[A], E[K])`` -- expected requested approximations and skips per
+    plan under none-bias ``B`` and skip-bias ``Bs``, F live faces, S
+    slots/face, k non-none ops/slot. The closed forms
+    :func:`derive_face_none_bias` / :func:`derive_face_skip_bias` invert."""
+    import math
+    e_a = F * S * k / (math.exp(B) + k)
+    e_k = F / (1.0 + math.exp(Bs))
+    return e_a, e_k
+
+
+def resolve_face_init_bias(args, F: float | None = None):
+    """``(B, Bs)`` derived from --face-init-approx-per-plan /
+    --face-init-skips-per-plan, or ``(None, None)`` when neither is set
+    (inert). Refuses if --face-none-bias / --face-skip-bias is ALSO set
+    (the two ways of setting the bias would conflict), if the argument
+    makes the closed form's log undefined, or if ``F`` -- the live-face
+    count of the built target -- is not known at this call site.
+
+    F is NOT a graph property computable ahead of time: eliminating a
+    vertex rewires its neighbours, so a plan's total live-face count is the
+    length of a walk over one ELIMINATION ORDER, not a property of the
+    jaxpr alone (tools/faces_per_vertex.py: "the unrolling's length is not
+    a property of the graph alone ... vertex k's face count depends on the
+    k-1 before it"). ``build_and_init_agent`` / ``ppo.main``'s inline copy
+    call this BEFORE any order exists: under --fixed-order free (the
+    dsnn-dfw.74 rows this flag exists for) the order is the sequence of
+    actions the policy itself samples during rollout, produced by code
+    that runs AFTER the agent (hence after this call) and differs per
+    episode and per environment -- there is no single F for "the built
+    target" to read here. A static order (--fixed-order reverse/markowitz,
+    common/order.py) does exist before init, but it is a property of that
+    CHOSEN ORDER, not of the target; treating its count as F would pick one
+    arbitrary order's number and label it the target's, which is the guess
+    this function must refuse rather than make. Callers therefore pass no
+    F today, and this refuses unconditionally whenever either flag is set."""
+    a = getattr(args, "face_init_approx_per_plan", None)
+    kappa = getattr(args, "face_init_skips_per_plan", None)
+    if a is None and kappa is None:
+        return None, None
+    _nb = getattr(args, "face_none_bias", 0.0) or 0.0
+    _sb = getattr(args, "face_skip_bias", None)
+    if float(_nb) != 0.0 or _sb is not None:
+        raise ValueError(
+            "--face-init-approx-per-plan/--face-init-skips-per-plan derive "
+            "B/Bs themselves; --face-none-bias and/or --face-skip-bias is "
+            f"also set (face_none_bias={_nb!r}, face_skip_bias={_sb!r}) "
+            "and would conflict. Drop one or the other.")
+    if F is None:
+        raise ValueError(
+            "--face-init-approx-per-plan/--face-init-skips-per-plan need "
+            "the live-face count F of the built target, and F is not known "
+            "at the point of agent init: it is the length of a walk over "
+            "one elimination ORDER (tools/faces_per_vertex.py), not a "
+            "property of the jaxpr alone, and under --fixed-order free the "
+            "order is produced by the policy's own rollout, after the "
+            "agent this flag would initialise already exists. See "
+            "resolve_face_init_bias's docstring for the exact order of "
+            "construction. Not implemented: refusing rather than guessing "
+            "which order's count to call F.")
+    from alphagrad.approx.unified_face_head import (
+        FACE_SLOTS as _S, NUM_APPROX_OPS as _NOPS)
+    _k = _NOPS - 1
+    B = None if a is None else derive_face_none_bias(F, _S, _k, a)
+    Bs = None if kappa is None else derive_face_skip_bias(F, kappa)
+    if B is None:
+        B = float(_nb)
+    if Bs is None:
+        Bs = B
+    e_a, e_k = expected_face_counts(F, _S, _k, B, Bs)
+    print(f"[factory] face-head init from plan targets: F={F:g} faces, "
+          f"--face-init-approx-per-plan={a!r} -> B={B:g}, "
+          f"--face-init-skips-per-plan={kappa!r} -> Bs={Bs:g}, "
+          f"E[A]={e_a:g}, E[K]={e_k:g}", flush=True)
+    return B, Bs
 
 
 def build_and_init_agent(args, total_v: int, num_factors: int, max_rules: int,
@@ -165,8 +300,14 @@ def build_and_init_agent(args, total_v: int, num_factors: int, max_rules: int,
     agent = _build_agent(args, total_v, num_factors, max_rules, key)
     agent = apply_init_scheme(agent, init_key, args)
 
-    agent = apply_face_none_bias(
-        agent, float(getattr(args, "face_none_bias", 0.0) or 0.0))
+    _derived_B, _derived_Bs = resolve_face_init_bias(args)
+    if _derived_B is None:
+        _nb = float(getattr(args, "face_none_bias", 0.0) or 0.0)
+        _skip_bias = getattr(args, "face_skip_bias", None)
+        _skip_bias = None if _skip_bias is None else float(_skip_bias)
+    else:
+        _nb, _skip_bias = _derived_B, _derived_Bs
+    agent = apply_face_none_bias(agent, _nb, _skip_bias)
     return agent
 
 
