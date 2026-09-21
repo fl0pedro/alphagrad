@@ -28,6 +28,12 @@ rather than on 150 files:
      round (the order-only tuning rows are arm C on NN256 too) moves.
   8c. THE LONG CONDITIONED ROWS (owner ruling 2026-09-20): condC on NN256,
      five seeds, renders --episodes 2000.  Every other row keeps 1000.
+  8d. CONDC RENDERS ON THE POPART FORM ON NN256 (owner ruling 2026-09-21):
+     the same three flags as arm C_popart -- --advantage-norm popart,
+     --no-symlog, --symlog-channels none -- read from C_popart's own row,
+     not retyped, in place of the symlog form THESIS_ARM_SPEC records for
+     condC.  condC on TLM and on the four recurrent targets keeps the
+     symlog form; nothing else about condC on NN256 moves.
   9. THE RECURRENT BLOCK: --example RSNN_SHD --dataset shd crossed with four
      temporal rules (tbptt, bptt, rtrl, window2), the same five arms and the
      same five seeds = 100 further runs, named `<arm>_rsnn_<rule>_s<seed>`,
@@ -566,6 +572,77 @@ def test_rung1_keeps_the_four_gpu_profile_and_the_paired_slots(gen, matrix):
     assert paired_halves, "the paired slots are gone"
 
 
+# --------------------------------- 2c. condC renders on popart on nn256
+
+#: The owner's condC-on-PopArt-on-NN256 ruling, typed here on purpose
+#: (2026-09-21).
+CONDC_POPART_TARGET = "nn256"
+
+
+def _is_condc_popart(a) -> bool:
+    return (a["thesis_target"] == CONDC_POPART_TARGET
+            and a["thesis_arm"] == "condC")
+
+
+def test_condc_on_nn256_renders_on_the_popart_form(gen, matrix):
+    """Owner ruling 2026-09-21: condC on NN256 takes arm C_popart's own
+    magnitude scaling -- read from C_popart's own row here, not retyped --
+    in place of the symlog form.  All five seeds, singles and pairs both
+    building from this same `cli`."""
+    c_popart_cli = next(
+        _cli(gen, a) for a in matrix
+        if a["thesis_arm"] == "C_popart"
+        and a["thesis_target"] == CONDC_POPART_TARGET)
+    seen = set()
+    for a in matrix:
+        if not _is_condc_popart(a):
+            continue
+        cli = _cli(gen, a)
+        for flag in ("--advantage-norm", "--no-symlog", "--symlog-channels"):
+            assert cli.get(flag, _MISSING) == c_popart_cli.get(flag, _MISSING), \
+                (a["name"], flag)
+        assert cli["--advantage-norm"] == "popart", a["name"]
+        assert "--no-symlog" in cli, a["name"]
+        assert cli["--symlog-channels"] == "none", a["name"]
+        seen.add(a["thesis_seed"])
+    assert seen == set(SEEDS)
+
+
+def test_condc_on_every_other_target_keeps_the_symlog_form(gen, matrix):
+    """condC on TLM and on the four recurrent targets is untouched: the
+    PopArt ruling reaches NN256 alone, by a target check."""
+    seen = set()
+    for a in matrix:
+        if a["thesis_arm"] != "condC" or _is_condc_popart(a):
+            continue
+        cli = _cli(gen, a)
+        assert cli["--advantage-norm"] == "none", a["name"]
+        assert "--no-symlog" not in cli, a["name"]
+        assert cli["--symlog-channels"] == "cost", a["name"]
+        seen.add(a["thesis_target"])
+    assert seen == {"tlm"} | {f"rsnn_{r}" for r in TEMPORAL_RULES}
+
+
+def test_only_a_matrix_coordinate_can_be_a_condc_popart_row(gen):
+    """Mirrors `test_only_a_matrix_coordinate_can_be_a_rung1_row`: the
+    order-only preference row (dsnn-dfw.29/.45's `orderonly_arm`/
+    `orderonly_rsnn_arm`, `pref=True`) is condC on NN256 too and builds its
+    command line with the same `thesis_cli`, but it is a different round
+    (quality inert, --approx-profile none) whose record reads "unchanged
+    from the matrix"; `matrix_row=False`, thesis_cli's own default,
+    protects it."""
+    assert gen.condc_popart_row("condC", CONDC_POPART_TARGET, True)
+    assert not gen.condc_popart_row("condC", CONDC_POPART_TARGET, False)
+    assert not gen.condc_popart_row("C", CONDC_POPART_TARGET, True)
+    assert not gen.condc_popart_row("condC", "tlm", True)
+    # and the default of thesis_cli is the safe one
+    cli = gen.thesis_cli(arm="condC", target=CONDC_POPART_TARGET,
+                         seed=SEEDS[0], node=gen.THESIS_NODES[0], name="x",
+                         episodes="1", checkpoint_every="1", auto_stop=False)
+    assert cli["--advantage-norm"] == "none"
+    assert "--no-symlog" not in cli
+
+
 def test_c_is_not_conditioned_and_condc_is(gen, matrix):
     """The one composition nothing has run: ppo.py ties nothing here, but
     `campaign_arm` does (its L rows are all conditioned), so C without the
@@ -580,12 +657,16 @@ def test_c_is_not_conditioned_and_condc_is(gen, matrix):
     assert "lagrangian + preference-conditioned" in ppo
 
 
-def test_popart_sets_no_symlog_at_every_site_and_only_on_c_popart(gen, matrix):
+def test_popart_sets_no_symlog_at_every_site_on_c_popart_and_condc_nn256(
+        gen, matrix):
     """The recorded trap of ticket .53: PopArt needs --no-symlog, and ppo.py
-    refuses a command line whose two symlog sites disagree."""
+    refuses a command line whose two symlog sites disagree.  condC on NN256
+    renders on the PopArt form too (owner ruling 2026-09-21, section 8d,
+    `test_condc_on_nn256_renders_on_the_popart_form` pins the detail);
+    every other row keeps the symlog form."""
     for a in matrix:
         cli = _cli(gen, a)
-        if a["thesis_arm"] == "C_popart":
+        if a["thesis_arm"] == "C_popart" or _is_condc_popart(a):
             assert cli["--advantage-norm"] == "popart", a["name"]
             assert "--no-symlog" in cli, a["name"]
             assert cli["--symlog-channels"] == "none", a["name"]
@@ -1077,10 +1158,17 @@ def test_every_recurrent_row_carries_the_nn256_and_tlm_flags_unchanged(
     ladder.  It is the same coordinate, written the other of the two ways,
     and `test_rung1_is_c_and_c_popart_on_nn256_and_nothing_else` is what
     pins which rows moved.
+
+    The three PopArt flags are excluded against the NN256 twin ONLY, and
+    only for condC: condC on NN256 renders on the PopArt form (owner ruling
+    2026-09-21), and the recurrent rows are not on that ruling either --
+    `test_condc_on_nn256_renders_on_the_popart_form` is what pins which rows
+    moved.
     """
     node_derived = {"--ray-measure"}
     face_init = {"--face-none-bias", "--face-init-approx-per-plan",
                  "--face-init-skips-per-plan"}
+    popart_flags = {"--advantage-norm", "--no-symlog", "--symlog-channels"}
     target_keys = {"--name", "--example", "--dataset", "--temporal-rule"}
     by_key = {(a["thesis_arm"], a["thesis_target"], a["thesis_seed"]): a
               for a in core}
@@ -1100,6 +1188,11 @@ def test_every_recurrent_row_carries_the_nn256_and_tlm_flags_unchanged(
                 # not on that ruling
                 assert "--episodes" in diff, (a["name"], t)
                 diff -= {"--episodes"}
+            if _is_condc_popart(twin):
+                # the NN256 twin renders on PopArt; the recurrent row is not
+                # on that ruling and keeps the symlog form
+                assert diff & popart_flags == popart_flags, (a["name"], t)
+                diff -= popart_flags
             assert diff == target_keys, (a["name"], t, sorted(diff))
 
 

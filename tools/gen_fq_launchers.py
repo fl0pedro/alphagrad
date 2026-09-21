@@ -2610,6 +2610,30 @@ def rung1_row(arm: str, target: str, matrix_row: bool = True) -> bool:
     """
     return (matrix_row and target == RUNG1_TARGET and arm in RUNG1_ARMS)
 
+#: CONDC RENDERS ON THE POPART FORM ON NN256 (owner ruling 2026-09-21).  Rung
+#: 1 (C symlog vs C_popart on NN256, dsnn-dfw epic comment 2026-09-21 06:30)
+#: found PopArt dominating symlog on every column at feasible fraction, q and
+#: feasible-plan latency; condC on NN256 was held on "the scaling ruling"
+#: until this one.  condC on NN256 now takes exactly arm C_popart's magnitude
+#: scaling: --advantage-norm popart, --no-symlog, --symlog-channels none
+#: (values read from THESIS_ARM_SPEC["C_popart"] and the popart branch below,
+#: not retyped).  condC on every other target (TLM, the recurrent rows) keeps
+#: its recorded symlog form from THESIS_ARM_SPEC unchanged.
+CONDC_POPART_TARGET = "nn256"
+
+
+def condc_popart_row(arm: str, target: str, matrix_row: bool = True) -> bool:
+    """Is this (arm, target) a condC-on-PopArt row (owner ruling 2026-09-21)?
+
+    ONLY A MATRIX COORDINATE CAN BE ONE, mirroring `rung1_row`.  The
+    order-only preference row (dsnn-dfw.29/.45's `orderonly_arm`/
+    `orderonly_rsnn_arm`, `pref=True`) is also condC on NN256 and also goes
+    through `thesis_cli`, but it is a DIFFERENT round -- quality is inert
+    there (--approx-profile none) and its record reads "unchanged from the
+    matrix" -- so `matrix_row` is False for it and it does not move.
+    """
+    return (matrix_row and target == CONDC_POPART_TARGET and arm == "condC")
+
 THESIS_FLAGS_FILES = REQUIRED_FLAGS_FILES + [
     # --checkpoint-every and --resume live in common/checkpoint.py and
     # --auto-stop in common/auto_stop.py; both install their arguments on
@@ -2777,6 +2801,11 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
     changes on purpose (episodes, checkpoint interval, auto-stop).
     """
     bias, form, advantage_norm, conditioned = THESIS_ARM_SPEC[arm]
+    if condc_popart_row(arm, target, matrix_row):
+        # Owner ruling 2026-09-21: condC on NN256 renders on the PopArt
+        # magnitude scaling, arm C_popart's own advantage_norm, in place of
+        # the "none" (symlog) form THESIS_ARM_SPEC records for condC.
+        advantage_norm = THESIS_ARM_SPEC["C_popart"][2]
     gpus = thesis_row_gpus(target, node)
     cli: dict = {
         "--name": name,
@@ -2926,7 +2955,14 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
                    "gets."
                    if cli["--episodes"] == THESIS_EPISODES_LONG
                    and target == LONG_EPISODES_TARGET
-                   and arm in LONG_EPISODES_ARMS else ""),
+                   and arm in LONG_EPISODES_ARMS else "")
+                + (f"\n\nTHIS ROW RENDERS ON THE POPART FORM, not symlog "
+                   "(owner ruling 2026-09-21): rung 1 found PopArt "
+                   "dominating symlog on every column, and condC on NN256 "
+                   "was held on the scaling ruling until this one.  condC "
+                   "on TLM and on the four recurrent targets keeps the "
+                   "symlog form."
+                   if condc_popart_row(arm, target) else ""),
         prediction=prediction or _THESIS_ARM_PREDICTION[arm],
         falsifier=_THESIS_FALSIFIER,
     )
