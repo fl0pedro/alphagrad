@@ -64,3 +64,73 @@ def test_a_small_gradient_scores_the_angle_and_not_its_size():
         a = tuple(x * scale for x in a0)
         got = float(envmod._quality_metrics(e, a)[0])
         assert abs(got - ref) < 1e-4, (scale, got, ref)
+
+
+# ---------------------------------------------------------------------------
+# A NON-FINITE ACCUMULATOR IS A REFUSED MEASUREMENT (dsnn-dfw.90).
+#
+# Job 67284-67288, plan log bptt s250197 ep 22 env 3: the quality slot read
+# "nan", the dual clipped it (clip(nan) = nan), lambda stayed nan for the rest
+# of the run and the policy went NaN. Nothing raised. These tests pin the
+# raise, its type, and the fact that no value is clamped or repaired.
+# ---------------------------------------------------------------------------
+
+def _pair_with(bad_value):
+    good = (jnp.asarray([[1.0, 2.0], [3.0, 4.0]], jnp.float32),)
+    bad = (jnp.asarray([[bad_value, 0.0], [0.0, 0.0]], jnp.float32),)
+    return good, bad
+
+
+@pytest.mark.parametrize("bad_value", [np.nan, np.inf, -np.inf])
+def test_quality_metrics_refuses_a_non_finite_accumulator(bad_value):
+    import alphagrad.approx.env as envmod
+    good, bad = _pair_with(bad_value)
+    with pytest.raises(envmod.NonFiniteQuality) as exc:
+        envmod._quality_metrics(good, bad)
+    msg = str(exc.value)
+    assert "grad_cosine" in msg, msg
+    assert "REFUSED" in msg, msg
+
+
+@pytest.mark.parametrize("bad_value", [np.nan, np.inf])
+def test_dense_cosine_refuses_a_non_finite_accumulator(bad_value):
+    import alphagrad.approx.env as envmod
+    good, bad = _pair_with(bad_value)
+    with pytest.raises(envmod.NonFiniteQuality, match="grad_cosine/dense"):
+        envmod._dense_cosine(good, bad)
+
+
+def test_the_refusal_names_the_plan_hash_and_the_site():
+    import alphagrad.approx.env as envmod
+    good, bad = _pair_with(np.nan)
+    envmod._PLAN_HASH[0] = "0123456789abcdef"
+    try:
+        with pytest.raises(envmod.NonFiniteQuality, match="0123456789abcdef"):
+            envmod._quality_metrics(good, bad, site="jac_cosine")
+        with pytest.raises(envmod.NonFiniteQuality, match="jac_cosine"):
+            envmod._quality_metrics(good, bad, site="jac_cosine")
+        with pytest.raises(envmod.NonFiniteQuality, match="0123456789abcdef"):
+            envmod._dense_cosine(good, bad)
+    finally:
+        envmod._PLAN_HASH[0] = ""
+
+
+def test_the_refusal_is_in_the_refusal_family():
+    """A REFUSED measurement, not a toolchain fault: the sentinel machinery
+    must absorb it into a sentinel row and let the run continue, so it may
+    NOT be a MeasureToolchainFault."""
+    import alphagrad.approx.env as envmod
+    assert issubclass(envmod.NonFiniteQuality, envmod.QualityRefusal)
+    assert issubclass(envmod.GradientStructureMismatch, envmod.QualityRefusal)
+    assert issubclass(envmod.QualityRefusal, RuntimeError)
+    assert not issubclass(envmod.NonFiniteQuality, envmod.MeasureToolchainFault)
+
+
+def test_a_finite_pair_is_untouched_by_the_guard():
+    """No nan_to_num and no clamp: a finite comparison keeps its exact score."""
+    import alphagrad.approx.env as envmod
+    g = tuple(jnp.asarray(np.random.RandomState(7).randn(*s), jnp.float32)
+              for s in ((6, 4), (4, 4)))
+    cos, rel = envmod._quality_metrics(g, g)
+    assert abs(float(cos) - 1.0) < 1e-5
+    assert float(rel) < 1e-5

@@ -1832,6 +1832,14 @@ def current_env_slot() -> int:
     return int(_ENV_SLOT[0])
 
 
+_PLAN_HASH = [""]
+
+
+def current_plan_hash() -> str:
+    """The content hash of the plan being measured right now, or ``""``."""
+    return str(_PLAN_HASH[0])
+
+
 # ---------------------------------------------------------------------------
 # THE ROLLOUT SHARDS' MEASUREMENT RENDEZVOUS (--rollout-shards).
 #
@@ -3977,7 +3985,18 @@ def _flatten_jacobians(jac):
 _JAC_LAZY_NOTED: list = []
 
 
-class GradientStructureMismatch(RuntimeError):
+class QualityRefusal(RuntimeError):
+    """The quality channel could not measure this plan. Every subclass is a
+    REFUSED measurement: counted, recorded, never scored."""
+
+
+class NonFiniteQuality(QualityRefusal):
+    """An accumulator of the quality comparison is not finite (dsnn-dfw.90).
+    No nan_to_num and no clamp: an inf or a nan here is missing data, and the
+    message names the plan and the site so the plan can be replayed."""
+
+
+class GradientStructureMismatch(QualityRefusal):
     """Two gradient pytrees that must share one structure do not (ticket
     dsnn-3qm.62). Raised by the grad-cosine and fidelity comparisons instead
     of the silent 0.0 clamp that hid finding 60; the measure actors re-raise
@@ -4741,6 +4760,15 @@ def _dense_cosine(jac_exact, jac_approx):
         ee += float(np.sum(e_np ** 2))
         aa += float(np.sum(a_np ** 2))
         rr += float(np.sum((e_np - a_np) ** 2))
+    _nf = [_n for _n, _v in (("dot", dot), ("exact_sq", ee), ("approx_sq", aa),
+                             ("residual_sq", rr))
+           if not math.isfinite(_v)]
+    if _nf:
+        raise NonFiniteQuality(
+            f"[grad_cosine/dense] plan {current_plan_hash() or 'unknown'}: "
+            f"{', '.join(_nf)} not finite (dot={dot!r} exact_sq={ee!r} "
+            f"approx_sq={aa!r} residual_sq={rr!r}). The measurement is "
+            f"REFUSED: counted, never scored.")
     if ee <= 0.0 or aa <= 0.0:
         return 0.0, 1.0
     return dot / math.sqrt(ee * aa), math.sqrt(rr) / math.sqrt(ee)
@@ -4793,6 +4821,18 @@ def _quality_metrics(jac_exact, jac_approx, *, align: bool = False,
         return jnp.array(0.0, dtype=jnp.float32), jnp.array(1.0, dtype=jnp.float32)
     exact_norm = jnp.sqrt(ee)
     approx_norm = jnp.sqrt(aa)
+    # dsnn-dfw.90: a non-finite accumulator is a REFUSED measurement, never a
+    # score. The cosine of an inf is not a number the dual may read.
+    _nf = [_n for _n, _v in (("dot", dot), ("exact_norm", exact_norm),
+                             ("approx_norm", approx_norm))
+           if not bool(np.all(np.isfinite(np.asarray(_v))))]
+    if _nf:
+        raise NonFiniteQuality(
+            f"[{site}] plan {current_plan_hash() or 'unknown'}: "
+            f"{', '.join(_nf)} not finite (dot={np.asarray(dot)} "
+            f"exact_norm={np.asarray(exact_norm)} "
+            f"approx_norm={np.asarray(approx_norm)} size={int(_total)}). "
+            f"The measurement is REFUSED: counted, never scored.")
     # THE DENOMINATOR IS GUARDED AGAINST ZERO, NOT AGAINST SMALL (defect found
     # 2026-09-16 on the recurrent SHD family). It used to be
     # ``max(||.||, sqrt(1e-7))`` on both factors, which is a FLOOR at a
@@ -8660,10 +8700,14 @@ def _callback_measured(
     # it is also what prints the per-episode seconds-per-plan line.
     _dedupe_key = None
     _plan_index = -1
+    _PLAN_HASH[0] = ""
     if is_terminal:
         _roll_measure_episode(_episode_measure_key(eval_samples))
         _plan_index = int(_MEASURE_EPISODE["n_plans"])
         _MEASURE_EPISODE["n_plans"] = _plan_index + 1
+        # A refused measurement names the plan it could not score.
+        _PLAN_HASH[0] = _plan_content_key(
+            o_list, partial_specs, _faces_np, _skips_np, _joins_np).hex()
     # NO EVAL SAMPLES, NO CACHE. The ruling keys the cache on the plan AND on
     # the episode's eval-sample key, and the samples are the only thing that
     # tells one episode's measurement from another's when nobody publishes an
@@ -8672,8 +8716,7 @@ def _callback_measured(
     # a cache that could not be bounded to an episode would live for the whole
     # process and turn a deliberate re-measurement into a replay.
     if is_terminal and measure_dedupe_enabled() and eval_samples:
-        _dedupe_key = _plan_content_key(
-            o_list, partial_specs, _faces_np, _skips_np, _joins_np)
+        _dedupe_key = bytes.fromhex(_PLAN_HASH[0])
         _hit = _PLAN_DEDUPE.get(_dedupe_key)
         if _hit is not None:
             _from_idx, _hit_slots = _hit
