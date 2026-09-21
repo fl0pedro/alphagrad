@@ -2579,6 +2579,18 @@ RUNG1_TARGET = "nn256"
 RUNG1_APPROX_PER_PLAN = "3"
 RUNG1_SKIPS_PER_PLAN = "0.3"
 
+#: RUNG 1 REACHES THE RECURRENT TARGET (owner ruling 2026-09-21, agent
+#: rsnnpace's init probe).  --face-none-bias 2 asks the recurrent target for
+#: 36-56 approximations per plan (F = 42 bptt / 65 rtrl), pins the quality
+#: median at exactly 0 and holds the PopArt quality head frozen from episode
+#: 0; the SAME plan as NN256's rung 1 -- 3 approximations, 0.3 skips -- gives
+#: q median 0.80 (bptt) / 0.46 (rtrl) and a feasible plan by episode 0. condC
+#: moves WITH C and C_popart here, unlike on NN256: the recurrent target has
+#: no PopArt-form ruling of its own to hold condC's init back (that ruling
+#: is NN256-only, `condc_popart_row`), so nothing keeps it on the ladder's
+#: first rung with its two siblings.
+RUNG1_RSNN_ARMS = ("C", "C_popart", "condC")
+
 #: THE LONG CONDITIONED ROWS (owner ruling 2026-09-20).  The
 #: preference-conditioned NN256 rows run TWICE the episodes of every other
 #: row: the conditioning has to amortise over the whole weight span before
@@ -2607,19 +2619,28 @@ def rung1_row(arm: str, target: str, matrix_row: bool = True) -> bool:
     round with its own record; moving their init would change a launcher
     under a comparison that is not this one.  `matrix_row` is False for
     them, and False is the default so a new caller has to ask.
-    """
-    return (matrix_row and target == RUNG1_TARGET and arm in RUNG1_ARMS)
 
-#: CONDC RENDERS ON THE POPART FORM ON NN256 (owner ruling 2026-09-21).  Rung
-#: 1 (C symlog vs C_popart on NN256, dsnn-dfw epic comment 2026-09-21 06:30)
-#: found PopArt dominating symlog on every column at feasible fraction, q and
-#: feasible-plan latency; condC on NN256 was held on "the scaling ruling"
-#: until this one.  condC on NN256 now takes exactly arm C_popart's magnitude
+    THE RECURRENT TARGET IS ON THE SAME RUNG (owner ruling 2026-09-21): its
+    four rules all take the same plan, RUNG1_APPROX_PER_PLAN /
+    RUNG1_SKIPS_PER_PLAN, for RUNG1_RSNN_ARMS -- a wider arm set than NN256's,
+    since condC has no PopArt-form ruling on this target to hold it back.
+    """
+    return (matrix_row
+            and ((target == RUNG1_TARGET and arm in RUNG1_ARMS)
+                 or (target in THESIS_RSNN_TARGETS and arm in RUNG1_RSNN_ARMS)))
+
+#: CONDC RENDERS ON THE POPART FORM ON NN256, AND NOW ON TLM TOO (owner
+#: rulings 2026-09-21).  Rung 1 (C symlog vs C_popart on NN256, dsnn-dfw epic
+#: comment 2026-09-21 06:30) found PopArt dominating symlog on every column
+#: at feasible fraction, q and feasible-plan latency; condC on NN256, then
+#: condC on TLM, were each held on "the scaling ruling" until their turn.
+#: condC on both targets now takes exactly arm C_popart's own magnitude
 #: scaling: --advantage-norm popart, --no-symlog, --symlog-channels none
 #: (values read from THESIS_ARM_SPEC["C_popart"] and the popart branch below,
-#: not retyped).  condC on every other target (TLM, the recurrent rows) keeps
-#: its recorded symlog form from THESIS_ARM_SPEC unchanged.
-CONDC_POPART_TARGET = "nn256"
+#: not retyped).  condC on the four recurrent targets keeps its recorded
+#: symlog form from THESIS_ARM_SPEC unchanged -- that ruling has not reached
+#: them.
+CONDC_POPART_TARGETS = ("nn256", "tlm")
 
 
 def condc_popart_row(arm: str, target: str, matrix_row: bool = True) -> bool:
@@ -2632,7 +2653,30 @@ def condc_popart_row(arm: str, target: str, matrix_row: bool = True) -> bool:
     there (--approx-profile none) and its record reads "unchanged from the
     matrix" -- so `matrix_row` is False for it and it does not move.
     """
-    return (matrix_row and target == CONDC_POPART_TARGET and arm == "condC")
+    return (matrix_row and target in CONDC_POPART_TARGETS and arm == "condC")
+
+
+#: CONDC ON TLM TAKES ITS OWN FACE-HEAD INIT (owner ruling 2026-09-21).  It
+#: renders on the PopArt form like condC on NN256 (`condc_popart_row`
+#: above), but NN256's rung-1 plan (3 approximations, 0.3 skips) was probed
+#: on NN256 alone; TLM gets its own two numbers instead of borrowing NN256's.
+#: THE ORCHESTRATOR SETS THE FINAL VALUES FROM A RUNNING PROBE BEFORE THE
+#: MERGE (init probes in flight 2026-09-21: a=1 kappa=0.1 on pgi15-gpu15,
+#: a=0.5 kappa=0.05 on pgi15-gpu18) -- these two lines are the one place to
+#: change.
+TLM_INIT_APPROX_PER_PLAN = "1"
+TLM_INIT_SKIPS_PER_PLAN = "0.1"
+CONDC_TLM_INIT_TARGET = "tlm"
+
+
+def condc_tlm_init_row(arm: str, target: str, matrix_row: bool = True) -> bool:
+    """Is this (arm, target) the condC-on-TLM init row (owner ruling
+    2026-09-21)?
+
+    ONLY A MATRIX COORDINATE CAN BE ONE, mirroring `rung1_row` and
+    `condc_popart_row`.
+    """
+    return (matrix_row and target == CONDC_TLM_INIT_TARGET and arm == "condC")
 
 THESIS_FLAGS_FILES = REQUIRED_FLAGS_FILES + [
     # --checkpoint-every and --resume live in common/checkpoint.py and
@@ -2802,10 +2846,21 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
     """
     bias, form, advantage_norm, conditioned = THESIS_ARM_SPEC[arm]
     if condc_popart_row(arm, target, matrix_row):
-        # Owner ruling 2026-09-21: condC on NN256 renders on the PopArt
-        # magnitude scaling, arm C_popart's own advantage_norm, in place of
-        # the "none" (symlog) form THESIS_ARM_SPEC records for condC.
+        # Owner ruling 2026-09-21: condC on NN256 and on TLM render on the
+        # PopArt magnitude scaling, arm C_popart's own advantage_norm, in
+        # place of the "none" (symlog) form THESIS_ARM_SPEC records for
+        # condC.
         advantage_norm = THESIS_ARM_SPEC["C_popart"][2]
+    if condc_tlm_init_row(arm, target, matrix_row):
+        # condC on TLM takes its own face-init plan, not rung 1's (that
+        # plan was probed on NN256 alone).
+        face_init_cli = {"--face-init-approx-per-plan": TLM_INIT_APPROX_PER_PLAN,
+                          "--face-init-skips-per-plan": TLM_INIT_SKIPS_PER_PLAN}
+    elif rung1_row(arm, target, matrix_row):
+        face_init_cli = {"--face-init-approx-per-plan": RUNG1_APPROX_PER_PLAN,
+                          "--face-init-skips-per-plan": RUNG1_SKIPS_PER_PLAN}
+    else:
+        face_init_cli = {"--face-none-bias": bias}
     gpus = thesis_row_gpus(target, node)
     cli: dict = {
         "--name": name,
@@ -2816,14 +2871,12 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
         "--approx-profile": THESIS_PROFILE,
         "--fixed-order": THESIS_ORDER,
         "--approx-add": APPROX_ADD,
-        # --- the face head at init.  A rung-1 row states the PLAN it wants
-        #     and lets ppo.py derive B and Bs from the reference order's
-        #     face count; every other row keeps its recorded bias.  The two
-        #     ways are mutually exclusive: ppo.py refuses both at once.
-        **({"--face-init-approx-per-plan": RUNG1_APPROX_PER_PLAN,
-            "--face-init-skips-per-plan": RUNG1_SKIPS_PER_PLAN}
-           if rung1_row(arm, target, matrix_row)
-           else {"--face-none-bias": bias}),
+        # --- the face head at init.  A rung-1 row (or condC on TLM) states
+        #     the PLAN it wants and lets ppo.py derive B and Bs from the
+        #     reference order's face count; every other row keeps its
+        #     recorded bias.  The two ways are mutually exclusive: ppo.py
+        #     refuses both at once.
+        **face_init_cli,
         "--scale-face-head": SCALE_FACE_HEAD_MVP,
         "--face-logit-clamp": FACE_LOGIT_CLAMP_MVP,
         "--face-entropy-weight": "0.05",
@@ -2942,7 +2995,8 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
         thesis_rule=thesis_temporal_rule(target),
         env=dict(THESIS_TARGET_ENV[target]),
         required_flags=(THESIS_REQUIRED_FLAGS + RUNG1_REQUIRED_FLAGS
-                        if rung1_row(arm, target) else THESIS_REQUIRED_FLAGS),
+                        if rung1_row(arm, target) or condc_tlm_init_row(arm, target)
+                        else THESIS_REQUIRED_FLAGS),
         required_flags_file=" ".join(THESIS_FLAGS_FILES),
         cli=cli,
         purpose=THESIS_HEAD + f"\n\nARM {arm} ON {target.upper()}, SEED "
@@ -2958,11 +3012,18 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
                    and arm in LONG_EPISODES_ARMS else "")
                 + (f"\n\nTHIS ROW RENDERS ON THE POPART FORM, not symlog "
                    "(owner ruling 2026-09-21): rung 1 found PopArt "
-                   "dominating symlog on every column, and condC on NN256 "
-                   "was held on the scaling ruling until this one.  condC "
-                   "on TLM and on the four recurrent targets keeps the "
-                   "symlog form."
-                   if condc_popart_row(arm, target) else ""),
+                   "dominating symlog on every column, and condC on this "
+                   "target was held on the scaling ruling until this one.  "
+                   "condC on the four recurrent targets keeps the symlog "
+                   "form."
+                   if condc_popart_row(arm, target) else "")
+                + (f"\n\nTHIS ROW'S FACE-HEAD INIT IS ITS OWN, not rung "
+                   "1's: --face-init-approx-per-plan "
+                   f"{TLM_INIT_APPROX_PER_PLAN} --face-init-skips-per-plan "
+                   f"{TLM_INIT_SKIPS_PER_PLAN} (owner ruling 2026-09-21, "
+                   "the orchestrator sets the final numbers from a running "
+                   "probe before the merge)."
+                   if condc_tlm_init_row(arm, target) else ""),
         prediction=prediction or _THESIS_ARM_PREDICTION[arm],
         falsifier=_THESIS_FALSIFIER,
     )
@@ -3241,13 +3302,40 @@ del _i, _arm, _target, _seed, _node, _half, _row, _rows, _HALVES, _SLOT
 # and TLM rows carry, flag for flag.  The ONLY flag a recurrent row adds is
 # --temporal-rule, and it adds no environment variable at all.
 #
-# THE ORDER of generation is rule, then arm, then seed, and the node is the
-# same round robin over THESIS_NODES the block above uses.  100 rows over
-# four nodes is 25 each, exactly.  It is a GENERATION order and not a
-# submission order: `thesis_submission_order` is the owner's priority list
-# and it still holds the 50 rows it always did, because no recurrent row is
-# released to be submitted.
+# THE ORDER of generation is rule, then arm, then seed.  It is a GENERATION
+# order and not a submission order: `thesis_submission_order` is the owner's
+# priority list and it still holds the 50 rows it always did, because no
+# recurrent row is released to be submitted.
+#
+# THE NODE, per rule (owner ruling 2026-09-21, agent rsnnpace's pace
+# diagnosis).  rtrl is the one rule whose measurement pipeline stalls once
+# the plan carries real approximations: 3 measure actors cannot absorb its
+# paired reference (a 188 MB carried Jacobian), so every rtrl row -- every
+# arm -- renders on an 8-GPU node with --ray-measure 7, round-robin BY SEED
+# over the two released 8-GPU nodes (gpu19 first) so a seed always lands on
+# the same node and no rtrl row is paired with another on the same node
+# (`thesis_pair_arm` is never called here).  tbptt, bptt and window2 keep
+# the 4-GPU profile, round-robin over the three released 4-GPU nodes: 75
+# rows over 3 nodes is 25 each, exactly.
 # ---------------------------------------------------------------------------
+#: The two 8-GPU nodes, in round-robin order (gpu19 first, owner ruling).
+THESIS_RSNN_RTRL_NODES = ("pgi15-gpu19", "pgi15-gpu20")
+#: The three 4-GPU nodes every other recurrent rule renders on.
+THESIS_RSNN_OTHER_NODES = ("pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu18")
+
+
+def thesis_snn_node(target: str, seed: str, i: int) -> str:
+    """The node of one recurrent row.
+
+    rtrl: round-robin BY SEED over the two 8-GPU nodes, so every arm of one
+    seed lands on the same node and a seed's node never depends on
+    generation order.  Every other rule: round-robin over the three 4-GPU
+    nodes by `i`, the caller's own counter over non-rtrl rows.
+    """
+    if thesis_temporal_rule(target) == "rtrl":
+        return THESIS_RSNN_RTRL_NODES[
+            THESIS_SEEDS.index(seed) % len(THESIS_RSNN_RTRL_NODES)]
+    return THESIS_RSNN_OTHER_NODES[i % len(THESIS_RSNN_OTHER_NODES)]
 
 _THESIS_RSNN_WHAT = {
     "tbptt": """TEMPORAL RULE tbptt, the baseline and ppo.py's default on
@@ -3295,15 +3383,21 @@ def thesis_snn_order() -> list[tuple[str, str, str]]:
 
 
 # --- the 100 runs of the recurrent block ------------------------------------
+_rsnn_other_i = 0
 for _i, (_arm, _target, _seed) in enumerate(thesis_snn_order()):
+    if thesis_temporal_rule(_target) == "rtrl":
+        _node = thesis_snn_node(_target, _seed, _i)
+    else:
+        _node = thesis_snn_node(_target, _seed, _rsnn_other_i)
+        _rsnn_other_i += 1
     thesis_arm(
         arm=_arm, target=_target, seed=_seed,
-        node=THESIS_NODES[_i % len(THESIS_NODES)],
+        node=_node,
         what=_THESIS_ARM_WHAT[_arm] + "\n\n"
              + _THESIS_RSNN_WHAT[thesis_temporal_rule(_target)],
         held=_THESIS_SNN_HELD,
     )
-del _i, _arm, _target, _seed
+del _i, _arm, _target, _seed, _node, _rsnn_other_i
 
 
 # ---------------------------------------------------------------------------

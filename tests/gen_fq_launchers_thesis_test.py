@@ -21,25 +21,34 @@ rather than on 150 files:
      NO auto-stop, its resume twin, and a condC run on NN256.
   7. `thesis_arm` RAISES on a row outside the rulings.
   8. ppo.py's own argparse accepts every thesis command line.
-  8b. RUNG 1 OF THE LADDER (owner ruling 2026-09-20): arms C and C_popart on
-     NN256, five seeds each, state the face-head init as a PLAN --
-     `--face-init-approx-per-plan 3 --face-init-skips-per-plan 0.3` -- instead
-     of `--face-none-bias 2`.  No other arm, no other target and no other
-     round (the order-only tuning rows are arm C on NN256 too) moves.
+  8b. RUNG 1 OF THE LADDER (owner rulings 2026-09-20 and 2026-09-21): arms C
+     and C_popart on NN256, five seeds each, state the face-head init as a
+     PLAN -- `--face-init-approx-per-plan 3 --face-init-skips-per-plan 0.3`
+     -- instead of `--face-none-bias 2`.  The recurrent target's four rules
+     take the SAME plan, for C, C_popart AND condC (2026-09-21: the init
+     probe reproduces on RSNN_SHD too).  No other arm, no other target and
+     no other round (the order-only tuning rows are arm C on NN256 too)
+     moves.
   8c. THE LONG CONDITIONED ROWS (owner ruling 2026-09-20): condC on NN256,
      five seeds, renders --episodes 2000.  Every other row keeps 1000.
-  8d. CONDC RENDERS ON THE POPART FORM ON NN256 (owner ruling 2026-09-21):
-     the same three flags as arm C_popart -- --advantage-norm popart,
-     --no-symlog, --symlog-channels none -- read from C_popart's own row,
-     not retyped, in place of the symlog form THESIS_ARM_SPEC records for
-     condC.  condC on TLM and on the four recurrent targets keeps the
-     symlog form; nothing else about condC on NN256 moves.
+  8d. CONDC RENDERS ON THE POPART FORM ON NN256 AND ON TLM (owner rulings
+     2026-09-21): the same three flags as arm C_popart -- --advantage-norm
+     popart, --no-symlog, --symlog-channels none -- read from C_popart's own
+     row, not retyped, in place of the symlog form THESIS_ARM_SPEC records
+     for condC.  condC on TLM ALSO takes its own face-head init plan
+     (TLM_INIT_APPROX_PER_PLAN / TLM_INIT_SKIPS_PER_PLAN, not rung 1's).
+     condC on the four recurrent targets keeps the symlog form; nothing
+     else about condC on NN256 or TLM moves.
   9. THE RECURRENT BLOCK: --example RSNN_SHD --dataset shd crossed with four
      temporal rules (tbptt, bptt, rtrl, window2), the same five arms and the
      same five seeds = 100 further runs, named `<arm>_rsnn_<rule>_s<seed>`,
-     carrying the NN256/TLM flags unchanged and GENERATED BUT HELD.  The
-     rule is part of the target key, so a recurrent run is one
-     (arm, target, seed) triple like every other row.
+     carrying the NN256/TLM flags unchanged (apart from 8b/8d above) and
+     GENERATED BUT HELD.  The rule is part of the target key, so a
+     recurrent run is one (arm, target, seed) triple like every other row.
+     rtrl renders on an 8-GPU node (round-robin by seed, gpu19 then gpu20,
+     never paired) because its measurement pipeline stalls at 3 actors
+     (owner ruling 2026-09-21); the other three rules keep the 4-GPU
+     profile on gpu15/16/18.
 """
 from __future__ import annotations
 
@@ -435,9 +444,10 @@ def test_the_three_c_arms_are_the_lagrangian_dual(gen, matrix):
         assert gen.THESIS_DUAL_LAMBDA_MAX == DUAL_MAX
         assert gen.DUAL_LAMBDA_MIN == DUAL_MIN
         assert cli["--lag-init"] == LAMBDA_Q, a["name"]
-        if _is_rung1(a):
-            # rung 1 states the plan instead of the bias; the two are
-            # mutually exclusive and ppo.py refuses both at once
+        if _has_normalized_init(a):
+            # rung 1 (or condC-on-TLM's own init) states the plan instead of
+            # the bias; the two are mutually exclusive and ppo.py refuses
+            # both at once
             assert "--face-none-bias" not in cli, a["name"]
         else:
             assert cli["--face-none-bias"] == "2", a["name"]
@@ -445,31 +455,70 @@ def test_the_three_c_arms_are_the_lagrangian_dual(gen, matrix):
 
 # ------------------------------------------------- 2b. rung 1: normalized init
 
-#: The owner's rung-1 numbers, typed here on purpose (2026-09-20).
+#: The owner's rung-1 numbers, typed here on purpose (2026-09-20 / -21).
 RUNG1_ARMS = ("C", "C_popart")
 RUNG1_TARGET = "nn256"
 RUNG1_A = "3"
 RUNG1_KAPPA = "0.3"
+#: The recurrent target's rung-1 arm set is WIDER than NN256's: condC moves
+#: with C and C_popart there because it has no PopArt-form ruling of its own
+#: on that target to hold it back (owner ruling 2026-09-21).
+RUNG1_RSNN_ARMS = ("C", "C_popart", "condC")
+#: condC on TLM renders on PopArt (like NN256) but takes its OWN face-init
+#: plan, not rung 1's (owner ruling 2026-09-21; the orchestrator sets these
+#: from a running probe before the merge).
+TLM_INIT_A = "1"
+TLM_INIT_KAPPA = "0.1"
 
 
-def _is_rung1(a) -> bool:
+def _is_nn256_rung1(a) -> bool:
+    """The ORIGINAL rung-1 rows (dsnn-dfw.74): NN256, C and C_popart only.
+    These are the rows on the uniform four-GPU NN256 hardware profile."""
     return (a["thesis_target"] == RUNG1_TARGET
             and a["thesis_arm"] in RUNG1_ARMS)
 
 
-def test_rung1_is_c_and_c_popart_on_nn256_and_nothing_else(gen, matrix):
-    """THE ROWS.  dsnn-dfw.74 is an NN256 C/C_popart defect, so rung 1 is
-    those ten rows -- five seeds each -- and no other arm and no other
-    target moves, or the ladder's first step is not a controlled one."""
+def _is_rsnn_rung1(a) -> bool:
+    return (a["thesis_target"] in RSNN_TARGETS
+            and a["thesis_arm"] in RUNG1_RSNN_ARMS)
+
+
+def _is_rung1(a) -> bool:
+    """Mirrors `gen.rung1_row`: NN256's rung 1 OR the recurrent target's,
+    which is a wider arm set."""
+    return _is_nn256_rung1(a) or _is_rsnn_rung1(a)
+
+
+def _is_condc_tlm_init(a) -> bool:
+    return a["thesis_target"] == "tlm" and a["thesis_arm"] == "condC"
+
+
+def _has_normalized_init(a) -> bool:
+    """Any row whose face-head init is a PLAN rather than a bias."""
+    return _is_rung1(a) or _is_condc_tlm_init(a)
+
+
+def test_rung1_reaches_nn256_and_the_recurrent_target_and_nothing_else(
+        gen, matrix):
+    """THE ROWS.  dsnn-dfw.74 is an NN256 C/C_popart defect, so rung 1 was
+    those ten rows -- five seeds each.  The recurrent target's init probe
+    (agent rsnnpace, 2026-09-21) reproduced the same finding for its four
+    rules, so rung 1 reaches it too, for C, C_popart AND condC -- a wider
+    arm set, since the recurrent target has no PopArt ruling to hold condC
+    back.  condC on TLM ALSO carries a face-init plan, but its own, not
+    rung 1's, so it is counted separately.  No other arm and no other
+    target moves, or the ladder's steps are not controlled ones."""
     seen = set()
     for a in matrix:
         cli = _cli(gen, a)
         normalized = "--face-init-approx-per-plan" in cli
-        assert normalized == _is_rung1(a), a["name"]
-        if normalized:
+        assert normalized == _has_normalized_init(a), a["name"]
+        if normalized and not _is_condc_tlm_init(a):
             seen.add((a["thesis_arm"], a["thesis_target"], a["thesis_seed"]))
-    assert seen == {(arm, RUNG1_TARGET, s)
-                    for arm in RUNG1_ARMS for s in SEEDS}
+    want = {(arm, RUNG1_TARGET, s) for arm in RUNG1_ARMS for s in SEEDS}
+    want |= {(arm, t, s) for arm in RUNG1_RSNN_ARMS for t in RSNN_TARGETS
+             for s in SEEDS}
+    assert seen == want
 
 
 def test_rung1_asks_for_three_approximations_and_a_third_of_a_skip(gen,
@@ -525,11 +574,13 @@ def test_the_long_budget_does_not_reach_a_row_that_names_its_own(gen, smoke):
         assert f"THIS ROW RUNS {LONG_EPISODES} EPISODES" not in gen.render(a)
 
 
-def test_only_a_rung1_launcher_greps_for_the_two_new_flags(gen, matrix):
+def test_only_a_normalized_init_launcher_greps_for_the_two_new_flags(gen,
+                                                                     matrix):
     """Layer 1 of a launcher greps ppo.py for every flag its own command
-    line uses, so a rung-1 row must name the two; and NO other row may,
-    because that list is rendered into the file and a running comparison's
-    launcher does not change for a guard its row does not need."""
+    line uses, so a row whose init is a plan (rung 1, or condC-on-TLM's own
+    plan) must name the two; and NO other row may, because that list is
+    rendered into the file and a running comparison's launcher does not
+    change for a guard its row does not need."""
     for a in matrix:
         text = gen.render(a)
         line = [ln for ln in text.splitlines()
@@ -537,7 +588,7 @@ def test_only_a_rung1_launcher_greps_for_the_two_new_flags(gen, matrix):
         greps = set(line[len("for F in "):].rstrip("; do").split())
         for flag in ("--face-init-approx-per-plan",
                      "--face-init-skips-per-plan"):
-            assert (flag in greps) == _is_rung1(a), (a["name"], flag)
+            assert (flag in greps) == _has_normalized_init(a), (a["name"], flag)
 
 
 def test_only_a_matrix_coordinate_can_be_a_rung1_row(gen):
@@ -548,6 +599,14 @@ def test_only_a_matrix_coordinate_can_be_a_rung1_row(gen):
     for arm in RUNG1_ARMS:
         assert gen.rung1_row(arm, RUNG1_TARGET, True)
         assert not gen.rung1_row(arm, RUNG1_TARGET, False)
+    # and the recurrent target's wider arm set (owner ruling 2026-09-21)
+    for rule in TEMPORAL_RULES:
+        t = f"rsnn_{rule}"
+        for arm in RUNG1_RSNN_ARMS:
+            assert gen.rung1_row(arm, t, True)
+            assert not gen.rung1_row(arm, t, False)
+        assert not gen.rung1_row("A", t, True)
+        assert not gen.rung1_row("B", t, True)
     # and the default of thesis_cli is the safe one
     cli = gen.thesis_cli(arm="C", target=RUNG1_TARGET, seed=SEEDS[0],
                          node=gen.THESIS_NODES[0], name="x",
@@ -557,11 +616,13 @@ def test_only_a_matrix_coordinate_can_be_a_rung1_row(gen):
 
 
 def test_rung1_keeps_the_four_gpu_profile_and_the_paired_slots(gen, matrix):
-    """The init is the ONLY thing rung 1 changes.  The uniform NN256
+    """The init is the ONLY thing NN256's rung 1 changes.  The uniform NN256
     hardware profile (dsnn-dfw.69) and the paired 8-GPU slots are what make
     the five seeds one distribution; a row that moved off them would not be
-    comparable with the seeds beside it."""
-    rows = [a for a in matrix if _is_rung1(a)]
+    comparable with the seeds beside it.  (The recurrent target's rung-1
+    rows are on a DIFFERENT profile, pinned by
+    `test_the_recurrent_scheduling_matches_the_rest_of_the_matrix`.)"""
+    rows = [a for a in matrix if _is_nn256_rung1(a)]
     assert len(rows) == len(RUNG1_ARMS) * len(SEEDS), len(rows)
     for a in rows:
         assert a["gpus"] == 4, a["name"]
@@ -572,45 +633,71 @@ def test_rung1_keeps_the_four_gpu_profile_and_the_paired_slots(gen, matrix):
     assert paired_halves, "the paired slots are gone"
 
 
-# --------------------------------- 2c. condC renders on popart on nn256
+# ---------------------------- 2c. condC renders on popart on nn256 and tlm
 
-#: The owner's condC-on-PopArt-on-NN256 ruling, typed here on purpose
-#: (2026-09-21).
-CONDC_POPART_TARGET = "nn256"
+#: The owner's condC-on-PopArt rulings, typed here on purpose (2026-09-21).
+CONDC_POPART_TARGETS = ("nn256", "tlm")
 
 
 def _is_condc_popart(a) -> bool:
-    return (a["thesis_target"] == CONDC_POPART_TARGET
+    return (a["thesis_target"] in CONDC_POPART_TARGETS
             and a["thesis_arm"] == "condC")
 
 
-def test_condc_on_nn256_renders_on_the_popart_form(gen, matrix):
-    """Owner ruling 2026-09-21: condC on NN256 takes arm C_popart's own
-    magnitude scaling -- read from C_popart's own row here, not retyped --
-    in place of the symlog form.  All five seeds, singles and pairs both
-    building from this same `cli`."""
-    c_popart_cli = next(
-        _cli(gen, a) for a in matrix
-        if a["thesis_arm"] == "C_popart"
-        and a["thesis_target"] == CONDC_POPART_TARGET)
+def test_condc_on_nn256_and_tlm_render_on_the_popart_form(gen, matrix):
+    """Owner rulings 2026-09-21: condC on NN256, then condC on TLM, take arm
+    C_popart's own magnitude scaling -- read from C_popart's own row on
+    that SAME target, not retyped -- in place of the symlog form.  All five
+    seeds each, singles and pairs both building from this same `cli`."""
+    for t in CONDC_POPART_TARGETS:
+        c_popart_cli = next(
+            _cli(gen, a) for a in matrix
+            if a["thesis_arm"] == "C_popart" and a["thesis_target"] == t)
+        seen = set()
+        for a in matrix:
+            if not (_is_condc_popart(a) and a["thesis_target"] == t):
+                continue
+            cli = _cli(gen, a)
+            for flag in ("--advantage-norm", "--no-symlog",
+                        "--symlog-channels"):
+                assert cli.get(flag, _MISSING) == \
+                    c_popart_cli.get(flag, _MISSING), (a["name"], flag)
+            assert cli["--advantage-norm"] == "popart", a["name"]
+            assert "--no-symlog" in cli, a["name"]
+            assert cli["--symlog-channels"] == "none", a["name"]
+            seen.add(a["thesis_seed"])
+        assert seen == set(SEEDS), t
+
+
+def test_condc_on_tlm_takes_its_own_face_init_plan(gen, matrix):
+    """condC on TLM renders on PopArt like condC on NN256, but its
+    face-head init is its OWN plan (TLM_INIT_APPROX_PER_PLAN /
+    TLM_INIT_SKIPS_PER_PLAN), not rung 1's 3/0.3 -- rung 1 was probed on
+    NN256 alone (owner ruling 2026-09-21, orchestrator sets the final
+    numbers from a running probe before the merge)."""
+    assert gen.TLM_INIT_APPROX_PER_PLAN == TLM_INIT_A
+    assert gen.TLM_INIT_SKIPS_PER_PLAN == TLM_INIT_KAPPA
     seen = set()
     for a in matrix:
-        if not _is_condc_popart(a):
+        if not (a["thesis_target"] == "tlm" and a["thesis_arm"] == "condC"):
             continue
         cli = _cli(gen, a)
-        for flag in ("--advantage-norm", "--no-symlog", "--symlog-channels"):
-            assert cli.get(flag, _MISSING) == c_popart_cli.get(flag, _MISSING), \
-                (a["name"], flag)
-        assert cli["--advantage-norm"] == "popart", a["name"]
-        assert "--no-symlog" in cli, a["name"]
-        assert cli["--symlog-channels"] == "none", a["name"]
+        assert cli["--face-init-approx-per-plan"] == TLM_INIT_A, a["name"]
+        assert cli["--face-init-skips-per-plan"] == TLM_INIT_KAPPA, a["name"]
+        assert "--face-none-bias" not in cli, a["name"]
+        text = gen.render(a)
+        assert f"--face-init-approx-per-plan {TLM_INIT_A}" in text, a["name"]
+        assert f"--face-init-skips-per-plan {TLM_INIT_KAPPA}" in text, \
+            a["name"]
         seen.add(a["thesis_seed"])
     assert seen == set(SEEDS)
 
 
-def test_condc_on_every_other_target_keeps_the_symlog_form(gen, matrix):
-    """condC on TLM and on the four recurrent targets is untouched: the
-    PopArt ruling reaches NN256 alone, by a target check."""
+def test_condc_on_the_recurrent_targets_keeps_the_symlog_form(gen, matrix):
+    """condC on the four recurrent targets is untouched by the PopArt
+    ruling: it reaches NN256 and TLM alone, by a target check.  (Its
+    face-head init DOES move on the recurrent target -- rung 1, section 8b
+    -- which is a different coordinate from the magnitude scaling here.)"""
     seen = set()
     for a in matrix:
         if a["thesis_arm"] != "condC" or _is_condc_popart(a):
@@ -620,7 +707,7 @@ def test_condc_on_every_other_target_keeps_the_symlog_form(gen, matrix):
         assert "--no-symlog" not in cli, a["name"]
         assert cli["--symlog-channels"] == "cost", a["name"]
         seen.add(a["thesis_target"])
-    assert seen == {"tlm"} | {f"rsnn_{r}" for r in TEMPORAL_RULES}
+    assert seen == {f"rsnn_{r}" for r in TEMPORAL_RULES}
 
 
 def test_only_a_matrix_coordinate_can_be_a_condc_popart_row(gen):
@@ -631,16 +718,31 @@ def test_only_a_matrix_coordinate_can_be_a_condc_popart_row(gen):
     (quality inert, --approx-profile none) whose record reads "unchanged
     from the matrix"; `matrix_row=False`, thesis_cli's own default,
     protects it."""
-    assert gen.condc_popart_row("condC", CONDC_POPART_TARGET, True)
-    assert not gen.condc_popart_row("condC", CONDC_POPART_TARGET, False)
-    assert not gen.condc_popart_row("C", CONDC_POPART_TARGET, True)
-    assert not gen.condc_popart_row("condC", "tlm", True)
+    for t in CONDC_POPART_TARGETS:
+        assert gen.condc_popart_row("condC", t, True)
+        assert not gen.condc_popart_row("condC", t, False)
+        assert not gen.condc_popart_row("C", t, True)
+    for r in TEMPORAL_RULES:
+        assert not gen.condc_popart_row("condC", f"rsnn_{r}", True)
     # and the default of thesis_cli is the safe one
-    cli = gen.thesis_cli(arm="condC", target=CONDC_POPART_TARGET,
+    cli = gen.thesis_cli(arm="condC", target="nn256",
                          seed=SEEDS[0], node=gen.THESIS_NODES[0], name="x",
                          episodes="1", checkpoint_every="1", auto_stop=False)
     assert cli["--advantage-norm"] == "none"
     assert "--no-symlog" not in cli
+
+
+def test_only_a_matrix_coordinate_can_be_a_condc_tlm_init_row(gen):
+    assert gen.condc_tlm_init_row("condC", "tlm", True)
+    assert not gen.condc_tlm_init_row("condC", "tlm", False)
+    assert not gen.condc_tlm_init_row("C", "tlm", True)
+    assert not gen.condc_tlm_init_row("condC", "nn256", True)
+    # and the default of thesis_cli is the safe one
+    cli = gen.thesis_cli(arm="condC", target="tlm", seed=SEEDS[0],
+                         node=gen.THESIS_NODES[0], name="x",
+                         episodes="1", checkpoint_every="1", auto_stop=False)
+    assert "--face-none-bias" in cli
+    assert "--face-init-approx-per-plan" not in cli
 
 
 def test_c_is_not_conditioned_and_condc_is(gen, matrix):
@@ -657,13 +759,13 @@ def test_c_is_not_conditioned_and_condc_is(gen, matrix):
     assert "lagrangian + preference-conditioned" in ppo
 
 
-def test_popart_sets_no_symlog_at_every_site_on_c_popart_and_condc_nn256(
+def test_popart_sets_no_symlog_at_every_site_on_c_popart_and_condc_popart(
         gen, matrix):
     """The recorded trap of ticket .53: PopArt needs --no-symlog, and ppo.py
     refuses a command line whose two symlog sites disagree.  condC on NN256
-    renders on the PopArt form too (owner ruling 2026-09-21, section 8d,
-    `test_condc_on_nn256_renders_on_the_popart_form` pins the detail);
-    every other row keeps the symlog form."""
+    and on TLM render on the PopArt form too (owner rulings 2026-09-21,
+    section 8d, `test_condc_on_nn256_and_tlm_render_on_the_popart_form`
+    pins the detail); every other row keeps the symlog form."""
     for a in matrix:
         cli = _cli(gen, a)
         if a["thesis_arm"] == "C_popart" or _is_condc_popart(a):
@@ -1145,25 +1247,24 @@ def test_every_recurrent_row_carries_the_nn256_and_tlm_flags_unchanged(
         gen, snn, core):
     """The strongest form of "everything else matches": diff each recurrent
     row against its own arm-and-seed twin on each core target.  The ONLY
-    keys allowed to differ are the run name and the three that say which
-    target this is.
+    keys allowed to differ are the run name, the three that say which
+    target this is, the face-head init, the PopArt magnitude-scaling flags
+    and (for condC on NN256) the episode count.
 
     --ray-measure is excluded because it is the node's GPU count minus one
-    and the rows are spread over nodes of two sizes;
-    `test_the_nodes_and_the_actors_per_node_size` pins it per row.
+    and the rows are spread over nodes of several sizes;
+    `test_the_nodes_and_the_actors_per_node_size` and
+    `test_the_recurrent_scheduling_matches_the_rest_of_the_matrix` pin it
+    per row.
 
-    The face-head init is excluded against the NN256 twin ONLY, and only for
-    the two rung-1 arms: rung 1 (owner 2026-09-20) states those rows' init
-    as a plan rather than as a bias, and the recurrent rows are not on the
-    ladder.  It is the same coordinate, written the other of the two ways,
-    and `test_rung1_is_c_and_c_popart_on_nn256_and_nothing_else` is what
-    pins which rows moved.
-
-    The three PopArt flags are excluded against the NN256 twin ONLY, and
-    only for condC: condC on NN256 renders on the PopArt form (owner ruling
-    2026-09-21), and the recurrent rows are not on that ruling either --
-    `test_condc_on_nn256_renders_on_the_popart_form` is what pins which rows
-    moved.
+    The face-head init and the PopArt flags are excluded WHOLESALE rather
+    than case-by-case: which rows carry the normalized init (rung 1, section
+    8b) and which render on PopArt (section 8d) is pinned by their own
+    dedicated tests, on both the NN256 and the TLM side (a recurrent C row
+    now shares rung 1's numbers with its NN256 twin but not with its TLM
+    one, and a recurrent condC row shares neither TLM condC's own init nor
+    either twin's PopArt form) -- this test's job is that NOTHING ELSE
+    differs.
     """
     node_derived = {"--ray-measure"}
     face_init = {"--face-none-bias", "--face-init-approx-per-plan",
@@ -1180,19 +1281,13 @@ def test_every_recurrent_row_carries_the_nn256_and_tlm_flags_unchanged(
             diff = {k for k in set(ref) | set(cli)
                     if ref.get(k, _MISSING) != cli.get(k, _MISSING)}
             diff -= node_derived
-            if _is_rung1(twin):
-                assert diff & face_init == face_init, (a["name"], t)
-                diff -= face_init
+            diff -= face_init
+            diff -= popart_flags
             if _is_long_episodes(twin):
                 # the NN256 twin runs the long budget; the recurrent row is
                 # not on that ruling
                 assert "--episodes" in diff, (a["name"], t)
                 diff -= {"--episodes"}
-            if _is_condc_popart(twin):
-                # the NN256 twin renders on PopArt; the recurrent row is not
-                # on that ruling and keeps the symlog form
-                assert diff & popart_flags == popart_flags, (a["name"], t)
-                diff -= popart_flags
             assert diff == target_keys, (a["name"], t, sorted(diff))
 
 
@@ -1233,17 +1328,53 @@ def test_the_recurrent_scheduling_matches_the_rest_of_the_matrix(gen, snn):
         text = gen.render(a)
         assert "#SBATCH --dependency=singleton\n" in text, a["name"]
         assert f"#SBATCH -w {a['node']}\n" in text, a["name"]
-    # 100 rows round-robin over the released nodes: every node carries its
-    # share and no node carries two more than another. The node count is
-    # THESIS_NODES', which grew from four to six when gpu17 and gpu19 were
-    # released, so the share is derived and not typed.
+    # 100 rows, NOT one even round robin any more (owner ruling 2026-09-21):
+    # the 75 non-rtrl rows split evenly over the three 4-GPU nodes, and the
+    # 25 rtrl rows split over the two 8-GPU nodes BY SEED (uneven, since the
+    # five seeds do not divide two nodes evenly).
     counts = {}
     for a in snn:
         counts[a["node"]] = counts.get(a["node"], 0) + 1
-    assert set(counts) == set(gen.THESIS_NODES)
-    _n = len(gen.THESIS_NODES)
+    assert counts == {"pgi15-gpu15": 25, "pgi15-gpu16": 25,
+                      "pgi15-gpu18": 25, "pgi15-gpu19": 15,
+                      "pgi15-gpu20": 10}, counts
     assert sum(counts.values()) == 100
-    assert set(counts.values()) <= {100 // _n, -(-100 // _n)}, counts
+
+
+def test_rtrl_renders_on_an_eight_gpu_node_round_robin_by_seed(gen, snn):
+    """Owner ruling 2026-09-21 (agent rsnnpace's pace diagnosis): rtrl's
+    measurement pipeline stalls at 3 actors once the plan carries real
+    approximations, so every rtrl row -- every arm -- renders on an 8-GPU
+    node with --ray-measure 7, round-robin BY SEED (gpu19 first) so a seed's
+    node does not depend on which arm generated it, and never paired with a
+    sibling on the same node.  bptt, tbptt and window2 keep the 4-GPU
+    profile on the three other released nodes."""
+    assert gen.THESIS_RSNN_RTRL_NODES == ("pgi15-gpu19", "pgi15-gpu20")
+    assert gen.THESIS_RSNN_OTHER_NODES == (
+        "pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu18")
+    want_rtrl_node = {
+        s: gen.THESIS_RSNN_RTRL_NODES[i % 2] for i, s in enumerate(SEEDS)}
+    for a in snn:
+        cli = _cli(gen, a)
+        if a["thesis_rule"] == "rtrl":
+            assert a["node"] == want_rtrl_node[a["thesis_seed"]], a["name"]
+            assert a["gpus"] == 8, a["name"]
+            assert cli["--ray-measure"] == "7", a["name"]
+        else:
+            assert a["node"] in gen.THESIS_RSNN_OTHER_NODES, a["name"]
+            assert a["gpus"] == 4, a["name"]
+            assert cli["--ray-measure"] == "3", a["name"]
+    # every rtrl seed's five arms land on the ONE node that seed maps to
+    for s in SEEDS:
+        nodes = {a["node"] for a in snn
+                 if a["thesis_rule"] == "rtrl" and a["thesis_seed"] == s}
+        assert nodes == {want_rtrl_node[s]}, s
+    # no rtrl row is paired with a sibling on its node (the recurrent block
+    # never calls `thesis_pair_arm`)
+    paired_names = {h["name"] for p in gen.thesis_pair_arms()
+                    for h in p["halves"]}
+    assert not ({a["name"] for a in snn if a["thesis_rule"] == "rtrl"}
+                & paired_names)
 
 
 def test_every_recurrent_row_is_generated_and_held_never_submitted(gen, snn):
