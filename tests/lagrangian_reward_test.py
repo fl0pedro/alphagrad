@@ -336,3 +336,125 @@ def test_floor_hinge_unaffected_by_face_entropy_weight():
         np.testing.assert_allclose(grad + few_eff, hinge_grad, rtol=1e-5)
         # below the floor the loss still pushes H UP even at flag 0
         assert grad < 0.0, (few, grad)
+
+
+# ---------------------------------------------------------------------------
+# 5. A REFUSED MEASUREMENT IS MISSING DATA, NOT A FULL VIOLATION
+#    (dsnn-dfw.90 and dsnn-dfw.91).
+#
+# A refused environment carries the sentinel row, whose quality slot is 0.0.
+# Read as a score, 0.0 is the worst possible quality: it entered
+# mean_violation as tau, frac_violating as 1, and the PopArt basin guard as an
+# occupant. The dual then priced a measurement that never happened.
+# ---------------------------------------------------------------------------
+
+def test_dual_ascent_raises_on_a_non_finite_input():
+    import pytest
+    from alphagrad.approx.ppo import NonFiniteUpdate
+    with pytest.raises(NonFiniteUpdate, match="not finite"):
+        _lag_dual_ascent(1.0, float("nan"), 0.05, 0.1, 10.0)
+    with pytest.raises(NonFiniteUpdate, match="not finite"):
+        _lag_dual_ascent(float("nan"), 0.5, 0.05, 0.1, 10.0)
+    with pytest.raises(NonFiniteUpdate, match="not finite"):
+        _lag_dual_ascent(1.0, float("inf"), 0.05, 0.1, 10.0)
+
+
+def test_dual_ascent_raises_on_a_non_finite_output():
+    import pytest
+    from alphagrad.approx.ppo import NonFiniteUpdate
+    # eta = inf with a zero violation gives inf * 0.0 = nan, which clip
+    # carries straight through. This is the shape of the defect: clip(nan)
+    # is nan, so lambda stayed nan for the rest of the run.
+    with pytest.raises(NonFiniteUpdate, match="produced"):
+        _lag_dual_ascent(1.0, 0.0, float("inf"), 0.1, 10.0)
+
+
+def test_dual_ascent_still_clips_a_finite_step():
+    # The guard changes nothing for a measured episode.
+    np.testing.assert_allclose(
+        _lag_dual_ascent(1.0, 0.5, 0.05, 0.1, 10.0), 1.025, rtol=1e-9)
+
+
+def _sentinel_rows(n_envs, n_refused, q_live):
+    """``(total_rewards_full, refused_mask)`` the way the trainer sees them:
+    the sentinel in EVERY cost channel marks a refused environment."""
+    from alphagrad.approx.ppo import (
+        COMPUTE_REWARD_INDICES, SENTINEL_COST, refused_env_mask)
+    tot = np.zeros((n_envs, NUM_REWARDS), np.float32)
+    tot[:, QIDX] = q_live
+    tot[:n_refused, QIDX] = 0.0
+    tot[:n_refused, list(COMPUTE_REWARD_INDICES)] = SENTINEL_COST
+    ref = np.asarray(refused_env_mask(jnp.asarray(tot)[:, None, :])[0])
+    return tot, ref
+
+
+def test_the_dual_reads_only_the_live_rows():
+    """The exact expression the trainer uses: mask, then mean."""
+    tot, ref = _sentinel_rows(16, 3, 0.95)
+    assert int(ref.sum()) == 3
+    q = tot[~ref, QIDX]
+    assert q.shape == (13,)
+    v = np.maximum(0.0, TAU - np.clip(q, -0.5, 1.0))
+    # Every live plan is above tau, so there is NO violation at all.
+    assert float(np.mean(v)) == 0.0
+    assert float(np.mean(v > 0.0)) == 0.0
+    # Unmasked, the same episode reports a violation on 3 of 16 rows.
+    q_all = tot[:, QIDX]
+    v_all = np.maximum(0.0, TAU - np.clip(q_all, -0.5, 1.0))
+    assert float(np.mean(v_all > 0.0)) > 0.0
+
+
+def test_an_all_refused_episode_leaves_no_live_quality():
+    tot, ref = _sentinel_rows(16, 16, 0.95)
+    assert bool(ref.all())
+    assert tot[~ref, QIDX].size == 0
+
+
+def test_basin_freeze_ignores_refused_rows():
+    old = _stats(5)
+    new = _stats(6)
+    # 9 sentinel rows at q = 0.0 and 7 healthy plans: unmasked this freezes,
+    # although not one of the nine was measured.
+    q = jnp.asarray([0.0] * 9 + [0.885] * 7)
+    *_, frozen_unmasked = _lag_basin_freeze(old, new, q, TAU, QHEAD)
+    assert bool(frozen_unmasked)
+    live = jnp.asarray([False] * 9 + [True] * 7)
+    m1, m2, w, frozen = _lag_basin_freeze(old, new, q, TAU, QHEAD, live=live)
+    assert not bool(frozen)
+    for got, n in zip((m1, m2, w), new):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(n))
+
+
+def test_basin_freeze_still_fires_on_a_measured_basin():
+    old = _stats(7)
+    new = _stats(8)
+    # 9 MEASURED plans in the basin out of 12 live rows: the guard is about
+    # measured occupancy, and that has not changed.
+    q = jnp.asarray([0.0] * 9 + [0.885] * 3 + [0.0] * 4)
+    live = jnp.asarray([True] * 12 + [False] * 4)
+    *_, frozen = _lag_basin_freeze(old, new, q, TAU, QHEAD, live=live)
+    assert bool(frozen)
+
+
+def test_basin_freeze_holds_when_every_row_is_refused():
+    """Nothing was measured, so nothing moves."""
+    old = _stats(9)
+    new = _stats(10)
+    q = jnp.zeros((16,))
+    live = jnp.zeros((16,), bool)
+    m1, m2, w, frozen = _lag_basin_freeze(old, new, q, TAU, QHEAD, live=live)
+    assert bool(frozen)
+    for got, o in zip((m1, m2, w), old):
+        np.testing.assert_array_equal(np.asarray(got)[QHEAD],
+                                      np.asarray(o)[QHEAD])
+
+
+def test_basin_freeze_without_a_live_mask_is_bit_identical():
+    old = _stats(11)
+    new = _stats(12)
+    q = jnp.asarray([0.0] * 9 + [0.885] * 7)
+    a = _lag_basin_freeze(old, new, q, TAU, QHEAD)
+    b = _lag_basin_freeze(old, new, q, TAU, QHEAD, live=jnp.ones((16,), bool))
+    for x, y in zip(a[:3], b[:3]):
+        np.testing.assert_array_equal(np.asarray(x), np.asarray(y))
+    assert bool(a[3]) == bool(b[3])

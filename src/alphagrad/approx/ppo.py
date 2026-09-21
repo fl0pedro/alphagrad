@@ -791,6 +791,12 @@ def _grad_oracle_boundary(oracle, path, episode, tol, log=print):
 # Print every loss component the moment the total goes non-finite. Off by
 # default because it forces a host callback inside the jitted update.
 _DEBUG_NAN = os.environ.get("ALPHAGRAD_DEBUG_NAN", "0") == "1"
+
+
+class NonFiniteUpdate(RuntimeError):
+    """A number the PPO update depends on is not finite (dsnn-dfw.90). The
+    run stops at the episode that produced it, not 35 episodes later."""
+
 # --- ORDER-SEARCH DIAGNOSTICS (task: PPO/GAZ vs POMO on the order space) ---
 # Both default OFF, so the trained path is byte-identical unless asked for.
 #   ALPHAGRAD_ADV_DIAG=1        -> one host callback per episode capturing the
@@ -1374,8 +1380,20 @@ def _lag_dual_ascent(lam: float, mean_violation: float, eta: float,
     preference vector (advantage scalarization) -- never through rewards,
     value targets or PopArt statistics.
     """
-    return float(np.clip(lam + eta * (float(mean_violation) - violation_target),
-                         lam_min, lam_max))
+    if not (np.isfinite(lam) and np.isfinite(mean_violation)):
+        raise NonFiniteUpdate(
+            f"[lagrangian] dual ascent input not finite: lambda={lam!r} "
+            f"mean_violation={mean_violation!r}. A non-finite violation is a "
+            f"quality channel that was not measured, not a constraint.")
+    _lam = float(np.clip(
+        lam + eta * (float(mean_violation) - violation_target),
+        lam_min, lam_max))
+    if not np.isfinite(_lam):
+        raise NonFiniteUpdate(
+            f"[lagrangian] dual ascent produced lambda={_lam!r} from "
+            f"lambda={lam!r} mean_violation={mean_violation!r} eta={eta!r} "
+            f"bounds=({lam_min!r}, {lam_max!r}).")
+    return _lam
 
 
 def _face_entropy_floor_penalty(h_face, floor, weight):
@@ -1627,7 +1645,8 @@ def _kl_ref_dual_update(coef, kl, target, eta, coef_min, coef_max):
                          float(coef_min), float(coef_max)))
 
 
-def _lag_basin_freeze(old_stats, new_stats, q_terminal, lag_tau, head_idx):
+def _lag_basin_freeze(old_stats, new_stats, q_terminal, lag_tau, head_idx,
+                      live=None):
     """Dossier section-10(3) basin-freeze guard for the quality PopArt channel.
 
     If more than half of the batch sits IN THE BASIN (terminal
@@ -1648,7 +1667,18 @@ def _lag_basin_freeze(old_stats, new_stats, q_terminal, lag_tau, head_idx):
     om1, om2, ow = old_stats
     nm1, nm2, nw = new_stats
     q_eff = jnp.clip(q_terminal, -0.5, 1.0)
-    frac_basin = jnp.mean((q_eff <= 0.05).astype(jnp.float32))
+    _in_basin = (q_eff <= 0.05).astype(jnp.float32)
+    if live is None:
+        frac_basin = jnp.mean(_in_basin)
+    else:
+        # dsnn-dfw.91: a REFUSED row carries the sentinel, whose quality slot
+        # is 0.0, and 0.0 sits inside the basin. Missing data must not fire
+        # the guard. An episode with no live row freezes: nothing was
+        # measured, so nothing moves.
+        _w = jnp.asarray(live, dtype=jnp.float32)
+        _n = jnp.sum(_w)
+        frac_basin = jnp.where(
+            _n > 0.0, jnp.sum(_in_basin * _w) / jnp.maximum(_n, 1.0), 1.0)
     frozen = frac_basin > 0.5
     keep = frozen & (jnp.arange(nm1.shape[-1]) == head_idx)
     return (
@@ -12614,6 +12644,7 @@ def main():
                     traj.reward[:, -1, REWARD_INDEX["cosine_sim"]],
                     args.lag_tau,
                     HEAD_NAMES.index("quality"),
+                    live=jnp.logical_not(_env_refused),
                 )
             new_mu, new_sigma = _popart_derive(
                 new_m1, new_m2, new_w, args.popart_sigma_min, 1e12)
@@ -16137,6 +16168,23 @@ def main():
         _face_max = int(_fe["face_max"])
         _xtr_on = bool(_fe["xtr_on"])
         _POOL_DRAIN[0] = _fe.get("pool_drain")
+        # dsnn-dfw.90: a non-finite total loss, or a non-finite parameter
+        # after the update, stops the run HERE. The old localizer only
+        # printed, and only under ALPHAGRAD_DEBUG_NAN, so a NaN policy ran on
+        # for 35 more episodes (job 67285).
+        _ep_loss = float(np.asarray(metrics[7]))
+        _ep_bad_params = int(jax.tree_util.tree_reduce(
+            lambda _a, _b: _a + _b,
+            jax.tree_util.tree_map(
+                lambda _l: jnp.sum(
+                    jnp.logical_not(jnp.isfinite(_l))).astype(jnp.int32),
+                eqx.filter(agent, eqx.is_inexact_array)),
+            jnp.int32(0)))
+        if not np.isfinite(_ep_loss) or _ep_bad_params:
+            raise NonFiniteUpdate(
+                f"episode {ep}: total_loss={_ep_loss!r} and {_ep_bad_params} "
+                f"non-finite parameter entries after the update. The policy "
+                f"is poisoned and every later episode would train on it.")
         # THE PARKED COUNTERS, PUT BACK FOR THE DRAIN. `host_log` reads env's
         # module globals through a dozen `consume_*` calls that POP, so the
         # only way to hand it this episode's numbers is to make them the live
@@ -16192,18 +16240,39 @@ def main():
             # episode's measured terminal qualities (total_rewards_full is
             # the raw per-env reward-vector sum; quality is sparse-terminal,
             # so the sum IS the terminal measurement, diverged -1.0 intact).
-            _lag_q = np.asarray(total_rewards_full)[:, REWARD_INDEX["cosine_sim"]]
+            #
+            # REFUSED ENVIRONMENTS ARE EXCLUDED (dsnn-dfw.91). A refused row
+            # carries the sentinel, whose quality slot is 0.0, and 0.0 is a
+            # full violation -- so a missing measurement used to push lambda
+            # up. The loss path has excluded those rows since `_live_mean`;
+            # the dual now uses the SAME predicate on the SAME tensor, with
+            # the time axis added back for `refused_env_mask`.
+            _lag_all = np.asarray(total_rewards_full)
+            _lag_ref = np.asarray(refused_env_mask(
+                jnp.asarray(_lag_all)[:, None, :])[0])
+            _lag_n_ref = int(_lag_ref.sum())
+            _lag_q = _lag_all[~_lag_ref, REWARD_INDEX["cosine_sim"]]
+            _lag_n_live = int(_lag_q.shape[0])
             _lag_v = np.maximum(
                 0.0, args.lag_tau - np.clip(_lag_q, -0.5, 1.0))
+            _lag_mean_v = float(np.mean(_lag_v)) if _lag_n_live else 0.0
+            _lag_frac_v = float(np.mean(_lag_v > 0.0)) if _lag_n_live else 0.0
+            _lag_mean_q = (float(np.mean(_lag_q)) if _lag_n_live
+                           else float("nan"))
+            # No live row is no evidence: the quality channel's PopArt
+            # accumulators hold, exactly as they do in the jitted guard.
             _lag_frozen = bool(
                 args.popart_basin_freeze
                 and args.advantage_norm == "popart"
-                and float(np.mean(
-                    np.clip(_lag_q, -0.5, 1.0) <= 0.05)) > 0.5)
-            lag_lambda = _lag_dual_ascent(
-                lag_lambda, float(np.mean(_lag_v)), args.lag_eta,
-                args.lag_min, args.lag_max,
-                violation_target=float(getattr(args, "lag_target", 0.0)))
+                and (not _lag_n_live
+                     or float(np.mean(
+                         np.clip(_lag_q, -0.5, 1.0) <= 0.05)) > 0.5))
+            # AN ALL-REFUSED EPISODE LEAVES LAMBDA WHERE IT WAS.
+            if _lag_n_live:
+                lag_lambda = _lag_dual_ascent(
+                    lag_lambda, _lag_mean_v, args.lag_eta,
+                    args.lag_min, args.lag_max,
+                    violation_target=float(getattr(args, "lag_target", 0.0)))
             # stdout mirror of the wandb keys: v61's log never carried
             # lambda anywhere, which made the collapse post-mortem blind.
             # diag_pack tail: (..., mask_frac, wz_clip_frac,
@@ -16215,23 +16284,27 @@ def main():
                           if diag_pack is not None else float("nan"))
             print("[lagrangian] ep=%d lambda=%.4f mean_violation=%.4f "
                   "frac_violating=%.3f mean_raw_q=%.4f frozen=%d "
-                  "mask_frac=%.3f raw_adv=%.3f"
-                  % (ep, lag_lambda, float(np.mean(_lag_v)),
-                     float(np.mean(_lag_v > 0.0)), float(np.mean(_lag_q)),
-                     int(_lag_frozen), _lag_mask_f, _lag_raw_a),
+                  "refused=%d mask_frac=%.3f raw_adv=%.3f"
+                  % (ep, lag_lambda, _lag_mean_v, _lag_frac_v, _lag_mean_q,
+                     int(_lag_frozen), _lag_n_ref, _lag_mask_f, _lag_raw_a),
                   flush=True)
             lag_extra = {
                 "lagrangian/lambda": float(lag_lambda),
-                "lagrangian/mean_violation": float(np.mean(_lag_v)),
-                "lagrangian/frac_violating": float(np.mean(_lag_v > 0.0)),
+                "lagrangian/refused": float(_lag_n_ref),
+                "lagrangian/live": float(_lag_n_live),
+            }
+            if _lag_n_live:
                 # 2026-08-21 dashboard confusion: the reward-channel
                 # quality slot stores -violation, so a HEALTHY run
                 # (q >= tau, violation 0) plots at 0 and reads like
-                # collapse. This is the RAW terminal quality, pre-clip,
-                # mean over envs -- the number actually to read.
-                "lagrangian/mean_raw_q": float(np.mean(_lag_q)),
-                "lagrangian/popart_frozen": float(_lag_frozen),
-            }
+                # collapse. `mean_raw_q` is the RAW terminal quality,
+                # pre-clip, over the LIVE rows -- the number to read.
+                lag_extra.update({
+                    "lagrangian/mean_violation": _lag_mean_v,
+                    "lagrangian/frac_violating": _lag_frac_v,
+                    "lagrangian/mean_raw_q": _lag_mean_q,
+                    "lagrangian/popart_frozen": float(_lag_frozen),
+                })
         # THE WINDOW BIN'S TELEMETRY, from the DEVICE. `tokens/delta_max`
         # beside it is the host counter, which is process-local and reads 0
         # under --ray-measure -- keep it, because it is the human-readable
