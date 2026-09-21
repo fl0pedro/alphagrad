@@ -30,8 +30,17 @@ from alphagrad.approx.common import preference_sweep as psweep
 
 def make_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--comparison", action="append", required=True,
+    p.add_argument("--comparison", action="append", default=[],
                    help="a per-seed preference_front_comparison.json; repeat")
+    p.add_argument("--archive", action="append", default=[],
+                   help="SEED=path/to/pareto_front.json for a seed whose "
+                        "sweep has not run yet. The row then carries the "
+                        "archive columns and the swept ones read '-', so the "
+                        "archive side of the set can be read before the GPU "
+                        "jobs land. Repeat.")
+    p.add_argument("--archive-window", type=int, default=200,
+                   help="the window for --archive rows; a --comparison row "
+                        "keeps the window its own run used")
     p.add_argument("--out", required=True, help="output directory")
     p.add_argument("--objectives", default="latency,peak_memory")
     p.add_argument("--quality-floor", type=float, default=0.9)
@@ -57,6 +66,26 @@ def _load(path, objectives):
     }
 
 
+def _load_archive_only(spec, window, objectives):
+    """A seed whose sweep has not run: the archive side of the row only."""
+    if "=" not in spec:
+        raise ValueError(f"--archive wants SEED=PATH, got {spec!r}")
+    seed, path = spec.split("=", 1)
+    with open(path) as fh:
+        archive_doc = json.load(fh)
+    late_doc = psweep.front_window(archive_doc, int(window))
+    return {
+        "comparison": None,
+        "seed": int(seed),
+        "plans": [],
+        "swept": np.empty((0, len(objectives)), dtype=np.float64),
+        "archive": psweep.front_points(archive_doc, objectives),
+        "late": psweep.front_points(late_doc, objectives),
+        "archive_window_episodes": int(window),
+        "archive_window_since_episode": int(late_doc["window_since_episode"]),
+    }
+
+
 def seed_table(rows) -> str:
     lines = [
         "| seed | swept | archive | archive late | C(swept,arch) | "
@@ -66,6 +95,12 @@ def seed_table(rows) -> str:
         "---: | ---: |",
     ]
     for r in rows:
+        if not r["swept_measured"]:
+            lines.append(
+                f"| {r['seed']} | - | {r['num_archive']} | {r['num_late']} | "
+                f"- | - | - | - | - | {r['hypervolume_archive']:.4g} | "
+                f"{r['hypervolume_late']:.4g} |")
+            continue
         lines.append(
             f"| {r['seed']} | {r['num_swept']} | {r['num_archive']} | "
             f"{r['num_late']} | {r['coverage_swept_of_archive']:.2f} | "
@@ -107,18 +142,25 @@ def main() -> int:
     if len(objectives) != 2:
         raise ValueError(f"--objectives wants two names, got {a.objectives!r}")
     runs = [_load(p, objectives) for p in a.comparison]
+    runs += [_load_archive_only(s, a.archive_window, objectives)
+             for s in a.archive]
+    if not runs:
+        raise ValueError("a summary needs at least one --comparison or "
+                         "--archive")
     seeds = [r["seed"] for r in runs]
     if len(set(seeds)) != len(seeds):
         raise ValueError(
-            f"two comparisons name the same seed {sorted(seeds)}. A summary "
-            f"over five seeds that read one seed twice is not a summary over "
-            f"five seeds.")
+            f"two inputs name the same seed {sorted(seeds)}. A summary over "
+            f"five seeds that read one seed twice is not a summary over five "
+            f"seeds.")
     ref = psweep.shared_nadir(*[r[k] for r in runs
                                 for k in ("swept", "archive")])
     rows = []
     for r in sorted(runs, key=lambda x: x["seed"]):
+        cmp_doc = r["comparison"] or {}
         rows.append({
             "seed": r["seed"],
+            "swept_measured": r["comparison"] is not None,
             "num_swept": int(r["swept"].shape[0]),
             "num_archive": int(r["archive"].shape[0]),
             "num_late": int(r["late"].shape[0]),
@@ -133,10 +175,14 @@ def main() -> int:
             "hypervolume_swept": psweep.hypervolume_of(r["swept"], ref),
             "hypervolume_archive": psweep.hypervolume_of(r["archive"], ref),
             "hypervolume_late": psweep.hypervolume_of(r["late"], ref),
-            "rollouts": int(r["comparison"]["rollouts"]),
-            "rollouts_measured": int(r["comparison"]["rollouts_measured"]),
-            "archive_window_episodes": int(
-                r["comparison"]["archive_window_episodes"]),
+            "rollouts": int(cmp_doc.get("rollouts", 0)),
+            "rollouts_measured": int(cmp_doc.get("rollouts_measured", 0)),
+            "archive_window_episodes": int(cmp_doc.get(
+                "archive_window_episodes",
+                r.get("archive_window_episodes", a.archive_window))),
+            "archive_window_since_episode": int(cmp_doc.get(
+                "archive_window_since_episode",
+                r.get("archive_window_since_episode", -1))),
         })
     pooled_plans = [p for r in runs for p in r["plans"]]
     pooled = psweep.per_weight_table(pooled_plans, a.quality_floor)
@@ -163,13 +209,16 @@ def main() -> int:
     out_json = os.path.join(a.out, "preference_sweep_summary.json")
     with open(out_json, "w") as fh:
         json.dump(doc, fh, indent=2)
+    swept_seeds = [r["seed"] for r in rows if r["swept_measured"]]
     body = (
         f"# The preference sweep over {len(rows)} condC NN256 seeds\n\n"
+        f"Swept: {swept_seeds or 'none yet'}. "
         f"{doc['rollouts']} rollouts, {doc['rollouts_measured']} measured. "
-        f"Quality floor {a.quality_floor:g}. Every hypervolume is above ONE "
-        f"nadir, {np.array2string(np.asarray(ref), precision=6)}, in "
-        f"{doc['nadir_space']}.\n\n"
-        f"## Per weight, pooled over the seeds\n\n"
+        f"Quality floor {a.quality_floor:g}. A seed with no sweep yet carries "
+        f"its archive columns and '-' in the swept ones. Every hypervolume is "
+        f"above ONE nadir, {np.array2string(np.asarray(ref), precision=6)}, "
+        f"in {doc['nadir_space']}.\n\n"
+        f"## Per weight, pooled over the swept seeds\n\n"
         + weight_table(pooled, objectives)
         + f"\n## Per seed\n\n"
         + seed_table(rows))

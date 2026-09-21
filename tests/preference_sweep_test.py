@@ -394,3 +394,19 @@ def test_per_weight_band_is_the_median_interval_not_the_envelope():
     assert row["memory_median"] == 0.0
     assert row["memory_hi"] <= 5.0
     assert row["memory_lo"] == 0.0
+
+
+def test_the_shared_nadir_ignores_a_front_that_is_not_measured_yet():
+    """A seed whose sweep has not run contributes its archive and no more.
+
+    The five-seed summary is read before all five sweeps have landed, so the
+    corner every hypervolume stands on must not move when an empty swept
+    front joins the set.
+    """
+    archive = np.array([[-0.5, -0.5], [0.1, -0.9]])
+    swept = np.array([[-0.2, 0.0]])
+    with_empty = psweep.shared_nadir(swept, archive, np.empty((0, 2)))
+    without = psweep.shared_nadir(swept, archive)
+    assert np.allclose(with_empty, without)
+    with pytest.raises(ValueError, match="at least one non-empty front"):
+        psweep.shared_nadir(np.empty((0, 2)))
