@@ -293,12 +293,14 @@ def figure(path, swept_doc, archive_doc, late_docs, plans, table,
                mec=SURFACE, mew=1.6,
                label=f"swept front ({s_med.shape[0] if s_med.size else 0})"),
     ]
-    # The legend takes the emptiest corner in the OTHER half of the panel.
-    # The coverage block is three long lines and spans most of the width, so
-    # a legend beside it is a legend on top of it whatever the counts say.
-    _leg = next(c for c in _corners if c[3] != _tva)
-    ax_a.legend(handles=handles, loc=_leg[4], frameon=False,
-                fontsize=9, labelcolor=INK_2, handletextpad=0.6)
+    # THE LEGEND GOES UNDER THE PANEL, not in it. Five entries is five rows,
+    # and on a seed whose rollout cloud lies along the zero line there is no
+    # corner of the axes that holds five rows without sitting on the marks.
+    # Outside the axes it collides with nothing, on any seed.
+    ax_a.legend(handles=handles, loc="upper center",
+                bbox_to_anchor=(0.5, -0.16), ncol=3, frameon=False,
+                fontsize=9, labelcolor=INK_2, handletextpad=0.6,
+                columnspacing=1.6)
     cb = fig.colorbar(
         plt.cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax_a,
         fraction=0.045, pad=0.02)
@@ -335,7 +337,7 @@ def figure(path, swept_doc, archive_doc, late_docs, plans, table,
     ax_b.legend(loc="upper left", frameon=False, fontsize=9,
                 labelcolor=INK_2)
 
-    fig.text(0.008, 0.012,
+    fig.text(0.008, 0.010,
              f"Lower is better on both axes; 0 is parity with the paired "
              f"reverse-exact reference.\n"
              f"Panel A's bars are each point's own 90 percent "
@@ -350,7 +352,7 @@ def figure(path, swept_doc, archive_doc, late_docs, plans, table,
              f"{comparison['quality_floor']:g} on grad-cosine.",
              fontsize=7.5, color=MUTED, ha="left", va="bottom",
              linespacing=1.6)
-    fig.subplots_adjust(left=0.065, right=0.965, top=0.91, bottom=0.20)
+    fig.subplots_adjust(left=0.065, right=0.965, top=0.91, bottom=0.30)
     fig.savefig(path, facecolor=SURFACE)
     return path
 
