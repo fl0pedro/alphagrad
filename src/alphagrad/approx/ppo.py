@@ -11972,9 +11972,22 @@ def main(args=None):
                 jnp.take_along_axis(new_vertex_dist, _fd_vd[:, None],
                                     axis=-1).squeeze(-1) + 1e-8)
             if args.face_actions:
+                from alphagrad.approx.unified_face_head import (
+                    OP_NONE as _fd_none)
                 _fd_face_old = batch.face_old_logp
+                _fd_okm = jnp.logical_and(
+                    jnp.asarray(batch.face_valid, jnp.float32)[..., None]
+                    > 0.5,
+                    jnp.asarray(face_actions_b.op_type, jnp.int32)
+                    != _fd_none)
+                fd["s_has_op"] = jnp.any(
+                    _fd_okm, axis=(-1, -2)).astype(jnp.float32).reshape(-1)
+                fd["s_n_op"] = jnp.sum(
+                    _fd_okm, axis=(-1, -2)).astype(jnp.float32).reshape(-1)
             else:
                 _fd_face_old = jnp.zeros_like(_fd_lpv)
+                fd["s_has_op"] = jnp.zeros_like(_fd_lpv)
+                fd["s_n_op"] = jnp.zeros_like(_fd_lpv)
             fd["log_ratio"] = _log_ratio
             fd["ratio"] = ratio
             fd["lr_face"] = (log_probs - _fd_lpv) - _fd_face_old
@@ -13505,7 +13518,8 @@ def main(args=None):
             jax.debug.callback(
                 _facediag.ratio_cb, _fd_sink["log_ratio"],
                 _fd_sink["lr_face"], _fd_sink["lr_rest"], _fd_sink["ratio"],
-                _fd_sink["w_live"], _fd_sink["norm_adv"])
+                _fd_sink["w_live"], _fd_sink["norm_adv"],
+                _fd_sink["s_has_op"], _fd_sink["s_n_op"])
 
         if _FACE_DIAG_GRAD:
             _fd_lay = agent.face_path_policy.head.layout
