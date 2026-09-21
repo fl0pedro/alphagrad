@@ -25,10 +25,12 @@ rather than on 150 files:
      and C_popart on NN256, five seeds each, state the face-head init as a
      PLAN -- `--face-init-approx-per-plan 3 --face-init-skips-per-plan 0.3`
      -- instead of `--face-none-bias 2`.  The recurrent target's four rules
-     take the SAME plan, for C, C_popart AND condC (2026-09-21: the init
-     probe reproduces on RSNN_SHD too).  No other arm, no other target and
-     no other round (the order-only tuning rows are arm C on NN256 too)
-     moves.
+     take the SAME rung, for C, C_popart AND condC (2026-09-21: the init
+     probe reproduces on RSNN_SHD too), but its own approximation count
+     dropped to 1 on a later ruling the same day (dsnn-dfw.84 and
+     dsnn-dfw.78): `--face-init-approx-per-plan 1
+     --face-init-skips-per-plan 0.3`.  No other arm, no other target and no
+     other round (the order-only tuning rows are arm C on NN256 too) moves.
   8c. THE LONG CONDITIONED ROWS (owner ruling 2026-09-20): condC on NN256,
      five seeds, renders --episodes 2000.  Every other row keeps 1000.
   8d. CONDC RENDERS ON THE POPART FORM ON NN256 AND ON TLM (owner rulings
@@ -112,6 +114,11 @@ GRAD_ORACLE_CADENCE = "50"
 #: test modules pin that).
 PPO_EPOCHS = "2"
 MINIBATCHES = "8"
+#: THE FACE-ENTROPY WEIGHT PER FAMILY (owner ruling 2026-09-21, dsnn-dfw.84
+#: and dsnn-dfw.78): the recurrent target and TLM render the near-zero
+#: bonus; NN256 keeps the campaign's 0.05.
+ENTROPY_WEIGHT_LOW = "0.005"
+ENTROPY_WEIGHT_NN256 = "0.05"
 
 _PLACEHOLDER = re.compile(r"\$\{([A-Z0-9_]+):\?[^}]*\}")
 _EXPORT = re.compile(r"^\s*export\s+([A-Za-z_][A-Za-z0-9_]*)=", re.M)
@@ -352,7 +359,14 @@ def test_every_arm_carries_the_shared_thesis_flags(gen, matrix):
         # the face head at init
         assert cli["--scale-face-head"] == "0.1", a["name"]
         assert cli["--face-logit-clamp"] == "15", a["name"]
-        assert cli["--face-entropy-weight"] == "0.05", a["name"]
+        # dsnn-dfw.84 and dsnn-dfw.78 (owner ruling 2026-09-21): the
+        # recurrent target and TLM render the near-zero bonus; NN256 keeps
+        # the campaign's 0.05.
+        want_weight = (ENTROPY_WEIGHT_NN256 if a["thesis_target"] == "nn256"
+                       else ENTROPY_WEIGHT_LOW)
+        assert cli["--face-entropy-weight"] == want_weight, a["name"]
+        assert gen.THESIS_FACE_ENTROPY_WEIGHT_NN256 == ENTROPY_WEIGHT_NN256
+        assert gen.THESIS_FACE_ENTROPY_WEIGHT_LOW == ENTROPY_WEIGHT_LOW
         # dsnn-dfw.78: 0.3 is an always-on igniter at identity-like init;
         # matrix rows use 0.05 (SEC-12 finding 2026-08-25).
         assert cli["--face-entropy-floor"] == "0.05", a["name"]
@@ -464,6 +478,9 @@ RUNG1_KAPPA = "0.3"
 #: with C and C_popart there because it has no PopArt-form ruling of its own
 #: on that target to hold it back (owner ruling 2026-09-21).
 RUNG1_RSNN_ARMS = ("C", "C_popart", "condC")
+#: The recurrent target drops to a=1 (owner ruling 2026-09-21, dsnn-dfw.84
+#: and dsnn-dfw.78); NN256 keeps a=3 above.  kappa is unchanged for both.
+RUNG1_RSNN_A = "1"
 #: condC on TLM renders on PopArt (like NN256) but takes its OWN face-init
 #: plan, not rung 1's (owner ruling 2026-09-21; the orchestrator sets these
 #: from a running probe before the merge).
@@ -521,22 +538,28 @@ def test_rung1_reaches_nn256_and_the_recurrent_target_and_nothing_else(
     assert seen == want
 
 
-def test_rung1_asks_for_three_approximations_and_a_third_of_a_skip(gen,
-                                                                   matrix):
+def test_rung1_asks_for_the_approximation_count_and_skip_fraction_per_family(
+        gen, matrix):
+    """NN256's rung 1 asks for RUNG1_A (3) approximations per plan; the
+    recurrent target's own rung 1 dropped to RUNG1_RSNN_A (1) on owner
+    ruling 2026-09-21 (dsnn-dfw.84 and dsnn-dfw.78).  kappa
+    (RUNG1_KAPPA, 0.3) is unchanged and the same for both families."""
     for a in matrix:
         if not _is_rung1(a):
             continue
         cli = _cli(gen, a)
-        assert cli["--face-init-approx-per-plan"] == RUNG1_A, a["name"]
+        want_a = RUNG1_RSNN_A if _is_rsnn_rung1(a) else RUNG1_A
+        assert cli["--face-init-approx-per-plan"] == want_a, a["name"]
         assert cli["--face-init-skips-per-plan"] == RUNG1_KAPPA, a["name"]
         assert "--face-none-bias" not in cli, a["name"]
         assert "--face-skip-bias" not in cli, a["name"]
-        assert gen.RUNG1_APPROX_PER_PLAN == RUNG1_A
-        assert gen.RUNG1_SKIPS_PER_PLAN == RUNG1_KAPPA
         # and the rendered command line carries both
         text = gen.render(a)
-        assert f"--face-init-approx-per-plan {RUNG1_A}" in text, a["name"]
+        assert f"--face-init-approx-per-plan {want_a}" in text, a["name"]
         assert f"--face-init-skips-per-plan {RUNG1_KAPPA}" in text, a["name"]
+    assert gen.RUNG1_APPROX_PER_PLAN == RUNG1_A
+    assert gen.RUNG1_RSNN_APPROX_PER_PLAN == RUNG1_RSNN_A
+    assert gen.RUNG1_SKIPS_PER_PLAN == RUNG1_KAPPA
 
 
 def test_the_conditioned_nn256_rows_run_two_thousand_episodes(gen, matrix):

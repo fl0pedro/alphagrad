@@ -2251,6 +2251,20 @@ THESIS_FINAL_AUTO_STOP = False
 #: thesis matrix.
 THESIS_FACE_ENTROPY_FLOOR = "0.05"
 
+#: THE FACE-ENTROPY WEIGHT ON THE RECURRENT AND TLM TARGETS (owner ruling
+#: 2026-09-21, dsnn-dfw.84 and dsnn-dfw.78).  dsnn-dfw.78 fixed the floor
+#: above to 0.05; dsnn-dfw.84 found the floor was not even the active term on
+#: the recurrent target -- the shared 0.05 entropy BONUS alone still drifted
+#: the trained policy's none-to-quantize mix with no latency reason (PopArt
+#: row zvmfnj2g, approx_prob/none 0.95 -> 0.78 -> 0.65 -> 0.57 at ep
+#: 50/150/290/410; symlog row 0.79 -> 0.60).  The trainer docstring
+#: (_split_entropy_bonus, ppo.py) records the same mechanism for v62 job
+#: 61844 and prescribes the floor PLUS a near-zero bonus, 0.005, not the
+#: campaign's 0.05.  RECURRENT (THESIS_RSNN_TARGETS) AND TLM: 0.005.  NN256
+#: keeps 0.05, unmeasured by dsnn-dfw.84's finding.
+THESIS_FACE_ENTROPY_WEIGHT_LOW = "0.005"
+THESIS_FACE_ENTROPY_WEIGHT_NN256 = "0.05"
+
 #: THE ACTOR UPDATE BUDGET (owner ruling 2026-09-20, epic dsnn-dfw, sweep
 #: rounds 2-3).  At today's SHARED_CLI defaults (--ppo-epochs 1,
 #: --minibatches 4) the Lagrangian constraint is not met; --ppo-epochs 2
@@ -2591,6 +2605,19 @@ RUNG1_SKIPS_PER_PLAN = "0.3"
 #: first rung with its two siblings.
 RUNG1_RSNN_ARMS = ("C", "C_popart", "condC")
 
+#: RUNG 1 ON THE RECURRENT TARGET DROPS TO a=1 (owner ruling 2026-09-21,
+#: dsnn-dfw.84 and dsnn-dfw.78).  a=3 above (RUNG1_APPROX_PER_PLAN, NN256's
+#: own number) gave the recurrent target a feasible plan at episode 0, but
+#: by episode 60 the trained policy still drifted its none-to-quantize mix
+#: under the entropy bonus with no latency reason (dsnn-dfw.84: PopArt row
+#: zvmfnj2g, approx_prob/none 0.95 -> 0.78 -> 0.65 -> 0.57 at ep
+#: 50/150/290/410).  THESIS_FACE_ENTROPY_WEIGHT_LOW above is the other half
+#: of the fix; this constant is the first half, on the recurrent target
+#: ONLY -- TLM already uses a=1 (TLM_INIT_APPROX_PER_PLAN, below) and NN256
+#: keeps RUNG1_APPROX_PER_PLAN (3), unmeasured by dsnn-dfw.84's finding.
+#: kappa is unchanged: RUNG1_SKIPS_PER_PLAN (0.3) stays for both families.
+RUNG1_RSNN_APPROX_PER_PLAN = "1"
+
 #: THE LONG CONDITIONED ROWS (owner ruling 2026-09-20).  The
 #: preference-conditioned NN256 rows run TWICE the episodes of every other
 #: row: the conditioning has to amortise over the whole weight span before
@@ -2837,6 +2864,7 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
                auto_stop: bool, grad_oracle_cadence: str = "50",
                matrix_row: bool = False,
                face_entropy_floor: str = "0.3",
+               face_entropy_weight: str | None = None,
                ppo_epochs: str = "1", minibatches: str = "4") -> dict:
     """The `cli` override dict of one thesis run.
 
@@ -2845,6 +2873,15 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
     changes on purpose (episodes, checkpoint interval, auto-stop).
     """
     bias, form, advantage_norm, conditioned = THESIS_ARM_SPEC[arm]
+    if face_entropy_weight is None:
+        # dsnn-dfw.84 and dsnn-dfw.78 (owner ruling 2026-09-21): the
+        # recurrent target and TLM render the near-zero bonus; NN256 is
+        # unmeasured by dsnn-dfw.84's finding and keeps the campaign's 0.05.
+        # A caller that names its own value (the smoke rows do, to stay
+        # outside this finding) is left alone.
+        face_entropy_weight = (THESIS_FACE_ENTROPY_WEIGHT_NN256
+                               if target == "nn256"
+                               else THESIS_FACE_ENTROPY_WEIGHT_LOW)
     if condc_popart_row(arm, target, matrix_row):
         # Owner ruling 2026-09-21: condC on NN256 and on TLM render on the
         # PopArt magnitude scaling, arm C_popart's own advantage_norm, in
@@ -2857,7 +2894,12 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
         face_init_cli = {"--face-init-approx-per-plan": TLM_INIT_APPROX_PER_PLAN,
                           "--face-init-skips-per-plan": TLM_INIT_SKIPS_PER_PLAN}
     elif rung1_row(arm, target, matrix_row):
-        face_init_cli = {"--face-init-approx-per-plan": RUNG1_APPROX_PER_PLAN,
+        # The recurrent target takes a=1 (dsnn-dfw.84 and dsnn-dfw.78, owner
+        # ruling 2026-09-21); NN256 keeps a=3.  kappa is the same number for
+        # both (RUNG1_SKIPS_PER_PLAN).
+        approx_per_plan = (RUNG1_RSNN_APPROX_PER_PLAN if target in
+                           THESIS_RSNN_TARGETS else RUNG1_APPROX_PER_PLAN)
+        face_init_cli = {"--face-init-approx-per-plan": approx_per_plan,
                           "--face-init-skips-per-plan": RUNG1_SKIPS_PER_PLAN}
     else:
         face_init_cli = {"--face-none-bias": bias}
@@ -2879,7 +2921,7 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
         **face_init_cli,
         "--scale-face-head": SCALE_FACE_HEAD_MVP,
         "--face-logit-clamp": FACE_LOGIT_CLAMP_MVP,
-        "--face-entropy-weight": "0.05",
+        "--face-entropy-weight": face_entropy_weight,
         "--face-entropy-floor": face_entropy_floor,
         "--face-entropy-floor-weight": "10.0",
         # --- the reward
@@ -2953,6 +2995,7 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
                time: str = THESIS_TIME, extra_cli: dict | None = None,
                grad_oracle_cadence: str = "50",
                face_entropy_floor: str = THESIS_FACE_ENTROPY_FLOOR,
+               face_entropy_weight: str | None = None,
                ppo_epochs: str = THESIS_PPO_EPOCHS,
                minibatches: str = THESIS_MINIBATCHES) -> dict:
     """One thesis run -> one `arm(...)`.  Returns the arm."""
@@ -2981,6 +3024,7 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
                      grad_oracle_cadence=grad_oracle_cadence,
                      matrix_row=True,
                      face_entropy_floor=face_entropy_floor,
+                     face_entropy_weight=face_entropy_weight,
                      ppo_epochs=ppo_epochs, minibatches=minibatches)
     if extra_cli:
         cli.update(extra_cli)
@@ -3449,8 +3493,11 @@ thesis_arm(
     arm="C", target="tlm", seed=THESIS_SEEDS[0], node=THESIS_SMOKE_NODE,
     name="smoke_C_tlm", episodes=THESIS_SMOKE_EPISODES,
     # dsnn-dfw.78 and owner ruling 2026-09-20: smoke is outside the thesis
-    # matrix, on both the entropy floor and the update budget.
-    face_entropy_floor="0.3", ppo_epochs="1", minibatches="4",
+    # matrix, on the entropy floor and the update budget.  dsnn-dfw.84
+    # (2026-09-21) is a TLM/recurrent matrix finding too; smoke keeps its
+    # own recorded 0.05 rather than picking up the near-zero bonus.
+    face_entropy_floor="0.3", face_entropy_weight="0.05",
+    ppo_epochs="1", minibatches="4",
     checkpoint_every=THESIS_SMOKE_CHECKPOINT_EVERY, auto_stop=False,
     grad_oracle_cadence="10",
     time="04:00:00", what=_SMOKE_WHAT, prediction=_SMOKE_PREDICTION,
@@ -3462,8 +3509,11 @@ thesis_arm(
     arm="C", target="tlm", seed=THESIS_SEEDS[0], node=THESIS_SMOKE_NODE,
     name="smoke_C_tlm", episodes=THESIS_SMOKE_EPISODES,
     # dsnn-dfw.78 and owner ruling 2026-09-20: smoke is outside the thesis
-    # matrix, on both the entropy floor and the update budget.
-    face_entropy_floor="0.3", ppo_epochs="1", minibatches="4",
+    # matrix, on the entropy floor and the update budget.  dsnn-dfw.84
+    # (2026-09-21) is a TLM/recurrent matrix finding too; smoke keeps its
+    # own recorded 0.05 rather than picking up the near-zero bonus.
+    face_entropy_floor="0.3", face_entropy_weight="0.05",
+    ppo_epochs="1", minibatches="4",
     checkpoint_every=THESIS_SMOKE_CHECKPOINT_EVERY, auto_stop=False,
     grad_oracle_cadence="10",
     time="04:00:00", what=_SMOKE_WHAT, prediction=_SMOKE_PREDICTION,
@@ -4423,11 +4473,15 @@ def orderonly_tlm_final_arm() -> dict:
              f"on Blackwell only (AGENTS.md)")
     lam_cmp, lam_mem = ORDERONLY_TLM_FINAL_WEIGHTS
     name = ORDERONLY_TLM_FINAL_NAME
+    # dsnn-dfw.84 (2026-09-21) is a thesis-matrix finding; this row is
+    # order-only, not a matrix coordinate, so it keeps its own recorded 0.05
+    # rather than picking up the near-zero bonus.
     cli = thesis_cli(arm=ORDERONLY_ARM, target="tlm",
                      seed=ORDERONLY_TLM_FINAL_SEED, node=node, name=name,
                      episodes=THESIS_EPISODES,
                      checkpoint_every=THESIS_CHECKPOINT_EVERY,
-                     auto_stop=THESIS_FINAL_AUTO_STOP)
+                     auto_stop=THESIS_FINAL_AUTO_STOP,
+                     face_entropy_weight="0.05")
     cli["--approx-profile"] = ORDERONLY_PROFILE
     cli["--lambda-cmp"] = lam_cmp
     cli["--lambda-mem"] = lam_mem
@@ -4601,10 +4655,13 @@ def orderonly_rsnn_arm(*, rule: str, seed: str, lam_cmp: str | None = None,
                  "a fixed-weight row needs both --lambda-cmp and --lambda-mem")
         name = orderonly_rsnn_run_name(rule, lam_cmp, lam_mem, seed)
         arm_name = ORDERONLY_ARM
+    # dsnn-dfw.84 (2026-09-21) is a thesis-matrix finding; this row is
+    # order-only, not a matrix coordinate, so it keeps its own recorded 0.05
+    # rather than picking up the near-zero bonus.
     cli = thesis_cli(arm=arm_name, target=target, seed=seed, node=node,
                      name=name, episodes=THESIS_EPISODES,
                      checkpoint_every=THESIS_CHECKPOINT_EVERY,
-                     auto_stop=True)
+                     auto_stop=True, face_entropy_weight="0.05")
     cli["--approx-profile"] = ORDERONLY_PROFILE
     if not pref:
         cli["--lambda-cmp"] = lam_cmp
@@ -4681,10 +4738,13 @@ def orderonly_rsnn_tbptt_arm(*, seed: str) -> dict:
     target = "rsnn_tbptt"
     lam_cmp, lam_mem = ORDERONLY_RSNN_TBPTT_WEIGHTS
     name = orderonly_rsnn_arm_name(seed)
+    # dsnn-dfw.84 (2026-09-21) is a thesis-matrix finding; this row is
+    # order-only, not a matrix coordinate, so it keeps its own recorded 0.05
+    # rather than picking up the near-zero bonus.
     cli = thesis_cli(arm=ORDERONLY_ARM, target=target, seed=seed, node=node,
                      name=name, episodes=THESIS_EPISODES,
                      checkpoint_every=THESIS_CHECKPOINT_EVERY,
-                     auto_stop=True)
+                     auto_stop=True, face_entropy_weight="0.05")
     cli["--approx-profile"] = ORDERONLY_PROFILE
     cli["--lambda-cmp"] = lam_cmp
     cli["--lambda-mem"] = lam_mem
