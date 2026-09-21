@@ -229,6 +229,10 @@ from alphagrad.approx.common import checkpoint as _ckpt
 # the three conditions live in that module; this file only marks the eight
 # points it is used at. Ticket dsnn-dfw.6.
 from alphagrad.approx.common import auto_stop as _auto
+# THE INFERENCE-TIME PREFERENCE SWEEP (ticket dsnn-dfw.86). The loader, the
+# grid and the front comparison live in that module; this file pins w and
+# rolls out.
+from alphagrad.approx.common import preference_sweep as _psweep
 
 # Same switch carry_stream reads, so one flag turns the whole fold on or
 # off rather than leaving half the consumers folded and half not.
@@ -6508,6 +6512,46 @@ def make_argparser() -> argparse.ArgumentParser:
         "--dirichlet-alpha; the same w drives advantage weighting. "
         "When off, the static --lambda-* CLI weights are used.",
     )
+    # ---- THE INFERENCE-TIME PREFERENCE SWEEP (ticket dsnn-dfw.86) --------
+    # A READ of a trained conditioned policy, not a resume: the four flags
+    # below load a checkpoint, pin w, roll out, measure and write a front.
+    # No gradient step runs and no optimiser state is touched. The loader is
+    # common/preference_sweep.py; `--resume` is untouched and stays
+    # argument-locked.
+    p.add_argument(
+        "--preference-sweep-checkpoint",
+        type=str,
+        default="",
+        help="Read this ppo_ckpt_* directory, pin the preference vector to "
+        "each point of --preference-sweep-weights, roll out "
+        "--preference-sweep-plans plans per point through the trainer's own "
+        "rollout and paired measurement, and write the front they describe. "
+        "Refuses --resume and any positive --checkpoint-every: a sweep reads "
+        "a run, it does not continue one.",
+    )
+    p.add_argument(
+        "--preference-sweep-weights",
+        type=str,
+        default="edge:11",
+        help="``edge:N`` = N points on the latency-memory edge, both corners "
+        "included (under --reward-mode lagrangian that edge IS the "
+        "conditioning: the quality coordinate carries lambda). Explicit "
+        "form: semicolon-separated vectors, ``1,0,0;0.5,0.5,0``.",
+    )
+    p.add_argument(
+        "--preference-sweep-plans",
+        type=int,
+        default=16,
+        help="Plans rolled out per preference point. One episode measures "
+        "--num-envs plans, so this must be a multiple of it.",
+    )
+    p.add_argument(
+        "--preference-sweep-out",
+        type=str,
+        default="",
+        help="Directory for the swept front and the per-rollout plan "
+        "records. Defaults to the run directory.",
+    )
     p.add_argument(
         "--dirichlet-alpha",
         type=float,
@@ -7122,6 +7166,33 @@ def _mask_vertex_logits(vertex_logits, vertex_avail_mask):
     )
 
 
+def _arch_plan_from_seq(seq, face_specs_arr, face_skips_arr, env_i):
+    """Archive form of one decoded plan: seq + SPARSE per-slot face wires.
+
+    The pareto archive and the preference sweep consume this
+    (json-serializable dict); every other consumer keeps the plain
+    (vertex, calls) list. Module level so the sweep, which runs no update and
+    so has no `host_log`, reads the plan the same way the archive does.
+    """
+    if face_specs_arr is None or face_skips_arr is None:
+        return seq
+    fs, sk = face_specs_arr[env_i], face_skips_arr[env_i]
+    faces = []
+    for k in range(min(len(seq), int(fs.shape[0]))):
+        rows_k, skip_k = fs[k], sk[k]
+        live = [int(f) for f in range(int(rows_k.shape[0]))
+                if int(skip_k[f]) == 1
+                or bool((rows_k[f, :, 0] != -1).any())]
+        if live:
+            faces.append({
+                "k": int(k),
+                "f": live,
+                "rows": [np.asarray(rows_k[f]).tolist() for f in live],
+                "skips": [int(skip_k[f]) for f in live],
+            })
+    return {"seq": seq, "faces": faces} if faces else seq
+
+
 def _action_to_pylist_dynamic(
     vertex_seq,
     op_seq,
@@ -7517,8 +7588,13 @@ def _setup_jax_compile_cache() -> None:
     setup_jax_compile_cache()
 
 
-def main():
-    args = make_argparser().parse_args()
+def main(args=None):
+    # `args` is given by `tools/preference_sweep.py`, which does not build a
+    # command line at all: it rebuilds the namespace from the checkpoint's own
+    # saved one (common/preference_sweep.load_sweep_args). None = the command
+    # line, which is every training run.
+    if args is None:
+        args = make_argparser().parse_args()
     # CHECKPOINT (3 of 8). THE ARGUMENT NAMESPACE, TAKEN HERE AND NOWHERE
     # ELSE. main() normalises args as it goes (--per-face-masks below,
     # --variant further down), so the only namespace two runs can be compared
@@ -7539,6 +7615,43 @@ def main():
         print(f"[checkpoint] resuming {_RESUME_PATH} at episode "
               f"{int(_RESUME_META['episode'])} of {int(args.episodes)}",
               flush=True)
+    # ---- THE PREFERENCE SWEEP (ticket dsnn-dfw.86), REFUSED HERE ---------
+    # Beside the resume's own refusal and for the same reason: a sweep that
+    # cannot be a sweep must not build an array. It is NOT a resume -- no
+    # argument check, because the namespace was rebuilt FROM this
+    # checkpoint's own and `load_ppo_tree`'s manifest is what proves the
+    # tree fits -- and it takes no gradient step.
+    _PSWEEP_PATH = str(getattr(args, "preference_sweep_checkpoint", "") or "")
+    _PSWEEP = bool(_PSWEEP_PATH)
+    _PSWEEP_META = None
+    _PSWEEP_PLAN = []
+    if _PSWEEP:
+        if _RESUME_PATH:
+            raise ValueError(
+                "--preference-sweep-checkpoint and --resume are two different "
+                "readings of a checkpoint: one rolls the policy out, the "
+                "other continues training it. Pass one.")
+        if _CKPT_EVERY:
+            raise ValueError(
+                f"--preference-sweep-checkpoint runs no episode of training, "
+                f"so --checkpoint-every {_CKPT_EVERY} would write a "
+                f"checkpoint of a state no run reached. Pass "
+                f"--checkpoint-every 0.")
+        if not bool(getattr(args, "preference_conditioned", False)):
+            raise ValueError(
+                "--preference-sweep-checkpoint reads a policy that was "
+                "trained with --preference-conditioned; this checkpoint's "
+                "namespace has it off, so there is no w to pin.")
+        _PSWEEP_META = _ckpt.read_ppo_meta(_PSWEEP_PATH)
+        _PSWEEP_W = _psweep.parse_weights(
+            args.preference_sweep_weights, NUM_VALUE_HEADS)
+        _PSWEEP_PLAN = _psweep.sweep_schedule(
+            _PSWEEP_W, int(args.preference_sweep_plans), int(args.num_envs))
+        print(f"[pref-sweep] {_PSWEEP_PATH} at episode "
+              f"{int(_PSWEEP_META['episode'])}: {len(_PSWEEP_W)} preference "
+              f"points, {int(args.preference_sweep_plans)} plans each, "
+              f"{len(_PSWEEP_PLAN)} episodes of {int(args.num_envs)} "
+              f"environments", flush=True)
     # AUTO-STOP (3 of 8). THE REFUSAL, AND THE MONITOR. The refusal is made
     # here, beside the checkpoint's own, so a command line that cannot stop
     # correctly never builds an array. The monitor holds one row per episode
@@ -13732,28 +13845,8 @@ def main():
             )
 
         def _decode_arch(env_i):
-            """Archive form of _decode: seq + SPARSE per-slot face wires.
-            Only the pareto archive consumes this (json-serializable dict);
-            every other consumer keeps the plain (vertex, calls) list."""
-            seq = _decode(env_i)
-            if face_specs_arr is None or face_skips_arr is None:
-                return seq
-            fs, sk = face_specs_arr[env_i], face_skips_arr[env_i]
-            faces = []
-            for k in range(min(len(seq), int(fs.shape[0]))):
-                rows_k, skip_k = fs[k], sk[k]
-                live = [int(f) for f in range(int(rows_k.shape[0]))
-                        if int(skip_k[f]) == 1
-                        or bool((rows_k[f, :, 0] != -1).any())]
-                if live:
-                    faces.append({
-                        "k": int(k),
-                        "f": live,
-                        "rows": [np.asarray(rows_k[f]).tolist()
-                                 for f in live],
-                        "skips": [int(skip_k[f]) for f in live],
-                    })
-            return {"seq": seq, "faces": faces} if faces else seq
+            return _arch_plan_from_seq(
+                _decode(env_i), face_specs_arr, face_skips_arr, env_i)
 
         mean_r = np.atleast_1d(np.array(mean_r))
         # ---- LIVE (successfully measured) envs -------------------------------
@@ -16317,6 +16410,75 @@ def main():
         _traj = _traj._replace(reward=_traj.reward.at[:, -1, :].set(_rw))
         return (roll[0], _traj, _rw) + tuple(roll[3:])
 
+    def _psweep_episode(ep, w, pref_row, roll, drain):
+        """ONE swept episode's plans, their bands, and the front they enter.
+
+        THE JOIN IS THE ELIMINATION ORDER, exactly as it is in the trainer's
+        epilogue: a measure actor is another process and its records carry no
+        environment row, so the per-window paired log ratios are keyed by the
+        order the plan eliminated in and matched against the decoded plan. A
+        plan whose record did not arrive, and a plan whose measurement came
+        back sentinelled, are EXCLUDED from the front and COUNTED -- a
+        refused measurement is missing data, never a point.
+        """
+        _traj, _es = roll[1], roll[0]
+        _rets = np.asarray(roll[2])
+        _arr = [np.asarray(x) for x in (
+            _traj.vertex_idx, _traj.pair_seq, _traj.factor_seq,
+            _traj.micro_op_seq, _traj.micro_i_seq, _traj.micro_j_seq,
+            _traj.micro_factor_seq, _traj.micro_compress_kind_seq,
+            _traj.micro_quant_dtype_seq, _es.face_specs, _es.face_skips)]
+        _recs = list((drain.get("local_plan") or {}).get("records", ()))
+        _recs.extend((drain.get("pool_plan") or {}).get("records", ()))
+        _bands = {}
+        for _r in _recs:
+            _rl = (_r or {}).get("ratio_log")
+            if not _rl:
+                continue
+            _k = tuple(int(v) for v in (_r.get("order") or ()))
+            if _k and _k not in _bands:
+                _bands[_k] = _rl
+        _sent_ch = np.asarray(COMPUTE_REWARD_INDICES, dtype=np.int64)
+        _added = 0
+        for i in range(num_envs):
+            _seq = _action_to_pylist_dynamic(
+                _arr[0][i], _arr[3][i], _arr[4][i], _arr[5][i], _arr[6][i],
+                _arr[7][i], _arr[8][i], args.max_substeps)
+            _plan = _arch_plan_from_seq(_seq, _arr[9], _arr[10], i)
+            _key = tuple(int(v) for v, _calls in _seq)
+            _band = _bands.get(_key)
+            _live = not bool(np.all(
+                _rets[i][_sent_ch] <= float(SENTINEL_COST) * 0.99))
+            _why = (None if (_live and _band is not None)
+                    else ("sentinelled" if not _live else "no-band"))
+            _PSWEEP_PLANS.append({
+                "episode": int(ep),
+                "env": int(i),
+                "w": [float(x) for x in w],
+                "preference": [float(x) for x in np.asarray(pref_row)],
+                "order": [int(v) for v in _key],
+                "seq": _plan,
+                "quality": float(_rets[i][cosine_idx]),
+                "band": (None if _band is None else
+                         {"latency": _band["latency"],
+                          "memory": _band["memory"]}),
+                "refused": _why,
+            })
+            if _why is None:
+                _added += int(_PSWEEP_ARCHIVE.add(
+                    {args.cmp_type: _band["latency"]["windows"],
+                     args.mem_type: _band["memory"]["windows"]},
+                    _plan, int(ep), quality=float(_rets[i][cosine_idx])))
+        _ok = [p for p in _PSWEEP_PLANS[-num_envs:] if p["refused"] is None]
+        print(f"[pref-sweep] ep{int(ep)} w={tuple(round(float(x), 3) for x in w)} "
+              f"pref={tuple(round(float(x), 3) for x in np.asarray(pref_row))}: "
+              f"{len(_ok)}/{num_envs} measured, {_added} admitted, front "
+              f"{len(_PSWEEP_ARCHIVE.pts)} points"
+              + (f", median latency log ratio "
+                 f"{np.median([p['band']['latency']['median'] for p in _ok]):+.4f}"
+                 f" memory {np.median([p['band']['memory']['median'] for p in _ok]):+.4f}"
+                 if _ok else ""), flush=True)
+
     def _pipe_update_dispatch(prev):
         """Dispatch the pending episode's PPO update; do NOT wait for it.
 
@@ -16583,7 +16745,44 @@ def main():
               f"lambda={lag_lambda:g}, kl_ref_coef={_kl_ref_coef:g}",
               flush=True)
 
-    for ep in range(_ep_start, args.episodes):
+    # ---- THE PREFERENCE SWEEP'S OWN RESTORE (ticket dsnn-dfw.86) --------
+    # The arithmetic half only, and of it only what a ROLLOUT reads: the
+    # policy, the key chain and lambda (which IS the quality coordinate of
+    # the preference under --reward-mode lagrangian, so a sweep that took
+    # this run's initial lambda would condition on a vector the trained
+    # policy never saw). The optimiser state is restored because the
+    # template demands the whole tree; nothing reads it, because no update
+    # runs. The TRAINING ARCHIVE IS NOT RESTORED: the sweep builds its own
+    # front from its own rollouts, and the archive it is compared against is
+    # read from the run's pareto_front.json as a separate set of points.
+    _PSWEEP_ARCHIVE = None
+    _PSWEEP_PLANS = []
+    if _PSWEEP:
+        _psrestored = _ckpt.load_ppo_tree(_PSWEEP_PATH, _ckpt_tree())
+        agent = _psrestored["agent"]
+        opt_state = _psrestored["opt_state"]
+        probes = _psrestored["probes"]
+        probe_opt_state = _psrestored["probe_opt_state"]
+        vprobes = _psrestored["vprobes"]
+        vprobe_opt_state = _psrestored["vprobe_opt_state"]
+        popart_m1 = _psrestored["popart_m1"]
+        popart_m2 = _psrestored["popart_m2"]
+        popart_w = _psrestored["popart_w"]
+        global_step = _psrestored["global_step"]
+        key = _psrestored["key"]
+        lag_lambda = float(_psrestored["lag_lambda"])
+        _kl_ref_coef = float(_psrestored["kl_ref_coef"])
+        from alphagrad.approx.common.pareto_archive import (
+            RatioBandArchive as _PSweepArchive)
+        _PSWEEP_ARCHIVE = _PSweepArchive(
+            obj_names=(args.cmp_type, args.mem_type), cap=64,
+            quality_floor=args.quality_floor)
+        print(f"[pref-sweep] loaded episode {int(_PSWEEP_META['episode'])}: "
+              f"global_step={int(global_step)}, lambda={lag_lambda:g}. No "
+              f"update runs from here.", flush=True)
+
+    _LOOP_EPISODES = len(_PSWEEP_PLAN) if _PSWEEP else args.episodes
+    for ep in range(_ep_start, _LOOP_EPISODES):
         # CHECKPOINT (7 of 8). THE QUIESCENT POINT: after episode ep-1's
         # update and epilogue, before episode ep's rollout. `_ckpt_write`
         # drains the pipeline first, so `ep` episodes really are complete.
@@ -16667,7 +16866,19 @@ def main():
                 _vps_pick = np.empty((0,), np.int64)
             _VP_SEL[0] = frozenset(
                 int(x) for x in _vps_pick) | {int(num_valid - 1)}
-        if args.preference_conditioned:
+        if _PSWEEP:
+            # THE PIN (ticket dsnn-dfw.86). The trainer's episode draws w from
+            # the Dirichlet mixture; a sweep is the same episode with w HELD,
+            # the same value in every environment, so the 16 plans of this
+            # episode are 16 samples of the policy AT ONE PREFERENCE. Under
+            # --reward-mode lagrangian `_lag_preferences` below renormalises
+            # the two cost coordinates and writes lambda into the quality
+            # slot, exactly as it does in training, so the vector the policy
+            # reads here is a vector it was trained on.
+            preferences_per_env = jnp.broadcast_to(
+                jnp.asarray(_PSWEEP_PLAN[ep], dtype=jnp.float32),
+                (num_envs, NUM_VALUE_HEADS))
+        elif args.preference_conditioned:
             # Stage F mixture: each env independently draws its preference
             # from either the corner Dirichlet (α<1) or the uniform Dirichlet
             # (α=1). With ``--dirichlet-mix-ratio=0.5`` the trainer sees a
@@ -17196,6 +17407,53 @@ def main():
                 return _out, _wov
             return _out, _epstream.overflow_from(_out[-7], _out[-6], _ep_n)
 
+        if _PSWEEP:
+            # ---- THE SWEEP EPISODE (ticket dsnn-dfw.86) ------------------
+            # THE ROLLOUT AND THE MEASUREMENT, AND NOTHING AFTER THEM. The
+            # same `_ep_rollout_attempt` the pipelined trainer runs, at the
+            # same bins, with the same terminal measurement through
+            # `env._callback` in the same measure actors -- the sweep adds no
+            # measurement code, which is what makes its numbers comparable
+            # with the archive's at all. What it does NOT do is dispatch an
+            # update: no gradient, no optimiser step, no PopArt move, no
+            # dual ascent. The policy that rolls out episode k is the
+            # checkpoint, unchanged, at every k.
+            #
+            # THE MEASUREMENT IS COLLECTED IMMEDIATELY. The pipeline exists
+            # to hide the collect behind the next update; there is no update
+            # to hide it behind, so the ticket opened by the attempt is
+            # closed here and its rewards go into this episode's trajectory.
+            _roll, _tkt = _epstream.run_episode(
+                _EP_BIN,
+                "sweep episode %d" % ep,
+                _ep_rollout_attempt,
+                log=lambda line: print(line, flush=True),
+                on_discard=_ep_discard_rollout,
+                window_policy=_WIN_BIN,
+            )
+            _EP_BIN.record(int(np.max(np.asarray(_roll[5]))))
+            _WIN_BIN.record(max(int(np.max(np.asarray(_roll[11]))),
+                                int(np.max(np.asarray(_roll[12])))))
+            if _xtr_on:
+                jax.block_until_ready(
+                    [x for x in jax.tree_util.tree_leaves(_roll)
+                     if isinstance(x, jax.Array)])
+                jax.profiler.stop_trace()
+                _xtr_on = False
+            if _tkt is not None:
+                _ep_env_mod.start_measurement(_tkt)
+                _psmeas = _ep_env_mod.collect_measurement(_tkt)
+                if bool(np.any(_psmeas["sentinel"])):
+                    print(f"[pref-sweep] ep{ep}: "
+                          f"{int(np.sum(_psmeas['sentinel']))} of "
+                          f"{_psmeas['rewards'].shape[0]} plans came back "
+                          f"sentinelled", flush=True)
+                _roll = _pipe_fill_rewards(_roll, _psmeas["rewards"])
+            _psdrain = _drain_measure_telemetry(_tkt, park=True)
+            _psweep_episode(ep, _PSWEEP_PLAN[ep], preferences_per_env[0],
+                            _roll, _psdrain)
+            _POOL_DRAIN[0] = None
+            continue
         if _PIPE_DEEP:
             # ---- THE DEEP PIPELINE (owner ruling 2026-09-15) -------------
             # Episode e's measurement overlaps the ROLLOUT of e+1, not just
@@ -17430,6 +17688,46 @@ def main():
             win_max=_win_max, face_max=_face_max, xtr_on=_xtr_on,
         )
         _finish_episode(_EP_CTX)
+
+    if _PSWEEP:
+        # ---- THE SWEEP'S OUTPUT (ticket dsnn-dfw.86) --------------------
+        # Two files and then out, before the training tail: there is no
+        # pending update to drain, no checkpoint of an untrained state to
+        # write and no top-N of a run that did not run. The front is dumped
+        # by the archive class the trainer dumps with, so the file
+        # `tools/landscape_map.py --archive` reads is the file it reads.
+        _ps_dir = str(getattr(args, "preference_sweep_out", "") or "")
+        if not _ps_dir:
+            try:
+                _ps_dir = wandb.run.dir if wandb.run is not None else "."
+            except Exception:
+                _ps_dir = "."
+        os.makedirs(_ps_dir, exist_ok=True)
+        _ps_front = os.path.join(_ps_dir, "preference_sweep_front.json")
+        _PSWEEP_ARCHIVE.dump_front(_ps_front, extra={
+            "source": "preference sweep at inference (ticket dsnn-dfw.86)",
+            "checkpoint": _PSWEEP_PATH,
+            "checkpoint_episode": int(_PSWEEP_META["episode"]),
+            # THE SEED THE POLICY WAS TRAINED UNDER, on the file. Five swept
+            # fronts are read as one set, and a set joined on a file path is
+            # a set that one move of the data breaks.
+            "seed": int(args.seed),
+            "weights": [list(w) for w in _PSWEEP_W],
+            "plans_per_weight": int(args.preference_sweep_plans),
+            "num_envs": int(args.num_envs),
+            "lag_lambda": float(lag_lambda),
+            "reward_mode": str(args.reward_mode),
+            "final": True,
+            "run_name": getattr(args, "name", None),
+        })
+        _ps_plans = os.path.join(_ps_dir, "preference_sweep_plans.jsonl")
+        _psweep.write_plan_records(_ps_plans, _PSWEEP_PLANS)
+        _ps_ok = sum(1 for p in _PSWEEP_PLANS if p["refused"] is None)
+        print(f"[pref-sweep] {len(_PSWEEP_PLANS)} rollouts, {_ps_ok} measured, "
+              f"{len(_PSWEEP_ARCHIVE.pts)} front points -> {_ps_front} and "
+              f"{_ps_plans}", flush=True)
+        pbar.close()
+        return
 
     # THE LAST EPISODE'S UPDATE. Pipelined, every episode's update runs one
     # iteration after its rollout, so the final one has nobody to ride behind:
