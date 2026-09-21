@@ -318,7 +318,8 @@ def test_the_archive_window_keeps_only_the_points_admitted_late():
     assert late["window_since_episode"] == 1800
     assert late["num_points"] == 3
     assert [p["episode"] for p in late["front"]] == [1851, 1927, 1800]
-    assert psweep.front_window(doc, 100)["num_points"] == 2
+    # A 100-episode window cuts at 1900, so only the 1927 point survives.
+    assert psweep.front_window(doc, 100)["num_points"] == 1
     # The window is a READ. The document it came from is untouched.
     assert len(doc["front"]) == 4
 
