@@ -400,17 +400,26 @@ def test_dual_clip_reaches_every_row_thesis_arm_emits_and_no_other(gen,
                                                                    smoke):
     """dsnn-dfw.95.  The cap is on the matrix -- A, B, C, C_popart and condC,
     on every target -- and on the smoke, which has to start the same command
-    line the matrix runs.  A tuning row that calls `thesis_cli` itself keeps
-    the flag OFF, and the absence is asserted rather than trusted, because an
-    off run is bit-identical to the loss before the flag existed and that is
-    what makes those rows still comparable with what they already measured.
+    line the matrix runs.
+
+    It is OFF on the order-only tuning rows and on the three Lagrangian
+    sweep rounds, and the absence is asserted rather than trusted.  Those
+    are frozen running comparisons: off is bit-identical to the loss before
+    the flag existed, which is what keeps them comparable with what they
+    already measured, and a launcher that moved under them would invalidate
+    the round.
     """
     for a in matrix + smoke:
         cli = _cli(gen, a)
         assert cli["--dual-clip"] == DUAL_CLIP, a["name"]
         assert f"--dual-clip {DUAL_CLIP}" in gen.render(a), a["name"]
-    for a in gen.orderonly_arms() + gen.orderonly_rsnn_arms():
+    off = (gen.orderonly_arms() + gen.orderonly_rsnn_arms()
+           + gen.orderonly_final_arms() + gen.orderonly_tlm_final_arms()
+           + gen.sweepl_arms() + gen.sweepl2_arms() + gen.sweepl3_arms())
+    assert off
+    for a in off:
         assert "--dual-clip" not in _cli(gen, a), a["name"]
+        assert "--dual-clip" not in gen.render(a), a["name"]
     # Layer 1 of a launcher greps ppo.py for every flag its OWN command line
     # uses, so the flag is named by the rows that pass it and by no other --
     # a running comparison's launcher does not change for a guard its row
@@ -419,7 +428,7 @@ def test_dual_clip_reaches_every_row_thesis_arm_emits_and_no_other(gen,
     assert "--dual-clip" not in gen.THESIS_REQUIRED_FLAGS
     for a in matrix + smoke:
         assert "--dual-clip" in a["required_flags"], a["name"]
-    for a in gen.orderonly_arms() + gen.orderonly_rsnn_arms():
+    for a in off:
         assert "--dual-clip" not in a["required_flags"], a["name"]
 
 
