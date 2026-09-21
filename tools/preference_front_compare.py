@@ -121,6 +121,34 @@ def _view(front_pts, rollouts, axis: int, pad: float = 0.08):
     return lo - pad * span, hi + pad * span
 
 
+def _quiet_corner(xs, ys, xlim, ylim):
+    """The corner of the view with the fewest marks in it.
+
+    The coverage block has to sit inside panel A -- it is the number the
+    panel is about -- and where the data is differs per seed: one run's
+    cloud sits on the zero line, another's spans three decades of memory
+    ratio. A fixed corner collides on some seed, every time. This counts the
+    marks in each corner box and returns the emptiest, as axes coordinates
+    plus the alignment that anchors the text there.
+    """
+    x = np.asarray(xs, dtype=np.float64).reshape(-1)
+    y = np.asarray(ys, dtype=np.float64).reshape(-1)
+    if x.size == 0:
+        return 0.015, 0.02, "left", "bottom"
+    fx = (x - xlim[0]) / max(xlim[1] - xlim[0], 1e-12)
+    fy = (y - ylim[0]) / max(ylim[1] - ylim[0], 1e-12)
+    inside = (fx >= 0.0) & (fx <= 1.0) & (fy >= 0.0) & (fy <= 1.0)
+    fx, fy = fx[inside], fy[inside]
+    corners = [
+        (0.015, 0.02, "left", "bottom", (fx <= 0.62) & (fy <= 0.30)),
+        (0.985, 0.02, "right", "bottom", (fx >= 0.38) & (fy <= 0.30)),
+        (0.015, 0.98, "left", "top", (fx <= 0.62) & (fy >= 0.70)),
+        (0.985, 0.98, "right", "top", (fx >= 0.38) & (fy >= 0.70)),
+    ]
+    best = min(corners, key=lambda c: int(np.sum(c[4])))
+    return best[0], best[1], best[2], best[3]
+
+
 def figure(path, swept_doc, archive_doc, late_docs, plans, table,
            objectives, comparison):
     import matplotlib
@@ -207,7 +235,16 @@ def figure(path, swept_doc, archive_doc, late_docs, plans, table,
     ax_a.set_ylabel("memory, log ratio", color=INK_2, fontsize=10)
     ax_a.set_title("A  the front, coloured by the preference that produced it",
                    color=INK, fontsize=11, loc="left", pad=10)
-    ax_a.text(0.015, 0.075,
+    all_x = np.concatenate([v for v in (roll_lat,
+                                        a_med[:, 0] if a_med.size else None,
+                                        s_med[:, 0] if s_med.size else None)
+                            if v is not None and np.size(v)] or [roll_lat])
+    all_y = np.concatenate([v for v in (roll_mem,
+                                        a_med[:, 1] if a_med.size else None,
+                                        s_med[:, 1] if s_med.size else None)
+                            if v is not None and np.size(v)] or [roll_mem])
+    _tx, _ty, _tha, _tva = _quiet_corner(all_x, all_y, xlim, ylim)
+    ax_a.text(_tx, _ty,
               f"coverage: swept of archive "
               f"{comparison['coverage_swept_of_archive']:.2f}, archive of "
               f"swept {comparison['coverage_archive_of_swept']:.2f}\n"
@@ -228,7 +265,7 @@ def figure(path, swept_doc, archive_doc, late_docs, plans, table,
               + (f"\n{outside} of {len(ok)} rollouts lie outside this view"
                  if outside else ""),
               transform=ax_a.transAxes, fontsize=8.5, color=INK_2,
-              va="bottom", ha="left", linespacing=1.5)
+              va=_tva, ha=_tha, linespacing=1.5)
     handles = [
         Line2D([], [], marker="o", ls="none", ms=6.5, mfc="none",
                mec=MUTED, mew=1.4,
@@ -248,7 +285,13 @@ def figure(path, swept_doc, archive_doc, late_docs, plans, table,
                mec=SURFACE, mew=1.6,
                label=f"swept front ({s_med.shape[0] if s_med.size else 0})"),
     ]
-    ax_a.legend(handles=handles, loc="center right", frameon=False,
+    # The legend takes the corner diagonally opposite the coverage block, so
+    # the two blocks of text on this panel can never land on each other.
+    _leg_loc = {("left", "bottom"): "upper right",
+                ("right", "bottom"): "upper left",
+                ("left", "top"): "lower right",
+                ("right", "top"): "lower left"}[(_tha, _tva)]
+    ax_a.legend(handles=handles, loc=_leg_loc, frameon=False,
                 fontsize=9, labelcolor=INK_2, handletextpad=0.6)
     cb = fig.colorbar(
         plt.cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax_a,
