@@ -199,7 +199,7 @@ def figure(path, swept_doc, archive_doc, archive_late_doc, plans, table,
     ax_a.set_ylabel("memory, log ratio", color=INK_2, fontsize=10)
     ax_a.set_title("A  the front, coloured by the preference that produced it",
                    color=INK, fontsize=11, loc="left", pad=10)
-    ax_a.text(0.015, 0.02,
+    ax_a.text(0.015, 0.075,
               f"coverage: swept of archive "
               f"{comparison['coverage_swept_of_archive']:.2f}, archive of "
               f"swept {comparison['coverage_archive_of_swept']:.2f}\n"
