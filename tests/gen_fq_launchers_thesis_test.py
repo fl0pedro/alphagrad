@@ -115,6 +115,11 @@ GRAD_ORACLE_CADENCE = "50"
 #: test modules pin that).
 PPO_EPOCHS = "2"
 MINIBATCHES = "8"
+#: DUAL-CLIP PPO (owner ruling 2026-09-21, dsnn-dfw.95): every row
+#: `thesis_arm` emits caps the negative-advantage branch of the PPO
+#: surrogate at c * A with c = 3.  The order-only tuning rows and the sweep
+#: sections call `thesis_cli` directly and keep the flag off.
+DUAL_CLIP = "3.0"
 #: THE FACE-ENTROPY WEIGHT PER FAMILY (owner ruling 2026-09-21, dsnn-dfw.84
 #: and dsnn-dfw.78): the recurrent target and TLM render the near-zero
 #: bonus; NN256 keeps the campaign's 0.05.
@@ -357,6 +362,12 @@ def test_every_arm_carries_the_shared_thesis_flags(gen, matrix):
         assert cli["--minibatches"] == MINIBATCHES, a["name"]
         assert gen.THESIS_PPO_EPOCHS == PPO_EPOCHS
         assert gen.THESIS_MINIBATCHES == MINIBATCHES
+        # dsnn-dfw.95 (owner ruling 2026-09-21): the face head's PPO ratio
+        # reached 2e4 on the recurrent target and PPO's one-sided clip
+        # bounds the ratio only for A > 0, so a violating plan pushed with
+        # unbounded weight.  Every matrix row caps the negative branch.
+        assert cli["--dual-clip"] == DUAL_CLIP, a["name"]
+        assert gen.THESIS_DUAL_CLIP == DUAL_CLIP
         # the face head at init
         assert cli["--scale-face-head"] == "0.1", a["name"]
         assert cli["--face-logit-clamp"] == "15", a["name"]
@@ -383,6 +394,43 @@ def test_every_arm_carries_the_shared_thesis_flags(gen, matrix):
                 == gen.CAMPAIGN_GATE_WINNERS_TABLES[ORDER]), a["name"]
         assert (cli["--gate-offline-contrast"]
                 == gen.GATE_OFFLINE_CONTRAST[ORDER]), a["name"]
+
+
+def test_dual_clip_reaches_every_row_thesis_arm_emits_and_no_other(gen,
+                                                                   matrix,
+                                                                   smoke):
+    """dsnn-dfw.95.  The cap is on the matrix -- A, B, C, C_popart and condC,
+    on every target -- and on the smoke, which has to start the same command
+    line the matrix runs.
+
+    It is OFF on the order-only tuning rows and on the three Lagrangian
+    sweep rounds, and the absence is asserted rather than trusted.  Those
+    are frozen running comparisons: off is bit-identical to the loss before
+    the flag existed, which is what keeps them comparable with what they
+    already measured, and a launcher that moved under them would invalidate
+    the round.
+    """
+    for a in matrix + smoke:
+        cli = _cli(gen, a)
+        assert cli["--dual-clip"] == DUAL_CLIP, a["name"]
+        assert f"--dual-clip {DUAL_CLIP}" in gen.render(a), a["name"]
+    off = (gen.orderonly_arms() + gen.orderonly_rsnn_arms()
+           + gen.orderonly_final_arms() + gen.orderonly_tlm_final_arms()
+           + gen.sweepl_arms() + gen.sweepl2_arms() + gen.sweepl3_arms())
+    assert off
+    for a in off:
+        assert "--dual-clip" not in _cli(gen, a), a["name"]
+        assert "--dual-clip" not in gen.render(a), a["name"]
+    # Layer 1 of a launcher greps ppo.py for every flag its OWN command line
+    # uses, so the flag is named by the rows that pass it and by no other --
+    # a running comparison's launcher does not change for a guard its row
+    # does not need (the same rule RUNG1_REQUIRED_FLAGS follows).
+    assert gen.DUAL_CLIP_REQUIRED_FLAGS == ["--dual-clip"]
+    assert "--dual-clip" not in gen.THESIS_REQUIRED_FLAGS
+    for a in matrix + smoke:
+        assert "--dual-clip" in a["required_flags"], a["name"]
+    for a in off:
+        assert "--dual-clip" not in a["required_flags"], a["name"]
 
 
 def test_the_targets_are_the_ones_the_owner_named(gen, matrix):

@@ -1494,6 +1494,67 @@ def _winsorize_adv(norm_adv_components, z):
     return clipped, clip_frac
 
 
+def dual_clip_coef(args) -> float:
+    """The validated --dual-clip coefficient, 0.0 when the flag is off.
+
+    c has to be > 1: the cap c * A must sit ABOVE the standard surrogate for
+    a healthy sample (ratio near 1), so c <= 1 would bite every
+    negative-advantage sample and change the objective of a run that has no
+    runaway. Refusing here is the whole check -- nothing downstream reads
+    `args.dual_clip`.
+    """
+    c = float(getattr(args, "dual_clip", 0.0) or 0.0)
+    if c != 0.0 and not c > 1.0:
+        raise SystemExit(
+            f"--dual-clip {c:g} is not > 1. The cap c * A has to sit ABOVE "
+            "the standard surrogate for a healthy sample (ratio near 1), so "
+            "c <= 1 would bite every negative-advantage sample and change "
+            "the objective of a run that has no runaway (dsnn-dfw.95).")
+    return c
+
+
+def dual_clip_enabled(args) -> bool:
+    """--dual-clip C is ON only when C > 0.
+
+    A STATIC Python gate, like `kl_ref_enabled`: with the flag off the loss
+    traces exactly the graph it traced before this flag existed, so an off
+    run is bit-identical.
+    """
+    return dual_clip_coef(args) > 0.0
+
+
+def _dual_clip_objective(objective, norm_adv, c):
+    """Dual-clip PPO (Ye et al. 2020, "Mastering Complex Control in MOBA
+    Games with Deep RL"), on the policy surrogate.
+
+    For A >= 0 the standard surrogate min(r A, clip(r) A) already bounds the
+    ratio. For A < 0 it is r A with r UNBOUNDED, so one sample whose ratio
+    exploded pushes with unbounded weight -- dsnn-dfw.95 measured r up to
+    2e4 on the recurrent target, because the face head's log-prob is a SUM
+    over 126-195 live slots whose logits move together. This caps the
+    objective from below at c * A on that branch:
+
+        objective = where(A < 0, maximum(standard, c * A), standard)
+
+    c > 1, so the cap never reaches a healthy sample (r near 1), and the
+    A >= 0 branch is returned untouched.
+    """
+    objective = jnp.asarray(objective)
+    cap = jnp.asarray(c, objective.dtype) * norm_adv
+    return jnp.where(norm_adv < 0.0, jnp.maximum(objective, cap), objective)
+
+
+def _dual_clip_active(objective, norm_adv, c):
+    """Per-sample: did the cap of `_dual_clip_objective` bite on this sample?
+
+    True exactly where the `maximum` above picked the cap over the standard
+    surrogate. `ppo/dual_clip_frac` is the live-weighted mean of this.
+    """
+    objective = jnp.asarray(objective)
+    cap = jnp.asarray(c, objective.dtype) * norm_adv
+    return jnp.logical_and(norm_adv < 0.0, cap > objective)
+
+
 # --lag-raw-viol-adv safety clip (sec 12.9). The raw violation-channel
 # advantage is bounded by construction: the channel stores -violation with
 # violation = max(0, tau - clip(q, -0.5, 1)) in [0, tau + 0.5] (tau 0.75 ->
@@ -6341,6 +6402,19 @@ def make_argparser() -> argparse.ArgumentParser:
                    "epoch instead). Independent of --kl-ref-*: this one "
                    "bounds movement per UPDATE, the reference KL bounds "
                    "movement per RUN.")
+    p.add_argument("--dual-clip", type=float, default=0.0,
+                   help="DUAL-CLIP PPO (Ye et al. 2020). For a NEGATIVE "
+                   "advantage the standard surrogate is ratio * A with the "
+                   "ratio unbounded, so a sample whose ratio exploded "
+                   "(dsnn-dfw.95: 2e4 on the recurrent target, because the "
+                   "face head's log-prob is a sum over 126-195 slots) pushes "
+                   "with unbounded weight. Dual-clip caps the objective from "
+                   "below at c * A for A < 0: objective = where(A < 0, "
+                   "maximum(standard, c * A), standard). 0 = OFF (default), "
+                   "and off is bit-identical to the loss before this flag "
+                   "existed. Must be > 1 when set, otherwise the cap would "
+                   "reach a healthy sample. The thesis matrix value is set "
+                   "by tools/gen_fq_launchers.py.")
     p.add_argument("--face-logit-clamp", type=float, default=0.0,
                    help="bound every unified-face-head logit to (-C, C) "
                    "via C*tanh(z/C) before softmax/sigmoid (see "
@@ -9925,6 +9999,14 @@ def main(args=None):
     #     where v62/v63 actually moved).
     _KL_REF_ON = kl_ref_enabled(args)
     _TARGET_KL = float(getattr(args, "target_kl", 0.0) or 0.0)
+    # --dual-clip C (dsnn-dfw.95). Read and checked once, and the gate is a
+    # static Python bool so an off run traces the old graph.
+    _DUAL_CLIP = dual_clip_coef(args)
+    _DUAL_CLIP_ON = _DUAL_CLIP > 0.0
+    if _DUAL_CLIP_ON:
+        print(f"[dual-clip] negative-advantage cap at c={_DUAL_CLIP:g} "
+              f"(Ye et al. 2020, dsnn-dfw.95). ppo/dual_clip_frac reports "
+              f"how often it bites.", flush=True)
     _kl_ref_agent = agent if _KL_REF_ON else None
     _kl_ref_coef = 0.0
     if _KL_REF_ON:
@@ -11872,6 +11954,18 @@ def main(args=None):
             jnp.clip(ratio, 1.0 - args.ppo_clip_eps, 1.0 + args.ppo_clip_eps)
             * batch.norm_adv,
         )
+        # --dual-clip C (dsnn-dfw.95). A STATIC Python gate: with the flag
+        # off nothing here is traced and the loss is bit-identical.
+        if _DUAL_CLIP_ON:
+            dual_clip_frac = _live_mean(
+                _dual_clip_active(
+                    clipping_objective, batch.norm_adv, _DUAL_CLIP
+                ).astype(jnp.float32),
+                _w_live)
+            clipping_objective = _dual_clip_objective(
+                clipping_objective, batch.norm_adv, _DUAL_CLIP)
+        else:
+            dual_clip_frac = jnp.zeros((), jnp.float32)
         ppo_loss = _live_mean(-clipping_objective, _w_live)
 
         # --target-kl: PPO EARLY STOPPING, minibatch-local. The update lives
@@ -12276,6 +12370,9 @@ def main(args=None):
             # Slot 11 (sec 12.10): per-channel critic MSE,
             # (NUM_VALUE_HEADS,). host_log maps it to value_loss/<channel>.
             _vloss_ch,
+            # Slot 12 (dsnn-dfw.95): the fraction of LIVE samples where the
+            # --dual-clip cap was active. Exactly 0.0 when the flag is off.
+            dual_clip_frac,
         )
         if _PROBE_ON or _VPROBE_ON:
             return total_loss, (_metrics, _probe_pack, _vp_pack)
@@ -13931,6 +14028,9 @@ def main(args=None):
         # 11-tuple caller (none should remain) degrades to "keys absent"
         # rather than an IndexError.
         vloss_ch = np.asarray(mets[11]) if len(mets) > 11 else None
+        # Slot 12 (dsnn-dfw.95): the dual-clip cap's live fraction. Guarded
+        # the same way slot 11 is, so a shorter tuple degrades to 0.0.
+        dual_clip_frac = float(mets[12]) if len(mets) > 12 else 0.0
 
         weights = reward_weights_np
         n_collapsed_this_ep = 0
@@ -14082,6 +14182,12 @@ def main(args=None):
             "ppo loss": ppo_loss,
             "value loss": value_loss,
             "total loss": total_loss,
+            # dsnn-dfw.95: how often PPO's clip and the --dual-clip cap bit
+            # this episode. The trigger fraction was already computed in the
+            # loss and dropped on the floor here; both are live now, so a
+            # run shows whether the negative-advantage branch is being held.
+            "ppo/clip_trigger_frac": _clipping_trigger_ratio,
+            "ppo/dual_clip_frac": dual_clip_frac,
         }
         # ---- REFUSED TERMINAL MEASUREMENTS, PER EPISODE AND PER KIND -------
         # The trainer now drops a refused environment from the update
