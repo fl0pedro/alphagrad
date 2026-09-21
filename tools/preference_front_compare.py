@@ -121,32 +121,39 @@ def _view(front_pts, rollouts, axis: int, pad: float = 0.08):
     return lo - pad * span, hi + pad * span
 
 
-def _quiet_corner(xs, ys, xlim, ylim):
-    """The corner of the view with the fewest marks in it.
+def _quiet_corners(xs, ys, xlim, ylim):
+    """The corners of the view, emptiest first.
 
-    The coverage block has to sit inside panel A -- it is the number the
-    panel is about -- and where the data is differs per seed: one run's
-    cloud sits on the zero line, another's spans three decades of memory
-    ratio. A fixed corner collides on some seed, every time. This counts the
-    marks in each corner box and returns the emptiest, as axes coordinates
-    plus the alignment that anchors the text there.
+    Panel A carries two blocks of text -- the coverage numbers, which are
+    what the panel is about, and the legend -- and where the data sits
+    differs per seed: one run's cloud lies on the zero line, another's spans
+    three decades of memory ratio. A fixed corner collides on some seed
+    every time. This counts the marks in each corner box and ranks the
+    corners, so the text takes the emptiest and the legend the next.
+
+    Each entry is `(x, y, ha, va, legend_loc, n)` with the first four in
+    axes coordinates and alignments.
     """
     x = np.asarray(xs, dtype=np.float64).reshape(-1)
     y = np.asarray(ys, dtype=np.float64).reshape(-1)
+    boxes = [
+        (0.015, 0.02, "left", "bottom", "lower left", 0.62, 0.30, True),
+        (0.985, 0.02, "right", "bottom", "lower right", 0.38, 0.30, False),
+        (0.015, 0.98, "left", "top", "upper left", 0.62, 0.70, True),
+        (0.985, 0.98, "right", "top", "upper right", 0.38, 0.70, False),
+    ]
     if x.size == 0:
-        return 0.015, 0.02, "left", "bottom"
+        return [(b[0], b[1], b[2], b[3], b[4], 0) for b in boxes]
     fx = (x - xlim[0]) / max(xlim[1] - xlim[0], 1e-12)
     fy = (y - ylim[0]) / max(ylim[1] - ylim[0], 1e-12)
     inside = (fx >= 0.0) & (fx <= 1.0) & (fy >= 0.0) & (fy <= 1.0)
     fx, fy = fx[inside], fy[inside]
-    corners = [
-        (0.015, 0.02, "left", "bottom", (fx <= 0.62) & (fy <= 0.30)),
-        (0.985, 0.02, "right", "bottom", (fx >= 0.38) & (fy <= 0.30)),
-        (0.015, 0.98, "left", "top", (fx <= 0.62) & (fy >= 0.70)),
-        (0.985, 0.98, "right", "top", (fx >= 0.38) & (fy >= 0.70)),
-    ]
-    best = min(corners, key=lambda c: int(np.sum(c[4])))
-    return best[0], best[1], best[2], best[3]
+    out = []
+    for bx, by, ha, va, loc, cut_x, cut_y, left in boxes:
+        in_x = (fx <= cut_x) if left else (fx >= cut_x)
+        in_y = (fy <= cut_y) if va == "bottom" else (fy >= cut_y)
+        out.append((bx, by, ha, va, loc, int(np.sum(in_x & in_y))))
+    return sorted(out, key=lambda c: c[5])
 
 
 def figure(path, swept_doc, archive_doc, late_docs, plans, table,
@@ -243,7 +250,8 @@ def figure(path, swept_doc, archive_doc, late_docs, plans, table,
                                         a_med[:, 1] if a_med.size else None,
                                         s_med[:, 1] if s_med.size else None)
                             if v is not None and np.size(v)] or [roll_mem])
-    _tx, _ty, _tha, _tva = _quiet_corner(all_x, all_y, xlim, ylim)
+    _corners = _quiet_corners(all_x, all_y, xlim, ylim)
+    _tx, _ty, _tha, _tva = _corners[0][:4]
     ax_a.text(_tx, _ty,
               f"coverage: swept of archive "
               f"{comparison['coverage_swept_of_archive']:.2f}, archive of "
@@ -285,13 +293,9 @@ def figure(path, swept_doc, archive_doc, late_docs, plans, table,
                mec=SURFACE, mew=1.6,
                label=f"swept front ({s_med.shape[0] if s_med.size else 0})"),
     ]
-    # The legend takes the corner diagonally opposite the coverage block, so
-    # the two blocks of text on this panel can never land on each other.
-    _leg_loc = {("left", "bottom"): "upper right",
-                ("right", "bottom"): "upper left",
-                ("left", "top"): "lower right",
-                ("right", "top"): "lower left"}[(_tha, _tva)]
-    ax_a.legend(handles=handles, loc=_leg_loc, frameon=False,
+    # The legend takes the next emptiest corner, so the panel's two blocks of
+    # text cannot land on each other and neither sits on the marks.
+    ax_a.legend(handles=handles, loc=_corners[1][4], frameon=False,
                 fontsize=9, labelcolor=INK_2, handletextpad=0.6)
     cb = fig.colorbar(
         plt.cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax_a,
