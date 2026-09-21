@@ -2656,18 +2656,18 @@ def rung1_row(arm: str, target: str, matrix_row: bool = True) -> bool:
             and ((target == RUNG1_TARGET and arm in RUNG1_ARMS)
                  or (target in THESIS_RSNN_TARGETS and arm in RUNG1_RSNN_ARMS)))
 
-#: CONDC RENDERS ON THE POPART FORM ON NN256, AND NOW ON TLM TOO (owner
-#: rulings 2026-09-21).  Rung 1 (C symlog vs C_popart on NN256, dsnn-dfw epic
-#: comment 2026-09-21 06:30) found PopArt dominating symlog on every column
-#: at feasible fraction, q and feasible-plan latency; condC on NN256, then
-#: condC on TLM, were each held on "the scaling ruling" until their turn.
-#: condC on both targets now takes exactly arm C_popart's own magnitude
-#: scaling: --advantage-norm popart, --no-symlog, --symlog-channels none
-#: (values read from THESIS_ARM_SPEC["C_popart"] and the popart branch below,
-#: not retyped).  condC on the four recurrent targets keeps its recorded
-#: symlog form from THESIS_ARM_SPEC unchanged -- that ruling has not reached
-#: them.
-CONDC_POPART_TARGETS = ("nn256", "tlm")
+#: CONDC RENDERS ON THE POPART FORM ON NN256, TLM, AND NOW THE FOUR
+#: RECURRENT TARGETS TOO (owner rulings 2026-09-21).  Rung 1 (C symlog vs
+#: C_popart on NN256, dsnn-dfw epic comment 2026-09-21 06:30) found PopArt
+#: dominating symlog on every column at feasible fraction, q and
+#: feasible-plan latency; condC on NN256, then condC on TLM, then condC on
+#: the recurrent target, were each held on "the scaling ruling" until their
+#: turn.  condC on all six targets now takes exactly arm C_popart's own
+#: magnitude scaling: --advantage-norm popart, --no-symlog,
+#: --symlog-channels none (values read from THESIS_ARM_SPEC["C_popart"] and
+#: the popart branch below, not retyped).  The ruling has now reached the
+#: recurrent targets: condC no longer keeps the symlog form on any target.
+CONDC_POPART_TARGETS = ("nn256", "tlm") + THESIS_RSNN_TARGETS
 
 
 def condc_popart_row(arm: str, target: str, matrix_row: bool = True) -> bool:

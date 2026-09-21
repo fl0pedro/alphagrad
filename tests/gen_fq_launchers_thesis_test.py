@@ -33,14 +33,15 @@ rather than on 150 files:
      other round (the order-only tuning rows are arm C on NN256 too) moves.
   8c. THE LONG CONDITIONED ROWS (owner ruling 2026-09-20): condC on NN256,
      five seeds, renders --episodes 2000.  Every other row keeps 1000.
-  8d. CONDC RENDERS ON THE POPART FORM ON NN256 AND ON TLM (owner rulings
-     2026-09-21): the same three flags as arm C_popart -- --advantage-norm
-     popart, --no-symlog, --symlog-channels none -- read from C_popart's own
-     row, not retyped, in place of the symlog form THESIS_ARM_SPEC records
-     for condC.  condC on TLM ALSO takes its own face-head init plan
-     (TLM_INIT_APPROX_PER_PLAN / TLM_INIT_SKIPS_PER_PLAN, not rung 1's).
-     condC on the four recurrent targets keeps the symlog form; nothing
-     else about condC on NN256 or TLM moves.
+  8d. CONDC RENDERS ON THE POPART FORM ON NN256, TLM, AND NOW THE FOUR
+     RECURRENT TARGETS TOO (owner rulings 2026-09-21): the same three flags
+     as arm C_popart -- --advantage-norm popart, --no-symlog,
+     --symlog-channels none -- read from C_popart's own row on the SAME
+     target, not retyped, in place of the symlog form THESIS_ARM_SPEC
+     records for condC.  condC on TLM ALSO takes its own face-head init
+     plan (TLM_INIT_APPROX_PER_PLAN / TLM_INIT_SKIPS_PER_PLAN, not rung
+     1's).  Arm C itself never moved: it keeps the symlog form everywhere,
+     recurrent targets included.
   9. THE RECURRENT BLOCK: --example RSNN_SHD --dataset shd crossed with four
      temporal rules (tbptt, bptt, rtrl, window2), the same five arms and the
      same five seeds = 100 further runs, named `<arm>_rsnn_<rule>_s<seed>`,
@@ -659,7 +660,7 @@ def test_rung1_keeps_the_four_gpu_profile_and_the_paired_slots(gen, matrix):
 # ---------------------------- 2c. condC renders on popart on nn256 and tlm
 
 #: The owner's condC-on-PopArt rulings, typed here on purpose (2026-09-21).
-CONDC_POPART_TARGETS = ("nn256", "tlm")
+CONDC_POPART_TARGETS = ("nn256", "tlm") + RSNN_TARGETS
 
 
 def _is_condc_popart(a) -> bool:
@@ -667,11 +668,12 @@ def _is_condc_popart(a) -> bool:
             and a["thesis_arm"] == "condC")
 
 
-def test_condc_on_nn256_and_tlm_render_on_the_popart_form(gen, matrix):
-    """Owner rulings 2026-09-21: condC on NN256, then condC on TLM, take arm
-    C_popart's own magnitude scaling -- read from C_popart's own row on
-    that SAME target, not retyped -- in place of the symlog form.  All five
-    seeds each, singles and pairs both building from this same `cli`."""
+def test_condc_on_all_six_targets_render_on_the_popart_form(gen, matrix):
+    """Owner rulings 2026-09-21: condC on NN256, then TLM, then the four
+    recurrent targets, all take arm C_popart's own magnitude scaling --
+    read from C_popart's own row on that SAME target, not retyped -- in
+    place of the symlog form.  All five seeds each, on every one of the
+    six targets, singles and pairs both building from this same `cli`."""
     for t in CONDC_POPART_TARGETS:
         c_popart_cli = next(
             _cli(gen, a) for a in matrix
@@ -716,21 +718,21 @@ def test_condc_on_tlm_takes_its_own_face_init_plan(gen, matrix):
     assert seen == set(SEEDS)
 
 
-def test_condc_on_the_recurrent_targets_keeps_the_symlog_form(gen, matrix):
-    """condC on the four recurrent targets is untouched by the PopArt
-    ruling: it reaches NN256 and TLM alone, by a target check.  (Its
-    face-head init DOES move on the recurrent target -- rung 1, section 8b
-    -- which is a different coordinate from the magnitude scaling here.)"""
+def test_c_on_the_recurrent_targets_keeps_the_symlog_form(gen, matrix):
+    """condC now renders on PopArt everywhere (owner ruling 2026-09-21
+    reaches the recurrent targets too), but arm C itself never moved: it
+    keeps the symlog form on every target, recurrent included."""
     seen = set()
     for a in matrix:
-        if a["thesis_arm"] != "condC" or _is_condc_popart(a):
+        if a["thesis_arm"] != "C":
             continue
         cli = _cli(gen, a)
         assert cli["--advantage-norm"] == "none", a["name"]
         assert "--no-symlog" not in cli, a["name"]
         assert cli["--symlog-channels"] == "cost", a["name"]
-        seen.add(a["thesis_target"])
-    assert seen == {f"rsnn_{r}" for r in TEMPORAL_RULES}
+        if a["thesis_target"] in RSNN_TARGETS:
+            seen.add(a["thesis_target"])
+    assert seen == set(RSNN_TARGETS)
 
 
 def test_only_a_matrix_coordinate_can_be_a_condc_popart_row(gen):
@@ -745,8 +747,6 @@ def test_only_a_matrix_coordinate_can_be_a_condc_popart_row(gen):
         assert gen.condc_popart_row("condC", t, True)
         assert not gen.condc_popart_row("condC", t, False)
         assert not gen.condc_popart_row("C", t, True)
-    for r in TEMPORAL_RULES:
-        assert not gen.condc_popart_row("condC", f"rsnn_{r}", True)
     # and the default of thesis_cli is the safe one
     cli = gen.thesis_cli(arm="condC", target="nn256",
                          seed=SEEDS[0], node=gen.THESIS_NODES[0], name="x",
