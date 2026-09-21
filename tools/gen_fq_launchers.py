@@ -2955,7 +2955,14 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
                    "gets."
                    if cli["--episodes"] == THESIS_EPISODES_LONG
                    and target == LONG_EPISODES_TARGET
-                   and arm in LONG_EPISODES_ARMS else ""),
+                   and arm in LONG_EPISODES_ARMS else "")
+                + (f"\n\nTHIS ROW RENDERS ON THE POPART FORM, not symlog "
+                   "(owner ruling 2026-09-21): rung 1 found PopArt "
+                   "dominating symlog on every column, and condC on NN256 "
+                   "was held on the scaling ruling until this one.  condC "
+                   "on TLM and on the four recurrent targets keeps the "
+                   "symlog form."
+                   if condc_popart_row(arm, target) else ""),
         prediction=prediction or _THESIS_ARM_PREDICTION[arm],
         falsifier=_THESIS_FALSIFIER,
     )
