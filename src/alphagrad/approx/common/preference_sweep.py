@@ -244,21 +244,26 @@ def compare_fronts(swept: np.ndarray, archive: np.ndarray,
 
 
 def per_weight_table(plans, quality_floor: float) -> list:
-    """One row per preference weight: the medians, the band, feasibility.
+    """One row per preference weight: the median, its band, feasibility.
+
+    THE BAND IS THE 90 PERCENT MEDIAN INTERVAL OF THE PLANS AT THAT WEIGHT,
+    fitted by the same `median_band` the archive fits its points with. It is
+    NOT the union of the per-plan bands: that is an envelope, one bad plan
+    sets it, and it says nothing about where the median of this weight's
+    plans is.
 
     `plans` are the sweep's plan records. A plan that was refused or
-    sentinelled carries no band and is counted as measured-and-infeasible
-    nowhere: it is excluded and counted, the standing rule for a refused
-    measurement.
+    sentinelled carries no band: it is excluded and counted, the standing
+    rule for a refused measurement.
     """
+    from alphagrad.approx.common.pareto_archive import median_band
+
     rows = {}
     for p in plans:
         key = tuple(round(float(x), 6) for x in p["w"])
         row = rows.setdefault(key, {"w": key, "n": 0, "refused": 0,
-                                    "lat": [], "mem": [],
-                                    "lat_lo": [], "lat_hi": [],
-                                    "mem_lo": [], "mem_hi": [],
-                                    "feasible": 0, "quality": []})
+                                    "lat": [], "mem": [], "feasible": 0,
+                                    "quality": []})
         if p.get("refused") or p.get("band") is None:
             row["refused"] += 1
             continue
@@ -266,10 +271,6 @@ def per_weight_table(plans, quality_floor: float) -> list:
         band = p["band"]
         row["lat"].append(float(band["latency"]["median"]))
         row["mem"].append(float(band["memory"]["median"]))
-        row["lat_lo"].append(float(band["latency"]["lo"]))
-        row["lat_hi"].append(float(band["latency"]["hi"]))
-        row["mem_lo"].append(float(band["memory"]["lo"]))
-        row["mem_hi"].append(float(band["memory"]["hi"]))
         row["quality"].append(float(p["quality"]))
         row["feasible"] += int(float(p["quality"]) >= float(quality_floor))
     out = []
@@ -280,16 +281,18 @@ def per_weight_table(plans, quality_floor: float) -> list:
                         "latency_median": None, "memory_median": None,
                         "feasible_fraction": None})
             continue
+        lat_med, lat_lo, lat_hi = median_band(r["lat"])
+        mem_med, mem_lo, mem_hi = median_band(r["mem"])
         out.append({
             "w": list(key),
             "n": r["n"],
             "refused": r["refused"],
-            "latency_median": float(np.median(r["lat"])),
-            "latency_lo": float(np.min(r["lat_lo"])),
-            "latency_hi": float(np.max(r["lat_hi"])),
-            "memory_median": float(np.median(r["mem"])),
-            "memory_lo": float(np.min(r["mem_lo"])),
-            "memory_hi": float(np.max(r["mem_hi"])),
+            "latency_median": float(lat_med),
+            "latency_lo": float(lat_lo),
+            "latency_hi": float(lat_hi),
+            "memory_median": float(mem_med),
+            "memory_lo": float(mem_lo),
+            "memory_hi": float(mem_hi),
             "quality_median": float(np.median(r["quality"])),
             "feasible_fraction": float(r["feasible"]) / float(r["n"]),
         })

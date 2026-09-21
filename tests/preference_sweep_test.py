@@ -307,3 +307,24 @@ def test_per_weight_table_reports_the_band_and_the_feasible_fraction():
     assert cold["n"] == 1
     assert cold["refused"] == 1
     assert cold["feasible_fraction"] == 1.0
+
+
+def test_per_weight_band_is_the_median_interval_not_the_envelope():
+    """One wild plan widens the SAMPLE, it does not set the band.
+
+    The band is the 90 percent median interval of the weight's plans. Taking
+    the union of their own bands instead would let a single memory blow-up
+    -- a real measurement, kept in the table and the file -- claim the whole
+    axis and hide every other weight.
+    """
+    plans = [_plan((0.5, 0.5, 0.0), -0.5, 0.0) for _ in range(8)]
+    wild = _plan((0.5, 0.5, 0.0), -0.5, 5.0)
+    wild["band"]["memory"]["hi"] = 9.0
+    wild["band"]["memory"]["lo"] = 4.0
+    rows = psweep.per_weight_table(plans + [wild], quality_floor=0.9)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["n"] == 9
+    assert row["memory_median"] == 0.0
+    assert row["memory_hi"] <= 5.0
+    assert row["memory_lo"] == 0.0

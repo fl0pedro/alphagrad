@@ -92,18 +92,43 @@ def _band_arrays(doc, objectives):
     return med, np.abs(med - lo), np.abs(hi - med)
 
 
+def _view(front_pts, rollouts, axis: int, pad: float = 0.08):
+    """The window the bulk of the data lives in, on one axis.
+
+    Every front point is kept -- a front point outside the view would be the
+    comparison hiding its own evidence. The ROLLOUT cloud enters by its 2nd
+    to 98th percentile: a handful of plans measure a log ratio of +5 (a
+    memory blow-up, which is a real measurement and is in the table and the
+    file), and letting those three points set the axis collapses the other
+    173 onto one pixel.
+    """
+    keep = [np.asarray(x, dtype=np.float64).reshape(-1)
+            for x in front_pts if np.size(x)]
+    r = np.asarray(rollouts, dtype=np.float64).reshape(-1)
+    if r.size:
+        keep.append(np.percentile(r, [2.0, 98.0]))
+    allv = np.concatenate(keep) if keep else np.zeros(1)
+    lo, hi = float(np.min(allv)), float(np.max(allv))
+    lo, hi = min(lo, 0.0), max(hi, 0.0)
+    span = hi - lo
+    if span <= 0.0:
+        span = 1.0
+    return lo - pad * span, hi + pad * span
+
+
 def figure(path, swept_doc, archive_doc, plans, table, objectives, comparison):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.colors import LinearSegmentedColormap, Normalize
+    from matplotlib.lines import Line2D
 
     cmap = LinearSegmentedColormap.from_list("w_lat", BLUE_RAMP)
     norm = Normalize(vmin=0.0, vmax=1.0)
 
     fig, (ax_a, ax_b) = plt.subplots(
-        1, 2, figsize=(12.2, 5.0), dpi=200,
-        gridspec_kw={"width_ratios": [1.15, 1.0], "wspace": 0.26})
+        1, 2, figsize=(12.6, 5.2), dpi=200,
+        gridspec_kw={"width_ratios": [1.12, 1.0], "wspace": 0.30})
     fig.patch.set_facecolor(SURFACE)
     for ax in (ax_a, ax_b):
         ax.set_facecolor(SURFACE)
@@ -148,25 +173,43 @@ def figure(path, swept_doc, archive_doc, plans, table, objectives, comparison):
                      label=f"swept front ({s_med.shape[0]})")
     ax_a.axhline(0.0, color=AXIS, lw=1.0, zorder=1)
     ax_a.axvline(0.0, color=AXIS, lw=1.0, zorder=1)
+    roll_lat = np.asarray([p["band"]["latency"]["median"] for p in ok])
+    roll_mem = np.asarray([p["band"]["memory"]["median"] for p in ok])
+    xlim = _view([a_med[:, 0] if a_med.size else [],
+                  s_med[:, 0] if s_med.size else []], roll_lat, 0)
+    ylim = _view([a_med[:, 1] if a_med.size else [],
+                  s_med[:, 1] if s_med.size else []], roll_mem, 1)
+    outside = int(np.sum(~((roll_lat >= xlim[0]) & (roll_lat <= xlim[1])
+                           & (roll_mem >= ylim[0]) & (roll_mem <= ylim[1]))))
+    ax_a.set_xlim(*xlim)
+    ax_a.set_ylim(*ylim)
     ax_a.set_xlabel("latency, log ratio against the paired rev-exact reference",
                     color=INK_2, fontsize=10)
     ax_a.set_ylabel("memory, log ratio", color=INK_2, fontsize=10)
     ax_a.set_title("A  the front, coloured by the preference that produced it",
                    color=INK, fontsize=11, loc="left", pad=10)
-    ax_a.text(0.02, 0.03,
-              f"coverage swept of archive {comparison['coverage_swept_of_archive']:.2f}"
-              f"   archive of swept {comparison['coverage_archive_of_swept']:.2f}\n"
-              f"hypervolume swept {comparison['hypervolume_swept']:.4g}"
-              f"   archive {comparison['hypervolume_archive']:.4g}",
+    ax_a.text(0.015, 0.985,
+              f"coverage: swept of archive "
+              f"{comparison['coverage_swept_of_archive']:.2f}, archive of "
+              f"swept {comparison['coverage_archive_of_swept']:.2f}\n"
+              f"hypervolume: swept {comparison['hypervolume_swept']:.4g}, "
+              f"archive {comparison['hypervolume_archive']:.4g}"
+              + (f"\n{outside} of {len(ok)} rollouts lie outside this view"
+                 if outside else ""),
               transform=ax_a.transAxes, fontsize=8.5, color=INK_2,
-              va="bottom", ha="left")
-    leg = ax_a.legend(loc="upper right", frameon=False, fontsize=9,
-                      labelcolor=INK_2)
-    for handle in leg.legend_handles:
-        try:
-            handle.set_color(MUTED)
-        except Exception:
-            pass
+              va="top", ha="left", linespacing=1.5)
+    handles = [
+        Line2D([], [], marker="o", ls="none", ms=6.5, mfc="none",
+               mec=MUTED, mew=1.4,
+               label=f"training archive front ({a_med.shape[0]})"),
+        Line2D([], [], marker="o", ls="none", ms=4.5, color=BLUE_RAMP[6],
+               alpha=0.6, label=f"swept rollouts ({len(ok)})"),
+        Line2D([], [], marker="o", ls="none", ms=9, color=BLUE_RAMP[7],
+               mec=SURFACE, mew=1.6,
+               label=f"swept front ({s_med.shape[0] if s_med.size else 0})"),
+    ]
+    ax_a.legend(handles=handles, loc="lower right", frameon=False,
+                fontsize=9, labelcolor=INK_2, handletextpad=0.6)
     cb = fig.colorbar(
         plt.cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax_a,
         fraction=0.045, pad=0.02)
@@ -186,29 +229,36 @@ def figure(path, swept_doc, archive_doc, plans, table, objectives, comparison):
         ax_b.errorbar(t, med, yerr=np.stack([np.abs(med - lo),
                                              np.abs(hi - med)]),
                       fmt="-o", color=colour, ecolor=colour, ms=6,
-                      mew=1.4, mec=SURFACE, lw=2.0, elinewidth=1.0,
+                      mew=1.4, mec=SURFACE, lw=2.0, elinewidth=1.2,
                       alpha=0.95, capsize=0, label=name, zorder=3)
         if med.size:
             ax_b.annotate(name, (t[-1], med[-1]), textcoords="offset points",
-                          xytext=(6, 0), color=colour, fontsize=9,
-                          va="center")
+                          xytext=(8, 0), color=colour, fontsize=9,
+                          va="center", ha="left", annotation_clip=False)
     ax_b.axhline(0.0, color=AXIS, lw=1.0, zorder=1)
+    if t.size:
+        ax_b.set_xlim(float(t.min()) - 0.04, float(t.max()) + 0.16)
     ax_b.set_xlabel("latency weight of the pinned w", color=INK_2, fontsize=10)
-    ax_b.set_ylabel("achieved median log ratio", color=INK_2, fontsize=10)
+    ax_b.set_ylabel("achieved median log ratio, 90 percent band",
+                    color=INK_2, fontsize=10)
     ax_b.set_title("B  does the policy honour its conditioning",
                    color=INK, fontsize=11, loc="left", pad=10)
-    ax_b.legend(loc="best", frameon=False, fontsize=9, labelcolor=INK_2)
+    ax_b.legend(loc="upper left", frameon=False, fontsize=9,
+                labelcolor=INK_2)
 
-    fig.text(0.008, 0.015,
+    fig.text(0.008, 0.012,
              f"Lower is better on both axes; 0 is parity with the paired "
-             f"reverse-exact reference. Bars are the 90 percent "
-             f"distribution-free interval for the median of the pooled "
-             f"per-window paired log ratios. Hypervolume for both fronts "
-             f"under ONE nadir, "
+             f"reverse-exact reference. Panel A's bars are each point's own "
+             f"90 percent distribution-free interval for the median of its "
+             f"pooled per-window paired log ratios; panel B's are the same "
+             f"interval over the "
+             f"{max((r['n'] for r in table if r['n']), default=0)} plans of "
+             f"that weight. Hypervolume for both fronts under ONE nadir, "
              f"{np.array2string(np.asarray(comparison['nadir']), precision=4)}"
-             f" in {comparison['nadir_space']}.",
-             fontsize=7.5, color=MUTED, ha="left", va="bottom", wrap=True)
-    fig.subplots_adjust(left=0.07, right=0.97, top=0.91, bottom=0.17)
+             f", in {comparison['nadir_space']}. Quality floor "
+             f"{comparison['quality_floor']:g} on grad-cosine.",
+             fontsize=7.5, color=MUTED, ha="left", va="bottom")
+    fig.subplots_adjust(left=0.065, right=0.965, top=0.91, bottom=0.16)
     fig.savefig(path, facecolor=SURFACE)
     return path
 
