@@ -2742,10 +2742,6 @@ THESIS_REQUIRED_FLAGS = REQUIRED_FLAGS + [
     # common/rsnn_shd.TEMPORAL_RULES is short of a rule this matrix names
     # fails at layer 2 instead, by value, which is the right message.
     "--temporal-rule",
-    # dsnn-dfw.95's flag, for the same reason every other name here is
-    # listed: a tree without it aborts 64 naming the flag rather than 65
-    # with an argparse dump.
-    "--dual-clip",
 ]
 #: Rung 1's two flags, added to the list a RUNG-1 ROW greps for and to no
 #: other row's.  A tree without them would otherwise reach argparse and
@@ -2756,6 +2752,13 @@ THESIS_REQUIRED_FLAGS = REQUIRED_FLAGS + [
 #: need.
 RUNG1_REQUIRED_FLAGS = ["--face-init-approx-per-plan",
                         "--face-init-skips-per-plan"]
+
+#: dsnn-dfw.95's flag, added to the list a row `thesis_arm` EMITS greps for
+#: and to no other row's, exactly as RUNG1_REQUIRED_FLAGS above.  The
+#: order-only tuning rows and the sweep sections call `thesis_cli` directly,
+#: do not pass --dual-clip, and a running comparison's launcher may not
+#: change for a guard its own row does not need.
+DUAL_CLIP_REQUIRED_FLAGS = ["--dual-clip"]
 
 THESIS_HEAD = f"""THE THESIS MATRIX (epic dsnn-dfw, ticket dsnn-dfw.4) under
 the owner's rulings of 2026-09-15 and 2026-09-16.  Data collection, not a
@@ -3065,9 +3068,10 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
         # passed in, so the two cannot disagree.
         thesis_rule=thesis_temporal_rule(target),
         env=dict(THESIS_TARGET_ENV[target]),
-        required_flags=(THESIS_REQUIRED_FLAGS + RUNG1_REQUIRED_FLAGS
-                        if rung1_row(arm, target) or condc_tlm_init_row(arm, target)
-                        else THESIS_REQUIRED_FLAGS),
+        required_flags=(THESIS_REQUIRED_FLAGS + DUAL_CLIP_REQUIRED_FLAGS
+                        + (RUNG1_REQUIRED_FLAGS
+                           if rung1_row(arm, target)
+                           or condc_tlm_init_row(arm, target) else [])),
         required_flags_file=" ".join(THESIS_FLAGS_FILES),
         cli=cli,
         purpose=THESIS_HEAD + f"\n\nARM {arm} ON {target.upper()}, SEED "

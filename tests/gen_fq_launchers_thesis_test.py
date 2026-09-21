@@ -411,9 +411,16 @@ def test_dual_clip_reaches_every_row_thesis_arm_emits_and_no_other(gen,
         assert f"--dual-clip {DUAL_CLIP}" in gen.render(a), a["name"]
     for a in gen.orderonly_arms() + gen.orderonly_rsnn_arms():
         assert "--dual-clip" not in _cli(gen, a), a["name"]
-    # the pre-flight greps for it, so a tree without the flag aborts 64
-    # naming it instead of 65 with an argparse dump
-    assert "--dual-clip" in gen.THESIS_REQUIRED_FLAGS
+    # Layer 1 of a launcher greps ppo.py for every flag its OWN command line
+    # uses, so the flag is named by the rows that pass it and by no other --
+    # a running comparison's launcher does not change for a guard its row
+    # does not need (the same rule RUNG1_REQUIRED_FLAGS follows).
+    assert gen.DUAL_CLIP_REQUIRED_FLAGS == ["--dual-clip"]
+    assert "--dual-clip" not in gen.THESIS_REQUIRED_FLAGS
+    for a in matrix + smoke:
+        assert "--dual-clip" in a["required_flags"], a["name"]
+    for a in gen.orderonly_arms() + gen.orderonly_rsnn_arms():
+        assert "--dual-clip" not in a["required_flags"], a["name"]
 
 
 def test_the_targets_are_the_ones_the_owner_named(gen, matrix):
