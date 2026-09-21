@@ -1158,10 +1158,17 @@ def test_every_recurrent_row_carries_the_nn256_and_tlm_flags_unchanged(
     ladder.  It is the same coordinate, written the other of the two ways,
     and `test_rung1_is_c_and_c_popart_on_nn256_and_nothing_else` is what
     pins which rows moved.
+
+    The three PopArt flags are excluded against the NN256 twin ONLY, and
+    only for condC: condC on NN256 renders on the PopArt form (owner ruling
+    2026-09-21), and the recurrent rows are not on that ruling either --
+    `test_condc_on_nn256_renders_on_the_popart_form` is what pins which rows
+    moved.
     """
     node_derived = {"--ray-measure"}
     face_init = {"--face-none-bias", "--face-init-approx-per-plan",
                  "--face-init-skips-per-plan"}
+    popart_flags = {"--advantage-norm", "--no-symlog", "--symlog-channels"}
     target_keys = {"--name", "--example", "--dataset", "--temporal-rule"}
     by_key = {(a["thesis_arm"], a["thesis_target"], a["thesis_seed"]): a
               for a in core}
@@ -1181,6 +1188,11 @@ def test_every_recurrent_row_carries_the_nn256_and_tlm_flags_unchanged(
                 # not on that ruling
                 assert "--episodes" in diff, (a["name"], t)
                 diff -= {"--episodes"}
+            if _is_condc_popart(twin):
+                # the NN256 twin renders on PopArt; the recurrent row is not
+                # on that ruling and keeps the symlog form
+                assert diff & popart_flags == popart_flags, (a["name"], t)
+                diff -= popart_flags
             assert diff == target_keys, (a["name"], t, sorted(diff))
 
 
