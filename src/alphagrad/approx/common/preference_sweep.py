@@ -190,6 +190,39 @@ def front_points(doc: dict, objectives) -> np.ndarray:
     return np.asarray(pts, dtype=np.float64).reshape(-1, len(objectives))
 
 
+def front_window(doc: dict, window: int) -> dict:
+    """The front restricted to the points admitted in its last `window` episodes.
+
+    A `pareto_front.json` is a LIFETIME UNION. A point admitted at episode 63
+    stays on the front for the rest of the run, whether or not the policy can
+    still produce that plan. A swept front comes from ONE checkpoint, so
+    comparing it against the whole union measures the run's exploration and
+    not its final policy. This is the like-for-like set: the points whose own
+    `episode` -- the episode they entered the front at -- falls in the last
+    `window` episodes of the run.
+
+    The end of the run is the dump's own `episode` field. A document without
+    one RAISES: guessing the end from the points would move the window
+    silently, and a window nobody can state is not a window.
+    """
+    if int(window) < 1:
+        raise ValueError(
+            f"an archive window needs at least one episode, got {window!r}")
+    if "episode" not in doc:
+        raise ValueError(
+            "this front document carries no 'episode', so the last "
+            f"{int(window)} episodes of its run cannot be identified.")
+    end = int(doc["episode"])
+    since = end - int(window)
+    out = dict(doc)
+    out["front"] = [p for p in doc.get("front") or ()
+                    if int(p.get("episode", -1)) >= since]
+    out["num_points"] = len(out["front"])
+    out["window_episodes"] = int(window)
+    out["window_since_episode"] = int(since)
+    return out
+
+
 def set_coverage(a, b) -> float:
     """C(A, B): the fraction of B weakly dominated by some point of A.
 
@@ -223,6 +256,18 @@ def shared_nadir(*fronts, margin: float = 1.0) -> np.ndarray:
     return allp.min(axis=0) - float(margin)
 
 
+def hypervolume_of(front, ref) -> float:
+    """The hypervolume of a MINIMISATION front above a maximisation nadir.
+
+    One place negates, so a caller cannot forget to. `ref` is what
+    `shared_nadir` returned for the set this front belongs to.
+    """
+    pts = np.asarray(front, dtype=np.float64)
+    if pts.size == 0:
+        return 0.0
+    return hypervolume(-pts, np.asarray(ref, dtype=np.float64))
+
+
 def compare_fronts(swept: np.ndarray, archive: np.ndarray,
                    objectives) -> dict:
     """Coverage both ways and hypervolume for both, under ONE nadir."""
@@ -236,10 +281,8 @@ def compare_fronts(swept: np.ndarray, archive: np.ndarray,
             np.asarray(archive).reshape(-1, len(objectives)).shape[0]),
         "coverage_swept_of_archive": set_coverage(swept, archive),
         "coverage_archive_of_swept": set_coverage(archive, swept),
-        "hypervolume_swept": hypervolume(-np.asarray(swept, dtype=np.float64),
-                                         ref),
-        "hypervolume_archive": hypervolume(
-            -np.asarray(archive, dtype=np.float64), ref),
+        "hypervolume_swept": hypervolume_of(swept, ref),
+        "hypervolume_archive": hypervolume_of(archive, ref),
     }
 
 

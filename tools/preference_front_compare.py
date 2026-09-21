@@ -57,6 +57,11 @@ def make_argparser() -> argparse.ArgumentParser:
                    help="the training run's pareto_front.json")
     p.add_argument("--out", required=True, help="output directory")
     p.add_argument("--quality-floor", type=float, default=0.9)
+    p.add_argument("--archive-window", type=int, default=200,
+                   help="Compare against the archive points admitted in the "
+                        "last N episodes of the run as well. The archive is "
+                        "a lifetime union and the swept front is one "
+                        "checkpoint, so this is the like-for-like set.")
     p.add_argument("--objectives", default="latency,peak_memory",
                    help="the two objective names, compute first")
     return p
@@ -116,7 +121,8 @@ def _view(front_pts, rollouts, axis: int, pad: float = 0.08):
     return lo - pad * span, hi + pad * span
 
 
-def figure(path, swept_doc, archive_doc, plans, table, objectives, comparison):
+def figure(path, swept_doc, archive_doc, archive_late_doc, plans, table,
+           objectives, comparison):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -150,6 +156,11 @@ def figure(path, swept_doc, archive_doc, plans, table, objectives, comparison):
                       fmt="o", ms=6.5, mfc="none", mec=MUTED, mew=1.4,
                       ecolor=GRID, elinewidth=1.2, capsize=0, zorder=2,
                       label=f"training archive ({a_med.shape[0]})")
+    l_med = psweep.front_points(archive_late_doc, objectives)
+    if l_med.size:
+        ax_a.scatter(l_med[:, 0], l_med[:, 1], s=42, marker="o",
+                     facecolors=MUTED, edgecolors=SURFACE, linewidths=1.4,
+                     zorder=3)
     w_of = _weight_of(plans, objectives)
     ok = [p for p in plans if p.get("refused") is None]
     if ok:
@@ -192,8 +203,13 @@ def figure(path, swept_doc, archive_doc, plans, table, objectives, comparison):
               f"coverage: swept of archive "
               f"{comparison['coverage_swept_of_archive']:.2f}, archive of "
               f"swept {comparison['coverage_archive_of_swept']:.2f}\n"
+              f"against the last "
+              f"{comparison['archive_window_episodes']} episodes: "
+              f"{comparison['coverage_swept_of_archive_late']:.2f} and "
+              f"{comparison['coverage_archive_late_of_swept']:.2f}\n"
               f"hypervolume: swept {comparison['hypervolume_swept']:.4g}, "
-              f"archive {comparison['hypervolume_archive']:.4g}"
+              f"archive {comparison['hypervolume_archive']:.4g}, late "
+              f"{comparison['hypervolume_archive_late']:.4g}"
               + (f"\n{outside} of {len(ok)} rollouts lie outside this view"
                  if outside else ""),
               transform=ax_a.transAxes, fontsize=8.5, color=INK_2,
@@ -202,6 +218,11 @@ def figure(path, swept_doc, archive_doc, plans, table, objectives, comparison):
         Line2D([], [], marker="o", ls="none", ms=6.5, mfc="none",
                mec=MUTED, mew=1.4,
                label=f"training archive front ({a_med.shape[0]})"),
+        Line2D([], [], marker="o", ls="none", ms=6.5, color=MUTED,
+               mec=SURFACE, mew=1.4,
+               label=f"admitted in the last "
+                     f"{comparison['archive_window_episodes']} episodes "
+                     f"({comparison['num_archive_late']})"),
         Line2D([], [], marker="o", ls="none", ms=4.5, color=BLUE_RAMP[6],
                alpha=0.6, label=f"swept rollouts ({len(ok)})"),
         Line2D([], [], marker="o", ls="none", ms=9, color=BLUE_RAMP[7],
@@ -310,6 +331,38 @@ def main() -> int:
     comparison["rollouts_measured"] = sum(
         1 for p in plans if p.get("refused") is None)
     comparison["quality_floor"] = float(a.quality_floor)
+    for name in ("seed", "checkpoint", "checkpoint_episode", "lag_lambda",
+                 "run_name", "plans_per_weight"):
+        if name in swept_doc:
+            comparison[name] = swept_doc[name]
+    if "seed" not in comparison:
+        # A front written before the sweep put the seed on the file. The
+        # checkpoint it names is the authority, so read it there rather than
+        # parsing a run name: five seeds are compared as a set and a set
+        # keyed on a guess is a set that is wrong quietly.
+        from alphagrad.approx.common.checkpoint import read_ppo_meta
+        comparison["seed"] = int(
+            read_ppo_meta(swept_doc["checkpoint"])["args"]["seed"])
+    # ---- THE LIKE-FOR-LIKE ARCHIVE ------------------------------------
+    # The swept front is ONE checkpoint. The archive is the union over the
+    # whole run. The window keeps the points that entered the front in its
+    # last `--archive-window` episodes, and the coverage against that set is
+    # the one the two sides can both be held to. The nadir does not move:
+    # the window is a subset of the archive the nadir was taken over, so all
+    # three hypervolumes stay in one space.
+    archive_late_doc = psweep.front_window(archive_doc, a.archive_window)
+    archive_late = psweep.front_points(archive_late_doc, objectives)
+    ref = np.asarray(comparison["nadir"], dtype=np.float64)
+    comparison["archive_window_episodes"] = int(a.archive_window)
+    comparison["archive_window_since_episode"] = int(
+        archive_late_doc["window_since_episode"])
+    comparison["num_archive_late"] = int(archive_late.shape[0])
+    comparison["coverage_swept_of_archive_late"] = psweep.set_coverage(
+        swept, archive_late)
+    comparison["coverage_archive_late_of_swept"] = psweep.set_coverage(
+        archive_late, swept)
+    comparison["hypervolume_archive_late"] = psweep.hypervolume_of(
+        archive_late, ref)
     table = psweep.per_weight_table(plans, a.quality_floor)
     comparison["per_weight"] = table
 
@@ -320,14 +373,21 @@ def main() -> int:
     with open(out_md, "w") as fh:
         fh.write(table_markdown(table, objectives))
     out_png = os.path.join(a.out, "preference_front.png")
-    figure(out_png, swept_doc, archive_doc, plans, table, objectives,
-           comparison)
+    figure(out_png, swept_doc, archive_doc, archive_late_doc, plans, table,
+           objectives, comparison)
     print(f"[compare] swept {comparison['num_swept']} points, archive "
-          f"{comparison['num_archive']}; coverage swept-of-archive "
+          f"{comparison['num_archive']}, archive since episode "
+          f"{comparison['archive_window_since_episode']} "
+          f"{comparison['num_archive_late']}", flush=True)
+    print(f"[compare] coverage swept-of-archive "
           f"{comparison['coverage_swept_of_archive']:.3f}, archive-of-swept "
-          f"{comparison['coverage_archive_of_swept']:.3f}; hypervolume "
-          f"{comparison['hypervolume_swept']:.6g} against "
-          f"{comparison['hypervolume_archive']:.6g} under nadir "
+          f"{comparison['coverage_archive_of_swept']:.3f}, swept-of-late "
+          f"{comparison['coverage_swept_of_archive_late']:.3f}, "
+          f"late-of-swept {comparison['coverage_archive_late_of_swept']:.3f}",
+          flush=True)
+    print(f"[compare] hypervolume swept {comparison['hypervolume_swept']:.6g}, "
+          f"archive {comparison['hypervolume_archive']:.6g}, archive-late "
+          f"{comparison['hypervolume_archive_late']:.6g}, under nadir "
           f"{comparison['nadir']}", flush=True)
     print(f"[compare] {out_json}\n[compare] {out_md}\n[compare] {out_png}",
           flush=True)

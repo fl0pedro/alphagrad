@@ -289,6 +289,71 @@ def test_the_nadir_does_not_move_when_the_fronts_are_swapped():
     assert np.allclose(psweep.shared_nadir(a, b), psweep.shared_nadir(b, a))
 
 
+# ---------------------------------------------------------------------------
+# THE LIKE-FOR-LIKE ARCHIVE WINDOW.
+# ---------------------------------------------------------------------------
+def _dated_front():
+    return {"objectives": ["latency", "peak_memory"], "episode": 2000,
+            "front": [
+                {"obj": {"latency": +0.07, "peak_memory": -0.45},
+                 "episode": 105},
+                {"obj": {"latency": -0.05, "peak_memory": +0.00},
+                 "episode": 1851},
+                {"obj": {"latency": -0.08, "peak_memory": +0.00},
+                 "episode": 1927},
+                {"obj": {"latency": +0.03, "peak_memory": -0.01},
+                 "episode": 1800},
+            ]}
+
+
+def test_the_archive_window_keeps_only_the_points_admitted_late():
+    """The like-for-like set for a checkpoint's swept front.
+
+    A `pareto_front.json` is a lifetime union. A point admitted at episode
+    105 stays on it whether or not the final policy can still produce that
+    plan, so the union is not what one checkpoint can be held to.
+    """
+    doc = _dated_front()
+    late = psweep.front_window(doc, 200)
+    assert late["window_since_episode"] == 1800
+    assert late["num_points"] == 3
+    assert [p["episode"] for p in late["front"]] == [1851, 1927, 1800]
+    assert psweep.front_window(doc, 100)["num_points"] == 2
+    # The window is a READ. The document it came from is untouched.
+    assert len(doc["front"]) == 4
+
+
+def test_the_archive_window_refuses_a_front_that_cannot_date_itself():
+    with pytest.raises(ValueError, match="carries no 'episode'"):
+        psweep.front_window(
+            {"objectives": ["latency", "peak_memory"], "front": []}, 200)
+    with pytest.raises(ValueError, match="at least one episode"):
+        psweep.front_window({"episode": 10, "front": []}, 0)
+
+
+def test_the_window_changes_the_coverage_the_sweep_is_judged_against():
+    doc = {"objectives": ["latency", "peak_memory"], "episode": 2000,
+           "front": [
+               {"obj": {"latency": +0.5, "peak_memory": -0.5},
+                "episode": 100},
+               {"obj": {"latency": +0.1, "peak_memory": +0.1},
+                "episode": 1990},
+           ]}
+    swept = np.array([[0.0, 0.0]])
+    full = psweep.front_points(doc, ("latency", "peak_memory"))
+    late = psweep.front_points(psweep.front_window(doc, 200),
+                               ("latency", "peak_memory"))
+    assert psweep.set_coverage(swept, full) == 0.5
+    assert psweep.set_coverage(swept, late) == 1.0
+
+
+def test_hypervolume_of_negates_once_and_is_empty_safe():
+    ref = psweep.shared_nadir(np.array([[-1.0, -1.0]]))
+    assert psweep.hypervolume_of(np.empty((0, 2)), ref) == 0.0
+    assert psweep.hypervolume_of(np.array([[-1.0, -1.0]]),
+                                 ref) == pytest.approx(1.0)
+
+
 def test_per_weight_table_reports_the_band_and_the_feasible_fraction():
     plans = [_plan((1.0, 0.0, 0.0), -0.5, 0.2, quality=0.95),
              _plan((1.0, 0.0, 0.0), -0.3, 0.3, quality=0.5),

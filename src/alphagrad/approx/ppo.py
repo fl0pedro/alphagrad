@@ -17708,6 +17708,10 @@ def main(args=None):
             "source": "preference sweep at inference (ticket dsnn-dfw.86)",
             "checkpoint": _PSWEEP_PATH,
             "checkpoint_episode": int(_PSWEEP_META["episode"]),
+            # THE SEED THE POLICY WAS TRAINED UNDER, on the file. Five swept
+            # fronts are read as one set, and a set joined on a file path is
+            # a set that one move of the data breaks.
+            "seed": int(args.seed),
             "weights": [list(w) for w in _PSWEEP_W],
             "plans_per_weight": int(args.preference_sweep_plans),
             "num_envs": int(args.num_envs),
