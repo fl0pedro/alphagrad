@@ -1271,8 +1271,8 @@ def test_every_recurrent_row_carries_the_nn256_and_tlm_flags_unchanged(
     """The strongest form of "everything else matches": diff each recurrent
     row against its own arm-and-seed twin on each core target.  The ONLY
     keys allowed to differ are the run name, the three that say which
-    target this is, the face-head init, the PopArt magnitude-scaling flags
-    and (for condC on NN256) the episode count.
+    target this is, the face-head init, the face-entropy weight, the PopArt
+    magnitude-scaling flags and (for condC on NN256) the episode count.
 
     --ray-measure is excluded because it is the node's GPU count minus one
     and the rows are spread over nodes of several sizes;
@@ -1288,11 +1288,19 @@ def test_every_recurrent_row_carries_the_nn256_and_tlm_flags_unchanged(
     one, and a recurrent condC row shares neither TLM condC's own init nor
     either twin's PopArt form) -- this test's job is that NOTHING ELSE
     differs.
+
+    The face-entropy weight is excluded too (owner ruling 2026-09-21,
+    dsnn-dfw.84 and dsnn-dfw.78), but NOT wholesale: the recurrent row
+    renders 0.005 against its NN256 twin's 0.05 (always a diff) and against
+    its TLM twin's OWN 0.005 (never a diff, since TLM is on the same number).
+    Both directions are asserted below; the actual values are pinned by
+    `test_every_arm_carries_the_shared_thesis_flags` above.
     """
     node_derived = {"--ray-measure"}
     face_init = {"--face-none-bias", "--face-init-approx-per-plan",
                  "--face-init-skips-per-plan"}
     popart_flags = {"--advantage-norm", "--no-symlog", "--symlog-channels"}
+    entropy_weight = {"--face-entropy-weight"}
     target_keys = {"--name", "--example", "--dataset", "--temporal-rule"}
     by_key = {(a["thesis_arm"], a["thesis_target"], a["thesis_seed"]): a
               for a in core}
@@ -1306,6 +1314,15 @@ def test_every_recurrent_row_carries_the_nn256_and_tlm_flags_unchanged(
             diff -= node_derived
             diff -= face_init
             diff -= popart_flags
+            if t == "nn256":
+                # the recurrent row renders 0.005 (dsnn-dfw.84 and
+                # dsnn-dfw.78) against NN256's 0.05: always a real diff.
+                assert "--face-entropy-weight" in diff, (a["name"], t)
+            else:
+                # TLM is on the SAME 0.005 as the recurrent target, so this
+                # key does not even appear as a diff against the TLM twin.
+                assert "--face-entropy-weight" not in diff, (a["name"], t)
+            diff -= entropy_weight
             if _is_long_episodes(twin):
                 # the NN256 twin runs the long budget; the recurrent row is
                 # not on that ruling
