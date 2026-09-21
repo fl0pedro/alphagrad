@@ -188,7 +188,7 @@ def figure(path, swept_doc, archive_doc, plans, table, objectives, comparison):
     ax_a.set_ylabel("memory, log ratio", color=INK_2, fontsize=10)
     ax_a.set_title("A  the front, coloured by the preference that produced it",
                    color=INK, fontsize=11, loc="left", pad=10)
-    ax_a.text(0.015, 0.985,
+    ax_a.text(0.015, 0.02,
               f"coverage: swept of archive "
               f"{comparison['coverage_swept_of_archive']:.2f}, archive of "
               f"swept {comparison['coverage_archive_of_swept']:.2f}\n"
@@ -197,7 +197,7 @@ def figure(path, swept_doc, archive_doc, plans, table, objectives, comparison):
               + (f"\n{outside} of {len(ok)} rollouts lie outside this view"
                  if outside else ""),
               transform=ax_a.transAxes, fontsize=8.5, color=INK_2,
-              va="top", ha="left", linespacing=1.5)
+              va="bottom", ha="left", linespacing=1.5)
     handles = [
         Line2D([], [], marker="o", ls="none", ms=6.5, mfc="none",
                mec=MUTED, mew=1.4,
@@ -208,7 +208,7 @@ def figure(path, swept_doc, archive_doc, plans, table, objectives, comparison):
                mec=SURFACE, mew=1.6,
                label=f"swept front ({s_med.shape[0] if s_med.size else 0})"),
     ]
-    ax_a.legend(handles=handles, loc="lower right", frameon=False,
+    ax_a.legend(handles=handles, loc="center right", frameon=False,
                 fontsize=9, labelcolor=INK_2, handletextpad=0.6)
     cb = fig.colorbar(
         plt.cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax_a,
@@ -248,17 +248,20 @@ def figure(path, swept_doc, archive_doc, plans, table, objectives, comparison):
 
     fig.text(0.008, 0.012,
              f"Lower is better on both axes; 0 is parity with the paired "
-             f"reverse-exact reference. Panel A's bars are each point's own "
-             f"90 percent distribution-free interval for the median of its "
-             f"pooled per-window paired log ratios; panel B's are the same "
-             f"interval over the "
+             f"reverse-exact reference.\n"
+             f"Panel A's bars are each point's own 90 percent "
+             f"distribution-free interval for the median of its pooled "
+             f"per-window paired log ratios; panel B's is the same interval "
+             f"over the "
              f"{max((r['n'] for r in table if r['n']), default=0)} plans of "
-             f"that weight. Hypervolume for both fronts under ONE nadir, "
+             f"that weight.\n"
+             f"Hypervolume for both fronts under ONE nadir, "
              f"{np.array2string(np.asarray(comparison['nadir']), precision=4)}"
              f", in {comparison['nadir_space']}. Quality floor "
              f"{comparison['quality_floor']:g} on grad-cosine.",
-             fontsize=7.5, color=MUTED, ha="left", va="bottom")
-    fig.subplots_adjust(left=0.065, right=0.965, top=0.91, bottom=0.16)
+             fontsize=7.5, color=MUTED, ha="left", va="bottom",
+             linespacing=1.6)
+    fig.subplots_adjust(left=0.065, right=0.965, top=0.91, bottom=0.20)
     fig.savefig(path, facecolor=SURFACE)
     return path
 
