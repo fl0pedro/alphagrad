@@ -225,7 +225,7 @@ def test_the_boundary_runs_after_the_checkpoint_in_the_episode_loop():
     import alphagrad.approx.ppo as ppo
 
     src = inspect.getsource(ppo.main)
-    loop = src[src.index("for ep in range(_ep_start, args.episodes):"):]
+    loop = src[src.index("for ep in range(_ep_start, _LOOP_EPISODES):"):]
     # The first iteration's body, up to the next rollout dispatch.
     head = loop[:loop.index("set_walk_episode")]
     assert "_ckpt_write(ep)" in head, head[:400]
