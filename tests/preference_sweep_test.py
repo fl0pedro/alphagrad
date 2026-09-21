@@ -410,3 +410,52 @@ def test_the_shared_nadir_ignores_a_front_that_is_not_measured_yet():
     assert np.allclose(with_empty, without)
     with pytest.raises(ValueError, match="at least one non-empty front"):
         psweep.shared_nadir(np.empty((0, 2)))
+
+
+def test_the_member_window_counts_a_point_re_measured_late():
+    """The owner's ruling of 2026-09-21, and the seed it was made for.
+
+    Seed 250197's archive admitted nothing after episode 824, so the
+    admission window over the last 200 episodes is EMPTY and says nothing.
+    A point whose member plans were still measuring inside its band at
+    episode 1990 is a point the late policy was still producing.
+    """
+    doc = {"objectives": ["latency", "peak_memory"], "episode": 2000,
+           "front": [
+               {"obj": {"latency": -0.09, "peak_memory": +0.00},
+                "episode": 824,
+                "members": [{"last_episode": 1990}, {"last_episode": 830}]},
+               {"obj": {"latency": +0.10, "peak_memory": -0.68},
+                "episode": 193,
+                "members": [{"last_episode": 200}]},
+               {"obj": {"latency": +0.02, "peak_memory": -0.01},
+                "episode": 1900, "members": []},
+           ]}
+    admitted = psweep.front_window(doc, 200, by="admitted")
+    members = psweep.front_window(doc, 200, by="members")
+    assert [p["episode"] for p in admitted["front"]] == [1900]
+    assert [p["episode"] for p in members["front"]] == [824, 1900]
+    assert admitted["window_by"] == "admitted"
+    assert members["window_by"] == "members"
+    # A point with no member list falls back to its own admission episode,
+    # which is all such a point knows.
+    assert 1900 in [p["episode"] for p in members["front"]]
+
+
+def test_the_member_window_contains_the_admitted_one():
+    doc = {"objectives": ["latency", "peak_memory"], "episode": 1000,
+           "front": [{"obj": {"latency": 0.0, "peak_memory": 0.0},
+                      "episode": ep,
+                      "members": [{"last_episode": ep}]}
+                     for ep in (10, 500, 900, 999)]}
+    admitted = {p["episode"] for p in
+                psweep.front_window(doc, 200, by="admitted")["front"]}
+    members = {p["episode"] for p in
+               psweep.front_window(doc, 200, by="members")["front"]}
+    assert admitted == {900, 999}
+    assert admitted <= members
+
+
+def test_an_unknown_window_rule_raises():
+    with pytest.raises(ValueError, match="admitted or members"):
+        psweep.front_window({"episode": 10, "front": []}, 5, by="guess")

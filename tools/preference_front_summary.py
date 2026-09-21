@@ -28,6 +28,17 @@ import numpy as np
 from alphagrad.approx.common import preference_sweep as psweep
 
 
+#: What each window reading means, on the table that uses it.
+WINDOW_NOTE = {
+    "admitted": "A point is late when it ENTERED the front inside the "
+                "window.",
+    "members": "A point is late when a MEMBER PLAN of it measured inside its "
+               "band inside the window (owner ruling 2026-09-21). A plan "
+               "re-measured late counts as late, so this set contains the "
+               "admitted one.",
+}
+
+
 def make_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--comparison", action="append", default=[],
@@ -54,16 +65,27 @@ def _load(path, objectives):
         swept_doc = json.load(fh)
     with open(cmp_doc["archive_front"]) as fh:
         archive_doc = json.load(fh)
-    late_doc = psweep.front_window(
-        archive_doc, int(cmp_doc["archive_window_episodes"]))
-    return {
+    window = int(cmp_doc["archive_window_episodes"])
+    out = {
         "comparison": cmp_doc,
         "seed": int(cmp_doc.get("seed", -1)),
         "plans": psweep.load_plan_records(cmp_doc["plans"]),
         "swept": psweep.front_points(swept_doc, objectives),
         "archive": psweep.front_points(archive_doc, objectives),
-        "late": psweep.front_points(late_doc, objectives),
+        "archive_window_episodes": window,
     }
+    out.update(_windows(archive_doc, window, objectives))
+    return out
+
+
+def _windows(archive_doc, window, objectives) -> dict:
+    """Both readings of the window (owner ruling 2026-09-21), as points."""
+    out = {}
+    for by in psweep.WINDOW_SETS:
+        doc = psweep.front_window(archive_doc, int(window), by=by)
+        out[f"late_{by}"] = psweep.front_points(doc, objectives)
+        out["archive_window_since_episode"] = int(doc["window_since_episode"])
+    return out
 
 
 def _load_archive_only(spec, window, objectives):
@@ -73,43 +95,44 @@ def _load_archive_only(spec, window, objectives):
     seed, path = spec.split("=", 1)
     with open(path) as fh:
         archive_doc = json.load(fh)
-    late_doc = psweep.front_window(archive_doc, int(window))
-    return {
+    out = {
         "comparison": None,
         "seed": int(seed),
         "plans": [],
         "swept": np.empty((0, len(objectives)), dtype=np.float64),
         "archive": psweep.front_points(archive_doc, objectives),
-        "late": psweep.front_points(late_doc, objectives),
         "archive_window_episodes": int(window),
-        "archive_window_since_episode": int(late_doc["window_since_episode"]),
     }
+    out.update(_windows(archive_doc, window, objectives))
+    return out
 
 
-def seed_table(rows) -> str:
+def seed_table(rows, by: str) -> str:
+    """One table per window reading. `by` names the set every column uses."""
     lines = [
-        "| seed | swept | archive | archive late | C(swept,arch) | "
-        "C(arch,swept) | C(swept,late) | C(late,swept) | HV swept | "
-        "HV archive | HV late |",
+        f"| seed | swept | archive | late ({by}) | C(swept,arch) | "
+        f"C(arch,swept) | C(swept,late) | C(late,swept) | HV swept | "
+        f"HV archive | HV late ({by}) |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | "
         "---: | ---: |",
     ]
     for r in rows:
         if not r["swept_measured"]:
             lines.append(
-                f"| {r['seed']} | - | {r['num_archive']} | {r['num_late']} | "
-                f"- | - | - | - | - | {r['hypervolume_archive']:.4g} | "
-                f"{r['hypervolume_late']:.4g} |")
+                f"| {r['seed']} | - | {r['num_archive']} | "
+                f"{r[f'num_late_{by}']} | - | - | - | - | - | "
+                f"{r['hypervolume_archive']:.4g} | "
+                f"{r[f'hypervolume_late_{by}']:.4g} |")
             continue
         lines.append(
             f"| {r['seed']} | {r['num_swept']} | {r['num_archive']} | "
-            f"{r['num_late']} | {r['coverage_swept_of_archive']:.2f} | "
+            f"{r[f'num_late_{by}']} | {r['coverage_swept_of_archive']:.2f} | "
             f"{r['coverage_archive_of_swept']:.2f} | "
-            f"{r['coverage_swept_of_late']:.2f} | "
-            f"{r['coverage_late_of_swept']:.2f} | "
+            f"{r[f'coverage_swept_of_late_{by}']:.2f} | "
+            f"{r[f'coverage_late_{by}_of_swept']:.2f} | "
             f"{r['hypervolume_swept']:.4g} | "
             f"{r['hypervolume_archive']:.4g} | "
-            f"{r['hypervolume_late']:.4g} |")
+            f"{r[f'hypervolume_late_{by}']:.4g} |")
     return "\n".join(lines) + "\n"
 
 
@@ -158,23 +181,17 @@ def main() -> int:
     rows = []
     for r in sorted(runs, key=lambda x: x["seed"]):
         cmp_doc = r["comparison"] or {}
-        rows.append({
+        row = {
             "seed": r["seed"],
             "swept_measured": r["comparison"] is not None,
             "num_swept": int(r["swept"].shape[0]),
             "num_archive": int(r["archive"].shape[0]),
-            "num_late": int(r["late"].shape[0]),
             "coverage_swept_of_archive": psweep.set_coverage(
                 r["swept"], r["archive"]),
             "coverage_archive_of_swept": psweep.set_coverage(
                 r["archive"], r["swept"]),
-            "coverage_swept_of_late": psweep.set_coverage(
-                r["swept"], r["late"]),
-            "coverage_late_of_swept": psweep.set_coverage(
-                r["late"], r["swept"]),
             "hypervolume_swept": psweep.hypervolume_of(r["swept"], ref),
             "hypervolume_archive": psweep.hypervolume_of(r["archive"], ref),
-            "hypervolume_late": psweep.hypervolume_of(r["late"], ref),
             "rollouts": int(cmp_doc.get("rollouts", 0)),
             "rollouts_measured": int(cmp_doc.get("rollouts_measured", 0)),
             "archive_window_episodes": int(cmp_doc.get(
@@ -183,7 +200,16 @@ def main() -> int:
             "archive_window_since_episode": int(cmp_doc.get(
                 "archive_window_since_episode",
                 r.get("archive_window_since_episode", -1))),
-        })
+        }
+        for by in psweep.WINDOW_SETS:
+            late = r[f"late_{by}"]
+            row[f"num_late_{by}"] = int(late.shape[0])
+            row[f"coverage_swept_of_late_{by}"] = psweep.set_coverage(
+                r["swept"], late)
+            row[f"coverage_late_{by}_of_swept"] = psweep.set_coverage(
+                late, r["swept"])
+            row[f"hypervolume_late_{by}"] = psweep.hypervolume_of(late, ref)
+        rows.append(row)
     pooled_plans = [p for r in runs for p in r["plans"]]
     pooled = psweep.per_weight_table(pooled_plans, a.quality_floor)
     by_w = {}
@@ -220,8 +246,9 @@ def main() -> int:
         f"in {doc['nadir_space']}.\n\n"
         f"## Per weight, pooled over the swept seeds\n\n"
         + weight_table(pooled, objectives)
-        + f"\n## Per seed\n\n"
-        + seed_table(rows))
+        + "".join(f"\n## Per seed, the window taken by {by}\n\n"
+                  + WINDOW_NOTE[by] + "\n\n" + seed_table(rows, by)
+                  for by in psweep.WINDOW_SETS))
     out_md = os.path.join(a.out, "preference_sweep_summary.md")
     with open(out_md, "w") as fh:
         fh.write(body)

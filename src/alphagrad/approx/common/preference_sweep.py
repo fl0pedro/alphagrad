@@ -190,16 +190,29 @@ def front_points(doc: dict, objectives) -> np.ndarray:
     return np.asarray(pts, dtype=np.float64).reshape(-1, len(objectives))
 
 
-def front_window(doc: dict, window: int) -> dict:
-    """The front restricted to the points admitted in its last `window` episodes.
+#: How a point may fall inside the archive window (owner ruling 2026-09-21).
+#: Both are reported, side by side, and every number says which it used.
+WINDOW_SETS = ("admitted", "members")
+
+
+def front_window(doc: dict, window: int, by: str = "admitted") -> dict:
+    """The front restricted to its last `window` episodes, by one of two rules.
 
     A `pareto_front.json` is a LIFETIME UNION. A point admitted at episode 63
     stays on the front for the rest of the run, whether or not the policy can
     still produce that plan. A swept front comes from ONE checkpoint, so
     comparing it against the whole union measures the run's exploration and
-    not its final policy. This is the like-for-like set: the points whose own
-    `episode` -- the episode they entered the front at -- falls in the last
-    `window` episodes of the run.
+    not its final policy. The window is the like-for-like set, and there are
+    two readings of it:
+
+    * ``admitted``: the point's own `episode`, the episode it ENTERED the
+      front at. A point that was found early and has been produced ever since
+      is outside it.
+    * ``members``: the last episode any MEMBER PLAN of the point measured
+      inside its band. A plan re-measured late counts as late (owner ruling
+      2026-09-21), so this set contains the ``admitted`` one and says which
+      points the run was still producing. A point with no member list falls
+      back to its admission episode, which is all such a point knows.
 
     The end of the run is the dump's own `episode` field. A document without
     one RAISES: guessing the end from the points would move the window
@@ -208,6 +221,10 @@ def front_window(doc: dict, window: int) -> dict:
     if int(window) < 1:
         raise ValueError(
             f"an archive window needs at least one episode, got {window!r}")
+    if by not in WINDOW_SETS:
+        raise ValueError(
+            f"an archive window is taken {' or '.join(WINDOW_SETS)}, not "
+            f"{by!r}")
     if "episode" not in doc:
         raise ValueError(
             "this front document carries no 'episode', so the last "
@@ -216,11 +233,22 @@ def front_window(doc: dict, window: int) -> dict:
     since = end - int(window)
     out = dict(doc)
     out["front"] = [p for p in doc.get("front") or ()
-                    if int(p.get("episode", -1)) >= since]
+                    if _point_episode(p, by) >= since]
     out["num_points"] = len(out["front"])
     out["window_episodes"] = int(window)
     out["window_since_episode"] = int(since)
+    out["window_by"] = str(by)
     return out
+
+
+def _point_episode(point: dict, by: str) -> int:
+    """The episode a window rule dates one front point by."""
+    admitted = int(point.get("episode", -1))
+    if by == "admitted":
+        return admitted
+    last = [int(m["last_episode"]) for m in point.get("members") or ()
+            if "last_episode" in m]
+    return max(last) if last else admitted
 
 
 def set_coverage(a, b) -> float:
