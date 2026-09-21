@@ -137,10 +137,10 @@ def _quiet_corners(xs, ys, xlim, ylim):
     x = np.asarray(xs, dtype=np.float64).reshape(-1)
     y = np.asarray(ys, dtype=np.float64).reshape(-1)
     boxes = [
-        (0.015, 0.02, "left", "bottom", "lower left", 0.62, 0.30, True),
-        (0.985, 0.02, "right", "bottom", "lower right", 0.38, 0.30, False),
-        (0.015, 0.98, "left", "top", "upper left", 0.62, 0.70, True),
-        (0.985, 0.98, "right", "top", "upper right", 0.38, 0.70, False),
+        (0.015, 0.02, "left", "bottom", "lower left", 0.62, 0.25, True),
+        (0.985, 0.02, "right", "bottom", "lower right", 0.38, 0.25, False),
+        (0.015, 0.98, "left", "top", "upper left", 0.62, 0.75, True),
+        (0.985, 0.98, "right", "top", "upper right", 0.38, 0.75, False),
     ]
     if x.size == 0:
         return [(b[0], b[1], b[2], b[3], b[4], 0) for b in boxes]
@@ -293,9 +293,11 @@ def figure(path, swept_doc, archive_doc, late_docs, plans, table,
                mec=SURFACE, mew=1.6,
                label=f"swept front ({s_med.shape[0] if s_med.size else 0})"),
     ]
-    # The legend takes the next emptiest corner, so the panel's two blocks of
-    # text cannot land on each other and neither sits on the marks.
-    ax_a.legend(handles=handles, loc=_corners[1][4], frameon=False,
+    # The legend takes the emptiest corner in the OTHER half of the panel.
+    # The coverage block is three long lines and spans most of the width, so
+    # a legend beside it is a legend on top of it whatever the counts say.
+    _leg = next(c for c in _corners if c[3] != _tva)
+    ax_a.legend(handles=handles, loc=_leg[4], frameon=False,
                 fontsize=9, labelcolor=INK_2, handletextpad=0.6)
     cb = fig.colorbar(
         plt.cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax_a,
