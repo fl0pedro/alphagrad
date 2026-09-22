@@ -133,11 +133,31 @@ TARGET_KL = "0.1"
 CACHE_CLEAR_EVERY = "100"
 #: What every row `thesis_arm` emits now carries beside its target shape.
 CLEAR_ENV = {"ALPHAGRAD_MEASURE_CACHE_CLEAR_EVERY": CACHE_CLEAR_EVERY}
+#: THE ACTOR PROCESS RECYCLE (dsnn-dfw.99 follow-up, owner ruling
+#: 2026-09-22, 08:58): the in-process clear above does not return the
+#: executables' device memory to the pool, so every row `thesis_arm` emits
+#: also exports these two, on the SAME footprint as CACHE_CLEAR_EVERY
+#: above.  The order-only tuning rows and the three sweep rounds keep both
+#: off too.
+RECYCLE_RETRY_ON_OOM = "1"
+PROACTIVE_RECYCLE_EVERY = "100"
+RECYCLE_ENV = {
+    "ALPHAGRAD_RECYCLE_RETRY_ON_OOM": RECYCLE_RETRY_ON_OOM,
+    "ALPHAGRAD_PROACTIVE_RECYCLE_EVERY": PROACTIVE_RECYCLE_EVERY,
+}
+#: What every row `thesis_arm` emits now carries beside its target shape:
+#: the retention bound and the process recycle together.
+MATRIX_ENV = {**CLEAR_ENV, **RECYCLE_ENV}
 #: THE FACE-ENTROPY WEIGHT PER FAMILY (owner ruling 2026-09-21, dsnn-dfw.84
 #: and dsnn-dfw.78): the recurrent target and TLM render the near-zero
 #: bonus; NN256 keeps the campaign's 0.05.
 ENTROPY_WEIGHT_LOW = "0.005"
 ENTROPY_WEIGHT_NN256 = "0.05"
+#: THE FACE-WIRE BUDGET (owner ruling 2026-09-22, dsnn-dfw.104): TLM alone
+#: renders the raised budget; every other thesis target keeps the
+#: campaign's 64.
+FACE_WIRE_FACES = "64"
+TLM_FACE_WIRE_FACES = "128"
 
 _PLACEHOLDER = re.compile(r"\$\{([A-Z0-9_]+):\?[^}]*\}")
 _EXPORT = re.compile(r"^\s*export\s+([A-Za-z_][A-Za-z0-9_]*)=", re.M)
@@ -401,7 +421,13 @@ def test_every_arm_carries_the_shared_thesis_flags(gen, matrix):
         # the measurement protocol
         assert cli["--measure-pipeline"] == "1", a["name"]
         assert cli["--tokenize-where"] == "local", a["name"]
-        assert cli["--face-wire-faces"] == "64", a["name"]
+        # dsnn-dfw.104 (owner ruling 2026-09-22): TLM alone renders the
+        # raised face-wire budget; every other target keeps the campaign's.
+        want_faces = (TLM_FACE_WIRE_FACES if a["thesis_target"] == "tlm"
+                      else FACE_WIRE_FACES)
+        assert cli["--face-wire-faces"] == want_faces, a["name"]
+        assert gen.CAMPAIGN_FACE_WIRE_FACES == FACE_WIRE_FACES
+        assert gen.THESIS_TLM_FACE_WIRE_FACES == TLM_FACE_WIRE_FACES
         assert cli["--ray-measure-timeout"] == "600", a["name"]
         assert cli["--rollout-shards"] == "1", a["name"]
         # the gate inputs, resolved from THIS arm's order
@@ -487,13 +513,15 @@ def test_the_targets_are_the_ones_the_owner_named(gen, matrix):
             assert cli["--example"] == "NeuralNetwork", a["name"]
             assert cli["--dataset"] == "mnist", a["name"]
             assert a["env"] == {"ALPHAGRAD_NN_HIDDEN": "256",
-                                **CLEAR_ENV}, a["name"]
+                                **MATRIX_ENV}, a["name"]
+            assert cli["--face-wire-faces"] == FACE_WIRE_FACES, a["name"]
             text = gen.render(a)
             assert "export ALPHAGRAD_NN_HIDDEN=256\n" in text, a["name"]
         elif a["thesis_target"] == "tlm":
             assert cli["--example"] == "TransformerLM", a["name"]
             assert cli["--dataset"] == "wikitext2", a["name"]
-            assert a["env"] == CLEAR_ENV, a["name"]
+            assert a["env"] == MATRIX_ENV, a["name"]
+            assert cli["--face-wire-faces"] == TLM_FACE_WIRE_FACES, a["name"]
             text = gen.render(a)
             assert "ALPHAGRAD_NN_HIDDEN" not in text, a["name"]
         else:
@@ -502,7 +530,8 @@ def test_the_targets_are_the_ones_the_owner_named(gen, matrix):
             assert cli["--dataset"] == RSNN_DATASET, a["name"]
             # the recurrent target's shape is module constants of
             # common/rsnn_shd.py, not an environment variable
-            assert a["env"] == CLEAR_ENV, a["name"]
+            assert a["env"] == MATRIX_ENV, a["name"]
+            assert cli["--face-wire-faces"] == FACE_WIRE_FACES, a["name"]
             text = gen.render(a)
             assert "ALPHAGRAD_NN_HIDDEN" not in text, a["name"]
     # the hidden width really is read from that variable and has no flag
@@ -970,7 +999,7 @@ def test_no_thesis_launcher_exports_an_xla_flag_or_a_promoted_var(gen,
 def test_every_export_in_a_thesis_launcher_is_allowed(gen, matrix, smoke):
     allowed = set(gen.THESIS_ENV_ALLOWED)
     assert allowed == (set(gen.CAMPAIGN_ENV_ALLOWED)
-                       | {"ALPHAGRAD_NN_HIDDEN"} | set(CLEAR_ENV))
+                       | {"ALPHAGRAD_NN_HIDDEN"} | set(MATRIX_ENV))
     for a in matrix + smoke:
         exported = set(_EXPORT.findall(gen.render(a)))
         assert exported <= allowed, (a["name"], sorted(exported - allowed))
@@ -1129,13 +1158,17 @@ def test_the_smoke_is_the_three_runs_the_owner_asked_for(gen, smoke):
     assert _cli(gen, first)["--grad-oracle-cadence"] == "10"
     assert "--preference-conditioned" not in _cli(gen, first)
     assert _cli(gen, resume)["--grad-oracle-cadence"] == "10"
+    # dsnn-dfw.104: the TLM smoke rows render the raised face-wire budget too.
+    assert _cli(gen, first)["--face-wire-faces"] == TLM_FACE_WIRE_FACES
+    assert _cli(gen, resume)["--face-wire-faces"] == TLM_FACE_WIRE_FACES
 
     assert _cli(gen, cond)["--episodes"] == "5"
     assert _cli(gen, cond)["--example"] == "NeuralNetwork"
     assert _cli(gen, cond)["--dataset"] == "mnist"
     assert "--preference-conditioned" in _cli(gen, cond)
     assert _cli(gen, cond)["--reward-mode"] == "lagrangian"
-    assert cond["env"] == {"ALPHAGRAD_NN_HIDDEN": "256", **CLEAR_ENV}
+    assert _cli(gen, cond)["--face-wire-faces"] == FACE_WIRE_FACES
+    assert cond["env"] == {"ALPHAGRAD_NN_HIDDEN": "256", **MATRIX_ENV}
 
 
 def test_the_resume_leg_differs_in_resume_alone(gen, smoke):
@@ -1432,11 +1465,12 @@ def test_no_recurrent_row_carries_an_xla_flag(gen, snn):
     """The same rule the whole matrix runs under, asserted again on the
     recurrent rows on their own: no XLA_*, no JAX_* beyond the shared
     compilation cache, and no per-arm export but the measure actors'
-    retention bound (dsnn-dfw.99), which is an ALPHAGRAD_ variable."""
+    retention bound and process recycle (dsnn-dfw.99), which are
+    ALPHAGRAD_ variables."""
     jax_cache_exports = {f"export {k}={v}" for k, v in gen.JAX_CACHE_ENV}
     jax_cache_mkdir = f"mkdir -p {gen.JAX_CACHE_DIR_EXPR}"
     for a in snn:
-        assert a["env"] == CLEAR_ENV, a["name"]
+        assert a["env"] == MATRIX_ENV, a["name"]
         text = gen.render(a)
         assert "XLA_FLAGS" not in text, a["name"]
         for line in text.splitlines():
@@ -1599,3 +1633,77 @@ def test_the_retention_bound_reaches_every_row_thesis_arm_emits(
     assert var in gen.THESIS_TARGET_ENV_ALLOWED
     assert var in gen.THESIS_ENV_ALLOWED
     assert var not in gen.CAMPAIGN_ENV_ALLOWED
+
+
+def test_the_process_recycle_reaches_every_row_thesis_arm_emits(
+        gen, matrix, smoke):
+    """dsnn-dfw.99, follow-up ruling 2026-09-22 (08:58 cluster time).  The
+    in-process cache clear tested above did not return the executables'
+    device memory to the BFC pool: the resumed cadence test (job 67437)
+    still hit RESOURCE_EXHAUSTED at calls 123/124 and 185/186.  Recycling
+    the ACTOR PROCESS is the fallback, on the SAME footprint as the
+    retention bound: the matrix on every target and the smoke, off on the
+    order-only tuning rows and the three Lagrangian sweep rounds."""
+    retry_var = gen.RECYCLE_RETRY_ON_OOM_VAR
+    every_var = gen.PROACTIVE_RECYCLE_EVERY_VAR
+    assert retry_var == "ALPHAGRAD_RECYCLE_RETRY_ON_OOM"
+    assert every_var == "ALPHAGRAD_PROACTIVE_RECYCLE_EVERY"
+    assert gen.THESIS_RECYCLE_RETRY_ON_OOM == RECYCLE_RETRY_ON_OOM
+    assert gen.THESIS_PROACTIVE_RECYCLE_EVERY == PROACTIVE_RECYCLE_EVERY
+    for a in matrix + smoke:
+        assert a["env"][retry_var] == RECYCLE_RETRY_ON_OOM, a["name"]
+        assert a["env"][every_var] == PROACTIVE_RECYCLE_EVERY, a["name"]
+        text = gen.render(a)
+        assert f"export {retry_var}={RECYCLE_RETRY_ON_OOM}" in text, a["name"]
+        assert (f"export {every_var}={PROACTIVE_RECYCLE_EVERY}"
+               in text), a["name"]
+    off = (gen.orderonly_arms() + gen.orderonly_rsnn_arms()
+           + gen.orderonly_final_arms() + gen.orderonly_tlm_final_arms()
+           + gen.sweepl_arms() + gen.sweepl2_arms() + gen.sweepl3_arms())
+    assert off
+    for a in off:
+        env = a.get("env") or {}
+        assert retry_var not in env, a["name"]
+        assert every_var not in env, a["name"]
+        text = gen.render(a)
+        assert retry_var not in text, a["name"]
+        assert every_var not in text, a["name"]
+    assert {retry_var, every_var} <= gen.THESIS_TARGET_ENV_ALLOWED
+    assert {retry_var, every_var} <= gen.THESIS_ENV_ALLOWED
+    assert not ({retry_var, every_var} & set(gen.CAMPAIGN_ENV_ALLOWED))
+
+
+def test_the_tlm_face_wire_budget_reaches_every_tlm_row_and_no_other(
+        gen, matrix, smoke):
+    """dsnn-dfw.104, owner ruling 2026-09-22.  Vertex 40 of a TLM plan
+    carried 72 live faces at episode 55, past the campaign's 64, and the
+    trainer raised by design.  TLM alone renders the raised budget; every
+    other thesis target keeps the campaign constant, and no opt-out list
+    exists for this one -- it is a property of the target, not a frozen
+    comparison's flag."""
+    assert gen.THESIS_TLM_FACE_WIRE_FACES == TLM_FACE_WIRE_FACES
+    assert gen.CAMPAIGN_FACE_WIRE_FACES == FACE_WIRE_FACES
+    for a in matrix + smoke:
+        cli = _cli(gen, a)
+        if a["thesis_target"] == "tlm":
+            assert cli["--face-wire-faces"] == TLM_FACE_WIRE_FACES, a["name"]
+            assert (f"--face-wire-faces {TLM_FACE_WIRE_FACES}"
+                   in gen.render(a)), a["name"]
+        else:
+            assert cli["--face-wire-faces"] == FACE_WIRE_FACES, a["name"]
+            assert (f"--face-wire-faces {FACE_WIRE_FACES}"
+                   in gen.render(a)), a["name"]
+    # the one order-only row that also targets TLM picks up the raised
+    # budget too: it is the same target, not a different comparison.
+    tlm_final = gen.orderonly_tlm_final_arms()
+    assert tlm_final
+    for a in tlm_final:
+        assert _cli(gen, a)["--face-wire-faces"] == TLM_FACE_WIRE_FACES, \
+            a["name"]
+    # every NN256/recurrent order-only and sweep row keeps the campaign's 64
+    off = (gen.orderonly_arms() + gen.orderonly_rsnn_arms()
+           + gen.orderonly_final_arms()
+           + gen.sweepl_arms() + gen.sweepl2_arms() + gen.sweepl3_arms())
+    assert off
+    for a in off:
+        assert _cli(gen, a)["--face-wire-faces"] == FACE_WIRE_FACES, a["name"]

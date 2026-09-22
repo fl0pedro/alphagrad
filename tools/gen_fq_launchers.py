@@ -2339,6 +2339,29 @@ THESIS_MEASURE_CACHE_CLEAR_EVERY = "100"
 #: THESIS_TARGET_ENV_ALLOWED admits it.
 MEASURE_CACHE_CLEAR_EVERY_VAR = "ALPHAGRAD_MEASURE_CACHE_CLEAR_EVERY"
 
+#: THE ACTOR PROCESS RECYCLE (dsnn-dfw.99, follow-up ruling 2026-09-22,
+#: 08:58 cluster time).  The in-process clear above does not return the
+#: executables' device memory to the BFC pool: the resumed cadence test
+#: (job 67437, ALPHAGRAD_MEASURE_CACHE_CLEAR_EVERY=100) still hit
+#: RESOURCE_EXHAUSTED in two actors at calls 123/124 and 185/186, and
+#: episode 261 refused 5 of 16.  Only recycling the ACTOR PROCESS frees the
+#: pool.  EVERY ROW `thesis_arm` EMITS reads these two, on the SAME
+#: footprint as THESIS_MEASURE_CACHE_CLEAR_EVERY above: the
+#: A/B/C/C_popart/condC matrix on all targets and the smoke.  The
+#: order-only tuning rows call `thesis_cli` directly and the three
+#: Lagrangian sweep rounds pass `retry_on_oom=None,
+#: proactive_recycle_every=None`, so both keep the exports OFF for the same
+#: reason: they are FROZEN running comparisons.  Unset is
+#: cpu_approx_pool.py's own default (no retry on OOM, no proactive
+#: recycle).
+THESIS_RECYCLE_RETRY_ON_OOM = "1"
+THESIS_PROACTIVE_RECYCLE_EVERY = "100"
+
+#: dsnn-dfw.99's two further export names, in ONE place each: the arm below
+#: renders them and THESIS_TARGET_ENV_ALLOWED admits them.
+RECYCLE_RETRY_ON_OOM_VAR = "ALPHAGRAD_RECYCLE_RETRY_ON_OOM"
+PROACTIVE_RECYCLE_EVERY_VAR = "ALPHAGRAD_PROACTIVE_RECYCLE_EVERY"
+
 # ---------------------------------------------------------------------------
 # THE HARDWARE.  Five Blackwell nodes we may use (dsnn-dfw.69, owner ruling
 # 2026-09-20).  pgi15-gpu17 has no matched CUDA 12.9 ptxas or nvlink (job
@@ -2600,7 +2623,8 @@ THESIS_TARGET_ENV = {
 #: any other key, exactly as it refuses every per-arm export on a campaign arm.
 THESIS_TARGET_ENV_ALLOWED = frozenset(
     k for env in THESIS_TARGET_ENV.values() for k in env
-) | {MEASURE_CACHE_CLEAR_EVERY_VAR}
+) | {MEASURE_CACHE_CLEAR_EVERY_VAR, RECYCLE_RETRY_ON_OOM_VAR,
+     PROACTIVE_RECYCLE_EVERY_VAR}
 #: Every `export NAME=` a THESIS launcher may contain: the campaign's allowed
 #: set plus the target-shape variables above.
 THESIS_ENV_ALLOWED = frozenset(CAMPAIGN_ENV_ALLOWED) | THESIS_TARGET_ENV_ALLOWED
@@ -2616,6 +2640,16 @@ def thesis_temporal_rule(target: str) -> str | None:
         raise CampaignRowError(
             f"target {target!r} is not one of {THESIS_TARGETS}")
     return THESIS_TARGET_CLI[target].get("--temporal-rule")
+
+
+#: THE TLM FACE-WIRE BUDGET (dsnn-dfw.104, owner ruling 2026-09-22).
+#: Vertex 40 of a TLM plan carried 72 live faces at episode 55, past
+#: CAMPAIGN_FACE_WIRE_FACES's 64, and the trainer raised by design (the
+#: budget is a hard stop, not a truncation).  Every arm on the TLM target
+#: -- the matrix, the pair launchers and the smoke -- renders this instead
+#: of the campaign constant.  Every other thesis target (nn256 and the four
+#: recurrent rules) keeps CAMPAIGN_FACE_WIRE_FACES.
+THESIS_TLM_FACE_WIRE_FACES = "128"
 
 
 # ---------------------------------------------------------------------------
@@ -3023,7 +3057,10 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
         "--ppo-epochs": ppo_epochs,
         "--minibatches": minibatches,
         "--tokenize-where": CAMPAIGN_TOKENIZE_WHERE,
-        "--face-wire-faces": CAMPAIGN_FACE_WIRE_FACES,
+        # dsnn-dfw.104: TLM alone renders the raised budget; every other
+        # thesis target keeps the campaign constant.
+        "--face-wire-faces": (THESIS_TLM_FACE_WIRE_FACES if target == "tlm"
+                              else CAMPAIGN_FACE_WIRE_FACES),
         # --- the gate inputs (G1's table is resolved from --fixed-order)
         "--gate-offline-contrast": GATE_OFFLINE_CONTRAST[THESIS_ORDER],
         # --- the run
@@ -3087,7 +3124,10 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
                dual_clip: str | None = THESIS_DUAL_CLIP,
                target_kl: str | None = THESIS_TARGET_KL,
                cache_clear_every: str | None =
-               THESIS_MEASURE_CACHE_CLEAR_EVERY) -> dict:
+               THESIS_MEASURE_CACHE_CLEAR_EVERY,
+               retry_on_oom: str | None = THESIS_RECYCLE_RETRY_ON_OOM,
+               proactive_recycle_every: str | None =
+               THESIS_PROACTIVE_RECYCLE_EVERY) -> dict:
     """One thesis run -> one `arm(...)`.  Returns the arm."""
     _require(node in THESIS_NODES,
              f"node {node!r} is not one of the permitted thesis nodes "
@@ -3129,11 +3169,16 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
         # coordinate a reader wants and it is DERIVED from the target, never
         # passed in, so the two cannot disagree.
         thesis_rule=thesis_temporal_rule(target),
-        # dsnn-dfw.99: the retention bound rides with the target shape, and
-        # a row that renders `cache_clear_every=None` drops it again.
+        # dsnn-dfw.99: the retention bound and the process recycle ride
+        # with the target shape, and a row that renders `None` for any of
+        # the three drops that one export again.
         env=dict(THESIS_TARGET_ENV[target],
                  **({MEASURE_CACHE_CLEAR_EVERY_VAR: cache_clear_every}
-                    if cache_clear_every is not None else {})),
+                    if cache_clear_every is not None else {}),
+                 **({RECYCLE_RETRY_ON_OOM_VAR: retry_on_oom}
+                    if retry_on_oom is not None else {}),
+                 **({PROACTIVE_RECYCLE_EVERY_VAR: proactive_recycle_every}
+                    if proactive_recycle_every is not None else {})),
         required_flags=(THESIS_REQUIRED_FLAGS
                         + (DUAL_CLIP_REQUIRED_FLAGS
                            if dual_clip is not None else [])
@@ -3821,6 +3866,9 @@ for _sweepl_tag, _sweepl_overrides in sweepl_configs():
             target_kl=None,
             # dsnn-dfw.99: same reason, keeps the retention bound off too.
             cache_clear_every=None,
+            # dsnn-dfw.99: same reason, keeps the process recycle off too.
+            retry_on_oom=None,
+            proactive_recycle_every=None,
         )
         ARMS[-1]["sweepl"] = True
         ARMS[-1]["sweepl_tag"] = _sweepl_tag
@@ -3986,6 +4034,9 @@ for _sweepl2_tag, _sweepl2_overrides in sweepl2_configs():
             target_kl=None,
             # dsnn-dfw.99: same reason, keeps the retention bound off too.
             cache_clear_every=None,
+            # dsnn-dfw.99: same reason, keeps the process recycle off too.
+            retry_on_oom=None,
+            proactive_recycle_every=None,
         )
         ARMS[-1]["sweepl2"] = True
         ARMS[-1]["sweepl2_tag"] = _sweepl2_tag
@@ -4138,6 +4189,9 @@ for _sweepl3_tag, _sweepl3_overrides in sweepl3_configs():
             target_kl=None,
             # dsnn-dfw.99: same reason, keeps the retention bound off too.
             cache_clear_every=None,
+            # dsnn-dfw.99: same reason, keeps the process recycle off too.
+            retry_on_oom=None,
+            proactive_recycle_every=None,
         )
         ARMS[-1]["sweepl3"] = True
         ARMS[-1]["sweepl3_tag"] = _sweepl3_tag
@@ -5297,6 +5351,20 @@ def _scratch_stack_block(target_env: dict | None = None) -> list[str]:
         L.append("# The on-disk compile cache survives the clear.  ppo.py has no")
         L.append("# flag for it.")
         L.append(f"export {MEASURE_CACHE_CLEAR_EVERY_VAR}={_clear_every}")
+    _retry_on_oom = target_env.pop(RECYCLE_RETRY_ON_OOM_VAR, None)
+    _proactive_recycle = target_env.pop(PROACTIVE_RECYCLE_EVERY_VAR, None)
+    if _retry_on_oom is not None or _proactive_recycle is not None:
+        L.append("")
+        L.append("# THE MEASURE ACTORS' PROCESS RECYCLE (thesis matrix,")
+        L.append("# dsnn-dfw.99 follow-up).  The retention bound above clears the")
+        L.append("# in-process JAX caches but does not return the executables'")
+        L.append("# device memory to the pool; only recycling the actor PROCESS")
+        L.append("# does.  ppo.py has no flag for either.")
+        if _retry_on_oom is not None:
+            L.append(f"export {RECYCLE_RETRY_ON_OOM_VAR}={_retry_on_oom}")
+        if _proactive_recycle is not None:
+            L.append(
+                f"export {PROACTIVE_RECYCLE_EVERY_VAR}={_proactive_recycle}")
     if target_env:
         L.append("")
         L.append("# THE TARGET SHAPE (thesis matrix, ticket dsnn-dfw.4).  The")
