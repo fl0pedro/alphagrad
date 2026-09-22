@@ -125,6 +125,14 @@ DUAL_CLIP = "3.0"
 #: rollout policy.  The order-only tuning rows and the sweep
 #: sections call `thesis_cli` directly and keep the flag off.
 TARGET_KL = "0.1"
+#: THE MEASURE ACTORS' EXECUTABLE RETENTION BOUND (dsnn-dfw.99): every
+#: row `thesis_arm` emits exports the clear cadence, so the actor drops
+#: its in-process JAX caches every 100 measurements instead of holding
+#: one executable per plan until the measure GPU refuses.  The
+#: order-only tuning rows and the three sweep rounds keep it off.
+CACHE_CLEAR_EVERY = "100"
+#: What every row `thesis_arm` emits now carries beside its target shape.
+CLEAR_ENV = {"ALPHAGRAD_MEASURE_CACHE_CLEAR_EVERY": CACHE_CLEAR_EVERY}
 #: THE FACE-ENTROPY WEIGHT PER FAMILY (owner ruling 2026-09-21, dsnn-dfw.84
 #: and dsnn-dfw.78): the recurrent target and TLM render the near-zero
 #: bonus; NN256 keeps the campaign's 0.05.
@@ -478,13 +486,14 @@ def test_the_targets_are_the_ones_the_owner_named(gen, matrix):
         if a["thesis_target"] == "nn256":
             assert cli["--example"] == "NeuralNetwork", a["name"]
             assert cli["--dataset"] == "mnist", a["name"]
-            assert a["env"] == {"ALPHAGRAD_NN_HIDDEN": "256"}, a["name"]
+            assert a["env"] == {"ALPHAGRAD_NN_HIDDEN": "256",
+                                **CLEAR_ENV}, a["name"]
             text = gen.render(a)
             assert "export ALPHAGRAD_NN_HIDDEN=256\n" in text, a["name"]
         elif a["thesis_target"] == "tlm":
             assert cli["--example"] == "TransformerLM", a["name"]
             assert cli["--dataset"] == "wikitext2", a["name"]
-            assert a["env"] == {}, a["name"]
+            assert a["env"] == CLEAR_ENV, a["name"]
             text = gen.render(a)
             assert "ALPHAGRAD_NN_HIDDEN" not in text, a["name"]
         else:
@@ -493,7 +502,7 @@ def test_the_targets_are_the_ones_the_owner_named(gen, matrix):
             assert cli["--dataset"] == RSNN_DATASET, a["name"]
             # the recurrent target's shape is module constants of
             # common/rsnn_shd.py, not an environment variable
-            assert a["env"] == {}, a["name"]
+            assert a["env"] == CLEAR_ENV, a["name"]
             text = gen.render(a)
             assert "ALPHAGRAD_NN_HIDDEN" not in text, a["name"]
     # the hidden width really is read from that variable and has no flag
@@ -960,7 +969,8 @@ def test_no_thesis_launcher_exports_an_xla_flag_or_a_promoted_var(gen,
 
 def test_every_export_in_a_thesis_launcher_is_allowed(gen, matrix, smoke):
     allowed = set(gen.THESIS_ENV_ALLOWED)
-    assert allowed == set(gen.CAMPAIGN_ENV_ALLOWED) | {"ALPHAGRAD_NN_HIDDEN"}
+    assert allowed == (set(gen.CAMPAIGN_ENV_ALLOWED)
+                       | {"ALPHAGRAD_NN_HIDDEN"} | set(CLEAR_ENV))
     for a in matrix + smoke:
         exported = set(_EXPORT.findall(gen.render(a)))
         assert exported <= allowed, (a["name"], sorted(exported - allowed))
@@ -1125,7 +1135,7 @@ def test_the_smoke_is_the_three_runs_the_owner_asked_for(gen, smoke):
     assert _cli(gen, cond)["--dataset"] == "mnist"
     assert "--preference-conditioned" in _cli(gen, cond)
     assert _cli(gen, cond)["--reward-mode"] == "lagrangian"
-    assert cond["env"] == {"ALPHAGRAD_NN_HIDDEN": "256"}
+    assert cond["env"] == {"ALPHAGRAD_NN_HIDDEN": "256", **CLEAR_ENV}
 
 
 def test_the_resume_leg_differs_in_resume_alone(gen, smoke):
@@ -1421,11 +1431,12 @@ def test_every_recurrent_row_carries_the_nn256_and_tlm_flags_unchanged(
 def test_no_recurrent_row_carries_an_xla_flag(gen, snn):
     """The same rule the whole matrix runs under, asserted again on the
     recurrent rows on their own: no XLA_*, no JAX_* beyond the shared
-    compilation cache, and no per-arm export at all."""
+    compilation cache, and no per-arm export but the measure actors'
+    retention bound (dsnn-dfw.99), which is an ALPHAGRAD_ variable."""
     jax_cache_exports = {f"export {k}={v}" for k, v in gen.JAX_CACHE_ENV}
     jax_cache_mkdir = f"mkdir -p {gen.JAX_CACHE_DIR_EXPR}"
     for a in snn:
-        assert a["env"] == {}, a["name"]
+        assert a["env"] == CLEAR_ENV, a["name"]
         text = gen.render(a)
         assert "XLA_FLAGS" not in text, a["name"]
         for line in text.splitlines():
@@ -1554,3 +1565,37 @@ def test_the_four_rules_are_the_four_the_tree_defines(gen, snn):
         assert _cli(gen, a)["--example"] == RSNN_EXAMPLE, a["name"]
         assert rsnn_shd.resolve_temporal_rule(
             RSNN_EXAMPLE, a["thesis_rule"]) == a["thesis_rule"], a["name"]
+
+
+def test_the_retention_bound_reaches_every_row_thesis_arm_emits(
+        gen, matrix, smoke):
+    """dsnn-dfw.99.  The measure actors held one XLA executable per plan
+    and nothing dropped them, so on the recurrent rows the actors' pool
+    climbed to 72.4 GiB of a 96 GB card and refused 5-6 plans of 16 per
+    episode (job 67410, from episode 120).  The bound is an EXPORT, not a
+    flag: ppo.py has none, the actor reads the variable at construction.
+
+    Its footprint is --dual-clip's and --target-kl's: the matrix on every
+    target and the smoke.  It is OFF on the order-only tuning rows and on
+    the three Lagrangian sweep rounds, and the absence is asserted rather
+    than trusted -- they are frozen running comparisons and a launcher
+    that moved under them would invalidate the round."""
+    var = gen.MEASURE_CACHE_CLEAR_EVERY_VAR
+    assert var == "ALPHAGRAD_MEASURE_CACHE_CLEAR_EVERY"
+    assert gen.THESIS_MEASURE_CACHE_CLEAR_EVERY == CACHE_CLEAR_EVERY
+    for a in matrix + smoke:
+        assert a["env"][var] == CACHE_CLEAR_EVERY, a["name"]
+        assert f"export {var}={CACHE_CLEAR_EVERY}" in gen.render(a), \
+            a["name"]
+    off = (gen.orderonly_arms() + gen.orderonly_rsnn_arms()
+           + gen.orderonly_final_arms() + gen.orderonly_tlm_final_arms()
+           + gen.sweepl_arms() + gen.sweepl2_arms() + gen.sweepl3_arms())
+    assert off
+    for a in off:
+        assert var not in (a.get("env") or {}), a["name"]
+        assert var not in gen.render(a), a["name"]
+    # The export is admitted by the thesis allow-list only: a campaign arm
+    # carries no per-arm environment at all.
+    assert var in gen.THESIS_TARGET_ENV_ALLOWED
+    assert var in gen.THESIS_ENV_ALLOWED
+    assert var not in gen.CAMPAIGN_ENV_ALLOWED

@@ -2313,6 +2313,32 @@ THESIS_DUAL_CLIP = "3.0"
 #: would invalidate what they measured.  Off is ppo.py's own default.
 THESIS_TARGET_KL = "0.1"
 
+#: THE MEASURE ACTORS' EXECUTABLE RETENTION BOUND (dsnn-dfw.99).  Under
+#: the free order almost every terminal plan is a NEW PROGRAM (3566
+#: distinct plan hashes in 3646 terminal records, job 67410), so every
+#: measurement leaves an XLA executable on the measure GPU and nothing
+#: drops it: the seven actors of that row climbed to 72.4 GiB of a 96 GB
+#: card and refused 5-6 plans of 16 per episode from episode 120.
+#: 100 measurements between clears, against the ~450 the pool took to
+#: fill.  The actor's clear
+#: (cpu_approx_worker._maybe_clear_compile_caches) drops JAX's
+#: in-process jit and compilation caches, which is what releases those
+#: executables; the ON-DISK compile cache survives, so a plan met again
+#: reloads instead of recompiling from HLO, and the paired reference is
+#: a _LOCAL_CACHE hit that no clear drops.  EVERY ROW `thesis_arm`
+#: EMITS reads this, exactly as THESIS_DUAL_CLIP and THESIS_TARGET_KL
+#: above: the A/B/C/C_popart/condC matrix on all targets and the smoke.
+#: The order-only tuning rows call `thesis_cli` directly and the three
+#: Lagrangian sweep rounds pass `cache_clear_every=None`, so both keep
+#: the export OFF: they are FROZEN running comparisons and a launcher
+#: that moved under them would invalidate what they measured.  Unset is
+#: the actor's own default, which is 0 and means never.
+THESIS_MEASURE_CACHE_CLEAR_EVERY = "100"
+
+#: dsnn-dfw.99's export name, in ONE place: the arm below renders it and
+#: THESIS_TARGET_ENV_ALLOWED admits it.
+MEASURE_CACHE_CLEAR_EVERY_VAR = "ALPHAGRAD_MEASURE_CACHE_CLEAR_EVERY"
+
 # ---------------------------------------------------------------------------
 # THE HARDWARE.  Five Blackwell nodes we may use (dsnn-dfw.69, owner ruling
 # 2026-09-20).  pgi15-gpu17 has no matched CUDA 12.9 ptxas or nvlink (job
@@ -2573,7 +2599,8 @@ THESIS_TARGET_ENV = {
 #: The ONLY per-arm exports a thesis launcher may carry.  `render` refuses
 #: any other key, exactly as it refuses every per-arm export on a campaign arm.
 THESIS_TARGET_ENV_ALLOWED = frozenset(
-    k for env in THESIS_TARGET_ENV.values() for k in env)
+    k for env in THESIS_TARGET_ENV.values() for k in env
+) | {MEASURE_CACHE_CLEAR_EVERY_VAR}
 #: Every `export NAME=` a THESIS launcher may contain: the campaign's allowed
 #: set plus the target-shape variables above.
 THESIS_ENV_ALLOWED = frozenset(CAMPAIGN_ENV_ALLOWED) | THESIS_TARGET_ENV_ALLOWED
@@ -3058,7 +3085,9 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
                ppo_epochs: str = THESIS_PPO_EPOCHS,
                minibatches: str = THESIS_MINIBATCHES,
                dual_clip: str | None = THESIS_DUAL_CLIP,
-               target_kl: str | None = THESIS_TARGET_KL) -> dict:
+               target_kl: str | None = THESIS_TARGET_KL,
+               cache_clear_every: str | None =
+               THESIS_MEASURE_CACHE_CLEAR_EVERY) -> dict:
     """One thesis run -> one `arm(...)`.  Returns the arm."""
     _require(node in THESIS_NODES,
              f"node {node!r} is not one of the permitted thesis nodes "
@@ -3100,7 +3129,11 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
         # coordinate a reader wants and it is DERIVED from the target, never
         # passed in, so the two cannot disagree.
         thesis_rule=thesis_temporal_rule(target),
-        env=dict(THESIS_TARGET_ENV[target]),
+        # dsnn-dfw.99: the retention bound rides with the target shape, and
+        # a row that renders `cache_clear_every=None` drops it again.
+        env=dict(THESIS_TARGET_ENV[target],
+                 **({MEASURE_CACHE_CLEAR_EVERY_VAR: cache_clear_every}
+                    if cache_clear_every is not None else {})),
         required_flags=(THESIS_REQUIRED_FLAGS
                         + (DUAL_CLIP_REQUIRED_FLAGS
                            if dual_clip is not None else [])
@@ -3786,6 +3819,8 @@ for _sweepl_tag, _sweepl_overrides in sweepl_configs():
             dual_clip=None,
             # dsnn-dfw.98: same reason, keeps --target-kl off too.
             target_kl=None,
+            # dsnn-dfw.99: same reason, keeps the retention bound off too.
+            cache_clear_every=None,
         )
         ARMS[-1]["sweepl"] = True
         ARMS[-1]["sweepl_tag"] = _sweepl_tag
@@ -3949,6 +3984,8 @@ for _sweepl2_tag, _sweepl2_overrides in sweepl2_configs():
             dual_clip=None,
             # dsnn-dfw.98: same reason, keeps --target-kl off too.
             target_kl=None,
+            # dsnn-dfw.99: same reason, keeps the retention bound off too.
+            cache_clear_every=None,
         )
         ARMS[-1]["sweepl2"] = True
         ARMS[-1]["sweepl2_tag"] = _sweepl2_tag
@@ -4099,6 +4136,8 @@ for _sweepl3_tag, _sweepl3_overrides in sweepl3_configs():
             dual_clip=None,
             # dsnn-dfw.98: same reason, keeps --target-kl off too.
             target_kl=None,
+            # dsnn-dfw.99: same reason, keeps the retention bound off too.
+            cache_clear_every=None,
         )
         ARMS[-1]["sweepl3"] = True
         ARMS[-1]["sweepl3_tag"] = _sweepl3_tag
@@ -5220,7 +5259,11 @@ def _scratch_stack_block(target_env: dict | None = None) -> list[str]:
 
     ``target_env`` is the thesis matrix's one addition: the target-shape
     variable a NeuralNetwork arm needs at import time (THESIS_TARGET_ENV).
-    Empty for every campaign arm, so their rendering does not move."""
+    Empty for every campaign arm, so their rendering does not move.
+
+    Since dsnn-dfw.99 it also carries the measure actors' retention
+    bound, which is rendered in its own block above the target shape.
+    """
     target_env = dict(target_env or {})
     L = _stack_exists_check() + [
         f"export PYTHONPATH={CAMPAIGN_STACK}/graphax/src:{CAMPAIGN_STACK}/alphagrad/src",
@@ -5244,6 +5287,16 @@ def _scratch_stack_block(target_env: dict | None = None) -> list[str]:
     L.append("# in the header's TODO block with their evidence; promote and delete.")
     for k, v, _why in NO_FLAG_ENV:
         L.append(f"export {k}={v}")
+    _clear_every = target_env.pop(MEASURE_CACHE_CLEAR_EVERY_VAR, None)
+    if _clear_every is not None:
+        L.append("")
+        L.append("# THE MEASURE ACTORS' EXECUTABLE RETENTION BOUND (thesis")
+        L.append("# matrix, dsnn-dfw.99).  Under the free order nearly every plan")
+        L.append("# is a new program, so the actor drops its in-process JAX caches")
+        L.append("# every N measurements and the executables go back to the device.")
+        L.append("# The on-disk compile cache survives the clear.  ppo.py has no")
+        L.append("# flag for it.")
+        L.append(f"export {MEASURE_CACHE_CLEAR_EVERY_VAR}={_clear_every}")
     if target_env:
         L.append("")
         L.append("# THE TARGET SHAPE (thesis matrix, ticket dsnn-dfw.4).  The")

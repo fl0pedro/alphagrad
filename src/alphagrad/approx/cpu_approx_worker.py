@@ -139,6 +139,10 @@ class CpuApproximationServer:
         # retry would just re-sentinel — do not recycle".
         self._last_was_oom = False
         self._n_oom = 0
+        # env._callback truncates a measure OOM into a refusal, so the OOM is
+        # recorded in the env module and drained here (dsnn-dfw.100).
+        from alphagrad.approx.env import register_measure_oom_consumer
+        register_measure_oom_consumer()
         # ------------------------------------------------------------------
         # GPU-executable leak bound. Each ``evaluate`` runs one (or more)
         # per-config ``jax.jit(jacve(...)).lower().compile()`` — a DISTINCT
@@ -327,7 +331,7 @@ class CpuApproximationServer:
             out = tuple(np.asarray(x) for x in _cb_out)
             # Results are now host-side numpy — safe to drop the per-config
             # XLA executables that env._callback compiled onto the measure GPU.
-            self._maybe_clear_compile_caches()
+            self._settle_after_callback()
             return out
         except Exception as exc:
             # A broken link toolchain on this node is not a bad action: a
@@ -503,7 +507,7 @@ class CpuApproximationServer:
                 *self._eval_samples,
                 precompile_only=True,
             )
-            self._maybe_clear_compile_caches()
+            self._settle_after_callback()
             return True
         except Exception as exc:  # pragma: no cover - defensive
             self.last_eval_error = (type(exc).__name__, str(exc)[:200])
@@ -642,7 +646,21 @@ class CpuApproximationServer:
         except Exception:
             pass
 
-    def _maybe_clear_compile_caches(self, *, force_on_oom: str | None = None) -> None:
+    def _settle_after_callback(self) -> None:
+        # Exactly one cache clear per OOM the callback truncated, and the
+        # one-shot flag the pool reads (dsnn-dfw.100).
+        from alphagrad.approx.env import pop_measure_oom
+        n_oom, oom_txt = pop_measure_oom()
+        if n_oom:
+            self._last_was_oom = True
+            self._n_oom += n_oom
+            self._maybe_clear_compile_caches(oom=True, force_on_oom=oom_txt)
+            return
+        self._maybe_clear_compile_caches()
+
+    def _maybe_clear_compile_caches(
+            self, *, force_on_oom: str | None = None,
+            oom: bool = False) -> None:
         """Periodically drop JAX's in-process compilation caches so XLA
         releases the accumulated per-config executables + their measure-GPU
         device buffers. Bounds the otherwise-unbounded distinct-executable
@@ -656,7 +674,7 @@ class CpuApproximationServer:
         recompile — the reclaim costs at most an occasional executable reload.
         """
         every = self._cache_clear_every
-        is_oom = bool(
+        is_oom = bool(oom) or bool(
             force_on_oom
             and (
                 "RESOURCE_EXHAUSTED" in force_on_oom
