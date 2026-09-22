@@ -415,7 +415,14 @@ class UnifiedFaceHead(eqx.Module):
             # tanh, not hard clip: see LOGIT_CLAMP. sample() and score()
             # both come through here, so behaviour and evaluation stay the
             # same parameterization and the PPO ratio is untouched.
-            z = c * jnp.tanh(z / c)
+            # dsnn-dfw.95: THE BARRIER IS LOAD-BEARING. Without it the loss
+            # program fused the projection into the bound and scored
+            # c*tanh(z) instead of c*tanh(z/c), so the +5.93 OP_NONE bias
+            # became the +15 rail and the replay read an approximation slot
+            # 9.2 nats below the sampler. The rollout scored the bound as
+            # written, so the PPO ratio of every plan that approximated was
+            # 1e-4 and those plans left the policy gradient.
+            z = c * jnp.tanh(jax.lax.optimization_barrier(z) / c)
         return z
 
     # ------------------------------------------------------------------ score
