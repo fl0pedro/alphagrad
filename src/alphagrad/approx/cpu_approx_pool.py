@@ -1100,10 +1100,17 @@ class CpuApproxPool:
                     if _is_toolchain_fault(_exc):
                         raise
                     self._n_other_errors += 1
+                    # THE FIRST ONE IN FULL. 120 characters of a RayTaskError
+                    # is the actor id and nothing else, so the one line that
+                    # says WHY an actor died was the one line the log did not
+                    # carry; every later error keeps the short form so a
+                    # storm of them does not bury the run.
+                    _first = self._n_other_errors == 1
                     print(
                         f"[SENTINEL] batch other-error slot={i} "
                         f"step={int(step_batch[i])}: {type(_exc).__name__}: "
-                        f"{str(_exc)[:120]} (n_other_errors={self._n_other_errors})",
+                        f"{str(_exc) if _first else str(_exc)[:120]} "
+                        f"(n_other_errors={self._n_other_errors})",
                         flush=True,
                     )
                     self._poison(actor, future=future)

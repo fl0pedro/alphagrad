@@ -11093,6 +11093,13 @@ class VertexEliminationEnv:
                         # (owner ruling 2026-09-16) reads it back through
                         # `current_env_slot`.
                         env_rows=list(_pipe),
+                        # THE GRAPH THIS PLAN WAS ACTED ON. The pipelined
+                        # submission is a dispatch like any other and the
+                        # actor holds one env per graph; without this it
+                        # would be asked to measure and not told which graph,
+                        # which is how the first two-graph smoke failed
+                        # (job 67527 / probe 67528).
+                        rule=self._temporal_rule,
                     )
                     _pipe_pos = ([ro[i] for i in _pipe],
                                  [rs[i] for i in _pipe],

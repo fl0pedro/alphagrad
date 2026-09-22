@@ -17185,6 +17185,13 @@ def main(args=None):
         the overlap: the trainer's GPU runs this update while the host blocks
         on the measure actors for the episode just rolled out.
         """
+        # THE PENDING EPISODE'S UPDATE RUNS ON THE PENDING EPISODE'S GRAPH.
+        # This reads `popart_m1/m2/w` out of the trainer's own locals, and
+        # under the pipeline it is called from the NEXT episode's iteration,
+        # so without this it would take the next graph's accumulators. Its
+        # partner `_pipe_finish` puts the graph back.
+        if _TWO_GRAPH:
+            _swap_graph(_GSTATES.rule_for(int(prev["ctx"]["ep"])))
         (_fm, _ovr, _vm, _pin, _mm, _kl, _e2, _w2) = prev["args"]
         return _episode_update_jit(
             agent, opt_state, prev["roll"], global_step, _fm, _ovr, _vm,
@@ -17192,25 +17199,39 @@ def main(args=None):
             probe_opt_state, vprobes, vprobe_opt_state, _kl, _e2, _w2)
 
     def _pipe_finish(prev, out):
-        """Rebind from the pending episode's update and run its epilogue."""
+        """Rebind from the pending episode's update and run its epilogue.
+
+        ON THE PENDING EPISODE'S GRAPH, and back to the running episode's
+        afterwards. `_finish_episode` takes the dual step, folds PopArt and
+        admits into the archive, and all three are per graph; under the
+        pipeline this runs inside the NEXT episode's iteration, so the graph
+        has to be put back the moment it is done. `_pipe_update_dispatch`,
+        which is evaluated to produce `out`, has already swapped here.
+        """
         nonlocal agent, opt_state, global_step
         nonlocal popart_m1, popart_m2, popart_w
         nonlocal probes, probe_opt_state, vprobes, vprobe_opt_state
-        (agent, opt_state, _unused_states, _metrics, _tot_rew, _acts,
-         global_step, _diag, popart_m1, popart_m2, popart_w, _attn,
-         _true_ret, probes, probe_opt_state, _probe_mets,
-         vprobes, vprobe_opt_state, _vp_mets,
-         _u1, _u2, _u3, _u4, _u5, _u6, _u7, _u8) = out
-        _ctx = prev["ctx"]
-        _ctx.update(
-            agent=agent, opt_state=opt_state, global_step=global_step,
-            metrics=_metrics, total_rewards_full=_tot_rew,
-            actions_pack=_acts, diag_pack=_diag,
-            popart_m1=popart_m1, popart_m2=popart_m2, popart_w=popart_w,
-            attn_ent=_attn, true_scalar_return=_true_ret,
-            probe_metrics=_probe_mets, vp_metrics=_vp_mets,
-        )
-        _finish_episode(_ctx)
+        if _TWO_GRAPH:
+            _swap_graph(_GSTATES.rule_for(int(prev["ctx"]["ep"])))
+        try:
+            (agent, opt_state, _unused_states, _metrics, _tot_rew, _acts,
+             global_step, _diag, popart_m1, popart_m2, popart_w, _attn,
+             _true_ret, probes, probe_opt_state, _probe_mets,
+             vprobes, vprobe_opt_state, _vp_mets,
+             _u1, _u2, _u3, _u4, _u5, _u6, _u7, _u8) = out
+            _ctx = prev["ctx"]
+            _ctx.update(
+                agent=agent, opt_state=opt_state, global_step=global_step,
+                metrics=_metrics, total_rewards_full=_tot_rew,
+                actions_pack=_acts, diag_pack=_diag,
+                popart_m1=popart_m1, popart_m2=popart_m2, popart_w=popart_w,
+                attn_ent=_attn, true_scalar_return=_true_ret,
+                probe_metrics=_probe_mets, vp_metrics=_vp_mets,
+            )
+            _finish_episode(_ctx)
+        finally:
+            if _TWO_GRAPH:
+                _swap_graph(_RULE_EP)
 
     # ---- CHECKPOINT (5 of 8) --------------------------------------------
     # THE DRAIN, THE SAVE AND THE RESTORE.
@@ -17250,6 +17271,8 @@ def main(args=None):
         _prev = _PIPE_PENDING[0]
         if not (_MPIPE and _prev is not None):
             return False
+        # (the graph is taken and put back by `_pipe_update_dispatch` and
+        # `_pipe_finish`, which is where the per-graph state is read.)
         _PIPE_PENDING[0] = None
         if _PIPE_DEEP:
             # DEEP: this episode's measurement was started at the end of its
@@ -17543,6 +17566,11 @@ def main(args=None):
               f"update runs from here.", flush=True)
 
     _LOOP_EPISODES = len(_PSWEEP_PLAN) if _PSWEEP else args.episodes
+    #: The graph the RUNNING episode is on. Set at the top of every
+    #: iteration; `_pipe_finish` puts the graph back to it after finishing a
+    #: pending episode on the pending episode's graph. Initialised for the
+    #: end-of-run drain of a loop that ran no episode at all.
+    _RULE_EP = _PRIMARY
     def _swap_graph(_to):
         """Put the running per-graph state back and take the next graph's.
 
@@ -17614,9 +17642,13 @@ def main(args=None):
         # the graph the uninterrupted run would have reached. FIRST in the
         # body, before the checkpoint writes the state it is about to swap.
         _RULE_EP = (_GSTATES.rule_for(ep) if _TWO_GRAPH else _PRIMARY)
-        if _TWO_GRAPH:
-            _swap_graph(_RULE_EP)
-            _GSTATES[_RULE_EP].episodes += 1
+        # THE SWAP IS NOT HERE. Under --measure-pipeline the previous
+        # episode's update has not run yet at the top of this one, and it has
+        # to run on ITS graph: `_pipe_drain` swaps to the pending episode's
+        # graph, and this episode takes its own just before its rollout,
+        # after every drain in this block. Swapping here put episode e-1's
+        # update on episode e's PopArt and multiplier, which produced a NaN
+        # loss on the first pipelined two-graph probe (job 67530).
         # CHECKPOINT (7 of 8). THE QUIESCENT POINT: after episode ep-1's
         # update and epilogue, before episode ep's rollout. `_ckpt_write`
         # drains the pipeline first, so `ep` episodes really are complete.
@@ -17760,6 +17792,15 @@ def main(args=None):
                 preferences_per_env, head_reward_weights_np, lag_lambda,
                 bool(args.preference_conditioned))
 
+        # ---- THE EPISODE TAKES ITS GRAPH (owner ruling 2026-09-22) -------
+        # HERE and not at the top of the body: every drain above runs the
+        # PREVIOUS episode's update, and that update belongs to the previous
+        # episode's graph. From this line on, `env`, the archive, the PopArt
+        # triple, the multiplier, the live-face stream and the face-init
+        # offset are this episode's.
+        if _TWO_GRAPH:
+            _swap_graph(_RULE_EP)
+            _GSTATES[_RULE_EP].episodes += 1
         eval_samples = generate_eval_samples(env, ep_eval_key, args.num_eval_samples)
         env_episode = eqx.tree_at(lambda e: e.eval_args_samples, env, eval_samples)
         # The eval samples ride the env and are drawn afresh every episode, so
@@ -17773,6 +17814,18 @@ def main(args=None):
         # pool already knows how to hold an ObjectRef -- it was simply never
         # handed one from here. Samples are regenerated per episode, so the
         # ref is refreshed here and nowhere else.
+        # THE BOUND OPERANDS FOR LOCALLY SERVED ROWS FOLLOW THE EPISODE'S
+        # GRAPH. `env.set_local_bound_operands` is PROCESS state: once the
+        # pool owns the bound operands the step callback ships zero-length
+        # placeholders, and a row served in this process reads the concrete
+        # copy from there. Installed once at setup it held the first graph's
+        # args for ever, so on an alternating run every locally served row of
+        # the other graph tokenized that graph's plan against the first
+        # graph's arguments (`safe_map() argument 2 is shorter than argument
+        # 1`, job 67527). Refreshed HERE, beside the eval samples it travels
+        # with, because this is where the episode's graph is already in hand.
+        _tok_env_mod.set_local_bound_operands(
+            env.args, env.consts, eval_samples)
         _ep_pool = getattr(env, "_remote_pool", None)
         if _ep_pool is not None:
             try:

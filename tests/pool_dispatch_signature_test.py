@@ -138,6 +138,80 @@ def test_the_wrapper_forwards_what_it_accepts():
         f"the Ray wrapper accepts {dropped} and does not forward them")
 
 
+def test_every_env_side_dispatch_names_the_graph():
+    """EVERY call into the pool says which graph the plan was acted on.
+
+    This is the same defect class as ``episode`` and ``env_row``, one hop
+    earlier: the pool and the wrapper both took ``rule`` and the PIPELINED
+    submission in ``env.py`` (``pool.submit_batch``) did not pass it, so
+    under ``--measure-pipeline 1`` every terminal batch reached an actor that
+    holds two graphs with no graph named. Measured: job 67527 on gpu14 and
+    probe 67528 on cpu1, every terminal plan sentinelled.
+
+    Read from the source, like the rest of this module: these are call sites,
+    not signatures, and only the source says what a call site passes.
+    """
+    from alphagrad.approx import env as env_mod
+
+    tree = _tree(env_mod)
+    # `name = dict(...)` keyword sets, so a site that passes its request as
+    # `**_pipe_kw` is read through the dict it unpacks rather than counted as
+    # passing nothing.
+    dict_kw: dict = {}
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id == "dict"):
+            dict_kw.setdefault(node.targets[0].id, set()).update(
+                kw.arg for kw in node.value.keywords if kw.arg)
+    # A deferred submission carries its request into a lambda as a DEFAULT
+    # argument (`lambda _k=_pipe_kw: pool.submit_batch(**_k)`), so the alias
+    # is followed; otherwise the one site that packages a batch for the
+    # pipeline reads as passing nothing, which is the site that was wrong.
+    for _ in range(4):                       # aliases of aliases
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Lambda):
+                for arg, default in zip(node.args.args[::-1],
+                                        node.args.defaults[::-1]):
+                    if (isinstance(default, ast.Name)
+                            and default.id in dict_kw):
+                        dict_kw.setdefault(arg.arg, set()).update(
+                            dict_kw[default.id])
+            elif (isinstance(node, ast.Assign) and len(node.targets) == 1
+                  and isinstance(node.targets[0], ast.Name)
+                  and isinstance(node.value, ast.Name)
+                  and node.value.id in dict_kw):
+                dict_kw.setdefault(node.targets[0].id, set()).update(
+                    dict_kw[node.value.id])
+    sites = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        if not isinstance(fn, ast.Attribute):
+            continue
+        if fn.attr not in ("evaluate", "evaluate_batch", "submit_batch"):
+            continue
+        # the tokenize-only pool serves its own actors and has no graph to
+        # name; it is reached through `_tokpool`, never through `pool`.
+        base = fn.value
+        if isinstance(base, ast.Name) and base.id.startswith("_tok"):
+            continue
+        kws = {kw.arg for kw in node.keywords if kw.arg}
+        for kw in node.keywords:
+            if kw.arg is None and isinstance(kw.value, ast.Name):
+                kws |= dict_kw.get(kw.value.id, set())
+        sites.append((fn.attr, node.lineno, kws))
+    assert sites, "no pool dispatch site found in env.py"
+    missing = [(n, ln) for n, ln, kws in sites if "rule" not in kws]
+    assert not missing, (
+        f"these env.py dispatch sites do not name the graph: {missing}. An "
+        f"actor that holds two graphs raises on a dispatch that names none, "
+        f"and every plan in that batch comes back sentinelled.")
+
+
 def test_a_keyword_the_wrapper_consumes_is_actually_read():
     """A consumed keyword that nothing reads is the dropped-field defect with
     the exemption written in. ``rule`` decides WHICH graph's server measures
