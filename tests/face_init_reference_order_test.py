@@ -232,16 +232,35 @@ def test_the_start_block_names_the_skip_bias_flag_when_it_is_set():
 # ----------------------------------------------------------- 4. the wiring
 
 def test_ppo_main_counts_f_on_the_env_before_the_agent_and_passes_it():
+    """F is counted on EVERY graph's env, before the agent, and reaches the
+    init.
+
+    THE WALK IS A LOOP NOW. Since the owner's ruling of 2026-09-22 a run may
+    hold two graphs of one target, each with its own reference face count
+    (measured: bptt 42, rtrl 65), so the count names the graph's env rather
+    than a single `env`. The three facts this guarded are unchanged and are
+    guarded here: the count happens before the agent exists, the derived bias
+    reads it, and the bias is applied to the agent built after it.
+    """
     import inspect
     from alphagrad.approx import ppo
     src = inspect.getsource(ppo.main)
     assert "reference_order_face_count as _ref_face_count" in src
     assert "resolve_face_init_bias(args, F=_face_ref_F)" in src
-    i_count = src.index("_ref_face_count(env)")
+    i_count = src.index('_ref_face_count(_gg["env"])')
     i_build = src.index("_build_agent(args, total_v")
     i_resolve = src.index("resolve_face_init_bias(args, F=_face_ref_F)")
     i_apply = src.index("apply_face_none_bias(agent")
     assert i_count < i_build < i_resolve < i_apply
+    # ONE WALK PER GRAPH, and the shared head's bias is derived from the
+    # PRIMARY graph's count.
+    i_guard = src.index("_face_bias_in_play = (")
+    assert "for _k in _GRAPH_KEYS:" in src[i_guard:i_count]
+    assert '_face_ref_F = _GRAPHS[_PRIMARY]["face_ref_F"]' in src
+    # AND EVERY OTHER GRAPH GETS ITS OWN PAIR from its own F, after the agent
+    # exists, because the offset is a vector over that agent's head.
+    i_off = src.index('resolve_face_init_bias(args, F=_gg["face_ref_F"])')
+    assert i_apply < i_off
 
 
 def test_the_block_reaches_the_wandb_config():
@@ -256,11 +275,14 @@ def test_the_block_reaches_the_wandb_config():
 def test_no_bias_flag_means_no_walk_and_no_block():
     """A run that sets none of the four flags applies no bias, so there is
     nothing to normalize -- and it must not pay an elimination walk over the
-    whole graph to be told so."""
+    whole graph to be told so. A run with TWO graphs must not pay two."""
     import inspect
     from alphagrad.approx import ppo
     src = inspect.getsource(ppo.main)
     i_guard = src.index("_face_bias_in_play = (")
-    i_count = src.index("_ref_face_count(env)")
+    i_count = src.index('_ref_face_count(_gg["env"])')
     assert i_guard < i_count
     assert "if _face_bias_in_play:" in src
+    # The per-graph pair is inside the same guard, so a run with no bias flag
+    # derives none of them either.
+    assert "if not (_face_bias_in_play and _TWO_GRAPH):" in src

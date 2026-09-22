@@ -100,18 +100,31 @@ def test_two_rules_name_one_target():
 
 
 def test_the_argparser_takes_one_or_two_rules():
+    """THE PARSER ITSELF hands back the plain string for one rule.
+
+    `nargs="+"` always produces a list, and collapsing it in `main` left the
+    parsed namespace holding `['tbptt']`, which every launcher test that reads
+    the parsed value compares against `'tbptt'`
+    (`gen_fq_launchers_thesis_test`, suite job 67542). The collapse is in the
+    action, so a one-rule namespace is byte for byte the old one at the
+    argparse level too.
+    """
     from alphagrad.approx.ppo import make_argparser
 
     p = make_argparser()
     base = ["--example", RSNN]
-    assert p.parse_args(base + ["--temporal-rule", "rtrl"]).temporal_rule \
-        == ["rtrl"]
+    for rule in ("tbptt", "bptt", "rtrl", "window2"):
+        got = p.parse_args(base + ["--temporal-rule", rule]).temporal_rule
+        assert got == rule and isinstance(got, str), got
     assert p.parse_args(
         base + ["--temporal-rule", "bptt", "rtrl"]).temporal_rule \
         == ["bptt", "rtrl"]
     assert p.parse_args(base).temporal_rule is None
     with pytest.raises(SystemExit):
         p.parse_args(base + ["--temporal-rule", "nonsense"])
+    # a bad value in a PAIR is refused too, by `choices`
+    with pytest.raises(SystemExit):
+        p.parse_args(base + ["--temporal-rule", "bptt", "nonsense"])
 
 
 def test_the_rule_list_helper_reads_every_form():
