@@ -4986,6 +4986,13 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument("--episodes", type=int, default=50)
     # CHECKPOINT (2 of 8). --checkpoint-every and --resume.
     _ckpt.add_checkpoint_args(p)
+    p.add_argument(
+        "--checkpoint-keep-at", type=int, nargs="+", default=[], metavar="N",
+        help="Episodes the checkpoint pruning never deletes, on top of the "
+             "newest two --checkpoint-every writes. Empty (the default) "
+             "pins nothing. Each value must be a positive multiple of "
+             "--checkpoint-every, checked once the whole namespace is "
+             "parsed (dsnn-dfw.117).")
     # AUTO-STOP (2 of 8). --auto-stop, and the two SUPPRESSed test-only knobs
     # that move the check points and the window size off their ruled values.
     _auto.add_auto_stop_args(p)
@@ -7704,6 +7711,33 @@ def _setup_jax_compile_cache() -> None:
     setup_jax_compile_cache()
 
 
+def _validate_checkpoint_keep_at(checkpoint_every: int, keep_at) -> frozenset:
+    """The `--checkpoint-keep-at` episodes, checked against `--checkpoint-every`.
+
+    Every pinned episode has to be one this run actually WRITES a checkpoint
+    at, so it must be a positive multiple of `--checkpoint-every`; with
+    checkpointing off (`--checkpoint-every 0`) no episode is ever a
+    checkpoint, so the list must be empty. Raised at parse time, before a
+    single array is built, same as every other argument mismatch here
+    (dsnn-dfw.117).
+    """
+    pinned = frozenset(int(e) for e in (keep_at or ()))
+    if not pinned:
+        return pinned
+    if checkpoint_every <= 0:
+        raise SystemExit(
+            f"--checkpoint-keep-at {sorted(pinned)} pins episodes to keep, "
+            f"but --checkpoint-every is {checkpoint_every}: with "
+            f"checkpointing off, no episode is ever written to pin.")
+    bad = sorted(e for e in pinned if e <= 0 or e % checkpoint_every != 0)
+    if bad:
+        raise SystemExit(
+            f"--checkpoint-keep-at {bad} must be positive multiples of "
+            f"--checkpoint-every {checkpoint_every}: no checkpoint is ever "
+            f"written at those episodes.")
+    return pinned
+
+
 def main(args=None):
     # `args` is given by `tools/preference_sweep.py`, which does not build a
     # command line at all: it rebuilds the namespace from the checkpoint's own
@@ -7723,6 +7757,8 @@ def main(args=None):
         raise ValueError(
             f"--checkpoint-every must be 0 (off) or positive, got "
             f"{_CKPT_EVERY}.")
+    _CKPT_KEEP_AT = _validate_checkpoint_keep_at(
+        _CKPT_EVERY, getattr(args, "checkpoint_keep_at", None))
     _RESUME_PATH = str(getattr(args, "resume", "") or "")
     _RESUME_META = None
     if _RESUME_PATH:
@@ -16974,7 +17010,7 @@ def main(args=None):
         _t1 = _prof_time.perf_counter()
         _path = _ckpt.save_ppo_checkpoint(
             _CKPT_DIR, episode=int(done), tree=_ckpt_tree(),
-            meta=_ckpt_meta(), keep=2)
+            meta=_ckpt_meta(), keep=2, keep_at=_CKPT_KEEP_AT)
         _t_write = _prof_time.perf_counter() - _t1
         _CKPT_LAST[0] = int(done)
         print(f"[checkpoint] {int(done)} episodes -> {_path} "

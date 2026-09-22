@@ -333,8 +333,8 @@ def test_the_top_n_heaps_and_the_best_so_far_round_trip():
 
 def _ns(**kw):
     base = dict(episodes=50, seed=42, name="unit", resume="",
-                checkpoint_every=25, lr=0.0003, live_faces=True,
-                rewards=["cmp", "mem"])
+                checkpoint_every=25, checkpoint_keep_at=[], lr=0.0003,
+                live_faces=True, rewards=["cmp", "mem"])
     base.update(kw)
     return argparse.Namespace(**base)
 
@@ -342,6 +342,15 @@ def _ns(**kw):
 def test_matching_arguments_are_accepted():
     saved = ckpt.args_to_json(_ns())
     ckpt.check_resume_args(saved, _ns(resume="/somewhere/ppo_ckpt_ep000000025"))
+
+
+def test_a_different_checkpoint_keep_at_is_exempt():
+    """dsnn-dfw.117: --checkpoint-keep-at only decides which OLD checkpoints
+    survive pruning. It reads no state and steps no gradient, so a resume
+    may change it freely, same as --episodes and --resume."""
+    saved = ckpt.args_to_json(_ns(checkpoint_keep_at=[25]))
+    ckpt.check_resume_args(
+        saved, _ns(resume="/x", checkpoint_keep_at=[25, 50]))
 
 
 def test_a_longer_episodes_is_accepted_and_a_shorter_one_is_not():
@@ -431,6 +440,45 @@ def test_only_the_last_two_checkpoints_are_kept(tmp_path):
     assert not os.path.exists(written[1])
 
 
+def test_a_pinned_episode_survives_pruning_beyond_the_newest_keep(tmp_path):
+    """dsnn-dfw.117: `keep_at` exempts specific episodes from the
+    newest-`keep` pruning; every other stale checkpoint is still removed."""
+    run_dir = str(tmp_path / "run")
+    written = {}
+    for ep in (10, 20, 30, 40, 50):
+        written[ep] = ckpt.save_ppo_checkpoint(
+            run_dir, episode=ep, tree=_example_tree(), meta=_example_meta(),
+            keep=2, keep_at={20})
+    kept = ckpt.list_checkpoints(run_dir)
+    assert kept == [written[20], written[40], written[50]], kept
+    assert not os.path.exists(written[10])
+    assert not os.path.exists(written[30])
+
+
+def test_several_pinned_episodes_all_survive(tmp_path):
+    run_dir = str(tmp_path / "run")
+    written = {}
+    for ep in (10, 20, 30, 40, 50, 60):
+        written[ep] = ckpt.save_ppo_checkpoint(
+            run_dir, episode=ep, tree=_example_tree(), meta=_example_meta(),
+            keep=2, keep_at={10, 30})
+    kept = ckpt.list_checkpoints(run_dir)
+    assert kept == [written[10], written[30], written[50], written[60]], kept
+    assert not os.path.exists(written[20])
+    assert not os.path.exists(written[40])
+
+
+def test_an_unset_keep_at_prunes_exactly_as_before(tmp_path):
+    run_dir = str(tmp_path / "run")
+    written = []
+    for ep in (10, 20, 30, 40):
+        written.append(ckpt.save_ppo_checkpoint(
+            run_dir, episode=ep, tree=_example_tree(), meta=_example_meta(),
+            keep=2, keep_at=None))
+    kept = ckpt.list_checkpoints(run_dir)
+    assert kept == written[-2:], kept
+
+
 def test_the_directory_names_sort_by_episode(tmp_path):
     run_dir = str(tmp_path / "run")
     for ep in (2, 10, 100, 1000):
@@ -468,3 +516,49 @@ def test_the_trainer_defines_the_two_flags_with_the_ruled_defaults():
     ns = p.parse_args(["--checkpoint-every", "0", "--resume", "/a/b"])
     assert ns.checkpoint_every == 0
     assert ns.resume == "/a/b"
+
+
+# ---------------------------------------------------------------------------
+# 6. --checkpoint-keep-at (dsnn-dfw.117): the flag and its parse-time checks.
+# ---------------------------------------------------------------------------
+
+def test_checkpoint_keep_at_defaults_to_empty():
+    from alphagrad.approx.ppo import make_argparser as _ppo_argparser
+
+    ns = _ppo_argparser().parse_args([])
+    assert ns.checkpoint_keep_at == []
+
+
+def test_checkpoint_keep_at_collects_every_value_given():
+    from alphagrad.approx.ppo import make_argparser as _ppo_argparser
+
+    ns = _ppo_argparser().parse_args(
+        ["--checkpoint-every", "50", "--checkpoint-keep-at", "50", "100"])
+    assert ns.checkpoint_keep_at == [50, 100]
+
+
+def test_a_pinned_episode_that_is_not_a_multiple_raises():
+    from alphagrad.approx.ppo import _validate_checkpoint_keep_at
+
+    with pytest.raises(SystemExit, match="checkpoint-keep-at"):
+        _validate_checkpoint_keep_at(50, [30])
+    with pytest.raises(SystemExit, match="checkpoint-keep-at"):
+        _validate_checkpoint_keep_at(50, [-50])
+    with pytest.raises(SystemExit, match="checkpoint-keep-at"):
+        _validate_checkpoint_keep_at(50, [0])
+
+
+def test_a_nonempty_list_with_checkpointing_off_raises():
+    from alphagrad.approx.ppo import _validate_checkpoint_keep_at
+
+    with pytest.raises(SystemExit, match="checkpoint-every"):
+        _validate_checkpoint_keep_at(0, [50])
+
+
+def test_valid_pins_return_a_frozenset_and_empty_is_a_no_op():
+    from alphagrad.approx.ppo import _validate_checkpoint_keep_at
+
+    assert _validate_checkpoint_keep_at(50, [50, 100]) == frozenset({50, 100})
+    assert _validate_checkpoint_keep_at(50, []) == frozenset()
+    assert _validate_checkpoint_keep_at(0, []) == frozenset()
+    assert _validate_checkpoint_keep_at(0, None) == frozenset()
