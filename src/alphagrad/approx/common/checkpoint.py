@@ -266,9 +266,13 @@ PPO_CKPT_PREFIX = "ppo_ckpt_ep"
 
 #: The arguments a resume is allowed to change. `--episodes` because a resume
 #: may extend the run, and `--resume` itself because the first leg did not
-#: carry it. EVERY other difference raises: the checkpoint is a state of one
-#: configuration and restoring it under another one is not a resume.
-PPO_RESUME_EXEMPT_ARGS = frozenset({"episodes", "resume"})
+#: carry it. `--checkpoint-keep-at` (dsnn-dfw.117) only pins which OLD
+#: checkpoints the pruning skips deleting; it reads no state, changes no
+#: computation and steps no gradient, so it does not touch training. EVERY
+#: other difference raises: the checkpoint is a state of one configuration
+#: and restoring it under another one is not a resume.
+PPO_RESUME_EXEMPT_ARGS = frozenset(
+    {"episodes", "resume", "checkpoint_keep_at"})
 
 
 class CheckpointError(RuntimeError):
@@ -323,6 +327,11 @@ def run_directory(wandb_on: bool = True) -> str:
 
 def checkpoint_dir_name(episode: int) -> str:
     return f"{PPO_CKPT_PREFIX}{int(episode):09d}"
+
+
+def _checkpoint_episode(path: str) -> int:
+    """The episode number a checkpoint directory's own name encodes."""
+    return int(os.path.basename(path)[len(PPO_CKPT_PREFIX):])
 
 
 def list_checkpoints(run_dir: str) -> list:
@@ -624,11 +633,15 @@ def _non_array_manifest(tree) -> list:
     return out
 
 
-def save_ppo_checkpoint(run_dir, *, episode, tree, meta, keep=2) -> str:
+def save_ppo_checkpoint(run_dir, *, episode, tree, meta, keep=2,
+                         keep_at=None) -> str:
     """Write ONE checkpoint and prune all but the newest `keep`.
 
     `tree` is the arithmetic half (see the header); `meta` is the bookkeeping
-    half and must already be JSON values. Returns the directory written.
+    half and must already be JSON values. `keep_at` is a set of episodes the
+    pruning never deletes, on top of the newest `keep`; every other
+    checkpoint older than the newest `keep` is still removed. Returns the
+    directory written.
 
     The write is staged in a sibling `.writing` directory and renamed into
     place, so a checkpoint directory that exists is a checkpoint that is
@@ -661,8 +674,11 @@ def save_ppo_checkpoint(run_dir, *, episode, tree, meta, keep=2) -> str:
     os.rename(staging, final)
 
     if keep is not None and int(keep) > 0:
+        pinned = frozenset(int(e) for e in (keep_at or ()))
         existing = list_checkpoints(run_dir)
         for stale in existing[:max(0, len(existing) - int(keep))]:
+            if _checkpoint_episode(stale) in pinned:
+                continue
             _shutil.rmtree(stale)
     return final
 
