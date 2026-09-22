@@ -86,12 +86,21 @@ _SITES = [
     (worker_mod, "CpuApproximationServer", "the server"),
 ]
 
+#: Dispatch keywords the WRAPPER consumes and does not forward.
+#:
+#: ``rule`` names the graph the plan was acted on (owner ruling 2026-09-22,
+#: the alternating run). The wrapper holds one server per graph and the
+#: keyword is how it picks between them, so it MUST stop there: a server is
+#: one graph and has nothing to do with the question. Every other keyword is
+#: part of the request and must reach the server.
+_CONSUMED_BY_THE_WRAPPER = {"rule"}
+
 
 def test_the_pool_has_dispatch_sites_to_read():
     kws = _dispatch_keywords()
     assert kws, "no `.evaluate.remote(...)` call site found in the pool"
     # the two that were forgotten, and some of the ones that were not
-    for name in ("eval_samples", "init", "episode", "env_row"):
+    for name in ("eval_samples", "init", "episode", "env_row", "rule"):
         assert name in kws, (name, sorted(kws))
 
 
@@ -100,7 +109,11 @@ def test_every_dispatch_keyword_binds(mod, cls, where):
     params = _parameters(_method(mod, cls, "evaluate"))
     if "**" in params:
         pytest.skip(f"{where} takes **kwargs; nothing to pin")
-    missing = sorted(k for k in _dispatch_keywords() if k not in params)
+    expected = _dispatch_keywords()
+    if cls == "CpuApproximationServer":
+        # The wrapper answers these itself; see _CONSUMED_BY_THE_WRAPPER.
+        expected = expected - _CONSUMED_BY_THE_WRAPPER
+    missing = sorted(k for k in expected if k not in params)
     assert not missing, (
         f"{where} does not accept {missing}, and the pool passes them on "
         f"every dispatch. Every pooled measurement would die with a "
@@ -120,6 +133,21 @@ def test_the_wrapper_forwards_what_it_accepts():
     assert forwarded, "the wrapper no longer forwards to the server"
     taken = {n for n in _parameters(fn)
              if n not in ("self", "order", "sparsity_specs", "step")}
-    dropped = sorted(taken - forwarded)
+    dropped = sorted(taken - forwarded - _CONSUMED_BY_THE_WRAPPER)
     assert not dropped, (
         f"the Ray wrapper accepts {dropped} and does not forward them")
+
+
+def test_a_keyword_the_wrapper_consumes_is_actually_read():
+    """A consumed keyword that nothing reads is the dropped-field defect with
+    the exemption written in. ``rule`` decides WHICH graph's server measures
+    the plan, so the wrapper's body has to mention it."""
+    fn = _method(actors_mod, "CpuApproximationActor", "evaluate")
+    names = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name)}
+    for kw in _CONSUMED_BY_THE_WRAPPER:
+        assert kw in _parameters(fn), (
+            f"{kw} is listed as consumed by the wrapper and the wrapper does "
+            f"not take it")
+        assert kw in names, (
+            f"the wrapper takes {kw} and its body never reads it, so the "
+            f"dispatch that sends it changes nothing")

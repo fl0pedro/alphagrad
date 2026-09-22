@@ -571,9 +571,15 @@ class CpuApproxPool:
         face_skips: Any = None,
         episode: int | None = None,
         env_row: int | None = None,
+        rule: str | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Dispatch one ``(order, specs, step)`` request to a pool
         actor and return ``(tokens, eqn_ids, reward)`` as numpy arrays.
+
+        ``rule`` NAMES THE GRAPH THE PLAN WAS ACTED ON (owner ruling
+        2026-09-22). It comes from the env that made the request, so a run
+        that alternates between two graphs measures the episode's own graph
+        and never the other one. ``None`` on a run with one graph.
 
         Always returns valid arrays of the correct shape, even when
         the actor times out / dies / there's no actor available.
@@ -640,6 +646,7 @@ class CpuApproxPool:
                             else np.asarray(face_skips, dtype=np.int32)),
                 episode=(None if episode is None else int(episode)),
                 env_row=(None if env_row is None else int(env_row)),
+                rule=(None if rule is None else str(rule)),
             )
             # Per-actor cold/warm timeout. ``timeout_for`` returns 0
             # when the user requested no-timeout (``--cpu-callback-timeout 0``);
@@ -744,6 +751,7 @@ class CpuApproxPool:
         face_skips_batch: "Sequence[Any] | None" = None,
         episode: int | None = None,
         env_rows: "Sequence[int] | None" = None,
+        rule: str | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Phase-2 memory-mitigation probe #8: optional batch dedup.
 
@@ -761,7 +769,7 @@ class CpuApproxPool:
                 eval_samples=eval_samples, init=init,
                 face_specs_batch=face_specs_batch,
                 face_skips_batch=face_skips_batch,
-                episode=episode, env_rows=env_rows,
+                episode=episode, env_rows=env_rows, rule=rule,
             )
         N = len(order_batch)
         # Build canonical key per slot; first-seen slot is the representative.
@@ -796,7 +804,7 @@ class CpuApproxPool:
                 eval_samples=eval_samples, init=init,
                 face_specs_batch=face_specs_batch,
                 face_skips_batch=face_skips_batch,
-                episode=episode, env_rows=env_rows,
+                episode=episode, env_rows=env_rows, rule=rule,
             )
         _u = self._evaluate_batch_impl(
             [order_batch[i] for i in uniq_idx],
@@ -810,6 +818,7 @@ class CpuApproxPool:
             episode=episode,
             env_rows=(None if env_rows is None else
                       [env_rows[i] for i in uniq_idx]),
+            rule=rule,
         )
         t_u, r_u, s_u = _u[0], _u[-2], _u[-1]
         e_u = _u[1] if self._emit_eqn_ids else None
@@ -842,6 +851,7 @@ class CpuApproxPool:
         face_skips_batch: "Sequence[Any] | None" = None,
         episode: int | None = None,
         env_rows: "Sequence[int] | None" = None,
+        rule: str | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Dispatch N requests concurrently. Returns
         ``(tokens_stack, eqn_ids_stack, rewards_stack, sentinel_mask)``
@@ -989,6 +999,7 @@ class CpuApproxPool:
                         episode=(None if episode is None else int(episode)),
                         env_row=(None if env_rows is None
                                  else int(env_rows[i])),
+                        rule=(None if rule is None else str(rule)),
                     )
                     f_timeouts[i] = self._timeout_for(actor)
                 except Exception as _exc:
@@ -1139,6 +1150,7 @@ class CpuApproxPool:
                             episode=(None if episode is None else int(episode)),
                             env_row=(None if env_rows is None
                                      else int(env_rows[i])),
+                            rule=(None if rule is None else str(rule)),
                         )
                         rto = self._timeout_for(fresh)
                         _rres = (ray.get(rf) if rto <= 0.0

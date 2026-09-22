@@ -10323,6 +10323,13 @@ class VertexEliminationEnv:
     # pytree child.
     _remote_pool: Any = None
     _remote_timeout_s: float = 60.0
+    # WHICH GRAPH THIS ENV IS (owner ruling 2026-09-22). A run may alternate
+    # between two graphs of one target, and the measure actors hold one env
+    # per graph, so every pooled request has to say which graph its plan was
+    # acted on. The env that made the request is what knows, so the rule
+    # lives here and rides in ``tree_flatten``'s aux data like the pool does.
+    # ``None`` on a run with one graph, which is every run before this one.
+    _temporal_rule: Any = None
     # WHICH ROLLOUT SHARD THIS ENV BELONGS TO (--rollout-shards). Data
     # parallelism over environments gives every GPU its own block of them and
     # every shard its own copy of this env, on its own device. The pair rides
@@ -10347,6 +10354,7 @@ class VertexEliminationEnv:
         remote_timeout_s: float = 60.0,
         rollout_shard: int = 0,
         rollout_shards: int = 1,
+        temporal_rule: Any = None,
     ):
         object.__setattr__(self, "config", config)
         object.__setattr__(self, "args", tuple(args))
@@ -10354,6 +10362,8 @@ class VertexEliminationEnv:
         object.__setattr__(self, "eval_args_samples", eval_args_samples)
         object.__setattr__(self, "_remote_pool", remote_pool)
         object.__setattr__(self, "_remote_timeout_s", float(remote_timeout_s))
+        object.__setattr__(self, "_temporal_rule",
+                           None if temporal_rule is None else str(temporal_rule))
         if not (0 <= int(rollout_shard) < int(rollout_shards)):
             raise ValueError(
                 f"rollout_shard {rollout_shard} is not in "
@@ -10430,6 +10440,7 @@ class VertexEliminationEnv:
             remote_timeout_s=self._remote_timeout_s,
             rollout_shard=self.rollout_shard,
             rollout_shards=self.rollout_shards,
+            temporal_rule=self._temporal_rule,
         )
 
     @classmethod
@@ -10576,6 +10587,7 @@ class VertexEliminationEnv:
             self.config, self.valid_vertices, self.num_envs,
             self._remote_pool, self._remote_timeout_s,
             self.rollout_shard, self.rollout_shards,
+            self._temporal_rule,
         )
         return children, aux_data
 
@@ -10588,7 +10600,15 @@ class VertexEliminationEnv:
         # fields were added are 3-tuples; the remote-pool ones are 5-tuples;
         # the rollout-shard ones are 7.
         rollout_shard, rollout_shards = 0, 1
-        if len(aux_data) == 3:
+        temporal_rule = None
+        if len(aux_data) == 8:
+            # THE GRAPH THE ENV IS, added 2026-09-22 with the alternating run.
+            (
+                config, valid_vertices, num_envs,
+                remote_pool, remote_timeout_s,
+                rollout_shard, rollout_shards, temporal_rule,
+            ) = aux_data
+        elif len(aux_data) == 3:
             config, valid_vertices, num_envs = aux_data
             remote_pool = None
             remote_timeout_s = 60.0
@@ -10611,6 +10631,7 @@ class VertexEliminationEnv:
             remote_timeout_s=remote_timeout_s,
             rollout_shard=rollout_shard,
             rollout_shards=rollout_shards,
+            temporal_rule=temporal_rule,
         )
 
     def with_rollout_shard(self, shard: int, n_shards: int):
@@ -10636,6 +10657,7 @@ class VertexEliminationEnv:
             remote_timeout_s=self._remote_timeout_s,
             rollout_shard=int(shard),
             rollout_shards=int(n_shards),
+            temporal_rule=self._temporal_rule,
         )
 
     def _shard_wrap(self, fn):
@@ -10934,6 +10956,11 @@ class VertexEliminationEnv:
                             # flag-off wire is unchanged.
                             episode=(walk_episode() if walk_rotate_enabled()
                                      else None),
+                            # THE GRAPH THIS PLAN WAS ACTED ON. The actor
+                            # holds one env per graph and this is what picks
+                            # between them; without it a run that alternates
+                            # would measure half its plans on the other graph.
+                            rule=self._temporal_rule,
                         )
                     finally:
                         _mwdt = time.perf_counter() - _mw0
@@ -11119,6 +11146,7 @@ class VertexEliminationEnv:
                     init=init,
                     episode=(walk_episode() if walk_rotate_enabled()
                              else None),
+                    rule=self._temporal_rule,
                 )
             finally:
                 _mwdt = time.perf_counter() - _mw0
