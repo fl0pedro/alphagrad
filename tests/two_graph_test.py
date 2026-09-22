@@ -108,6 +108,23 @@ def test_the_argparser_takes_one_or_two_rules():
         p.parse_args(base + ["--temporal-rule", "nonsense"])
 
 
+def test_the_trainer_refuses_two_rules_until_its_own_build_is_per_graph():
+    """ppo.main still builds ONE graph, so it says so at startup.
+
+    The refusal is the point: the two graphs have different vertex counts
+    (58 and 68 valid on RSNN_SHD, measured 2026-09-22), so a run that got
+    past this check would act on one graph's program and measure the other's.
+    Delete this test WITH the refusal, never on its own.
+    """
+    import alphagrad.approx.ppo as ppo
+
+    ns = ppo.make_argparser().parse_args(
+        ["--example", RSNN, "--temporal-rule", "bptt", "rtrl",
+         "--episodes", "1", "--wandb", "disabled"])
+    with pytest.raises(SystemExit, match="two graphs in one run"):
+        ppo.main(ns)
+
+
 def test_the_rule_list_helper_reads_every_form():
     assert temporal_rule_list(None) == ()
     assert temporal_rule_list("bptt") == ("bptt",)

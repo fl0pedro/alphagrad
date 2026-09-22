@@ -7823,6 +7823,35 @@ def main(args=None):
     # built from -- is byte for byte the one it had before two rules existed.
     args.temporal_rule = _resolve_temporal_rules(args.example,
                                                  args.temporal_rule)
+    # THE TRAINER STILL BUILDS ONE GRAPH. The rule list, the alternation
+    # schedule, the per-graph state (archive, PopArt, multiplier) with its
+    # checkpoint round trip, the per-graph carry plan and the measure actors'
+    # per-graph envs are landed and tested; ppo.main's own build is not, and
+    # it is refused HERE rather than failing inside `get_args` with a rule it
+    # cannot read. What is still one-graph in this function, measured on
+    # RSNN_SHD 2026-09-22 (bptt 59 equations / 58 valid vertices / F 42 /
+    # face bound 230; rtrl 69 / 68 / 65 / 384):
+    #   * `closed_jaxpr`, `env`, `gen`, the base token stream and the eval
+    #     samples -- one of each, built from `args.temporal_rule` directly;
+    #   * `total_v`, `num_valid`, `vertex_valid_static`, the fixed-order
+    #     table, `pair_valid_mask` and the oracle's per-vertex arrays, all
+    #     sized by ONE graph's equation count, while the agent's vertex
+    #     embedding is `Embedding(total_v, .)` and must be built at the
+    #     WIDER count with the narrower graph's slots masked off;
+    #   * `configure_max_faces`, which is process state and must be installed
+    #     at the wider of the two bounds before any face-shaped array exists;
+    #   * the swap at the top of the episode loop that rebinds `env`, the
+    #     archive, the PopArt triple and `lag_lambda` to the episode's graph.
+    if len(_rule_list(args.temporal_rule)) > 1:
+        raise SystemExit(
+            f"--temporal-rule {list(args.temporal_rule)} asks ppo.py to run "
+            f"two graphs in one run. The rule list, the alternation, the "
+            f"per-graph state and the measure actors' per-graph envs are in "
+            f"place; the trainer's own graph build is not, and the two "
+            f"graphs have different vertex counts (58 and 68 valid on "
+            f"RSNN_SHD), so running one graph's plan on the other's program "
+            f"would be silently wrong. See the comment above this check for "
+            f"what is still one-graph in ppo.main, and bead dsnn-dfw.116.")
     # THE TARGET THE RULE BUILDS. --temporal-rule window2 is not another
     # given edge on the one-step body; it is a two-copy graph with no given
     # edge at all, and it has its own registered target. Resolved HERE, in
