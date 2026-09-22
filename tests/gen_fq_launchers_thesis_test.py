@@ -120,6 +120,11 @@ MINIBATCHES = "8"
 #: surrogate at c * A with c = 3.  The order-only tuning rows and the sweep
 #: sections call `thesis_cli` directly and keep the flag off.
 DUAL_CLIP = "3.0"
+#: TARGET-KL TRUST REGION BOUND (dsnn-dfw.98): every row
+#: `thesis_arm` emits bounds the PPO update at a KL of 0.1 to the
+#: rollout policy.  The order-only tuning rows and the sweep
+#: sections call `thesis_cli` directly and keep the flag off.
+TARGET_KL = "0.1"
 #: THE FACE-ENTROPY WEIGHT PER FAMILY (owner ruling 2026-09-21, dsnn-dfw.84
 #: and dsnn-dfw.78): the recurrent target and TLM render the near-zero
 #: bonus; NN256 keeps the campaign's 0.05.
@@ -368,6 +373,8 @@ def test_every_arm_carries_the_shared_thesis_flags(gen, matrix):
         # unbounded weight.  Every matrix row caps the negative branch.
         assert cli["--dual-clip"] == DUAL_CLIP, a["name"]
         assert gen.THESIS_DUAL_CLIP == DUAL_CLIP
+        assert cli["--target-kl"] == TARGET_KL, a["name"]
+        assert gen.THESIS_TARGET_KL == TARGET_KL
         # the face head at init
         assert cli["--scale-face-head"] == "0.1", a["name"]
         assert cli["--face-logit-clamp"] == "15", a["name"]
@@ -431,6 +438,38 @@ def test_dual_clip_reaches_every_row_thesis_arm_emits_and_no_other(gen,
         assert "--dual-clip" in a["required_flags"], a["name"]
     for a in off:
         assert "--dual-clip" not in a["required_flags"], a["name"]
+
+
+def test_target_kl_reaches_every_row_thesis_arm_emits_and_no_other(gen,
+                                                                   matrix,
+                                                                   smoke):
+    """dsnn-dfw.98.  The trust-region bound is on the matrix -- A, B, C,
+    C_popart and condC, on every target -- and on the smoke, which has to
+    start the same command line the matrix runs.
+
+    It is OFF on the order-only tuning rows and on the three Lagrangian
+    sweep rounds, and the absence is asserted rather than trusted, for
+    the same reason dual-clip is off there: those are frozen running
+    comparisons and a launcher that moved under them would invalidate
+    the round.
+    """
+    for a in matrix + smoke:
+        cli = _cli(gen, a)
+        assert cli["--target-kl"] == TARGET_KL, a["name"]
+        assert f"--target-kl {TARGET_KL}" in gen.render(a), a["name"]
+    off = (gen.orderonly_arms() + gen.orderonly_rsnn_arms()
+           + gen.orderonly_final_arms() + gen.orderonly_tlm_final_arms()
+           + gen.sweepl_arms() + gen.sweepl2_arms() + gen.sweepl3_arms())
+    assert off
+    for a in off:
+        assert "--target-kl" not in _cli(gen, a), a["name"]
+        assert "--target-kl" not in gen.render(a), a["name"]
+    assert gen.TARGET_KL_REQUIRED_FLAGS == ["--target-kl"]
+    assert "--target-kl" not in gen.THESIS_REQUIRED_FLAGS
+    for a in matrix + smoke:
+        assert "--target-kl" in a["required_flags"], a["name"]
+    for a in off:
+        assert "--target-kl" not in a["required_flags"], a["name"]
 
 
 def test_the_targets_are_the_ones_the_owner_named(gen, matrix):
