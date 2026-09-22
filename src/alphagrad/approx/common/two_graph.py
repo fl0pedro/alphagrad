@@ -198,17 +198,27 @@ def namespaced(key: str, rule: str | None) -> str:
     return f"{head}/{rule}/{tail}"
 
 
-def namespace_log(log: dict, rule: str | None) -> dict:
-    """``log`` with every key namespaced by ``rule``, plus the plain keys.
+def namespace_log(log: dict, rule: str | None, prefixes=None) -> dict:
+    """``log`` with keys namespaced by ``rule``, plus every plain key.
 
     BOTH FORMS ARE EMITTED. The namespaced key is the one that means
-    something over a whole run -- two graphs write two series -- and the plain
-    key is the episode's own value, which is what the existing dashboards
-    read. A single-rule run emits the plain keys only, so nothing about its
-    wandb record moves.
+    something over a whole run -- two graphs write two series and a shared key
+    would interleave them -- and the plain key is the episode's own value,
+    which is what the existing dashboards read. A single-rule run emits the
+    plain keys only, so nothing about its wandb record moves.
+
+    ``prefixes`` limits the namespacing to the key families that are PER
+    GRAPH (``("lagrangian", "popart", "pareto")`` at the call site). A key
+    outside them describes the episode and means the same thing whichever
+    graph it ran on, so a second copy of it would only be noise. ``None``
+    namespaces everything.
     """
     if rule is None:
         return dict(log)
-    out = {namespaced(k, rule): v for k, v in log.items()}
+    want = None if prefixes is None else tuple(prefixes)
+    out = {}
+    for k, v in log.items():
+        if want is None or k.partition("/")[0] in want:
+            out[namespaced(k, rule)] = v
     out.update(log)
     return out

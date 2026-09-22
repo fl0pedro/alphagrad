@@ -243,6 +243,40 @@ def set_logit_clamp(c: float) -> None:
     LOGIT_CLAMP[0] = float(c)
 
 
+# THE PER-GRAPH FACE-INIT OFFSET (owner ruling 2026-09-22). A run may hold two
+# graphs of one target, and the face head is SHARED, so its bias vector can
+# carry only ONE (B, Bs). The normalized init is a function of the graph's own
+# reference face count F, which differs (measured: 42 and 65), so each graph
+# carries a fixed offset that restores its own (B_g, Bs_g) on top of the
+# shared pair. The offset is a CONSTANT, never trained, and it is added where
+# the init bias sits -- to the projection's output, BEFORE the clamp -- so the
+# two are the same parameterization and nothing about a one-graph run moves
+# (its offset is None).
+#
+# IT MUST BE THE SAME NUMBER IN THE SAMPLER AND IN THE REPLAY. That is
+# dsnn-dfw.95 exactly: when the two disagreed by a bias, the PPO ratio of
+# every plan that approximated went to 1e-4 and those plans left the policy
+# gradient. `logits` is the ONE funnel both paths come through, which is why
+# the offset is added here and nowhere else.
+FACE_LOGIT_OFFSET = [None]
+
+
+def set_face_logit_offset(vec) -> None:
+    """Install the active graph's offset vector, or ``None`` for no offset.
+
+    Call it before the episode's programs are traced. Every program that
+    reaches the face head takes the env as an argument, and two graphs are two
+    envs with two different treedefs, so the two graphs get two traces and
+    each bakes its own offset.
+    """
+    FACE_LOGIT_OFFSET[0] = vec
+
+
+def face_logit_offset():
+    """The offset currently installed, or ``None``."""
+    return FACE_LOGIT_OFFSET[0]
+
+
 def slot_base(s: int, layout: FaceHeadLayout | None = None) -> int:
     """Logit offset of slot ``s``'s 31-wide block: ``1 + 31*s``.
 
@@ -410,6 +444,18 @@ class UnifiedFaceHead(eqx.Module):
 
     def logits(self, ctx):
         z = self.proj(ctx)
+        # THE PER-GRAPH FACE-INIT OFFSET, added where the init bias sits: on
+        # the projection's output, BEFORE the clamp. sample() and score()
+        # both come through here, so the sampler and the replay read the same
+        # number by construction (dsnn-dfw.95).
+        _off = FACE_LOGIT_OFFSET[0]
+        if _off is not None:
+            if _off.shape != (self.layout.width,):
+                raise ValueError(
+                    f"the face-logit offset has shape {_off.shape} and this "
+                    f"head is {self.layout.width} wide. An offset built for "
+                    f"another layout would land on the wrong logits.")
+            z = z + _off
         c = LOGIT_CLAMP[0]
         if c > 0.0:
             # tanh, not hard clip: see LOGIT_CLAMP. sample() and score()

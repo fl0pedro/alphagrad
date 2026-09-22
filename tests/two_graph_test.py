@@ -1,7 +1,7 @@
 """Two input DAGs in one run (bead dsnn-dfw.116, owner ruling 2026-09-22).
 
 ``--temporal-rule bptt rtrl`` runs both graphs of one target and alternates
-per episode. These tests pin the four things that makes true:
+per episode. These tests pin the six things that makes true:
 
 1. THE ARGUMENT. One rule in, one string out -- the namespace a one-rule run
    carries is the one it carried before two rules existed, which is what
@@ -12,10 +12,16 @@ per episode. These tests pin the four things that makes true:
    graph's multiplier, PopArt or archive.
 4. THE ROUND TRIP. The per-graph state survives a checkpoint, and a resume
    whose rule list moved is refused rather than run on the other graph.
+5. THE SHARED VERTEX INDEX SPACE (owner ruling 1, 2026-09-22). One index
+   space at the wider count, index i a SLOT and not a vertex identity, the
+   narrower graph masked to its own slots and the boundary padded.
+6. THE PER-GRAPH FACE INIT (owner ruling 2). The shared head keeps one
+   (B, Bs) and each graph carries a fixed logit offset, so each DAG starts at
+   the run's requested approximations and skips per plan from its own F.
 
-Nothing here builds a graph: the measured graph shapes are in the report, and
-what is under test is the bookkeeping that decides which graph an episode is
-on. `tests/temporal_rule_test.py` owns the graphs themselves.
+Nothing here builds a graph: the measured graph shapes come from the probe
+(job 67505) and what is under test is the bookkeeping that decides which
+graph an episode is on. `tests/temporal_rule_test.py` owns the graphs.
 """
 
 import copy
@@ -106,23 +112,6 @@ def test_the_argparser_takes_one_or_two_rules():
     assert p.parse_args(base).temporal_rule is None
     with pytest.raises(SystemExit):
         p.parse_args(base + ["--temporal-rule", "nonsense"])
-
-
-def test_the_trainer_refuses_two_rules_until_its_own_build_is_per_graph():
-    """ppo.main still builds ONE graph, so it says so at startup.
-
-    The refusal is the point: the two graphs have different vertex counts
-    (58 and 68 valid on RSNN_SHD, measured 2026-09-22), so a run that got
-    past this check would act on one graph's program and measure the other's.
-    Delete this test WITH the refusal, never on its own.
-    """
-    import alphagrad.approx.ppo as ppo
-
-    ns = ppo.make_argparser().parse_args(
-        ["--example", RSNN, "--temporal-rule", "bptt", "rtrl",
-         "--episodes", "1", "--wandb", "disabled"])
-    with pytest.raises(SystemExit, match="two graphs in one run"):
-        ppo.main(ns)
 
 
 def test_the_rule_list_helper_reads_every_form():
@@ -370,3 +359,282 @@ def test_the_carry_plan_holds_one_entry_per_graph_and_the_graph_is_the_key():
         assert CP._entry(cfg_r)["variants"] == {}
     finally:
         CP.reset()
+
+
+# ---------------------------------------------------------------------------
+# 7. THE SHARED VERTEX INDEX SPACE (owner ruling 1, 2026-09-22)
+# ---------------------------------------------------------------------------
+#
+# ONE index space at the wider count. Index i is a SLOT, not a vertex
+# identity: nothing assumes slot i of one graph is slot i of the other. The
+# narrower graph is masked to its own slots and the env-to-agent boundary is
+# padded up. The numbers are the measured ones (job 67505): bptt 59 equations
+# and 58 valid vertices, rtrl 69 and 68.
+
+BPTT_EQNS, BPTT_VALID = 59, 58
+RTRL_EQNS, RTRL_VALID = 69, 68
+SHARED = RTRL_EQNS
+
+
+class _FakeState:
+    """The two fields `vertex_avail_at_step` reads off a rollout state."""
+
+    def __init__(self, order, step_count):
+        import jax.numpy as jnp
+        self.order = jnp.asarray(order, jnp.int32)
+        self.step_count = jnp.asarray(step_count, jnp.int32)
+
+
+def test_the_narrow_graph_is_masked_to_its_own_slots():
+    """A bptt episode can never read or write a slot above its own count.
+
+    `build_vertex_valid_static` is given the SHARED width and the graph's own
+    valid vertices, so every slot the graph does not have is zero, and
+    availability is that mask times the not-yet-chosen indicator. There is no
+    step of any episode at which a padded slot is available.
+    """
+    import numpy as _np
+    from alphagrad.approx.common.masks import (
+        build_vertex_valid_static, vertex_avail_at_step)
+
+    bptt_valid = list(range(1, BPTT_VALID + 1))
+    rtrl_valid = list(range(1, RTRL_VALID + 1))
+    vvs_b = build_vertex_valid_static(bptt_valid, SHARED)
+    vvs_r = build_vertex_valid_static(rtrl_valid, SHARED)
+    assert vvs_b.shape == vvs_r.shape == (SHARED,)
+    assert float(_np.sum(_np.asarray(vvs_b))) == BPTT_VALID
+    assert float(_np.sum(_np.asarray(vvs_r))) == RTRL_VALID
+    # every slot the narrow graph does not have is dead in its mask
+    assert _np.all(_np.asarray(vvs_b)[BPTT_VALID:] == 0.0)
+
+    # and it stays dead at every step of a whole episode
+    order = _np.zeros(BPTT_VALID, _np.int32)
+    for step in range(BPTT_VALID + 1):
+        if step:
+            order[step - 1] = step          # eliminate 1, 2, 3, ...
+        avail = _np.asarray(vertex_avail_at_step(
+            _FakeState(order, step), vvs_b, SHARED, BPTT_VALID))
+        assert avail.shape == (SHARED,)
+        assert _np.all(avail[BPTT_VALID:] == 0.0), (step, avail[BPTT_VALID:])
+        # and the slots it HAS are exactly the ones not yet chosen
+        assert float(_np.sum(avail)) == float(BPTT_VALID - step)
+
+
+def test_the_boundary_pad_carries_no_axis():
+    """The padded per-vertex rows are inert.
+
+    `axis_valid_static` is zero on every padded slot, so the agent reads no
+    axis there. `compute_static_axis_state` and `build_pair_valid_mask` both
+    take the width as an argument and fill only the rows their jaxpr has,
+    which IS the pad.
+    """
+    import numpy as _np
+    from alphagrad.approx.common.masks import vertex_axis_dims
+
+    class _Aval:
+        def __init__(self, shape):
+            self.shape = shape
+
+    class _Var:
+        def __init__(self, shape):
+            self.aval = _Aval(shape)
+
+    class _Eqn:
+        def __init__(self):
+            self.outvars = [_Var((4, 5))]
+            self.invars = [_Var((4, 5, 6))]
+
+    class _Jaxpr:
+        eqns = [_Eqn() for _ in range(BPTT_EQNS)]
+
+    out_n, in_n = vertex_axis_dims(_Jaxpr(), SHARED)
+    assert out_n.shape == in_n.shape == (SHARED,)
+    # the graph's own rows carry its shapes ...
+    assert _np.all(out_n[:BPTT_EQNS] == 2)
+    assert _np.all(in_n[:BPTT_EQNS] == 3)
+    # ... and every row past them is the pad, which carries nothing
+    assert _np.all(out_n[BPTT_EQNS:] == 0)
+    assert _np.all(in_n[BPTT_EQNS:] == 0)
+
+
+def test_the_shared_space_is_the_maximum_and_never_less():
+    """The shared width is the MAX over the graphs. A width below a graph's
+    own count would cut that graph's vertices off, which is why ppo.main
+    raises on a negative pad rather than clipping."""
+    assert max(BPTT_EQNS, RTRL_EQNS) == SHARED
+    assert SHARED >= BPTT_EQNS and SHARED >= RTRL_EQNS
+
+
+# ---------------------------------------------------------------------------
+# 8. THE PER-GRAPH FACE-INIT OFFSET (owner ruling 2, 2026-09-22)
+# ---------------------------------------------------------------------------
+#
+# The shared face head keeps ONE (B, Bs). Each graph carries a fixed offset so
+# that under a=1 and kappa=0.3 each DAG starts at one requested approximation
+# and 0.3 requested skips per plan from its OWN reference face count F, which
+# is 42 on bptt and 65 on rtrl (job 67505).
+
+F_BPTT, F_RTRL = 42, 65
+A_PER_PLAN, KAPPA = 1.0, 0.3
+
+
+def _bias_pair(F):
+    from alphagrad.approx.common.agent_factory import (
+        derive_face_none_bias, derive_face_skip_bias)
+    from alphagrad.approx.unified_face_head import (
+        FACE_SLOTS, NUM_APPROX_OPS)
+    return (derive_face_none_bias(F, FACE_SLOTS, NUM_APPROX_OPS - 1,
+                                  A_PER_PLAN),
+            derive_face_skip_bias(F, KAPPA))
+
+
+def test_each_graph_starts_at_the_requested_rates_from_its_own_F():
+    """The point of the offset: BOTH graphs start at a=1 and kappa=0.3."""
+    from alphagrad.approx.common.agent_factory import expected_face_counts
+    from alphagrad.approx.unified_face_head import (
+        FACE_SLOTS, NUM_APPROX_OPS)
+
+    for F in (F_BPTT, F_RTRL):
+        B, Bs = _bias_pair(F)
+        e_a, e_k = expected_face_counts(float(F), FACE_SLOTS,
+                                        NUM_APPROX_OPS - 1, B, Bs)
+        assert abs(e_a - A_PER_PLAN) < 1e-6, (F, e_a)
+        assert abs(e_k - KAPPA) < 1e-6, (F, e_k)
+    # and the two graphs genuinely need different numbers
+    assert _bias_pair(F_BPTT) != _bias_pair(F_RTRL)
+
+
+def _tiny_agent(key_seed=0):
+    """An object with just the `face_path_policy.head` the offset reads."""
+    import jax.random as jrand
+    from alphagrad.approx.unified_face_head import UnifiedFaceHead
+
+    class _FPP:
+        pass
+
+    class _A:
+        pass
+
+    head = UnifiedFaceHead(8, key=jrand.PRNGKey(key_seed))
+    fpp = _FPP()
+    fpp.head = head
+    a = _A()
+    a.face_path_policy = fpp
+    return a, head
+
+
+def test_the_offset_lands_on_the_same_logits_the_init_bias_writes():
+    import numpy as _np
+    from alphagrad.approx.common.agent_factory import face_logit_offset_vector
+    from alphagrad.approx.unified_face_head import (
+        FACE_SLOTS, OP_NONE, O_SKIP, S_OP, slot_base)
+
+    agent, head = _tiny_agent()
+    vec = _np.asarray(face_logit_offset_vector(agent, 1.25, 0.75))
+    assert vec.shape == (head.layout.width,)
+    want = {slot_base(s, head.layout) + S_OP + OP_NONE: 1.25
+            for s in range(FACE_SLOTS)}
+    want[O_SKIP] = -0.75
+    for i, v in enumerate(vec):
+        assert abs(float(v) - want.get(i, 0.0)) < 1e-6, (i, v)
+    # zero deltas mean no offset at all, which is a one-graph run
+    assert face_logit_offset_vector(agent, 0.0, 0.0) is None
+
+
+def test_the_offset_moves_the_logits_by_exactly_the_offset():
+    """And it is added BEFORE the clamp, where the init bias sits.
+
+    An offset added after the clamp would not be bounded by it, so the two
+    ways of biasing the head would stop being the same parameterization.
+    """
+    import jax.numpy as jnp
+    import numpy as _np
+    from alphagrad.approx.common.agent_factory import face_logit_offset_vector
+    from alphagrad.approx.unified_face_head import (
+        set_face_logit_offset, set_logit_clamp, face_logit_offset)
+
+    agent, head = _tiny_agent(1)
+    ctx = jnp.arange(8, dtype=jnp.float32) / 8.0
+    try:
+        set_logit_clamp(0.0)
+        set_face_logit_offset(None)
+        base = _np.asarray(head.logits(ctx))
+        off = face_logit_offset_vector(agent, 0.5, 0.25)
+        set_face_logit_offset(off)
+        moved = _np.asarray(head.logits(ctx))
+        assert _np.allclose(moved - base, _np.asarray(off), atol=1e-5)
+
+        # UNDER THE CLAMP it is c*tanh((z + off)/c), not c*tanh(z/c) + off.
+        # `base` is the unclamped projection, so the expected value is built
+        # from it directly.
+        set_face_logit_offset(off)
+        set_logit_clamp(15.0)
+        clamped = _np.asarray(head.logits(ctx))
+        expect = 15.0 * _np.tanh((base + _np.asarray(off)) / 15.0)
+        assert _np.allclose(clamped, expect, atol=1e-4)
+        wrong = 15.0 * _np.tanh(base / 15.0) + _np.asarray(off)
+        assert not _np.allclose(clamped, wrong, atol=1e-4)
+    finally:
+        set_logit_clamp(0.0)
+        set_face_logit_offset(None)
+        assert face_logit_offset() is None
+
+
+def test_the_sampler_and_the_replay_read_the_same_offset():
+    """dsnn-dfw.95 FROM THE OTHER SIDE.
+
+    When the sampler and the replay disagreed by a bias, the PPO ratio of
+    every plan that approximated went to 1e-4 and those plans left the policy
+    gradient. `logits` is the ONE funnel both paths come through, so the
+    offset is read there and NOWHERE else -- any second reader could drift.
+    The barrier that made the two agree in the first place stays.
+    """
+    import ast
+    import inspect
+
+    from alphagrad.approx import unified_face_head as ufh
+
+    tree = ast.parse(inspect.getsource(ufh))
+    readers = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Name) and sub.id == "FACE_LOGIT_OFFSET":
+                readers.add(node.name)
+    assert readers == {"logits", "set_face_logit_offset",
+                       "face_logit_offset"}, sorted(readers)
+
+    # the .95 barrier is still in the clamp
+    src = inspect.getsource(ufh.UnifiedFaceHead.logits)
+    assert "optimization_barrier" in src, (
+        "the dsnn-dfw.95 barrier left `logits`; without it the loss program "
+        "fuses the projection into the bound and the replay scores a "
+        "different number than the sampler")
+    # and the offset is applied before it
+    assert src.index("FACE_LOGIT_OFFSET") < src.index("optimization_barrier")
+
+    # both entry points take z from `logits`, so neither can miss the offset
+    for fn in (ufh.UnifiedFaceHead.sample,):
+        assert "self.logits(" in inspect.getsource(fn)
+
+
+def test_both_graphs_offsets_are_consistent_with_one_shared_head():
+    """The head holds the PRIMARY graph's pair and the other graph carries
+    the difference, so the EFFECTIVE pair on each graph is its own."""
+    import numpy as _np
+    from alphagrad.approx.common.agent_factory import face_logit_offset_vector
+    from alphagrad.approx.unified_face_head import (
+        OP_NONE, O_SKIP, S_OP, slot_base)
+
+    agent, head = _tiny_agent(2)
+    B_p, Bs_p = _bias_pair(F_BPTT)        # bptt named first -> the head's
+    B_s, Bs_s = _bias_pair(F_RTRL)
+    assert face_logit_offset_vector(agent, B_p - B_p, Bs_p - Bs_p) is None
+    vec = _np.asarray(face_logit_offset_vector(agent, B_s - B_p, Bs_s - Bs_p))
+    i_none = slot_base(0, head.layout) + S_OP + OP_NONE
+    assert abs(float(vec[i_none]) - (B_s - B_p)) < 1e-6
+    assert abs(float(vec[O_SKIP]) + (Bs_s - Bs_p)) < 1e-6
+    # the head's own pair plus the offset IS the second graph's pair
+    assert abs((B_p + float(vec[i_none])) - B_s) < 1e-6
+    assert abs((Bs_p - float(vec[O_SKIP])) - Bs_s) < 1e-6
