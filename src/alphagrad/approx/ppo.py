@@ -7419,8 +7419,17 @@ def _mem_reward_index(mem_type: str) -> int:
 
 
 
-def _dump_pareto(archive, args, ep, *, final=False):
-    """Persist the front + a replayable best_sequences.json. Never raises."""
+def _dump_pareto(archive, args, ep, *, final=False, rule=None):
+    """Persist the front + a replayable best_sequences.json. Never raises.
+
+    ``rule`` NAMES THE GRAPH (owner ruling 2026-09-22). A run that alternates
+    holds one archive per graph, so it writes one front per graph:
+    ``pareto_front_bptt.json`` beside ``pareto_front_rtrl.json``. The two
+    fronts live in log-ratio space against their OWN graph's rev-exact
+    reference and are not comparable point by point, which is exactly why
+    they must not share a file. ``None`` keeps the one name a one-graph run
+    has always written.
+    """
     if archive is None or not getattr(archive, "pts", None):
         return
     try:
@@ -7431,9 +7440,11 @@ def _dump_pareto(archive, args, ep, *, final=False):
         except Exception:
             _dir = "."
         _os.makedirs(_dir, exist_ok=True)
+        _tag = "" if rule is None else f"_{rule}"
         archive.dump_front(
-            _os.path.join(_dir, "pareto_front.json"),
+            _os.path.join(_dir, f"pareto_front{_tag}.json"),
             extra={"episode": int(ep), "final": bool(final),
+                   "temporal_rule": (None if rule is None else str(rule)),
                    "run_name": getattr(args, "name", None)},
         )
         # Replayable form. Objective 0 is the compute channel and objective 1
@@ -7466,7 +7477,8 @@ def _dump_pareto(archive, args, ep, *, final=False):
             "_provenance": {"source": "ParetoArchive.dump", "episode": int(ep),
                             "num_points": len(_pts)},
         }
-        with open(_os.path.join(_dir, "best_sequences.json"), "w") as _fh:
+        with open(_os.path.join(_dir,
+                                f"best_sequences{_tag}.json"), "w") as _fh:
             _json.dump(_doc, _fh, indent=2)
     except Exception as _exc:
         try:
@@ -9416,6 +9428,18 @@ def main(args=None):
         bool(getattr(args, "unified_face_head", False)),
         not getattr(args, "no_approx_head", False),
     ))
+    # THE TWO PROBE SURFACES ARE STILL ONE-GRAPH. Both build a per-vertex
+    # table from ONE jaxpr at setup and read it for every episode, so on an
+    # alternating run half the episodes would decode the other graph's
+    # vertices. Refused rather than run wrong; neither is part of a campaign
+    # row and neither has a per-graph table yet (bead dsnn-dfw.116).
+    if _TWO_GRAPH and (_PROBE_ON or _VPROBE_ON):
+        raise SystemExit(
+            "--temporal-rule names two graphs and a probe surface is on "
+            f"(feature probe {bool(_PROBE_ON)}, var probe {bool(_VPROBE_ON)}). "
+            "Both hold a per-vertex table built from one graph at setup and "
+            "read it on every episode, so half the episodes would decode the "
+            "other graph. Turn the probe off, or run one rule.")
     if bool(getattr(args, "var_probe", False)) and not _VPROBE_ON:
         print("[vprobe] --var-probe IGNORED: the probe reads the per-face "
               "scatter, which exists only under --dynamic-substeps "
@@ -9609,9 +9633,20 @@ def main(args=None):
     _live_face_sizes = None
     _live_face_decide = None
     _EDGE_TABLE = None
-    if getattr(args, "live_faces", False):
+    def _build_live_faces(_g):
+        """The live-face stream and its callbacks, for ONE graph.
+
+        THE STREAM IS THE GRAPH'S. It replays eliminations on the jaxpr it
+        was built from, so a stream built on one graph and driven with the
+        other graph's order walks off the end of the equation list
+        (`graphax.core.face_specs_of`, IndexError). A run with two graphs
+        therefore holds two streams and the swap picks one.
+        """
         _LIVE_FACES = build_live_face_stream(
-            _oracle_jaxpr, _oracle_argnums, _oracle_consts, _oracle_args,
+            _g["closed_jaxpr"].jaxpr,
+            tuple(int(a) for a in _g["argnums"]),
+            list(_g["closed_jaxpr"].literals),
+            list(_g["xs"]),
             vocab=incr_token_vocab(),
             max_faces=_F_FACES, max_axes=_oracle_N,
             # A chunk is a slice of the step delta, so the delta cap is the
@@ -9697,6 +9732,27 @@ def main(args=None):
                  "static one)" if _FACE_STAGE2 else
                  "STATIC (ALPHAGRAD_FACE_STAGE2=0): known wrong for `new`, "
                  "finding 75"), flush=True)
+        return {
+            "LIVE_FACES": _LIVE_FACES,
+            "live_face": _live_face,
+            "live_face_count": _live_face_count,
+            "live_face_for": _live_face_for,
+            "live_face_sizes": _live_face_sizes,
+            "live_face_decide": _live_face_decide,
+            "EDGE_TABLE": _EDGE_TABLE,
+        }
+
+    if getattr(args, "live_faces", False):
+        for _k in _GRAPH_KEYS:
+            _GRAPHS[_k]["live"] = _build_live_faces(_GRAPHS[_k])
+        _lv = _GRAPHS[_PRIMARY]["live"]
+        _LIVE_FACES = _lv["LIVE_FACES"]
+        _live_face = _lv["live_face"]
+        _live_face_count = _lv["live_face_count"]
+        _live_face_for = _lv["live_face_for"]
+        _live_face_sizes = _lv["live_face_sizes"]
+        _live_face_decide = _lv["live_face_decide"]
+        _EDGE_TABLE = _lv["EDGE_TABLE"]
 
     # Live elimination chains: one per concurrent env, plus the previous
     # episode's, which the LRU only sheds once the new ones exist. Sized like
@@ -15688,7 +15744,9 @@ def main(args=None):
             # Persist the FRONT, not just these two scalars — see _dump_pareto.
             _pd = int(getattr(args, "pareto_dump_every", 50) or 0)
             if _pd > 0 and (ep % _pd == 0):
-                _dump_pareto(pareto_archive, args, ep)
+                _dump_pareto(pareto_archive, args, ep,
+                             rule=(_rule_for_episode(_RULES, int(ep))
+                                   if _TWO_GRAPH else None))
             if pareto_archive.pts:
                 fx = np.stack(pareto_archive.pts).astype(np.float64)
                 # 3 scatter tables: (latency|cmp x cos), (mem x cos), (cmp x mem)
@@ -17504,6 +17562,8 @@ def main(args=None):
         nonlocal _BASE_TOK, _BASE_N, _BASE_W, _BASE_OWN
         nonlocal _oracle_jaxpr, _oracle_consts, _oracle_args, _oracle_argnums
         nonlocal popart_m1, popart_m2, popart_w, lag_lambda
+        nonlocal _LIVE_FACES, _live_face, _live_face_count, _live_face_for
+        nonlocal _live_face_sizes, _live_face_decide, _EDGE_TABLE
         _from = _RULE_PREV[0]
         if _from == _to:
             return
@@ -17532,6 +17592,18 @@ def main(args=None):
         _oracle_consts = list(_g["closed_jaxpr"].literals)
         _oracle_args = list(_g["xs"])
         _oracle_argnums = tuple(int(a) for a in _g["argnums"])
+        # THE LIVE-FACE STREAM IS THE GRAPH'S. A stream driven with the other
+        # graph's order walks off its equation list, which is how the first
+        # two-graph probe failed (job 67523, IndexError in `face_specs_of`).
+        _lv_g = _g.get("live")
+        if _lv_g is not None:
+            _LIVE_FACES = _lv_g["LIVE_FACES"]
+            _live_face = _lv_g["live_face"]
+            _live_face_count = _lv_g["live_face_count"]
+            _live_face_for = _lv_g["live_face_for"]
+            _live_face_sizes = _lv_g["live_face_sizes"]
+            _live_face_decide = _lv_g["live_face_decide"]
+            _EDGE_TABLE = _lv_g["EDGE_TABLE"]
         _set_face_off(_g["face_offset"])
         _RULE_PREV[0] = _to
 
@@ -18566,7 +18638,16 @@ def main(args=None):
             file=sys.stderr,
         )
 
-    _dump_pareto(pareto_archive, args, _EPISODES_DONE[0], final=True)
+    # EVERY GRAPH'S FRONT AT THE END, not just the one the last episode ran
+    # on: the other graph's archive is in the store and a run that dumped one
+    # would drop half its result.
+    if _TWO_GRAPH:
+        _gstates_flush()
+        for _k in _GRAPH_KEYS:
+            _dump_pareto(_GSTATES[_k].archive, args, _EPISODES_DONE[0],
+                         final=True, rule=_k)
+    else:
+        _dump_pareto(pareto_archive, args, _EPISODES_DONE[0], final=True)
     print_top_n("Total Reward", host_state["top_n_total"])
     print_top_n(f"CMP (Lowest {args.cmp_type})", host_state["top_n_cmp"])
     print_top_n(f"Memory (Lowest {args.mem_type})", host_state["top_n_mem"])
