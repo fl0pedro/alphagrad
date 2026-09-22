@@ -2646,9 +2646,14 @@ def thesis_temporal_rule(target: str) -> str | None:
 #: Vertex 40 of a TLM plan carried 72 live faces at episode 55, past
 #: CAMPAIGN_FACE_WIRE_FACES's 64, and the trainer raised by design (the
 #: budget is a hard stop, not a truncation).  Every arm on the TLM target
-#: -- the matrix, the pair launchers and the smoke -- renders this instead
-#: of the campaign constant.  Every other thesis target (nn256 and the four
-#: recurrent rules) keeps CAMPAIGN_FACE_WIRE_FACES.
+#: -- the matrix, the pair launchers and the smoke, i.e. every row
+#: `thesis_arm` emits (`matrix_row=True`) -- renders this instead of the
+#: campaign constant.  The order-only TLM final row is also target "tlm"
+#: and also goes through `thesis_cli`, but it is a DIFFERENT round with its
+#: own record (mirroring `rung1_row`/`condc_popart_row`/
+#: `condc_tlm_init_row`), so it keeps 64.  Every other thesis target (nn256
+#: and the four recurrent rules) keeps CAMPAIGN_FACE_WIRE_FACES regardless
+#: of `matrix_row`.
 THESIS_TLM_FACE_WIRE_FACES = "128"
 
 
@@ -3057,9 +3062,16 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
         "--ppo-epochs": ppo_epochs,
         "--minibatches": minibatches,
         "--tokenize-where": CAMPAIGN_TOKENIZE_WHERE,
-        # dsnn-dfw.104: TLM alone renders the raised budget; every other
-        # thesis target keeps the campaign constant.
-        "--face-wire-faces": (THESIS_TLM_FACE_WIRE_FACES if target == "tlm"
+        # dsnn-dfw.104: TLM matrix coordinates (the matrix, the pair
+        # launchers and the smoke -- everything `thesis_arm` emits) render
+        # the raised budget.  ONLY A MATRIX COORDINATE CAN, mirroring
+        # `rung1_row`/`condc_popart_row`/`condc_tlm_init_row`: the
+        # order-only TLM final row is also target "tlm" and also goes
+        # through `thesis_cli`, but it is a DIFFERENT round with its own
+        # record, so `matrix_row` is False for it and it keeps 64.  Every
+        # other thesis target keeps the campaign constant regardless.
+        "--face-wire-faces": (THESIS_TLM_FACE_WIRE_FACES
+                              if target == "tlm" and matrix_row
                               else CAMPAIGN_FACE_WIRE_FACES),
         # --- the gate inputs (G1's table is resolved from --fixed-order)
         "--gate-offline-contrast": GATE_OFFLINE_CONTRAST[THESIS_ORDER],

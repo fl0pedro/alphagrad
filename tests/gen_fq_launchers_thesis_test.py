@@ -1425,6 +1425,11 @@ def test_every_recurrent_row_carries_the_nn256_and_tlm_flags_unchanged(
     its TLM twin's OWN 0.005 (never a diff, since TLM is on the same number).
     Both directions are asserted below; the actual values are pinned by
     `test_every_arm_carries_the_shared_thesis_flags` above.
+
+    The face-wire budget (dsnn-dfw.104, owner ruling 2026-09-22) is
+    excluded the same way, in the OPPOSITE direction: the recurrent row
+    stays on the campaign's 64, same as its NN256 twin (never a diff), but
+    its TLM twin renders 128 (always a diff).
     """
     node_derived = {"--ray-measure"}
     face_init = {"--face-none-bias", "--face-init-approx-per-plan",
@@ -1453,6 +1458,14 @@ def test_every_recurrent_row_carries_the_nn256_and_tlm_flags_unchanged(
                 # key does not even appear as a diff against the TLM twin.
                 assert "--face-entropy-weight" not in diff, (a["name"], t)
             diff -= entropy_weight
+            if t == "tlm":
+                # dsnn-dfw.104: the TLM twin renders 128, the recurrent row
+                # stays on the campaign's 64: always a real diff here.
+                assert "--face-wire-faces" in diff, (a["name"], t)
+            else:
+                # NN256 is on the SAME 64 as the recurrent target.
+                assert "--face-wire-faces" not in diff, (a["name"], t)
+            diff -= {"--face-wire-faces"}
             if _is_long_episodes(twin):
                 # the NN256 twin runs the long budget; the recurrent row is
                 # not on that ruling
@@ -1677,10 +1690,13 @@ def test_the_tlm_face_wire_budget_reaches_every_tlm_row_and_no_other(
         gen, matrix, smoke):
     """dsnn-dfw.104, owner ruling 2026-09-22.  Vertex 40 of a TLM plan
     carried 72 live faces at episode 55, past the campaign's 64, and the
-    trainer raised by design.  TLM alone renders the raised budget; every
-    other thesis target keeps the campaign constant, and no opt-out list
-    exists for this one -- it is a property of the target, not a frozen
-    comparison's flag."""
+    trainer raised by design.  Its footprint mirrors `rung1_row`,
+    `condc_popart_row` and `condc_tlm_init_row`: ONLY A MATRIX COORDINATE
+    (everything `thesis_arm` emits -- the matrix, the pair launchers and
+    the smoke) renders it.  The order-only TLM final row is also target
+    "tlm" and also goes through `thesis_cli`, but it is a DIFFERENT round
+    with its own record, so it keeps 64 -- the same reason its rung-1 init
+    and PopArt form do not move either."""
     assert gen.THESIS_TLM_FACE_WIRE_FACES == TLM_FACE_WIRE_FACES
     assert gen.CAMPAIGN_FACE_WIRE_FACES == FACE_WIRE_FACES
     for a in matrix + smoke:
@@ -1693,17 +1709,13 @@ def test_the_tlm_face_wire_budget_reaches_every_tlm_row_and_no_other(
             assert cli["--face-wire-faces"] == FACE_WIRE_FACES, a["name"]
             assert (f"--face-wire-faces {FACE_WIRE_FACES}"
                    in gen.render(a)), a["name"]
-    # the one order-only row that also targets TLM picks up the raised
-    # budget too: it is the same target, not a different comparison.
-    tlm_final = gen.orderonly_tlm_final_arms()
-    assert tlm_final
-    for a in tlm_final:
-        assert _cli(gen, a)["--face-wire-faces"] == TLM_FACE_WIRE_FACES, \
-            a["name"]
-    # every NN256/recurrent order-only and sweep row keeps the campaign's 64
+    # the order-only row that also targets TLM is a DIFFERENT round (its
+    # own record) and keeps the campaign's 64, exactly as its rung-1 init
+    # and PopArt form stay off too.
     off = (gen.orderonly_arms() + gen.orderonly_rsnn_arms()
-           + gen.orderonly_final_arms()
+           + gen.orderonly_final_arms() + gen.orderonly_tlm_final_arms()
            + gen.sweepl_arms() + gen.sweepl2_arms() + gen.sweepl3_arms())
     assert off
+    assert gen.orderonly_tlm_final_arms()
     for a in off:
         assert _cli(gen, a)["--face-wire-faces"] == FACE_WIRE_FACES, a["name"]
