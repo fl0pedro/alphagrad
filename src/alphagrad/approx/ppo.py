@@ -817,6 +817,18 @@ _ADV_DIAG = os.environ.get("ALPHAGRAD_ADV_DIAG", "0") == "1"
 _ADV_STATS = {}
 _UPD_JSONL = os.environ.get("ALPHAGRAD_UPDATE_JSONL", "")
 
+# ALPHAGRAD_FACE_DIAG=<prefix> (dsnn-dfw.95): three JSON dumps per episode --
+# the replay alignment of the first minibatch of epoch 0, the advantage split
+# by plan class, and the face head's OP_NONE gradient per loss term. Every
+# block below is behind a STATIC Python gate, so the trained path traces the
+# same jaxpr as before unless the variable is set.
+from alphagrad.approx import facediag as _facediag  # noqa: E402
+_FACE_DIAG = _facediag.ON
+# The check-3 gradients cost one extra backward pass per loss term. Set to 0
+# to keep checks 1 and 2 when that compile is too expensive.
+_FACE_DIAG_GRAD = _FACE_DIAG and os.environ.get(
+    "ALPHAGRAD_FACE_DIAG_GRAD", "1") == "1"
+
 
 def _spread(prefix, x):
     """min/max/mean/std/absmax of a finite-masked array, as a flat dict."""
@@ -11267,6 +11279,7 @@ def main(args=None):
         kl_ref_coef=None,
         ep_streams=None,
         delta_window=None,
+        fd=None,
     ):
         # Dynamic-substeps path branches off here so the legacy path
         # stays exactly as written. `_dynamic_loss_fn` lives below and
@@ -11280,11 +11293,11 @@ def main(args=None):
             with _read_path("loss"):
                 return _dynamic_loss_fn(
                     agent, batch, key, op_legality_override, kl_ref_coef,
-                    ep_streams, delta_window,
+                    ep_streams, delta_window, fd,
                 )
     def _dynamic_loss_fn(
         agent, batch: TrainBatch, key, op_legality_override,
-        kl_ref_coef=None, ep_streams=None, delta_window=None,
+        kl_ref_coef=None, ep_streams=None, delta_window=None, fd=None,
     ):
         """Dynamic-substeps loss: routes through MicroActionPolicy.evaluate.
 
@@ -11946,6 +11959,42 @@ def main(args=None):
         # Schulman's low-variance, non-negative KL estimator:
         #   k3 = (r - 1) - log r,  with r = exp(new - old)
         _kl_approx = _live_mean((ratio - 1.0) - _log_ratio, _w_live)
+        # ALPHAGRAD_FACE_DIAG check 1. Split the joint log-ratio into the FACE
+        # term and everything else. The face side is `log_probs` minus the new
+        # vertex log-prob (the sub-step term is a structural 0 under
+        # --live-faces, the same identity the kl-ref block relies on), against
+        # the stored `face_old_logp`; the rest is the complement of both sides,
+        # so the two parts sum to the joint log-ratio exactly.
+        if fd is not None:
+            _fd_vd = jnp.clip(batch.vertex_idx.astype(jnp.int32), 0,
+                              new_vertex_dist.shape[-1] - 1)
+            _fd_lpv = jnp.log(
+                jnp.take_along_axis(new_vertex_dist, _fd_vd[:, None],
+                                    axis=-1).squeeze(-1) + 1e-8)
+            if args.face_actions:
+                from alphagrad.approx.unified_face_head import (
+                    OP_NONE as _fd_none)
+                _fd_face_old = batch.face_old_logp
+                _fd_okm = jnp.logical_and(
+                    jnp.asarray(batch.face_valid, jnp.float32)[..., None]
+                    > 0.5,
+                    jnp.asarray(face_actions_b.op_type, jnp.int32)
+                    != _fd_none)
+                fd["s_has_op"] = jnp.any(
+                    _fd_okm, axis=(-1, -2)).astype(jnp.float32).reshape(-1)
+                fd["s_n_op"] = jnp.sum(
+                    _fd_okm, axis=(-1, -2)).astype(jnp.float32).reshape(-1)
+            else:
+                _fd_face_old = jnp.zeros_like(_fd_lpv)
+                fd["s_has_op"] = jnp.zeros_like(_fd_lpv)
+                fd["s_n_op"] = jnp.zeros_like(_fd_lpv)
+            fd["log_ratio"] = _log_ratio
+            fd["ratio"] = ratio
+            fd["lr_face"] = (log_probs - _fd_lpv) - _fd_face_old
+            fd["lr_rest"] = _fd_lpv - (old_log_probs - _fd_face_old)
+            fd["w_live"] = (jnp.ones_like(_log_ratio) if _w_live is None
+                            else _w_live)
+            fd["norm_adv"] = batch.norm_adv
         num_triggers = get_num_clipping_triggers(ratio, args.ppo_clip_eps)
         trigger_ratio = num_triggers / len(ratio)
 
@@ -12254,18 +12303,31 @@ def main(args=None):
         # entropy/approx_head panel). Static gate: the face head must
         # exist, or face_ents is a structural zero and the hinge would
         # penalise a head that was never built.
+        _fd_hinge = None
         if (float(getattr(args, "face_entropy_floor", 0.0)) > 0.0
                 and bool(getattr(args, "face_actions", False))
                 and bool(getattr(args, "unified_face_head", False))):
-            total_loss = total_loss + _face_entropy_floor_penalty(
+            _fd_pen = _face_entropy_floor_penalty(
                 _face_ent_mean,
                 float(args.face_entropy_floor),
                 float(args.face_entropy_floor_weight))
+            total_loss = total_loss + _fd_pen
+            if fd is not None:
+                _fd_hinge = _fd_pen
         # --kl-ref-weight: the trust region enters the loss HERE and
         # nowhere else -- never through rewards, value targets or PopArt
         # statistics (the same containment rule the Lagrangian dual has).
         if _KL_REF_ON:
             total_loss = total_loss + kl_ref_pen
+        # ALPHAGRAD_FACE_DIAG check 3 needs each term as its OWN scalar, so
+        # the caller can take one gradient per term.
+        if fd is not None:
+            fd["t_ppo"] = ppo_loss
+            fd["t_value"] = args.value_weight * value_loss
+            fd["t_entropy"] = -_ent_bonus
+            fd["t_hinge"] = (jnp.zeros((), jnp.float32)
+                             if _fd_hinge is None else _fd_hinge)
+            fd["t_total"] = total_loss
 
         # ---------------------------------------------------- FEATURE PROBE
         # The pack is returned as `has_aux` DATA, never as a term of
@@ -13033,6 +13095,29 @@ def main(args=None):
                 _adv_cb, advantages, norm_adv, estim_returns, traj.value,
                 _sig_diag)
 
+        # ALPHAGRAD_FACE_DIAG check 2: the advantage split by plan class. This
+        # is the only place the PER-CHANNEL normalized advantage exists -- the
+        # TrainBatch carries the scalarized `norm_adv` alone.
+        if _FACE_DIAG and bool(getattr(args, "face_actions", False)):
+            from alphagrad.approx.unified_face_head import (
+                OP_NONE as _fd_op_none)
+            _fd_fv = jnp.asarray(traj.face_valid, jnp.float32) > 0.5
+            _fd_has_op = jnp.any(
+                jnp.logical_and(
+                    _fd_fv[..., None],
+                    jnp.asarray(traj.face_action.op_type, jnp.int32)
+                    != _fd_op_none),
+                axis=(-1, -2)).astype(jnp.float32)
+            _fd_has_skip = jnp.any(
+                jnp.logical_and(
+                    _fd_fv,
+                    jnp.asarray(traj.face_action.skip, jnp.int32) > 0),
+                axis=-1).astype(jnp.float32)
+            jax.debug.callback(
+                partial(_facediag.adv_cb, tuple(HEAD_NAMES)),
+                norm_adv_components, norm_adv, _fd_has_op, _fd_has_skip,
+                jnp.asarray(_live_step, jnp.float32))
+
         # GATE TELEMETRY (ticket .45): hand the critic's per-head target and
         # prediction -- the pair the value loss compares -- and the per-env
         # preference to the host for gate/g2/* and gate/g5/*. A host copy,
@@ -13403,6 +13488,62 @@ def main(args=None):
         # prof/postrollout: GAE + PopArt + the TrainBatch assembly.
         dynamic_carry, full_batch = _pp_mark(
             "prof/postrollout", (dynamic_carry, full_batch))
+        # ALPHAGRAD_FACE_DIAG checks 1 and 3 (dsnn-dfw.95). The SAME minibatch
+        # the scan below takes first, scored at the SAME parameters the
+        # rollout used, so the log ratio must be 0 by construction. Nothing
+        # here writes `dynamic_carry`, so the update is untouched.
+        if _FACE_DIAG:
+            from alphagrad.approx.unified_face_head import (
+                NUM_APPROX_OPS as _fd_nops, O_SKIP as _fd_o_skip,
+                S_OP as _fd_s_op)
+            _fd_batches = (
+                shuffle_and_batch_by_trajectory(
+                    full_batch, args.minibatches, epoch_keys[0])
+                if use_traj_batch
+                else shuffle_and_batch(
+                    full_batch, args.minibatches, epoch_keys[0])
+            )
+            _fd_batch = jax.tree_util.tree_map(lambda x: x[0], _fd_batches)
+            _fd_key = jrand.split(epoch_keys[0], args.minibatches)[0]
+
+            def _fd_call(_ag, _sink):
+                return loss_fn(
+                    _ag, _fd_batch, _fd_key, pin_rules_to_exact_arg,
+                    op_legality_override_arg, kl_ref_coef_arg,
+                    (ep_tokens, ep_face_tokens), 1 << int(win_log2),
+                    _sink)
+
+            _fd_sink = {}
+            _fd_call(agent, _fd_sink)
+            jax.debug.callback(
+                _facediag.ratio_cb, _fd_sink["log_ratio"],
+                _fd_sink["lr_face"], _fd_sink["lr_rest"], _fd_sink["ratio"],
+                _fd_sink["w_live"], _fd_sink["norm_adv"],
+                _fd_sink["s_has_op"], _fd_sink["s_n_op"])
+
+        if _FACE_DIAG_GRAD:
+            _fd_lay = agent.face_path_policy.head.layout
+            _fd_rows = jnp.asarray(
+                [[_fd_lay.slot_base(_s) + _fd_s_op + _o
+                  for _o in range(_fd_nops)]
+                 for _s in range(_fd_lay.n_slots)], jnp.int32)
+
+            def _fd_term(_ag, _which):
+                _sk = {}
+                _fd_call(_ag, _sk)
+                return _sk[_which]
+
+            _fd_terms = ("t_ppo", "t_value", "t_entropy", "t_hinge",
+                         "t_total")
+            _fd_packs = []
+            for _t in _fd_terms:
+                _fd_g = eqx.filter_grad(_fd_term)(agent, _t)
+                _fd_b = _fd_g.face_path_policy.head.proj.layers[-1].bias
+                _fd_packs.extend((_fd_b[_fd_rows], _fd_b[_fd_o_skip], _fd_b))
+            jax.debug.callback(
+                partial(_facediag.grad_cb, _fd_terms,
+                        ("blockdiag", "reduce", "quant", "none")),
+                *_fd_packs)
         (dynamic_carry, final_step), metrics_seq = lax.scan(
             epoch_step_fn,
             (dynamic_carry, global_step),
