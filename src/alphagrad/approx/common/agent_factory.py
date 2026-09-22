@@ -147,6 +147,44 @@ def apply_face_none_bias(agent, bias: float, skip_bias: float | None = None):
     return agent
 
 
+def face_logit_offset_vector(agent, d_none: float, d_skip: float):
+    """The per-graph face-init offset, as a vector over the head's logits.
+
+    ``+d_none`` on every slot's OP_NONE logit and ``-d_skip`` on the face's
+    SKIP logit: the SAME two indices :func:`apply_face_none_bias` writes, so
+    the offset and the init bias are the same quantity in the same place.
+
+    Owner ruling 2026-09-22: the face head is SHARED between the graphs of an
+    alternating run and can hold one ``(B, Bs)``, so each graph carries the
+    difference between its own normalized pair and the shared one. The graph
+    whose pair the head holds gets an all-zero vector, and a one-graph run
+    gets no offset at all.
+
+    Returns ``None`` when both deltas are zero, which is what a one-graph run
+    and the primary graph of a two-graph run both produce.
+    """
+    import jax.numpy as _jnp
+    from alphagrad.approx.unified_face_head import (
+        FACE_SLOTS as _FS, OP_NONE as _NONE, O_SKIP as _SKIP,
+        S_OP as _SOP, slot_base as _slot_base)
+    _dn, _ds = float(d_none), float(d_skip)
+    if _dn == 0.0 and _ds == 0.0:
+        return None
+    _fpp = getattr(agent, "face_path_policy", None)
+    if _fpp is None or getattr(_fpp, "head", None) is None:
+        raise ValueError(
+            "a per-graph face-init offset was asked for and this agent has "
+            "no face head. The offset is the face head's own quantity; "
+            "installing it on an agent without one would change nothing and "
+            "hide the fact that the graphs start at different rates.")
+    _width = int(_fpp.head.layout.width)
+    _v = _jnp.zeros((_width,), _jnp.float32)
+    for _s in range(_FS):
+        _v = _v.at[_slot_base(_s, _fpp.head.layout) + _SOP + _NONE].add(_dn)
+    _v = _v.at[_SKIP].add(-_ds)
+    return _v
+
+
 def derive_face_none_bias(F: float, S: int, k: int, a: float) -> float:
     """B = ln(F*S*k/a - k), the none-logit bias whose expected requested
     approximations per plan is ``a`` (--face-init-approx-per-plan), given

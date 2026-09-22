@@ -194,10 +194,40 @@ class CpuApproximationActor:
         # worker actor actually starts. Mirrors the
         # `mu0_ray_actors.SPMDActor` pattern.
         from alphagrad.approx.cpu_approx_worker import CpuApproximationServer
+        from alphagrad.approx.common.rsnn_shd import temporal_rule_list
 
-        self._impl = CpuApproximationServer.from_args_dict(
-            args_dict, variant=variant, seed=seed,
-        )
+        # ONE SERVER PER GRAPH (owner ruling 2026-09-22). A run that
+        # alternates between two graphs of one target measures whichever
+        # graph the episode is on, so the actor holds both and `evaluate`
+        # names one. Both are built HERE, at __init__, and not on first use:
+        # a graph built inside an episode's callback would stall the whole
+        # rollout behind a trace, and a build that fails must fail at
+        # startup where the pool can see it.
+        self._rules = temporal_rule_list(args_dict.get("temporal_rule"))
+        if len(self._rules) <= 1:
+            self._impls = {None: CpuApproximationServer.from_args_dict(
+                args_dict, variant=variant, seed=seed)}
+        else:
+            # THE WIDER FACE BOUND WINS. env.MAX_FACES is process state and
+            # the trainer fills ONE face wire, so both graphs must decode it
+            # at the same width; each build reports the bound it derived and
+            # the second pass installs the larger.
+            from alphagrad.approx.env import (
+                configure_max_faces as _cfg_faces)
+            self._impls = {
+                r: CpuApproximationServer.from_args_dict(
+                    args_dict, variant=variant, seed=seed, rule=r)
+                for r in self._rules
+            }
+            _bounds = [getattr(s._env, "_derived_max_faces", None)
+                       for s in self._impls.values()]
+            _bounds = [int(b) for b in _bounds if b is not None]
+            if _bounds:
+                _cfg_faces(max(_bounds))
+                print(f"[measure-actor {self._actor_id}] graphs "
+                      f"{list(self._rules)}, face bounds {_bounds}, "
+                      f"in force {max(_bounds)}", flush=True)
+        self._impl = next(iter(self._impls.values()))
         # Node/GPU tracking: log where this measurement actor landed.
         try:
             import socket as _sock, os as _os2, jax as _jax
@@ -221,7 +251,16 @@ class CpuApproximationActor:
         face_skips=None,
         episode: int | None = None,
         env_row: int | None = None,
+        rule: str | None = None,
     ):
+        # ``rule`` IS THE GRAPH THIS PLAN WAS ACTED ON (owner ruling
+        # 2026-09-22). A run that alternates sends it on every dispatch and
+        # this actor measures that graph; a run with one graph sends None and
+        # gets the one server it built. Measuring the other graph would score
+        # a plan against a program the policy never saw, which is the one
+        # failure this whole per-graph split exists to prevent, so an
+        # unknown rule RAISES rather than falling back to the default.
+        #
         # ``episode`` IS NOT OPTIONAL AT THE WIRE. 4c4d872 gave
         # ``CpuApproxPool.evaluate`` / ``evaluate_batch`` an ``episode``
         # field (A3's pooled walk rotation) and both forward it to
@@ -250,12 +289,30 @@ class CpuApproximationActor:
         # ``tests/pool_dispatch_signature_test.py`` now binds the pool's own
         # dispatch keywords against this signature and the server's, so a
         # third one cannot land.
-        return self._impl.evaluate(
+        return self._server(rule).evaluate(
             order, sparsity_specs, step,
             eval_samples=eval_samples, init=init, point_idx=point_idx,
             face_specs=face_specs, face_skips=face_skips,
             episode=episode, env_row=env_row,
         )
+
+    def _server(self, rule: str | None):
+        """The server that holds ``rule``'s graph."""
+        if len(self._impls) == 1:
+            return self._impl
+        if rule is None:
+            raise ValueError(
+                f"measure actor {self._actor_id} holds {sorted(self._impls)} "
+                f"and the dispatch named no graph. Picking one would measure "
+                f"the wrong graph on half the episodes in silence.")
+        impl = self._impls.get(str(rule))
+        if impl is None:
+            raise ValueError(
+                f"measure actor {self._actor_id} was asked to measure the "
+                f"{str(rule)!r} graph and holds {sorted(self._impls)}. The "
+                f"plan was acted on a graph this actor never built, so "
+                f"measuring it here would score it against another program.")
+        return impl
 
     def evaluate_batch(self, batch: Sequence[tuple]):
         return self._impl.evaluate_batch(batch)
@@ -267,19 +324,27 @@ class CpuApproximationActor:
         return bool(self._impl.precompile(order, sparsity_specs, int(step)))
 
     def reset_caches(self) -> dict:
-        return self._impl.reset_caches()
+        # EVERY GRAPH THIS ACTOR HOLDS. The retention bound exists to return
+        # executables to the device; clearing one graph's caches and keeping
+        # the other's would leave half the memory held.
+        out = {}
+        for impl in self._impls.values():
+            out.update(impl.reset_caches() or {})
+        return out
 
     def pop_oom_flag(self) -> bool:
         """Return-and-reset whether the most recent ``evaluate`` OOM-ed.
         Ray-remote wrapper; see CpuApproximationServer.pop_oom_flag. Drives
-        CpuApproxPool's recycle+retry-on-OOM path."""
-        return bool(self._impl.pop_oom_flag())
+        CpuApproxPool's recycle+retry-on-OOM path. An OOM on EITHER graph is
+        this actor's OOM, and every flag is reset so none is read twice."""
+        return bool(sum(int(bool(impl.pop_oom_flag()))
+                        for impl in self._impls.values()))
 
     def actor_id(self) -> int:
         return self._actor_id
 
     def ready(self) -> bool:
-        return self._impl.ready()
+        return all(impl.ready() for impl in self._impls.values())
 
     def set_cost_mode_full(self) -> bool:
         """Phase-2 cutover: swap target_fun=None → target_fun=target_fn
@@ -287,8 +352,10 @@ class CpuApproximationActor:
         (XLA cost_analysis + ResourceMonitor + compiled_exact at terminal).
 
         Idempotent. See CpuApproximationServer.set_cost_mode_full for
-        implementation details — this is the Ray-remote wrapper."""
-        return bool(self._impl.set_cost_mode_full())
+        implementation details — this is the Ray-remote wrapper. The cutover
+        is the RUN's, so every graph this actor holds cuts over together."""
+        return all(bool(impl.set_cost_mode_full())
+                   for impl in self._impls.values())
 
     def compile_approximations(self) -> dict:
         """Pool warm-up handshake.

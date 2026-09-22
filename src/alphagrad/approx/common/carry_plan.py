@@ -58,70 +58,100 @@ from __future__ import annotations
 
 import numpy as np
 
-#: What :func:`register` was told, or ``None`` when no recurrent target is in
-#: this process. One process serves one target, which is why this is module
-#: state and not a field of every call.
-_SPEC: dict | None = None
-
-#: The base (policy-side) program: the config, its args and its consts.
-_BASE: dict | None = None
-
-#: container name -> the built variant. A variant is a dict with the keys
-#: ``config``, ``args``, ``consts``, ``vertex_map``, ``alt_carry`` and
-#: ``valid``.
-_VARIANTS: dict = {}
-
-#: (container, base-draw digest, count) -> the eval samples that variant
-#: draws. Bounded, and cleared when it grows.
-_EVAL_SAMPLES: dict = {}
+#: temporal rule -> what :func:`register` was told for THAT GRAPH. One
+#: process may serve two graphs of one target (owner ruling 2026-09-22, the
+#: alternating run), so this is a map and not a single spec. Each entry is
+#: ``{"spec": …, "base": …, "variants": {}, "eval_samples": {}}``:
+#:
+#:   spec          what the base target was built from
+#:   base          the policy-side program: config, its args and its consts
+#:   variants      container name -> the built variant, a dict with the keys
+#:                 ``config``, ``args``, ``consts``, ``vertex_map``,
+#:                 ``alt_carry`` and ``valid``
+#:   eval_samples  (container, base-draw digest, count) -> that variant's
+#:                 eval samples; bounded, and cleared when it grows
+#:
+#: A rule with no given edge (tbptt, window2) holds NO entry: there is no
+#: carried value, so there is no container to choose.
+_ENTRIES: dict = {}
 
 
 def reset() -> None:
     """Forget everything. For tests, and for a process that rebuilds."""
-    global _SPEC, _BASE
-    _SPEC = None
-    _BASE = None
-    _VARIANTS.clear()
-    _EVAL_SAMPLES.clear()
+    _ENTRIES.clear()
 
 
-def armed() -> bool:
-    """Is a plan's container a question in this process at all?"""
-    return _SPEC is not None
+def _entry(config=None) -> dict | None:
+    """The entry whose BASE PROGRAM is ``config``'s, or ``None``.
+
+    THE GRAPH IS THE KEY. Two rules of one target have identical step bodies
+    and differ only in the given edge, so nothing but the base jaxpr tells
+    their entries apart; selecting by anything weaker would build the other
+    graph's container and measure a program the policy never acted on.
+
+    ``config`` is ``None`` only where there is nothing to select by -- a test
+    or a tool with one graph in the process. That RAISES when the process
+    holds two, rather than picking one of them.
+    """
+    if config is None:
+        if len(_ENTRIES) > 1:
+            raise ValueError(
+                f"this process holds {len(_ENTRIES)} carry-plan graphs "
+                f"({sorted(_ENTRIES)}) and the caller named none. Pass the "
+                f"config of the graph the plan was acted on; picking one "
+                f"would measure the other graph's container.")
+        return next(iter(_ENTRIES.values()), None)
+    for entry in _ENTRIES.values():
+        if entry["base"]["config"].jaxpr is config.jaxpr:
+            return entry
+    return None
+
+
+def armed(config=None) -> bool:
+    """Is a plan's container a question for ``config``'s graph at all?"""
+    if config is None:
+        return bool(_ENTRIES)
+    return _entry(config) is not None
 
 
 def register(args_like, key, example, temporal_rule, config, args, consts,
              *, dataset=None, dataset_size=-1, step_position=None):
-    """Record what the base target was built from.
+    """Record what the base target was built from, for ONE graph.
 
-    Called at every site that builds a recurrent SHD env. On any other target
-    it is a no-op, so the call can sit unconditionally beside the build.
+    Called at every site that builds a recurrent SHD env, once per graph the
+    process holds. On any other target it is a no-op, so the call can sit
+    unconditionally beside the build.
 
     ``args_like`` is the argparse namespace (or the actor's args dict) that
     ``grad_target_setup`` reads; ``key`` is the SAME key ``get_args`` was
     given, because the variant has to draw the same recording and the same
     weights or its reference weights stop matching the run's own.
+
+    Registering a rule REPLACES that rule's entry and leaves every other
+    rule's alone: a run that alternates registers each of its graphs in turn,
+    and a second call must not forget the first.
     """
-    global _SPEC, _BASE
     from alphagrad.approx.common.rsnn_shd import GIVEN_EDGE_RULES, is_rsnn
-    _VARIANTS.clear()
-    _EVAL_SAMPLES.clear()
-    if not is_rsnn(example) or str(temporal_rule) not in GIVEN_EDGE_RULES:
+    rule = str(temporal_rule)
+    _ENTRIES.pop(rule, None)
+    if not is_rsnn(example) or rule not in GIVEN_EDGE_RULES:
         # No given temporal edge means no carried value, so there is no
         # container to choose and nothing here has anything to do.
-        _SPEC = None
-        _BASE = None
         return
-    _SPEC = {
-        "args_like": args_like,
-        "key": key,
-        "example": str(example),
-        "rule": str(temporal_rule),
-        "dataset": dataset,
-        "dataset_size": dataset_size,
-        "step_position": step_position,
+    _ENTRIES[rule] = {
+        "spec": {
+            "args_like": args_like,
+            "key": key,
+            "example": str(example),
+            "rule": rule,
+            "dataset": dataset,
+            "dataset_size": dataset_size,
+            "step_position": step_position,
+        },
+        "base": {"config": config, "args": tuple(args), "consts": consts},
+        "variants": {},
+        "eval_samples": {},
     }
-    _BASE = {"config": config, "args": tuple(args), "consts": consts}
 
 
 def _eval_key(eval_samples):
@@ -246,7 +276,7 @@ def container_for_plan(config, o_list, face_specs, face_skips,
     """
     from alphagrad.approx.common.rsnn_shd import (EXACT_CONTAINER,
                                                   container_from_classes)
-    if _SPEC is None:
+    if _entry(config) is None:
         return None
     classes = classes_on_carry_faces(config.jaxpr, o_list, face_specs,
                                      face_skips, rule_specs)
@@ -293,15 +323,16 @@ def valid_vertices(jaxpr, args, consts, argnums) -> tuple:
     return tuple(out)
 
 
-def _build_variant(container: str) -> dict:
+def _build_variant(container: str, entry: dict) -> dict:
     """Build the program ``container`` implies, and its map from the base."""
     from alphagrad.approx.common.examples import (data_gen, get_args, get_fn,
                                                   grad_target_setup)
     from alphagrad.approx.common.rsnn_shd import (EXACT_CONTAINER,
                                                   SKIP_CONTAINER,
                                                   target_example)
-    spec = _SPEC
-    base_cfg = _BASE["config"]
+    spec = entry["spec"]
+    base = entry["base"]
+    base_cfg = base["config"]
     if container == SKIP_CONTAINER:
         # NO CARRY AT ALL. The rule the measurement compiles is the truncated
         # one, which is the graph with no given edge.
@@ -330,9 +361,9 @@ def _build_variant(container: str) -> dict:
             "draw": base_gen,
             "target": base_cfg.target_fun,
             "argnums": tuple(base_cfg.argnums),
-            "args": tuple(_BASE["args"]),
+            "args": tuple(base["args"]),
             "slots": tuple(getattr(base_gen, "data_slots",
-                                   range(len(_BASE["args"])))),
+                                   range(len(base["args"])))),
         }
     cfg = base_cfg._replace(jaxpr=cj.jaxpr, argnums=tuple(argnums),
                             target_fun=fn, data_gen=gen)
@@ -350,37 +381,44 @@ def _build_variant(container: str) -> dict:
     }
 
 
-def measurement_env(container: str) -> dict | None:
-    """The built variant for ``container``, or ``None`` when none is needed."""
+def measurement_env(container: str, config=None) -> dict | None:
+    """The built variant for ``container`` on ``config``'s graph.
+
+    ``None`` when no variant is needed, or when this process holds no entry
+    for that graph. ``config`` names WHICH graph in a process that serves two.
+    """
     from alphagrad.approx.common.rsnn_shd import EXACT_CONTAINER
-    if _SPEC is None:
+    entry = _entry(config)
+    if entry is None:
         return None
     if container == EXACT_CONTAINER:
         # The base program IS the exact container: the policy's graph carries
         # the dense edge by construction, so there is nothing to build.
         return None
-    v = _VARIANTS.get(container)
+    v = entry["variants"].get(container)
     if v is None:
-        v = _build_variant(container)
-        _VARIANTS[container] = v
+        v = _build_variant(container, entry)
+        entry["variants"][container] = v
     return v
 
 
-def eval_samples_for(container: str, eval_samples):
+def eval_samples_for(container: str, eval_samples, config=None):
     """This episode's eval samples, redrawn in ``container``.
 
     Keyed by a digest of the base draw (:func:`_eval_key`), so every process
     that measures this plan builds the same ones, and cached per (container,
-    digest) so an episode draws them once however many plans it measures.
+    digest) INSIDE the graph's own entry, so two graphs in one process never
+    read each other's draw. ``config`` names which graph.
     """
     if not eval_samples:
         return None
-    var = measurement_env(container)
+    var = measurement_env(container, config)
     if var is None:
         return None
+    cache = _entry(config)["eval_samples"]
     n = int(len(eval_samples[0]))
     tag = (container, _eval_tag(eval_samples), n)
-    hit = _EVAL_SAMPLES.get(tag)
+    hit = cache.get(tag)
     if hit is not None:
         return hit
     from alphagrad.approx.common.eval_samples import generate_eval_samples
@@ -390,9 +428,9 @@ def eval_samples_for(container: str, eval_samples):
         args = var["args"]
 
     out = generate_eval_samples(_Shim, _eval_key(eval_samples), n)
-    if len(_EVAL_SAMPLES) > 64:
-        _EVAL_SAMPLES.clear()
-    _EVAL_SAMPLES[tag] = out
+    if len(cache) > 64:
+        cache.clear()
+    cache[tag] = out
     return out
 
 

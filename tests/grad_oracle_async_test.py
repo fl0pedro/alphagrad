@@ -422,8 +422,20 @@ def test_the_late_record_names_the_plan_and_the_episode(tmp_path):
     plan["episode"] = 4
 
     jobs = _grad_oracle_jobs([plan])
+    # A job names the ORDER and the GRAPH. `rule` is None on a run with one
+    # graph, which is every run that does not pass two to --temporal-rule.
     assert jobs == [{"order": tuple(int(v) for v in order),
+                     "rule": None,
                      "plan_hashes": [plan["plan_hash"]]}]
+    # ONE ORDER ON TWO GRAPHS IS TWO CHECKS (owner ruling 2026-09-22): two
+    # graphs of one target share a vertex numbering, so the same order names
+    # two different programs and one answer cannot stand for both.
+    _b = dict(plan, temporal_rule="bptt")
+    _r = dict(plan, temporal_rule="rtrl")
+    _two = _grad_oracle_jobs([_b, _r])
+    assert len(_two) == 2
+    assert {j["rule"] for j in _two} == {"bptt", "rtrl"}
+    assert all(j["order"] == tuple(int(v) for v in order) for j in _two)
 
     oracle = AsyncGradOracle(lambda o, s, e: ("pass", 7e-15), timeout_s=60.0)
     path = str(tmp_path / "plan_log.jsonl")

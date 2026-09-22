@@ -44,9 +44,11 @@ actor case, a kill) and nothing else the run's numbers depend on.
 WHY A MEMO. "Once per process and order" is the oracle's own rule: the exact
 gradient of an order does not depend on the episode. An order that has been
 checked returns its recorded answer at once, so a run whose policy converges on
-a few orders pays for each of them once. The memo is keyed on the order alone
--- the approximation rules of a plan are not part of what the oracle checks --
-which is why one result can carry several plan hashes.
+a few orders pays for each of them once. The memo is keyed on the order and on
+the GRAPH -- the approximation rules of a plan are not part of what the oracle
+checks, but the graph is, because two graphs of one target share a vertex
+numbering and one order can name a plan on either of them (owner ruling
+2026-09-22). That is why one result can carry several plan hashes.
 """
 
 from __future__ import annotations
@@ -68,6 +70,15 @@ STATUS_TIMEOUT = "timeout"
 # one core to not be the slowest part of a check that otherwise takes 1-30s
 # (section 2 of the agent-oracle-async report, 2026-09-18).
 ORACLE_ACTOR_NUM_CPUS = 4
+
+
+def _memo_key(job):
+    """``(order, graph)`` -- what makes two checks the same check.
+
+    A job without a graph (every run with one graph, and every test here)
+    keys on the order alone, exactly as before.
+    """
+    return (job["order"], job.get("rule"))
 
 
 def make_ray_oracle_actor_factory(args_dict: dict,
@@ -117,20 +128,28 @@ def make_ray_oracle_actor_factory(args_dict: dict,
                 except (AttributeError, OSError, ValueError):
                     pass
             self._args_dict = dict(args_dict)
-            self._config = None       # built lazily, once, on first check()
+            # ONE CONFIG PER GRAPH, built lazily on the first check of that
+            # graph. A run may alternate between two graphs of one target
+            # (owner ruling 2026-09-22) and the oracle checks the EXACT
+            # gradient of a plan, so it has to build the graph that plan was
+            # acted on; one config for both would compare the wrong program.
+            self._configs: dict = {}
 
-        def _config_once(self):
-            if self._config is None:
+        def _config_once(self, rule=None):
+            key = None if rule is None else str(rule)
+            cfg = self._configs.get(key)
+            if cfg is None:
                 from alphagrad.approx.cpu_approx_worker import (
                     _build_env_from_args)
-                self._config = _build_env_from_args(
-                    self._args_dict, None).config
-            return self._config
+                cfg = _build_env_from_args(
+                    self._args_dict, None, rule=key).config
+                self._configs[key] = cfg
+            return cfg
 
-        def check(self, args_np, order, probe_seed):
+        def check(self, args_np, order, probe_seed, rule=None):
             from alphagrad.approx import env as _env
             return _env.grad_oracle_cpu_check(
-                self._config_once(), args_np, order, probe_seed)
+                self._config_once(rule), args_np, order, probe_seed)
 
     def _factory():
         return _GradOracleActor.remote(args_dict)
@@ -222,7 +241,7 @@ class AsyncGradOracle:
             if job is None:
                 return
             t0 = time.monotonic()
-            memo = self._memo.get(job["order"])
+            memo = self._memo.get(_memo_key(job))
             if memo is not None:
                 status, rel = memo
                 seconds = 0.0
@@ -242,7 +261,7 @@ class AsyncGradOracle:
                     status, rel = STATUS_FAIL, None
                     error = f"{type(exc).__name__}: {exc}"
                 seconds = time.monotonic() - t0
-                self._memo[job["order"]] = (status, rel)
+                self._memo[_memo_key(job)] = (status, rel)
             self._done.put({
                 "id": job["id"],
                 "episode": job["episode"],
@@ -272,6 +291,13 @@ class AsyncGradOracle:
                 "episode": int(episode),
                 "probe_seed": int(probe_seed),
                 "order": order,
+                # THE GRAPH THE PLANS WERE ACTED ON. `None` on a run with one
+                # graph. It is part of the MEMO KEY as well as the request:
+                # two graphs of one target share a vertex numbering, so one
+                # order can name a plan on either of them and a memo without
+                # the graph would answer for the wrong one.
+                "rule": (None if job.get("rule") is None
+                         else str(job["rule"])),
                 "plan_hashes": [str(h) for h in job.get("plan_hashes", ())],
                 "submitted_at": time.monotonic(),
             }
@@ -291,7 +317,7 @@ class AsyncGradOracle:
         with no remote call; a new order is dispatched to the actor and its
         object ref is kept until :meth:`take_results` finds it ready or
         stale."""
-        memo = self._memo.get(rec["order"])
+        memo = self._memo.get(_memo_key(rec))
         rec["actor_gen"] = self._actor_generation
         if memo is not None:
             status, rel = memo
@@ -300,7 +326,7 @@ class AsyncGradOracle:
             return
         args_np = self._arg_resolver(rec["episode"])
         rec["ref"] = self._actor.check.remote(
-            args_np, rec["order"], rec["probe_seed"])
+            args_np, rec["order"], rec["probe_seed"], rec.get("rule"))
         rec["memo_result"] = None
 
     def _count(self, res) -> None:
@@ -398,7 +424,7 @@ class AsyncGradOracle:
                 # thread's: reported as a fail with the exception text.
                 status, rel = STATUS_FAIL, None
                 error = f"{type(exc).__name__}: {exc}"
-            self._memo[job["order"]] = (status, rel)
+            self._memo[_memo_key(job)] = (status, rel)
             self._done.put({
                 "id": jid, "episode": job["episode"], "order": job["order"],
                 "plan_hashes": job["plan_hashes"], "status": status,

@@ -195,8 +195,11 @@ class CpuApproximationServer:
         variant: str | None = None,
         *,
         seed: int = 0,
+        rule: str | None = None,
+        max_faces: int | None = None,
     ) -> "CpuApproximationServer":
-        env = _build_env_from_args(args_dict, variant, seed=seed)
+        env = _build_env_from_args(args_dict, variant, seed=seed, rule=rule,
+                                   max_faces=max_faces)
         server = cls(env)
         # Stash for set_cost_mode_full — we need to rebuild target_fn
         # without shipping a Callable through Ray, so reconstruct from
@@ -741,8 +744,21 @@ def _quality_is_rewarded(args) -> bool:
         return True
 
 
-def _build_env_from_args(args_dict: dict, variant: str | None, *, seed: int = 0):
+def _build_env_from_args(args_dict: dict, variant: str | None, *,
+                         seed: int = 0, rule: str | None = None,
+                         max_faces: int | None = None):
     """Rebuild a `VertexEliminationEnv` from a serialisable args_dict.
+
+    ``rule`` names WHICH GRAPH to build when the run alternates between two
+    (owner ruling 2026-09-22). It must be named then: an actor that read the
+    rule list would have no graph to build, and one that picked the first
+    would measure the wrong graph on every odd episode.
+
+    ``max_faces`` overrides the bound this graph derives for itself. A
+    process that holds two graphs must run both on the WIDER of the two
+    bounds, because the face wire the trainer fills is one width; the caller
+    that holds both graphs is the only one that knows it, and the value this
+    graph derived on its own is left on the env as ``_derived_max_faces``.
 
     This is a stripped-down twin of
     `mu0_ray_worker._build_actor_state`'s env-build branch — same
@@ -785,8 +801,16 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *, seed: int = 0)
     # dict travels, so this is normally already resolved; resolving it again
     # here is the idempotent way to make the actor and the trainer build the
     # SAME graph even if the dict was built by hand.
-    _rule = resolve_temporal_rule(args.example,
-                                  getattr(args, "temporal_rule", None))
+    # THE GRAPH THIS ENV IS. `rule` names it when the run alternates between
+    # two; without it the args' own rule is the graph, exactly as before.
+    _want = getattr(args, "temporal_rule", None) if rule is None else rule
+    if isinstance(_want, (list, tuple)):
+        raise ValueError(
+            f"--temporal-rule {list(_want)} names two graphs and this env "
+            f"build was told none. A measure actor holds one env per graph "
+            f"and every build must say which one it is, or the actor would "
+            f"measure the wrong graph on half the episodes.")
+    _rule = resolve_temporal_rule(args.example, _want)
     args.example = target_example(args.example, _rule)
     args.temporal_rule = _rule
     use_dataset = (
@@ -826,13 +850,16 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *, seed: int = 0)
     # ("20 faces exceed the derived bound 16", dsnn-dfw.36) although the
     # trainer's bound is 1920 and its wire carries --face-wire-faces columns.
     # Same function, same graph, same number.
+    _derived_faces = None
     if bool(getattr(args, "face_actions", False)):
         from alphagrad.approx.env import (
             configure_max_faces as _cfg_faces,
             derived_max_faces as _derive_faces,
         )
-        _cfg_faces(_derive_faces(
+        _derived_faces = int(_derive_faces(
             closed_jaxpr.jaxpr, argnums, closed_jaxpr.literals, xs))
+        _cfg_faces(_derived_faces if max_faces is None
+                   else max(_derived_faces, int(max_faces)))
 
     # Always pass target_fun so env._callback runs the JIT-compile +
     # cost_analysis + ResourceMonitor path on every step — this is what
@@ -948,4 +975,9 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *, seed: int = 0)
 
     num_eval = int(getattr(args, "num_eval_samples", 10) or 10)
     eval_samples = generate_eval_samples(env, eval_key, num_eval)
-    return eqx.tree_at(lambda e: e.eval_args_samples, env, eval_samples)
+    env = eqx.tree_at(lambda e: e.eval_args_samples, env, eval_samples)
+    # WHICH GRAPH THIS ENV IS, and the bound it derived on its own. A process
+    # that holds two reads both back to decide the one width both must run at.
+    object.__setattr__(env, "_temporal_rule", _rule)
+    object.__setattr__(env, "_derived_max_faces", _derived_faces)
+    return env

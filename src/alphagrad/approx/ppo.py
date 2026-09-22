@@ -126,6 +126,9 @@ from alphagrad.approx.common.rsnn_shd import (
     last_step_position as _last_step_position,
     target_example as _target_example,
     resolve_temporal_rule as _resolve_temporal_rule,
+    resolve_temporal_rules as _resolve_temporal_rules,
+    temporal_rule_for_episode as _rule_for_episode,
+    temporal_rule_list as _rule_list,
 )
 from alphagrad.approx.common.schedules import cosine_warmup_exp_decay_lr
 from alphagrad.approx.env import (
@@ -714,9 +717,14 @@ def _grad_oracle_jobs(records):
         plan_hash = rec.get("plan_hash")
         if not order or not plan_hash:
             continue
-        key = tuple(int(v) for v in order)
+        # ONE JOB PER (ORDER, GRAPH). The record carries `temporal_rule` only
+        # on a run that alternates; two graphs of one target share a vertex
+        # numbering, so the same order can name a plan on either of them and
+        # a job keyed on the order alone would check one graph for both.
+        key = (tuple(int(v) for v in order), rec.get("temporal_rule"))
         jobs.setdefault(key, []).append(str(plan_hash))
-    return [{"order": k, "plan_hashes": v} for k, v in jobs.items()]
+    return [{"order": k[0], "rule": k[1], "plan_hashes": v}
+            for k, v in jobs.items()]
 
 
 def _grad_oracle_write(path, results, checked_at_episode, tol):
@@ -5636,6 +5644,7 @@ def make_argparser() -> argparse.ArgumentParser:
              "different quantity entirely.")
     p.add_argument(
         "--temporal-rule", choices=list(_TEMPORAL_RULES), default=None,
+        nargs="+", metavar="RULE",
         help="HOW TEMPORAL CREDIT ENTERS THE ONE-STEP RECURRENT GRAPH "
              "(--example RSNN_SHD; owner ruling 2026-09-16). The graph is "
              "always ONE recurrent step -- inputs the weights, the carried "
@@ -5654,7 +5663,18 @@ def make_argparser() -> argparse.ArgumentParser:
              "exactly dL_t/dW through the whole prefix. bptt and rtrl are "
              "both EXACT; the face where the given quantity meets the step is "
              "where an e-prop-like approximation (Zenke and Neftci 2020) "
-             "lives. RAISES on any target without time steps.")
+             "lives. RAISES on any target without time steps. "
+             "TWO RULES MAY BE GIVEN (owner ruling 2026-09-22): "
+             "`--temporal-rule bptt rtrl` runs BOTH graphs of the same "
+             "example in one run and ALTERNATES per episode -- even episodes "
+             "on the first rule named, odd on the second -- with one compiled "
+             "rollout program per graph. The policy, the optimizer, the "
+             "quality floor and the preference conditioning are SHARED; the "
+             "band archive and its front, the reference measurements, the "
+             "PopArt statistics and the Lagrangian multiplier are PER GRAPH. "
+             "There is no graph flag in the observation: the token stream "
+             "carries the structure. A single rule is the old behaviour "
+             "unchanged, argument namespace included.")
     # --carry-container IS GONE (owner ruling 2026-09-16, A). The
     # plan-produced carry is the ONLY mode and the container follows the
     # PLAN's approximation on the carried-Jacobian face, per plan, on the
@@ -7411,8 +7431,17 @@ def _mem_reward_index(mem_type: str) -> int:
 
 
 
-def _dump_pareto(archive, args, ep, *, final=False):
-    """Persist the front + a replayable best_sequences.json. Never raises."""
+def _dump_pareto(archive, args, ep, *, final=False, rule=None):
+    """Persist the front + a replayable best_sequences.json. Never raises.
+
+    ``rule`` NAMES THE GRAPH (owner ruling 2026-09-22). A run that alternates
+    holds one archive per graph, so it writes one front per graph:
+    ``pareto_front_bptt.json`` beside ``pareto_front_rtrl.json``. The two
+    fronts live in log-ratio space against their OWN graph's rev-exact
+    reference and are not comparable point by point, which is exactly why
+    they must not share a file. ``None`` keeps the one name a one-graph run
+    has always written.
+    """
     if archive is None or not getattr(archive, "pts", None):
         return
     try:
@@ -7423,9 +7452,11 @@ def _dump_pareto(archive, args, ep, *, final=False):
         except Exception:
             _dir = "."
         _os.makedirs(_dir, exist_ok=True)
+        _tag = "" if rule is None else f"_{rule}"
         archive.dump_front(
-            _os.path.join(_dir, "pareto_front.json"),
+            _os.path.join(_dir, f"pareto_front{_tag}.json"),
             extra={"episode": int(ep), "final": bool(final),
+                   "temporal_rule": (None if rule is None else str(rule)),
                    "run_name": getattr(args, "name", None)},
         )
         # Replayable form. Objective 0 is the compute channel and objective 1
@@ -7458,7 +7489,8 @@ def _dump_pareto(archive, args, ep, *, final=False):
             "_provenance": {"source": "ParetoArchive.dump", "episode": int(ep),
                             "num_points": len(_pts)},
         }
-        with open(_os.path.join(_dir, "best_sequences.json"), "w") as _fh:
+        with open(_os.path.join(_dir,
+                                f"best_sequences{_tag}.json"), "w") as _fh:
             _json.dump(_doc, _fh, indent=2)
     except Exception as _exc:
         try:
@@ -7837,7 +7869,41 @@ def main(args=None):
     # measure actors and before the wandb config is written, so the trainer,
     # every actor and the run record carry the SAME rule. An actor that read a
     # different rule would measure a different graph than the search acts on.
-    args.temporal_rule = _resolve_temporal_rule(args.example, args.temporal_rule)
+    # ONE RULE IS A STRING, TWO ARE A LIST. `--temporal-rule` takes one or
+    # two values (owner ruling 2026-09-22), and a one-rule run keeps the plain
+    # string it has always carried, so its argument namespace -- and with it
+    # its checkpoint, its wandb config and the dict the measure actors are
+    # built from -- is byte for byte the one it had before two rules existed.
+    args.temporal_rule = _resolve_temporal_rules(args.example,
+                                                 args.temporal_rule)
+    # THE GRAPHS THIS RUN HOLDS, in the order named. `()` on a target with no
+    # time steps, which is every non-recurrent example, and the key of that
+    # one graph is then `None` -- the value `args.temporal_rule` already has.
+    # ONE SHARED VERTEX INDEX SPACE (owner ruling 2026-09-22). Two graphs of
+    # one target have different vertex counts (measured: bptt 59 equations,
+    # rtrl 69), and the policy is SHARED, so index i is a SLOT and not a
+    # vertex identity: nothing here assumes slot i of one graph is slot i of
+    # the other. Every per-vertex array the agent reads is built at the WIDER
+    # count and the narrower graph's own slots are the only ones its
+    # availability mask ever admits. There is no graph flag in the
+    # observation; the token stream carries the structure.
+    _RULES = _rule_list(args.temporal_rule)
+    _GRAPH_KEYS = list(_RULES) or [None]
+    _TWO_GRAPH = len(_GRAPH_KEYS) > 1
+    #: rule -> everything about that graph. Filled as the build reaches each
+    #: piece, read by the swap at the top of the episode loop.
+    _GRAPHS: dict = {_k: {"rule": _k} for _k in _GRAPH_KEYS}
+    #: the graph episode 0 runs on, and the one every "primary" binding below
+    #: starts at. The alternation is `ep % len(_GRAPH_KEYS)`.
+    _PRIMARY = _GRAPH_KEYS[0]
+    if _TWO_GRAPH:
+        print(f"[two-graph] --temporal-rule {list(_RULES)}: even episodes on "
+              f"{_RULES[0]}, odd on {_RULES[1]}. One compiled rollout "
+              f"program per graph. Shared: the policy, the optimizer, the "
+              f"quality floor, the preference conditioning. Per graph: the "
+              f"band archive and its front, the reference measurements, the "
+              f"PopArt statistics, the Lagrangian multiplier and the "
+              f"face-init logit offset.", flush=True)
     # THE TARGET THE RULE BUILDS. --temporal-rule window2 is not another
     # given edge on the one-step body; it is a two-copy graph with no given
     # edge at all, and it has its own registered target. Resolved HERE, in
@@ -8080,23 +8146,56 @@ def main(args=None):
             f"example. Use --quality-metric jac_cosine for the analytic AD "
             f"benchmarks, or `auto`, which reads the same fact and picks "
             f"jac_cosine by itself.")
-    target_fn = get_fn(args.example)
-    xs = get_args(args.example, args_key, dataset=dataset_for_call,
-                  grad_window=args.target_grad_window,
-                  dataset_size=args.dataset_size,
-                  temporal_rule=args.temporal_rule,
-                  step_position=args.step_position)
-    if args.temporal_rule is not None:
-        _pos = _last_step_position()
-        print(f"[cfg] --temporal-rule {args.temporal_rule}: step t={_pos.get('t')} "
-              f"of T={_pos.get('T')}, recording {_pos.get('recording')}, "
-              f"carry {_pos.get('carry')}",
-              flush=True)
-    gen = data_gen(
-        args.example, dataset=dataset_for_call, dataset_size=args.dataset_size,
-        key=args_key, temporal_rule=args.temporal_rule,
-        grad_window=args.target_grad_window,
-    )
+    def _trace_graph(_rule):
+        """Trace ONE graph of the target: its args, its generator, its jaxpr.
+
+        Every graph of a run draws from the SAME `args_key`, so the recording
+        and the weights are the run's own on both of them and the two differ
+        only in the given edge the rule attaches.
+        """
+        from alphagrad.approx.common import grad_target_setup as _gts
+        _fn = get_fn(args.example)
+        _xs = get_args(args.example, args_key, dataset=dataset_for_call,
+                       grad_window=args.target_grad_window,
+                       dataset_size=args.dataset_size,
+                       temporal_rule=_rule,
+                       step_position=args.step_position)
+        if _rule is not None:
+            _pos = _last_step_position()
+            print(f"[cfg] --temporal-rule {_rule}: step t={_pos.get('t')} "
+                  f"of T={_pos.get('T')}, recording {_pos.get('recording')}, "
+                  f"carry {_pos.get('carry')}",
+                  flush=True)
+        _gen = data_gen(
+            args.example, dataset=dataset_for_call,
+            dataset_size=args.dataset_size,
+            key=args_key, temporal_rule=_rule,
+            grad_window=args.target_grad_window,
+        )
+        # `xs` gains the appended tangent seed under --seed-vertices and
+        # `argnums` shifts with it, so both come back from the builder.
+        _fn, _xs, _an = _gts(args, _fn, _xs, args.example)
+        return {"target_fn": _fn, "xs": _xs, "argnums": _an,
+                "closed_jaxpr": _traced_inlined(_fn, _xs), "gen": _gen}
+
+    for _k in _GRAPH_KEYS:
+        _GRAPHS[_k].update(_trace_graph(_k))
+        _GRAPHS[_k]["total_v"] = len(_GRAPHS[_k]["closed_jaxpr"].jaxpr.eqns)
+    # THE SHARED VERTEX INDEX SPACE (owner ruling 2026-09-22): the wider
+    # graph's equation count. Every per-vertex array the agent reads is this
+    # wide on BOTH graphs, and the narrower graph's extra slots are invalid in
+    # its own availability mask, so the policy can never choose one.
+    _TOTAL_V_SHARED = max(_GRAPHS[_k]["total_v"] for _k in _GRAPH_KEYS)
+    if _TWO_GRAPH:
+        print("[two-graph] equations per graph: "
+              + ", ".join(f"{_k} {_GRAPHS[_k]['total_v']}"
+                          for _k in _GRAPH_KEYS)
+              + f"; shared index space {_TOTAL_V_SHARED} slots", flush=True)
+    target_fn = _GRAPHS[_PRIMARY]["target_fn"]
+    xs = _GRAPHS[_PRIMARY]["xs"]
+    argnums = _GRAPHS[_PRIMARY]["argnums"]
+    closed_jaxpr = _GRAPHS[_PRIMARY]["closed_jaxpr"]
+    gen = _GRAPHS[_PRIMARY]["gen"]
     # TARGET SETUP -- routed through the shared builder so the trainer and
     # every measure-actor construct the IDENTICAL graph (jaxpr / vertex+action
     # space / argnums). Two modes:
@@ -8118,12 +8217,11 @@ def main(args=None):
     #
     # `xs` gains the appended tangent seed and `argnums` shifts accordingly, so
     # both must come back from the builder rather than being recomputed.
-    from alphagrad.approx.common import grad_target_setup as _grad_target_setup
-    target_fn, xs, argnums = _grad_target_setup(args, target_fn, xs, args.example)
-    closed_jaxpr = _traced_inlined(target_fn, xs)
+    # (`grad_target_setup` and the jaxpr trace happen inside `_trace_graph`
+    # above, once per graph, because a run may hold two.)
     # Always pass target_fun so flops/bytes_accessed/latency_ns/peak_memory
     # populate every step (see cpu_approx_worker.py for the full rationale).
-    env_target_fun = target_fn
+    # (the env's target function is the graph's own; `_env_for` passes it.)
 
     # Latency is the only optional component of the reward harness; auto-enable
     # measurement when the user has selected it as their primary compute metric
@@ -8265,13 +8363,12 @@ def main(args=None):
                  else " (gradient cosine at init vs the exact reference; "
                   "'cosine' is a deprecated alias)")),
         flush=True)
-    env = VertexEliminationEnv.from_jaxpr(
-        closed_jaxpr,
-        args=xs,
-        argnums=argnums,
+    # EVERY KWARG THAT IS NOT THE GRAPH. The four that are -- the jaxpr, its
+    # args, its argnums, its generator and its target function -- come from
+    # the graph bundle in `_env_for` below, so a run with two graphs builds
+    # two envs from ONE description and the two cannot drift.
+    _ENV_KWARGS = dict(
         num_envs=0,
-        data_gen=gen,
-        target_fun=env_target_fun,
         cmp_type=args.cmp_type,
         mem_type=args.mem_type,
         exec_on_gpu=args.exec_on_gpu,
@@ -8303,6 +8400,67 @@ def main(args=None):
         grad_oracle_cadence=int(args.grad_oracle_cadence),
     )
 
+    def _env_for(_g):
+        """The env of ONE graph, at the SHARED vertex index space.
+
+        The per-vertex statics the AGENT reads are padded up to the wider
+        graph's slot count (owner ruling 2026-09-22). `axis_valid_static` is
+        zero on every padded slot, so the pad carries no axis and the
+        availability mask never admits it; the env's own updates index by
+        vertex id and never reach past its own count.
+        """
+        _e = VertexEliminationEnv.from_jaxpr(
+            _g["closed_jaxpr"],
+            args=_g["xs"],
+            argnums=_g["argnums"],
+            data_gen=_g["gen"],
+            target_fun=_g["target_fn"],
+            **_ENV_KWARGS)
+        _pad = int(_TOTAL_V_SHARED) - int(_g["total_v"])
+        if _pad < 0:
+            raise ValueError(
+                f"graph {_g['rule']!r} has {_g['total_v']} equations, more "
+                f"than the shared index space {_TOTAL_V_SHARED}. The shared "
+                f"space is the MAXIMUM over the graphs and cannot be smaller "
+                f"than one of them.")
+        if _pad:
+            _e = eqx.tree_at(
+                lambda _x: (_x.axis_state_static, _x.axis_valid_static), _e,
+                (jnp.pad(_e.axis_state_static, ((0, _pad), (0, 0), (0, 0))),
+                 jnp.pad(_e.axis_valid_static, ((0, _pad), (0, 0)))))
+        # WHICH GRAPH THIS ENV IS. Read by every pooled measurement request,
+        # so the actor measures the graph the episode acted on.
+        object.__setattr__(_e, "_temporal_rule", _g["rule"])
+        # THE CARRY CONTAINER FOLLOWS THE PLAN (owner rulings 2026-09-16, A
+        # and B). One entry per graph, keyed by the base jaxpr.
+        _carry_plan.register(
+            args, args_key, args.example, _g["rule"],
+            _e.config, _e.args, _e.consts,
+            dataset=dataset_for_call, dataset_size=args.dataset_size,
+            step_position=args.step_position)
+        return _e
+
+    for _k in _GRAPH_KEYS:
+        _g = _GRAPHS[_k]
+        _g["env"] = _env_for(_g)
+        _g["num_valid"] = len(_g["env"].valid_vertices)
+        _bt, _bn = _g["env"].base_observation()
+        _g["base_n"] = int(_bn)
+        _g["base_w"] = max(int(_bn), 1)
+        _g["base_tok"] = _bt[:_g["base_w"]]
+        try:
+            _g["base_own"] = _g["env"].base_owners()
+        except Exception:
+            _g["base_own"] = None
+    env = _GRAPHS[_PRIMARY]["env"]
+    if _TWO_GRAPH:
+        print("[two-graph] valid vertices per graph: "
+              + ", ".join(f"{_k} {_GRAPHS[_k]['num_valid']}"
+                          for _k in _GRAPH_KEYS)
+              + "; base tokens: "
+              + ", ".join(f"{_k} {_GRAPHS[_k]['base_n']}"
+                          for _k in _GRAPH_KEYS), flush=True)
+
     # THE ASYNCHRONOUS GRADIENT ORACLE is built after the measurement pool,
     # once we know whether one exists (owner ruling 2026-09-18 / dsnn-dfw.22:
     # a Ray CPU actor when a pool is up, built with it and torn down with it;
@@ -8313,29 +8471,26 @@ def main(args=None):
     # measurement builds the program that each plan's own classes on the
     # carried face imply. This is where that builder learns what the target
     # was made from. A no-op on every target with no given temporal edge.
-    _carry_plan.register(
-        args, args_key, args.example, args.temporal_rule,
-        env.config, env.args, env.consts,
-        dataset=dataset_for_call, dataset_size=args.dataset_size,
-        step_position=args.step_position)
+    # (Registered per graph inside `_env_for` above.)
 
-    # THE BASE STREAM, once, on the host. `len(base_tokens())` depends only on
-    # the jaxpr -- not on the elimination order -- so this is a constant every
-    # env and every episode shares, and its length is the tokenizer's own
-    # rather than a device-side non-zero count over a padded buffer (which is
-    # what token id 0, the literal '-', used to corrupt). Sliced to its exact
-    # length, so the base encode scan is exactly as long as the base is.
-    _BASE_TOK, _BASE_N = env.base_observation()
-    _BASE_W = max(int(_BASE_N), 1)
-    _BASE_TOK = _BASE_TOK[:_BASE_W]
-    # Per-token owning VERTEX for the base stream (1-based, 0 = none). It is
-    # the KEY of the base scatter -- which vertex slot each base row lands in
-    # -- and it is read by the rollout, the loss and AZ, so it is resolved
-    # ONCE here.
-    try:
-        _BASE_OWN = env.base_owners()
-    except Exception:
-        _BASE_OWN = None
+    # THE BASE STREAM, once per graph, on the host. `len(base_tokens())`
+    # depends only on the jaxpr -- not on the elimination order -- so it is a
+    # constant every env and every episode of THAT GRAPH shares, and its
+    # length is the tokenizer's own rather than a device-side non-zero count
+    # over a padded buffer (which is what token id 0, the literal '-', used to
+    # corrupt). Sliced to its exact length, so the base encode scan is exactly
+    # as long as the base is. The two graphs' streams differ in length
+    # (measured: bptt 893 tokens, rtrl 1049), which is one of the reasons a
+    # graph gets its own compiled rollout program.
+    #
+    # `_BASE_OWN` is the per-token owning VERTEX of the base stream (1-based,
+    # 0 = none): the KEY of the base scatter, read by the rollout, the loss
+    # and AZ. Its values are the graph's own vertex ids, which are always
+    # inside the shared index space.
+    _BASE_TOK = _GRAPHS[_PRIMARY]["base_tok"]
+    _BASE_N = _GRAPHS[_PRIMARY]["base_n"]
+    _BASE_W = _GRAPHS[_PRIMARY]["base_w"]
+    _BASE_OWN = _GRAPHS[_PRIMARY]["base_own"]
     # THE FIRST WINDOW BIN, resolved here because the two prints below are
     # about the WINDOW the programs scan and not about the hard cap. The
     # `BinPolicy` that owns it is built later, from this same number.
@@ -8645,9 +8800,14 @@ def main(args=None):
             fidelity_idx=int(REWARD_INDEX["fidelity"]),
             sparsity_idx=int(REWARD_INDEX["sparsity"]),
         )
-        object.__setattr__(env, "_remote_pool", _pool)
-        object.__setattr__(env, "_remote_timeout_s",
-                           float(args.ray_measure_timeout))
+        # EVERY GRAPH'S ENV GETS THE POOL. One pool serves both graphs; the
+        # request names which one, and an env without the pool would move its
+        # measurements back into the driver in silence.
+        for _k in _GRAPH_KEYS:
+            object.__setattr__(_GRAPHS[_k]["env"], "_remote_pool", _pool)
+            object.__setattr__(_GRAPHS[_k]["env"], "_remote_timeout_s",
+                               float(args.ray_measure_timeout))
+        env = _GRAPHS[_PRIMARY]["env"]
         _first_gpu = int(os.environ.get("ALPHAGRAD_MEASURE_FIRST_GPU", "1"))
         print(f"[ray-measure] {_n_actors} actors on gpus "
               f"{[i + _first_gpu for i in range(_n_actors)] if _gpu else 'cpu'}"
@@ -8812,6 +8972,21 @@ def main(args=None):
                   f"{float(args.grad_oracle_timeout):g}s, bar "
                   f"{_GRAD_ORACLE_TOL:.0e}. A check over the timeout kills "
                   f"and recreates the actor.", flush=True)
+        elif _TWO_GRAPH:
+            # THE THREAD MODE IS ONE GRAPH'S. Its check closure reads the
+            # trainer's own live env, which the swap rebinds under it, and the
+            # thread runs asynchronously, so a two-graph run would check
+            # whichever graph the loop happened to hold. The actor mode builds
+            # a config per graph and is what a campaign row uses; a run
+            # without a measurement pool must say which it wants.
+            raise SystemExit(
+                f"--temporal-rule {list(_RULES)} names two graphs and "
+                f"--grad-oracle {args.grad_oracle} has no measurement pool to "
+                f"build its Ray actor with, so it would fall back to the "
+                f"worker THREAD. That thread reads the trainer's live graph "
+                f"while the loop swaps it, so it would check whichever graph "
+                f"it happened to find. Give --ray-measure N, or "
+                f"--grad-oracle off.")
         else:
             _GRAD_ORACLE = _AsyncGradOracle(
                 _grad_oracle_run_check,
@@ -8851,12 +9026,32 @@ def main(args=None):
     # call; fine for the small vertex graphs.
     from alphagrad.approx.common.masks import LiveVertexMaskOracle as _LVMO
     from alphagrad.approx.env import decode_vertex_rule_specs as _decode_specs
-    _oracle_jaxpr = closed_jaxpr.jaxpr
-    _oracle_consts = list(closed_jaxpr.literals)
-    _oracle_args = list(xs)
-    _oracle_argnums = tuple(int(a) for a in argnums)
+    # THE ORACLE READS THE EPISODE'S GRAPH. These four are rebound by the
+    # swap at the top of the episode loop, and every oracle closure below
+    # reads them as enclosing-scope locals, so a closure called during an
+    # episode sees that episode's graph. `_oracle_total_v` is NOT rebound: it
+    # is the SHARED index space, because it is a SHAPE the rollout declares
+    # and a shape that moved per episode would retrace on every alternation.
+    _oracle_jaxpr = _GRAPHS[_PRIMARY]["closed_jaxpr"].jaxpr
+    _oracle_consts = list(_GRAPHS[_PRIMARY]["closed_jaxpr"].literals)
+    _oracle_args = list(_GRAPHS[_PRIMARY]["xs"])
+    _oracle_argnums = tuple(int(a) for a in _GRAPHS[_PRIMARY]["argnums"])
     _oracle_N = MAX_AXES_PER_VERTEX
-    _oracle_total_v = len(_oracle_jaxpr.eqns)
+    _oracle_total_v = int(_TOTAL_V_SHARED)
+
+    def _oracle_pad_rows(a, width):
+        """Pad a per-vertex oracle array up to the shared index space.
+
+        The oracle builds its masks on the EPISODE's graph, whose row count
+        is that graph's own. The rollout declares one shape, so the narrower
+        graph's rows are padded with zeros -- no legal pair, no legal
+        compress -- on slots its availability mask already refuses.
+        """
+        _n = int(np.asarray(a).shape[0])
+        if _n >= int(width):
+            return a
+        _pad = [(0, int(width) - _n)] + [(0, 0)] * (np.asarray(a).ndim - 1)
+        return np.pad(np.asarray(a), _pad)
 
     # Host-phase profiling: the oracle replays are prime slow-suspects (a
     # full LVMO elimination replay per CALL, per step). Accumulated into the
@@ -8891,7 +9086,9 @@ def main(args=None):
             except Exception:
                 break
         pair, comp = o.masks()
-        return np.asarray(pair, np.float32), np.asarray(comp, np.float32)
+        _w = _oracle_total_v + 1
+        return (_oracle_pad_rows(np.asarray(pair, np.float32), _w),
+                _oracle_pad_rows(np.asarray(comp, np.float32), _w))
 
     def _oracle_masks(order, spec_hist, step_count):
         """(pair (total_v+1, N, N), comp (total_v+1, N)) for the current graph."""
@@ -8910,14 +9107,26 @@ def main(args=None):
         # Face width = the provable per-graph bound, derived BEFORE anything
         # builds a shape from it (env wire arrays, the 94-head's max_faces,
         # the trajectory zero-fills all read it downstream of here).
+        # THE WIDER BOUND WINS when the run holds two graphs: `MAX_FACES` is
+        # process state and one face wire carries both graphs, so the width
+        # has to be the maximum over them (measured: bptt 230, rtrl 384).
+        # A bound below a graph's own would refuse that graph's wide vertices.
         from alphagrad.approx import env as _env_mod
-        _B = _env_mod.derived_max_faces(
-            closed_jaxpr.jaxpr, argnums, closed_jaxpr.literals, xs)
+        for _k in _GRAPH_KEYS:
+            _gg = _GRAPHS[_k]
+            _gg["max_faces"] = int(_env_mod.derived_max_faces(
+                _gg["closed_jaxpr"].jaxpr, _gg["argnums"],
+                _gg["closed_jaxpr"].literals, _gg["xs"]))
+        _B = max(_GRAPHS[_k]["max_faces"] for _k in _GRAPH_KEYS)
         _env_mod.configure_max_faces(_B)
         global ENV_MAX_FACES
         ENV_MAX_FACES = _env_mod.MAX_FACES
         print(f"face width: derived bound {_B} "
-              f"(max_v |anc|x|desc|; in force: {ENV_MAX_FACES})")
+              + ("(max over "
+                 + ", ".join(f"{_k} {_GRAPHS[_k]['max_faces']}"
+                             for _k in _GRAPH_KEYS) + ") "
+                 if _TWO_GRAPH else "")
+              + f"(max_v |anc|x|desc|; in force: {ENV_MAX_FACES})")
 
     _F_FACES = ENV_MAX_FACES
 
@@ -8986,7 +9195,9 @@ def main(args=None):
             if _PFM_SIZES:
                 fsizes[v] = np.asarray(fs, np.int32)
                 fquant[v] = np.asarray(fq, np.float32)
-        out = (np.asarray(pair, np.float32), np.asarray(comp, np.float32),
+        _w = V + 1
+        out = (_oracle_pad_rows(np.asarray(pair, np.float32), _w),
+               _oracle_pad_rows(np.asarray(comp, np.float32), _w),
                fpair, fcomp, fvalid)
         return out + ((fsizes, fquant) if _PFM_SIZES else ())
 
@@ -9273,6 +9484,18 @@ def main(args=None):
         bool(getattr(args, "unified_face_head", False)),
         not getattr(args, "no_approx_head", False),
     ))
+    # THE TWO PROBE SURFACES ARE STILL ONE-GRAPH. Both build a per-vertex
+    # table from ONE jaxpr at setup and read it for every episode, so on an
+    # alternating run half the episodes would decode the other graph's
+    # vertices. Refused rather than run wrong; neither is part of a campaign
+    # row and neither has a per-graph table yet (bead dsnn-dfw.116).
+    if _TWO_GRAPH and (_PROBE_ON or _VPROBE_ON):
+        raise SystemExit(
+            "--temporal-rule names two graphs and a probe surface is on "
+            f"(feature probe {bool(_PROBE_ON)}, var probe {bool(_VPROBE_ON)}). "
+            "Both hold a per-vertex table built from one graph at setup and "
+            "read it on every episode, so half the episodes would decode the "
+            "other graph. Turn the probe off, or run one rule.")
     if bool(getattr(args, "var_probe", False)) and not _VPROBE_ON:
         print("[vprobe] --var-probe IGNORED: the probe reads the per-face "
               "scatter, which exists only under --dynamic-substeps "
@@ -9466,9 +9689,20 @@ def main(args=None):
     _live_face_sizes = None
     _live_face_decide = None
     _EDGE_TABLE = None
-    if getattr(args, "live_faces", False):
+    def _build_live_faces(_g):
+        """The live-face stream and its callbacks, for ONE graph.
+
+        THE STREAM IS THE GRAPH'S. It replays eliminations on the jaxpr it
+        was built from, so a stream built on one graph and driven with the
+        other graph's order walks off the end of the equation list
+        (`graphax.core.face_specs_of`, IndexError). A run with two graphs
+        therefore holds two streams and the swap picks one.
+        """
         _LIVE_FACES = build_live_face_stream(
-            _oracle_jaxpr, _oracle_argnums, _oracle_consts, _oracle_args,
+            _g["closed_jaxpr"].jaxpr,
+            tuple(int(a) for a in _g["argnums"]),
+            list(_g["closed_jaxpr"].literals),
+            list(_g["xs"]),
             vocab=incr_token_vocab(),
             max_faces=_F_FACES, max_axes=_oracle_N,
             # A chunk is a slice of the step delta, so the delta cap is the
@@ -9554,6 +9788,27 @@ def main(args=None):
                  "static one)" if _FACE_STAGE2 else
                  "STATIC (ALPHAGRAD_FACE_STAGE2=0): known wrong for `new`, "
                  "finding 75"), flush=True)
+        return {
+            "LIVE_FACES": _LIVE_FACES,
+            "live_face": _live_face,
+            "live_face_count": _live_face_count,
+            "live_face_for": _live_face_for,
+            "live_face_sizes": _live_face_sizes,
+            "live_face_decide": _live_face_decide,
+            "EDGE_TABLE": _EDGE_TABLE,
+        }
+
+    if getattr(args, "live_faces", False):
+        for _k in _GRAPH_KEYS:
+            _GRAPHS[_k]["live"] = _build_live_faces(_GRAPHS[_k])
+        _lv = _GRAPHS[_PRIMARY]["live"]
+        _LIVE_FACES = _lv["LIVE_FACES"]
+        _live_face = _lv["live_face"]
+        _live_face_count = _lv["live_face_count"]
+        _live_face_for = _lv["live_face_for"]
+        _live_face_sizes = _lv["live_face_sizes"]
+        _live_face_decide = _lv["live_face_decide"]
+        _EDGE_TABLE = _lv["EDGE_TABLE"]
 
     # Live elimination chains: one per concurrent env, plus the previous
     # episode's, which the LRU only sheds once the new ones exist. Sized like
@@ -9658,14 +9913,23 @@ def main(args=None):
                 "re-runs the per-face recurrence from the stored step carry)."
             )
 
-    total_v = len(closed_jaxpr.jaxpr.eqns)
-    num_valid = len(env.valid_vertices)
-    print(
-        f"Total vertices: {total_v}, Valid vertices: {num_valid}, "
-        f"Valid set: {env.valid_vertices}"
-    )
-
-    vertex_valid_static = build_vertex_valid_static(env.valid_vertices, total_v)
+    # THE SHARED INDEX SPACE IS `total_v` (owner ruling 2026-09-22). The
+    # agent's vertex embedding, every per-vertex mask and every per-vertex
+    # feature row are this wide on both graphs. `num_valid` stays PER GRAPH:
+    # it is how many vertices that graph's episode eliminates, i.e. the length
+    # of its rollout, and the rollout is compiled per graph anyway.
+    total_v = int(_TOTAL_V_SHARED)
+    for _k in _GRAPH_KEYS:
+        _gg = _GRAPHS[_k]
+        _gg["vertex_valid_static"] = build_vertex_valid_static(
+            _gg["env"].valid_vertices, total_v)
+        print(
+            f"Total vertices: {_gg['total_v']}, Valid vertices: "
+            f"{_gg['num_valid']}, Valid set: {_gg['env'].valid_vertices}"
+            + (f"  [graph {_k}, slots {total_v}]" if _TWO_GRAPH else "")
+        )
+    num_valid = _GRAPHS[_PRIMARY]["num_valid"]
+    vertex_valid_static = _GRAPHS[_PRIMARY]["vertex_valid_static"]
     # --fixed-order (ticket .64): the static order table, computed ONCE here on
     # the exact graph and gathered inside vertex_avail_at_step; None = free.
     # TWO INDEPENDENT PINS. --fixed-order is the SPATIAL one (within a time
@@ -9673,17 +9937,24 @@ def main(args=None):
     # they generate a PARTIAL order, and only the "one copy" case collapses to
     # the ticket .64 table. The builder returns exactly one of the two, and
     # vertex_avail_at_step refuses both at once.
-    fixed_order_table, order_constraint = _build_order_constraint(
-        args.fixed_order, args.fixed_temporal_order, env, args.example)
-    print("[cfg] " + _describe_order(order_constraint, fixed_order_table,
-                                     args.fixed_order,
-                                     args.fixed_temporal_order), flush=True)
-    if fixed_order_table is not None:
-        print(f"[cfg] fixed order: {args.fixed_order}, {len(fixed_order_table)} "
-              f"steps, {fixed_order_table[:6].tolist()} ... "
-              f"{fixed_order_table[-3:].tolist()}; only approximations are "
-              "learned", flush=True)
-        fixed_order_table = jnp.asarray(fixed_order_table, dtype=jnp.int32)
+    # PER GRAPH: the table is a walk over THAT graph's vertices.
+    for _k in _GRAPH_KEYS:
+        _gg = _GRAPHS[_k]
+        _fot, _oc = _build_order_constraint(
+            args.fixed_order, args.fixed_temporal_order, _gg["env"],
+            args.example)
+        print("[cfg] " + (f"[graph {_k}] " if _TWO_GRAPH else "")
+              + _describe_order(_oc, _fot, args.fixed_order,
+                                args.fixed_temporal_order), flush=True)
+        if _fot is not None:
+            print(f"[cfg] fixed order: {args.fixed_order}, {len(_fot)} "
+                  f"steps, {_fot[:6].tolist()} ... "
+                  f"{_fot[-3:].tolist()}; only approximations are "
+                  "learned", flush=True)
+            _fot = jnp.asarray(_fot, dtype=jnp.int32)
+        _gg["fixed_order_table"], _gg["order_constraint"] = _fot, _oc
+    fixed_order_table = _GRAPHS[_PRIMARY]["fixed_order_table"]
+    order_constraint = _GRAPHS[_PRIMARY]["order_constraint"]
 
     # F_ref: THE REFERENCE ORDER'S LIVE-FACE COUNT (owner ruling 2026-09-20),
     # counted HERE -- beside the order tables, on the env, before the agent
@@ -9708,16 +9979,30 @@ def main(args=None):
     if _face_bias_in_play:
         from alphagrad.approx.common.order import (
             reference_order_face_count as _ref_face_count)
-        _face_ref_F, _face_ref_order_name, _face_ref_order = \
-            _ref_face_count(env)
+        # ONE WALK PER GRAPH. The two graphs have different reference face
+        # counts (measured: bptt 42, rtrl 65), and the per-graph logit offset
+        # below is what makes each of them start at the run's requested
+        # approximations and skips per plan from its OWN F.
+        for _k in _GRAPH_KEYS:
+            _gg = _GRAPHS[_k]
+            (_gg["face_ref_F"], _gg["face_ref_order_name"],
+             _gg["face_ref_order"]) = _ref_face_count(_gg["env"])
+        _face_ref_F = _GRAPHS[_PRIMARY]["face_ref_F"]
+        _face_ref_order_name = _GRAPHS[_PRIMARY]["face_ref_order_name"]
+        _face_ref_order = _GRAPHS[_PRIMARY]["face_ref_order"]
 
-    pair_valid_mask = build_pair_valid_mask(
-        closed_jaxpr.jaxpr,
-        total_v,
-        num_pair_choices=NUM_PAIR_CHOICES,
-        pair_stop_idx=PAIR_STOP,
-        disable_sparsification=args.disable_sparsification,
-    )
+    # PER GRAPH, at the SHARED width: `build_pair_valid_mask` fills the rows
+    # its jaxpr has and leaves the rest zero, which is exactly the pad the
+    # narrower graph needs.
+    for _k in _GRAPH_KEYS:
+        _GRAPHS[_k]["pair_valid_mask"] = build_pair_valid_mask(
+            _GRAPHS[_k]["closed_jaxpr"].jaxpr,
+            total_v,
+            num_pair_choices=NUM_PAIR_CHOICES,
+            pair_stop_idx=PAIR_STOP,
+            disable_sparsification=args.disable_sparsification,
+        )
+    pair_valid_mask = _GRAPHS[_PRIMARY]["pair_valid_mask"]
 
     # Hyperparameters / agent.
     factor_table, factors_py, num_factors, max_rules = _build_factor_table(args)
@@ -9938,15 +10223,20 @@ def main(args=None):
     # division (num_envs * rollout_length // minibatches); when the result is
     # zero, the PPO loss is `jnp.mean(<empty>) = NaN`, training is a no-op,
     # and the only surface signal is `ent:nan` in the progress bar.
-    _mb_size = (num_envs * num_valid) // args.minibatches
-    if _mb_size == 0:
-        raise ValueError(
-            f"--minibatches={args.minibatches} > num_envs * rollout "
-            f"({num_envs} * {num_valid} = {num_envs * num_valid}). "
-            "Each minibatch would be empty, so the PPO loss becomes NaN "
-            "and no learning happens. Lower --minibatches or raise "
-            "--num-envs."
-        )
+    # CHECKED ON EVERY GRAPH. The rollout length is the graph's valid-vertex
+    # count, so a run that alternates has to clear the bound on the SHORTER
+    # graph too or half its episodes would take an empty minibatch.
+    for _k in _GRAPH_KEYS:
+        _nv = _GRAPHS[_k]["num_valid"]
+        if (num_envs * _nv) // args.minibatches == 0:
+            raise ValueError(
+                f"--minibatches={args.minibatches} > num_envs * rollout "
+                f"({num_envs} * {_nv} = {num_envs * _nv})"
+                + (f" on the {_k} graph" if _TWO_GRAPH else "") + ". "
+                "Each minibatch would be empty, so the PPO loss becomes NaN "
+                "and no learning happens. Lower --minibatches or raise "
+                "--num-envs."
+            )
     # FULL-HORIZON SCAN (--grad-window 0) minibatches over SEQUENCES, not
     # steps: a scan needs a trajectory's steps in order, so the unit of a
     # minibatch is a whole env. `shuffle_and_batch_by_trajectory` floor-divides
@@ -10008,6 +10298,48 @@ def main(args=None):
             _face_skip_bias, order=_face_ref_order)
         print("\n".join(_face_init_lines), flush=True)
     agent = apply_face_none_bias(agent, _face_none_bias, _face_skip_bias)
+
+    # ---- THE PER-GRAPH FACE-INIT OFFSET (owner ruling 2026-09-22) --------
+    # The head holds the PRIMARY graph's (B, Bs). Each graph carries the
+    # difference between its OWN normalized pair -- derived from its own
+    # reference face count F -- and that one, as a constant added to the same
+    # two logit indices the init bias writes. Under `--face-init-approx-per-
+    # plan a --face-init-skips-per-plan kappa` each graph then starts at `a`
+    # requested approximations and `kappa` requested skips per plan from its
+    # own F, which is the whole point of the normalized init.
+    #
+    # The primary graph's offset is exactly zero, and a one-graph run gets
+    # `None`, so nothing about a single-rule run moves.
+    from alphagrad.approx.common.agent_factory import (
+        expected_face_counts as _exp_faces,
+        face_logit_offset_vector as _face_off_vec)
+    from alphagrad.approx.unified_face_head import (
+        FACE_SLOTS as _FS_N, NUM_APPROX_OPS as _NOPS_N,
+        set_face_logit_offset as _set_face_off)
+    for _k in _GRAPH_KEYS:
+        _gg = _GRAPHS[_k]
+        _gg["face_offset"] = None
+        _gg["face_none_bias"] = _face_none_bias
+        _gg["face_skip_bias"] = _face_skip_bias
+        if not (_face_bias_in_play and _TWO_GRAPH):
+            continue
+        _Bg, _Bsg = resolve_face_init_bias(args, F=_gg["face_ref_F"])
+        if _Bg is None:
+            continue
+        _gg["face_none_bias"], _gg["face_skip_bias"] = _Bg, _Bsg
+        _gg["face_offset"] = _face_off_vec(
+            agent, _Bg - float(_face_none_bias),
+            float(_Bsg) - float(_face_skip_bias
+                                if _face_skip_bias is not None
+                                else _face_none_bias))
+        _ea, _ek = _exp_faces(float(_gg["face_ref_F"]), _FS_N, _NOPS_N - 1,
+                              float(_Bg), float(_Bsg))
+        print(f"[face-init] graph {_k}: F = {_gg['face_ref_F']}, "
+              f"B = {float(_Bg):.6f}, Bs = {float(_Bsg):.6f}, "
+              f"offset = {'zero' if _gg['face_offset'] is None else 'set'}, "
+              f"E[A] = {_ea:.6f}, E[K] = {_ek:.6f}", flush=True)
+    # ARMED FOR THE FIRST EPISODE'S GRAPH, before any program is traced.
+    _set_face_off(_GRAPHS[_PRIMARY]["face_offset"])
     # ------------------------------------------- KL-TO-REFERENCE TRUST REGION
     # THE FROZEN REFERENCE POLICY, snapshotted HERE and never again: after
     # _build_agent + apply_init_scheme + apply_face_none_bias, i.e. exactly
@@ -10310,9 +10642,15 @@ def main(args=None):
     # compiled programs, one per power of two, and this object picks one per
     # episode from the recent history. It goes DOWN as readily as up. The
     # rule itself lives in `episode_stream.SELECTION_RULE`.
+    # ONE BIN POLICY FOR BOTH GRAPHS, seeded from the LONGER rollout. The bin
+    # is a compiled-program width, not per-graph state the ruling names, and
+    # it adapts from the recent history either way; seeding it from the
+    # shorter graph would only make the first episodes of the longer one
+    # overflow and repeat.
     _EP_BIN = _epstream.BinPolicy(
         _epstream.resolve_log2(
-            MAX_DELTA_TOKENS, int(num_valid),
+            MAX_DELTA_TOKENS,
+            int(max(_GRAPHS[_k]["num_valid"] for _k in _GRAPH_KEYS)),
             override=int(getattr(args, "episode_tokens_log2", 0) or 0)))
     # THE SECOND BIN, chosen with the first and from its own history: the
     # PER-STEP DELTA WINDOW. It has a FLOOR that the stream bin does not --
@@ -14015,20 +14353,50 @@ def main(args=None):
               "REWARD-VECTOR front instead, whose latency axis is floored at "
               "the reference (ticket dsnn-dfw.44). Give --plan-log auto for "
               "the band archive.", flush=True)
-    if _RATIO_ARCHIVE:
-        from alphagrad.approx.common.pareto_archive import RatioBandArchive
-        pareto_archive = RatioBandArchive(
-            obj_names=(args.cmp_type, args.mem_type),
-            cap=64,
-            quality_floor=args.quality_floor,
-        )
-    else:
+    def _new_archive():
+        """ONE archive. A run with two graphs builds one PER GRAPH.
+
+        The two graphs have different sizes, so their paired log ratios are
+        two distributions and a shared archive would merge two fronts into
+        one and band them together.
+        """
+        if _RATIO_ARCHIVE:
+            from alphagrad.approx.common.pareto_archive import RatioBandArchive
+            return RatioBandArchive(
+                obj_names=(args.cmp_type, args.mem_type),
+                cap=64,
+                quality_floor=args.quality_floor,
+            )
         from alphagrad.approx.common.pareto_archive import ParetoArchive
-        pareto_archive = ParetoArchive(
+        return ParetoArchive(
             obj_names=(args.cmp_type, args.mem_type, "cosine_sim"),
             obj_idx=(cmp_idx, mem_idx, cosine_idx),
             quality_floor=args.quality_floor,
         )
+
+    pareto_archive = _new_archive()
+    # ---- THE PER-GRAPH RUN STATE (owner ruling 2026-09-22) ---------------
+    # Built ONLY when the run alternates, so a one-graph run takes not one
+    # new code path and its behaviour is the old behaviour by construction.
+    _GSTATES = None
+    if _TWO_GRAPH:
+        from alphagrad.approx.common.two_graph import GraphStates as _GStates
+        _GSTATES = _GStates(_RULES, lag_init=float(args.lag_init))
+        for _k in _GRAPH_KEYS:
+            _st = _GSTATES[_k]
+            _st.archive = (pareto_archive if _k == _PRIMARY
+                           else _new_archive())
+            _st.popart = (popart_m1, popart_m2, popart_w)
+            _st.total_v = _GRAPHS[_k]["total_v"]
+            _st.num_valid = _GRAPHS[_k]["num_valid"]
+            _st.face_F = _GRAPHS[_k].get("face_ref_F")
+            _st.face_none_bias = _GRAPHS[_k]["face_none_bias"]
+            _st.face_skip_bias = _GRAPHS[_k]["face_skip_bias"]
+        print(_GSTATES.describe(), flush=True)
+    #: The graph the PREVIOUS episode ran on, so the swap knows whose state
+    #: the trainer's own locals are holding. `None` before the first episode,
+    #: and after a restore, where every graph's state is in the store.
+    _RULE_PREV = [None]
     elim_order_table = wandb.Table(columns=["episode", "return", "elimination order"])
     pbar = tqdm(total=args.episodes)
 
@@ -14963,8 +15331,18 @@ def main(args=None):
                 # policy trained with a systematic off-policy bias, and
                 # nothing else in the record says so.
                 _plog_rd_r, _plog_rd_l = _read_pair()
+                # THE GRAPH THE PLAN WAS ACTED ON. A pure function of the
+                # episode number, so it is right even under
+                # --measure-pipeline, where these records are drained one
+                # episode after the one they belong to. Stamped only when the
+                # run alternates: on a one-graph run every record names the
+                # same graph and the argument namespace already says which.
+                _plog_rule = (_rule_for_episode(_RULES, int(ep))
+                              if _TWO_GRAPH else None)
                 for _plog_j, _plog_r in enumerate(_plog_recs):
                     _plog_r["episode"] = int(ep)
+                    if _plog_rule is not None:
+                        _plog_r["temporal_rule"] = _plog_rule
                     _plog_r["plan_index"] = _plog_n0 + _plog_j
                     _plog_r["palimpsa_read_rollout"] = _plog_rd_r
                     _plog_r["palimpsa_read_loss"] = _plog_rd_l
@@ -15422,7 +15800,9 @@ def main(args=None):
             # Persist the FRONT, not just these two scalars — see _dump_pareto.
             _pd = int(getattr(args, "pareto_dump_every", 50) or 0)
             if _pd > 0 and (ep % _pd == 0):
-                _dump_pareto(pareto_archive, args, ep)
+                _dump_pareto(pareto_archive, args, ep,
+                             rule=(_rule_for_episode(_RULES, int(ep))
+                                   if _TWO_GRAPH else None))
             if pareto_archive.pts:
                 fx = np.stack(pareto_archive.pts).astype(np.float64)
                 # 3 scatter tables: (latency|cmp x cos), (mem x cos), (cmp x mem)
@@ -15993,6 +16373,19 @@ def main(args=None):
                     _fh.write(_json.dumps(_row) + "\n")
             except Exception as _je:
                 print(f"[update-jsonl] write failed: {_je}", flush=True)
+        # THE PER-GRAPH METRIC FAMILIES GAIN THE RULE (owner ruling
+        # 2026-09-22): `lagrangian/bptt/lambda` beside `lagrangian/lambda`.
+        # The plain key keeps the episode's own value, so every existing
+        # dashboard reads what it always read, and the namespaced one is the
+        # series that means something over a whole run. Only the three
+        # families that ARE per graph are doubled; everything else describes
+        # the episode and means the same thing whichever graph it ran on.
+        if _TWO_GRAPH:
+            from alphagrad.approx.common.two_graph import (
+                namespace_log as _ns_log)
+            log_dict = _ns_log(
+                log_dict, _rule_for_episode(_RULES, int(ep)),
+                prefixes=("lagrangian", "popart", "pareto"))
         wandb.log(log_dict)
 
         # Per-episode memory + JIT-cache diagnostic. Off by default; flip on
@@ -16658,7 +17051,13 @@ def main(args=None):
                            if diag_pack is not None else -1.0)
             _lag_raw_a = (float(np.asarray(diag_pack[-2]))
                           if diag_pack is not None else float("nan"))
-            print("[lagrangian] ep=%d lambda=%.4f mean_violation=%.4f "
+            # THE GRAPH IS ON THE LINE when the run alternates: the two
+            # multipliers are two duals and a log that did not say which was
+            # which would read as one that oscillates.
+            print("[lagrangian] "
+                  + (f"graph={_rule_for_episode(_RULES, int(ep))} "
+                     if _TWO_GRAPH else "")
+                  + "ep=%d lambda=%.4f mean_violation=%.4f "
                   "frac_violating=%.3f mean_raw_q=%.4f frozen=%d "
                   "refused=%d mask_frac=%.3f raw_adv=%.3f"
                   % (ep, lag_lambda, _lag_mean_v, _lag_frac_v, _lag_mean_q,
@@ -16842,6 +17241,13 @@ def main(args=None):
         the overlap: the trainer's GPU runs this update while the host blocks
         on the measure actors for the episode just rolled out.
         """
+        # THE PENDING EPISODE'S UPDATE RUNS ON THE PENDING EPISODE'S GRAPH.
+        # This reads `popart_m1/m2/w` out of the trainer's own locals, and
+        # under the pipeline it is called from the NEXT episode's iteration,
+        # so without this it would take the next graph's accumulators. Its
+        # partner `_pipe_finish` puts the graph back.
+        if _TWO_GRAPH:
+            _swap_graph(_GSTATES.rule_for(int(prev["ctx"]["ep"])))
         (_fm, _ovr, _vm, _pin, _mm, _kl, _e2, _w2) = prev["args"]
         return _episode_update_jit(
             agent, opt_state, prev["roll"], global_step, _fm, _ovr, _vm,
@@ -16849,25 +17255,39 @@ def main(args=None):
             probe_opt_state, vprobes, vprobe_opt_state, _kl, _e2, _w2)
 
     def _pipe_finish(prev, out):
-        """Rebind from the pending episode's update and run its epilogue."""
+        """Rebind from the pending episode's update and run its epilogue.
+
+        ON THE PENDING EPISODE'S GRAPH, and back to the running episode's
+        afterwards. `_finish_episode` takes the dual step, folds PopArt and
+        admits into the archive, and all three are per graph; under the
+        pipeline this runs inside the NEXT episode's iteration, so the graph
+        has to be put back the moment it is done. `_pipe_update_dispatch`,
+        which is evaluated to produce `out`, has already swapped here.
+        """
         nonlocal agent, opt_state, global_step
         nonlocal popart_m1, popart_m2, popart_w
         nonlocal probes, probe_opt_state, vprobes, vprobe_opt_state
-        (agent, opt_state, _unused_states, _metrics, _tot_rew, _acts,
-         global_step, _diag, popart_m1, popart_m2, popart_w, _attn,
-         _true_ret, probes, probe_opt_state, _probe_mets,
-         vprobes, vprobe_opt_state, _vp_mets,
-         _u1, _u2, _u3, _u4, _u5, _u6, _u7, _u8) = out
-        _ctx = prev["ctx"]
-        _ctx.update(
-            agent=agent, opt_state=opt_state, global_step=global_step,
-            metrics=_metrics, total_rewards_full=_tot_rew,
-            actions_pack=_acts, diag_pack=_diag,
-            popart_m1=popart_m1, popart_m2=popart_m2, popart_w=popart_w,
-            attn_ent=_attn, true_scalar_return=_true_ret,
-            probe_metrics=_probe_mets, vp_metrics=_vp_mets,
-        )
-        _finish_episode(_ctx)
+        if _TWO_GRAPH:
+            _swap_graph(_GSTATES.rule_for(int(prev["ctx"]["ep"])))
+        try:
+            (agent, opt_state, _unused_states, _metrics, _tot_rew, _acts,
+             global_step, _diag, popart_m1, popart_m2, popart_w, _attn,
+             _true_ret, probes, probe_opt_state, _probe_mets,
+             vprobes, vprobe_opt_state, _vp_mets,
+             _u1, _u2, _u3, _u4, _u5, _u6, _u7, _u8) = out
+            _ctx = prev["ctx"]
+            _ctx.update(
+                agent=agent, opt_state=opt_state, global_step=global_step,
+                metrics=_metrics, total_rewards_full=_tot_rew,
+                actions_pack=_acts, diag_pack=_diag,
+                popart_m1=popart_m1, popart_m2=popart_m2, popart_w=popart_w,
+                attn_ent=_attn, true_scalar_return=_true_ret,
+                probe_metrics=_probe_mets, vp_metrics=_vp_mets,
+            )
+            _finish_episode(_ctx)
+        finally:
+            if _TWO_GRAPH:
+                _swap_graph(_RULE_EP)
 
     # ---- CHECKPOINT (5 of 8) --------------------------------------------
     # THE DRAIN, THE SAVE AND THE RESTORE.
@@ -16907,6 +17327,8 @@ def main(args=None):
         _prev = _PIPE_PENDING[0]
         if not (_MPIPE and _prev is not None):
             return False
+        # (the graph is taken and put back by `_pipe_update_dispatch` and
+        # `_pipe_finish`, which is where the per-graph state is read.)
         _PIPE_PENDING[0] = None
         if _PIPE_DEEP:
             # DEEP: this episode's measurement was started at the end of its
@@ -16937,6 +17359,23 @@ def main(args=None):
         _pipe_finish(_prev, _pipe_update_dispatch(_prev))
         return True
 
+    def _gstates_flush():
+        """Put the RUNNING per-graph values back into the store.
+
+        The swap holds one graph's archive, PopArt and multiplier in the
+        trainer's own locals while the others sit in the store, so anything
+        that serialises the store has to put the running one back first or it
+        would write that graph's state as of its previous episode.
+        """
+        if not _TWO_GRAPH or _RULE_PREV[0] is None:
+            # Before the first episode, and right after a restore, the store
+            # holds every graph and the locals hold none of them.
+            return
+        _cur = _GSTATES[_RULE_PREV[0]]
+        _cur.popart = (popart_m1, popart_m2, popart_w)
+        _cur.lag_lambda = float(lag_lambda)
+        _cur.archive = pareto_archive
+
     def _ckpt_tree():
         """THE ARITHMETIC HALF: everything the next episode's numbers read.
 
@@ -16944,8 +17383,13 @@ def main(args=None):
         is deliberately absent -- it is the identity-initialised policy, it is
         rebuilt from --seed on every start, and a checkpoint that carried it
         could disagree with the run it continues about what the reference is.
+
+        THE OTHER GRAPH'S PopArt RIDES HERE TOO (owner ruling 2026-09-22):
+        the accumulators are arrays and arrays belong in this half, while the
+        rest of the per-graph state is JSON and rides in `meta`.
         """
-        return {
+        _gstates_flush()
+        _tree = {
             "agent": agent,
             "opt_state": opt_state,
             "probes": probes,
@@ -16960,6 +17404,14 @@ def main(args=None):
             "lag_lambda": float(lag_lambda),
             "kl_ref_coef": float(_kl_ref_coef),
         }
+        # ADDED ONLY WHEN THE RUN ALTERNATES, so a one-graph run's tree has
+        # exactly the leaves it had before two graphs existed and an older
+        # checkpoint still resumes: `load_ppo_tree` compares this tree to the
+        # saved one leaf by leaf and a key nobody wrote would refuse it.
+        if _TWO_GRAPH:
+            _tree["two_graph_popart"] = {
+                str(_k): list(_GSTATES[_k].popart) for _k in _GRAPH_KEYS}
+        return _tree
 
     def _ckpt_meta():
         """THE BOOKKEEPING HALF: what a person reads, in JSON."""
@@ -16967,10 +17419,19 @@ def main(args=None):
             _rid = wandb.run.id if wandb.run is not None else ""
         except Exception:
             _rid = ""
+        # THE PER-GRAPH STATE (owner ruling 2026-09-22). The RUNNING values
+        # belong to the graph the current episode is on, so they go back into
+        # the store before it is serialised; the other graph's are already
+        # there, put back by the swap. `null` on a one-graph run, which is
+        # what a one-graph resume then checks against.
+        _gstates_flush()
+        _tg = (_GSTATES.to_json(_ckpt.pareto_archive_to_json)
+               if _TWO_GRAPH else None)
         return {
             "args": _CKPT_ARGS,
             "wandb_run_id": str(_rid or ""),
             "pareto_archive": _ckpt.pareto_archive_to_json(pareto_archive),
+            "two_graph": _tg,
             "episode_bin": _ckpt.bin_policy_to_json(_EP_BIN),
             "window_bin": _ckpt.bin_policy_to_json(_WIN_BIN),
             "host_state": _ckpt.host_state_to_json(host_state),
@@ -17082,6 +17543,29 @@ def main(args=None):
         _kl_ref_coef = float(_restored["kl_ref_coef"])
         _ckpt.pareto_archive_from_json(
             pareto_archive, _RESUME_META["pareto_archive"])
+        # ---- THE PER-GRAPH STATE COMES BACK (owner ruling 2026-09-22) ----
+        # The archives and multipliers from `meta`, the PopArt accumulators
+        # from `tree`. `from_json` refuses a checkpoint whose rule list is not
+        # this run's, in this order: the alternation is the episode number
+        # modulo the rule count, so a resume across a changed list would run
+        # every episode on the other graph's state.
+        if _TWO_GRAPH:
+            _tg_meta = _RESUME_META.get("two_graph")
+            if _tg_meta is None:
+                raise _ckpt.CheckpointError(
+                    f"--temporal-rule {list(_RULES)} alternates between two "
+                    f"graphs and this checkpoint carries no per-graph state. "
+                    f"It was written by a run with one graph, so its archive "
+                    f"and multiplier belong to one of them and there is no "
+                    f"honest way to split them.")
+            _GSTATES.from_json(_tg_meta, _ckpt.pareto_archive_from_json)
+            _tg_pop = _restored.get("two_graph_popart") or {}
+            for _k in _GRAPH_KEYS:
+                _GSTATES[_k].popart = tuple(_tg_pop[str(_k)])
+            # The loop's first swap takes the episode's graph out of the
+            # store, so the running locals must not be one graph's state
+            # already; `_RULE_PREV` stays None and the swap only loads.
+            _RULE_PREV[0] = None
         _ckpt.bin_policy_from_json(_EP_BIN, _RESUME_META["episode_bin"])
         _ckpt.bin_policy_from_json(_WIN_BIN, _RESUME_META["window_bin"])
         _ckpt.host_state_from_json(host_state, _RESUME_META["host_state"])
@@ -17138,7 +17622,89 @@ def main(args=None):
               f"update runs from here.", flush=True)
 
     _LOOP_EPISODES = len(_PSWEEP_PLAN) if _PSWEEP else args.episodes
+    #: The graph the RUNNING episode is on. Set at the top of every
+    #: iteration; `_pipe_finish` puts the graph back to it after finishing a
+    #: pending episode on the pending episode's graph. Initialised for the
+    #: end-of-run drain of a loop that ran no episode at all.
+    _RULE_EP = _PRIMARY
+    def _swap_graph(_to):
+        """Put the running per-graph state back and take the next graph's.
+
+        ONE PLACE. Every binding below is read by closures defined before the
+        loop, and Python's closures over an enclosing function's locals are
+        late-binding, so rebinding a name here is what those closures see on
+        the next call. Every jitted program that reads one of them also takes
+        `env_obj` as an argument, and two graphs are two envs with two
+        different treedefs, so each graph gets its OWN trace and no program
+        ever runs with the other graph's constants baked in.
+
+        Called at the top of the episode, before anything traces or measures,
+        and it is a no-op when the episode stays on the graph it was on.
+        """
+        nonlocal env, num_valid, vertex_valid_static, pareto_archive
+        nonlocal fixed_order_table, order_constraint, pair_valid_mask
+        nonlocal _BASE_TOK, _BASE_N, _BASE_W, _BASE_OWN
+        nonlocal _oracle_jaxpr, _oracle_consts, _oracle_args, _oracle_argnums
+        nonlocal popart_m1, popart_m2, popart_w, lag_lambda
+        nonlocal _LIVE_FACES, _live_face, _live_face_count, _live_face_for
+        nonlocal _live_face_sizes, _live_face_decide, _EDGE_TABLE
+        _from = _RULE_PREV[0]
+        if _from == _to:
+            return
+        if _from is not None:
+            # THE RUNNING STATE BELONGS TO THE GRAPH IT CAME FROM. Saved
+            # before anything is taken, so an update on one graph's episode
+            # can never land on the other graph's multiplier or PopArt.
+            _prev = _GSTATES[_from]
+            _prev.popart = (popart_m1, popart_m2, popart_w)
+            _prev.lag_lambda = float(lag_lambda)
+            _prev.archive = pareto_archive
+        _next = _GSTATES[_to]
+        popart_m1, popart_m2, popart_w = _next.popart
+        lag_lambda = float(_next.lag_lambda)
+        pareto_archive = _next.archive
+        _g = _GRAPHS[_to]
+        env = _g["env"]
+        num_valid = _g["num_valid"]
+        vertex_valid_static = _g["vertex_valid_static"]
+        fixed_order_table = _g["fixed_order_table"]
+        order_constraint = _g["order_constraint"]
+        pair_valid_mask = _g["pair_valid_mask"]
+        _BASE_TOK, _BASE_N = _g["base_tok"], _g["base_n"]
+        _BASE_W, _BASE_OWN = _g["base_w"], _g["base_own"]
+        _oracle_jaxpr = _g["closed_jaxpr"].jaxpr
+        _oracle_consts = list(_g["closed_jaxpr"].literals)
+        _oracle_args = list(_g["xs"])
+        _oracle_argnums = tuple(int(a) for a in _g["argnums"])
+        # THE LIVE-FACE STREAM IS THE GRAPH'S. A stream driven with the other
+        # graph's order walks off its equation list, which is how the first
+        # two-graph probe failed (job 67523, IndexError in `face_specs_of`).
+        _lv_g = _g.get("live")
+        if _lv_g is not None:
+            _LIVE_FACES = _lv_g["LIVE_FACES"]
+            _live_face = _lv_g["live_face"]
+            _live_face_count = _lv_g["live_face_count"]
+            _live_face_for = _lv_g["live_face_for"]
+            _live_face_sizes = _lv_g["live_face_sizes"]
+            _live_face_decide = _lv_g["live_face_decide"]
+            _EDGE_TABLE = _lv_g["EDGE_TABLE"]
+        _set_face_off(_g["face_offset"])
+        _RULE_PREV[0] = _to
+
     for ep in range(_ep_start, _LOOP_EPISODES):
+        # ---- THE EPISODE'S GRAPH (owner ruling 2026-09-22) -----------------
+        # Even episodes on the first rule named, odd on the second, as a pure
+        # function of the episode number -- so a resume at episode N lands on
+        # the graph the uninterrupted run would have reached. FIRST in the
+        # body, before the checkpoint writes the state it is about to swap.
+        _RULE_EP = (_GSTATES.rule_for(ep) if _TWO_GRAPH else _PRIMARY)
+        # THE SWAP IS NOT HERE. Under --measure-pipeline the previous
+        # episode's update has not run yet at the top of this one, and it has
+        # to run on ITS graph: `_pipe_drain` swaps to the pending episode's
+        # graph, and this episode takes its own just before its rollout,
+        # after every drain in this block. Swapping here put episode e-1's
+        # update on episode e's PopArt and multiplier, which produced a NaN
+        # loss on the first pipelined two-graph probe (job 67530).
         # CHECKPOINT (7 of 8). THE QUIESCENT POINT: after episode ep-1's
         # update and epilogue, before episode ep's rollout. `_ckpt_write`
         # drains the pipeline first, so `ep` episodes really are complete.
@@ -17282,6 +17848,15 @@ def main(args=None):
                 preferences_per_env, head_reward_weights_np, lag_lambda,
                 bool(args.preference_conditioned))
 
+        # ---- THE EPISODE TAKES ITS GRAPH (owner ruling 2026-09-22) -------
+        # HERE and not at the top of the body: every drain above runs the
+        # PREVIOUS episode's update, and that update belongs to the previous
+        # episode's graph. From this line on, `env`, the archive, the PopArt
+        # triple, the multiplier, the live-face stream and the face-init
+        # offset are this episode's.
+        if _TWO_GRAPH:
+            _swap_graph(_RULE_EP)
+            _GSTATES[_RULE_EP].episodes += 1
         eval_samples = generate_eval_samples(env, ep_eval_key, args.num_eval_samples)
         env_episode = eqx.tree_at(lambda e: e.eval_args_samples, env, eval_samples)
         # The eval samples ride the env and are drawn afresh every episode, so
@@ -17295,6 +17870,18 @@ def main(args=None):
         # pool already knows how to hold an ObjectRef -- it was simply never
         # handed one from here. Samples are regenerated per episode, so the
         # ref is refreshed here and nowhere else.
+        # THE BOUND OPERANDS FOR LOCALLY SERVED ROWS FOLLOW THE EPISODE'S
+        # GRAPH. `env.set_local_bound_operands` is PROCESS state: once the
+        # pool owns the bound operands the step callback ships zero-length
+        # placeholders, and a row served in this process reads the concrete
+        # copy from there. Installed once at setup it held the first graph's
+        # args for ever, so on an alternating run every locally served row of
+        # the other graph tokenized that graph's plan against the first
+        # graph's arguments (`safe_map() argument 2 is shorter than argument
+        # 1`, job 67527). Refreshed HERE, beside the eval samples it travels
+        # with, because this is where the episode's graph is already in hand.
+        _tok_env_mod.set_local_bound_operands(
+            env.args, env.consts, eval_samples)
         _ep_pool = getattr(env, "_remote_pool", None)
         if _ep_pool is not None:
             try:
@@ -18160,7 +18747,16 @@ def main(args=None):
             file=sys.stderr,
         )
 
-    _dump_pareto(pareto_archive, args, _EPISODES_DONE[0], final=True)
+    # EVERY GRAPH'S FRONT AT THE END, not just the one the last episode ran
+    # on: the other graph's archive is in the store and a run that dumped one
+    # would drop half its result.
+    if _TWO_GRAPH:
+        _gstates_flush()
+        for _k in _GRAPH_KEYS:
+            _dump_pareto(_GSTATES[_k].archive, args, _EPISODES_DONE[0],
+                         final=True, rule=_k)
+    else:
+        _dump_pareto(pareto_archive, args, _EPISODES_DONE[0], final=True)
     print_top_n("Total Reward", host_state["top_n_total"])
     print_top_n(f"CMP (Lowest {args.cmp_type})", host_state["top_n_cmp"])
     print_top_n(f"Memory (Lowest {args.mem_type})", host_state["top_n_mem"])
