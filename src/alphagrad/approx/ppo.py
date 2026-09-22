@@ -126,6 +126,9 @@ from alphagrad.approx.common.rsnn_shd import (
     last_step_position as _last_step_position,
     target_example as _target_example,
     resolve_temporal_rule as _resolve_temporal_rule,
+    resolve_temporal_rules as _resolve_temporal_rules,
+    temporal_rule_for_episode as _rule_for_episode,
+    temporal_rule_list as _rule_list,
 )
 from alphagrad.approx.common.schedules import cosine_warmup_exp_decay_lr
 from alphagrad.approx.env import (
@@ -5629,6 +5632,7 @@ def make_argparser() -> argparse.ArgumentParser:
              "different quantity entirely.")
     p.add_argument(
         "--temporal-rule", choices=list(_TEMPORAL_RULES), default=None,
+        nargs="+", metavar="RULE",
         help="HOW TEMPORAL CREDIT ENTERS THE ONE-STEP RECURRENT GRAPH "
              "(--example RSNN_SHD; owner ruling 2026-09-16). The graph is "
              "always ONE recurrent step -- inputs the weights, the carried "
@@ -5647,7 +5651,18 @@ def make_argparser() -> argparse.ArgumentParser:
              "exactly dL_t/dW through the whole prefix. bptt and rtrl are "
              "both EXACT; the face where the given quantity meets the step is "
              "where an e-prop-like approximation (Zenke and Neftci 2020) "
-             "lives. RAISES on any target without time steps.")
+             "lives. RAISES on any target without time steps. "
+             "TWO RULES MAY BE GIVEN (owner ruling 2026-09-22): "
+             "`--temporal-rule bptt rtrl` runs BOTH graphs of the same "
+             "example in one run and ALTERNATES per episode -- even episodes "
+             "on the first rule named, odd on the second -- with one compiled "
+             "rollout program per graph. The policy, the optimizer, the "
+             "quality floor and the preference conditioning are SHARED; the "
+             "band archive and its front, the reference measurements, the "
+             "PopArt statistics and the Lagrangian multiplier are PER GRAPH. "
+             "There is no graph flag in the observation: the token stream "
+             "carries the structure. A single rule is the old behaviour "
+             "unchanged, argument namespace included.")
     # --carry-container IS GONE (owner ruling 2026-09-16, A). The
     # plan-produced carry is the ONLY mode and the container follows the
     # PLAN's approximation on the carried-Jacobian face, per plan, on the
@@ -7801,7 +7816,13 @@ def main(args=None):
     # measure actors and before the wandb config is written, so the trainer,
     # every actor and the run record carry the SAME rule. An actor that read a
     # different rule would measure a different graph than the search acts on.
-    args.temporal_rule = _resolve_temporal_rule(args.example, args.temporal_rule)
+    # ONE RULE IS A STRING, TWO ARE A LIST. `--temporal-rule` takes one or
+    # two values (owner ruling 2026-09-22), and a one-rule run keeps the plain
+    # string it has always carried, so its argument namespace -- and with it
+    # its checkpoint, its wandb config and the dict the measure actors are
+    # built from -- is byte for byte the one it had before two rules existed.
+    args.temporal_rule = _resolve_temporal_rules(args.example,
+                                                 args.temporal_rule)
     # THE TARGET THE RULE BUILDS. --temporal-rule window2 is not another
     # given edge on the one-step body; it is a two-copy graph with no given
     # edge at all, and it has its own registered target. Resolved HERE, in

@@ -201,6 +201,89 @@ def resolve_temporal_rule(example: str | None, rule, *,
     return r
 
 
+#: How many rules one run may alternate between (owner ruling 2026-09-22).
+MAX_TEMPORAL_RULES = 2
+
+
+def resolve_temporal_rules(example: str | None, rules, *,
+                           flag: str = "--temporal-rule"):
+    """The resolved rule, or the resolved LIST of rules, of ``rules``.
+
+    ONE VALUE IN, ONE VALUE OUT. A run that names a single rule keeps the
+    plain string every caller has always carried, so a one-rule run's argument
+    namespace -- and therefore its checkpoint, its wandb config and the dict
+    the measure actors are built from -- is the one it had before two rules
+    existed. Two values in, a LIST out, in the order given: that order IS the
+    alternation, even episodes on the first.
+
+    Two rules must name two DIFFERENT graphs of the SAME target, which is why
+    ``window2`` is refused in a pair: it resolves to its own registered
+    target, so a pair containing it would be two targets and not two graphs
+    of one.
+    """
+    if rules is None or isinstance(rules, str):
+        return resolve_temporal_rule(example, rules, flag=flag)
+    rs = list(rules)
+    if not rs:
+        raise ValueError(f"{flag} was given an empty list of rules.")
+    if len(rs) > MAX_TEMPORAL_RULES:
+        raise ValueError(
+            f"{flag} was given {len(rs)} rules {rs}; a run alternates between "
+            f"at most {MAX_TEMPORAL_RULES} graphs (owner ruling 2026-09-22). "
+            f"One rule per graph, and the order is the alternation.")
+    out = [resolve_temporal_rule(example, r, flag=flag) for r in rs]
+    if len(out) == 1:
+        return out[0]
+    if len(set(out)) != len(out):
+        raise ValueError(
+            f"{flag} {out} names the same rule twice. Two rules mean two "
+            f"graphs the run alternates between; naming one twice asks for "
+            f"the same graph on every episode, which is what a single rule "
+            f"already does.")
+    for r in out:
+        if r == "window2":
+            raise ValueError(
+                f"{flag} {out} pairs window2 with another rule. window2 is "
+                f"not another given edge on the one-step body -- it builds "
+                f"its own registered target ({RSNN_W2_TARGET}) -- so the "
+                f"pair would be two TARGETS, and the alternation is over two "
+                f"graphs of ONE target. Run window2 on its own.")
+    return out
+
+
+def temporal_rule_list(rule) -> tuple[str, ...]:
+    """``rule`` as the tuple of rules it names, whatever form it arrived in.
+
+    The one place that knows a resolved temporal rule is either a string or a
+    list of them. ``None`` -- a target with no time steps -- names no rule and
+    gives the empty tuple.
+    """
+    if rule is None:
+        return ()
+    if isinstance(rule, (list, tuple)):
+        return tuple(str(r) for r in rule)
+    return (str(rule),)
+
+
+def temporal_rule_for_episode(rule, episode: int) -> str | None:
+    """THE RULE EPISODE ``episode`` RUNS ON (owner ruling 2026-09-22).
+
+    Even episodes take the first rule, odd episodes the second, and a run
+    with one rule takes it on every episode. The schedule is a pure function
+    of the episode number, so a resume at episode N lands on the same graph
+    the run would have reached without the interruption.
+    """
+    rules = temporal_rule_list(rule)
+    if not rules:
+        return None
+    ep = int(episode)
+    if ep < 0:
+        raise ValueError(
+            f"episode {ep} is negative; the alternation is indexed by the "
+            f"episode number and there is no episode before the first.")
+    return rules[ep % len(rules)]
+
+
 def rsnn_weights(key):
     """``(W, V, Wo)`` at Zenke's ``std = 0.2 / sqrt(fan_in)`` normal init."""
     h = RSNN_HIDDEN
@@ -929,7 +1012,19 @@ def target_example(example: str | None, rule) -> str | None:
     body; it is a DIFFERENT graph, two step copies wide, with no given edge at
     all. It therefore has its own registered target, and this is the one place
     that says so. Every other rule keeps the target it was asked for.
+
+    A LIST of rules names two graphs of ONE target, so the answer has to be
+    one example; a list that would name two is refused here rather than
+    letting the second graph's build read the first graph's target.
     """
+    if isinstance(rule, (list, tuple)):
+        out = {target_example(example, r) for r in rule}
+        if len(out) != 1:
+            raise ValueError(
+                f"--temporal-rule {list(rule)} names {sorted(out)}: two "
+                f"TARGETS, not two graphs of one target. The alternation is "
+                f"over two graphs of the same target.")
+        return out.pop()
     if is_rsnn(example) and rule is not None and str(rule) == "window2":
         return RSNN_W2_TARGET
     return example

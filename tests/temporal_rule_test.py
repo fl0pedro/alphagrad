@@ -1293,11 +1293,20 @@ def _env_for(rule):
 
 
 def test_the_seam_is_armed_only_on_a_rule_with_a_given_edge():
+    """A rule with a given edge holds a carry-plan entry, one without holds
+    none, and THE GRAPH ANSWERS FOR ITSELF.
+
+    The question used to be asked of the process, because one process served
+    one target. Since the owner's ruling of 2026-09-22 a run may alternate
+    between two graphs of one target and the process holds an entry per
+    graph, so registering the truncated graph must not disarm the other one.
+    """
     from alphagrad.approx.common import carry_plan as CP
-    _env_for("rtrl")
-    assert CP.armed()
-    _env_for("tbptt")
-    assert not CP.armed()
+    _lm, _cp, rtrl_env = _env_for("rtrl")
+    assert CP.armed(rtrl_env.config)
+    _lm, _cp, tbptt_env = _env_for("tbptt")
+    assert not CP.armed(tbptt_env.config)
+    assert CP.armed(rtrl_env.config)
 
 
 @pytest.mark.parametrize("container",

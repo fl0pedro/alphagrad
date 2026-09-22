@@ -8790,10 +8790,14 @@ def _callback_measured(
     # them.
     _rec_order = o_list
     _carry_container = None
-    if is_terminal and _carry.armed():
+    # THE GRAPH THE POLICY ACTED ON, held before the variant replaces
+    # `config`. A process that serves two graphs of one target holds a
+    # carry-plan entry per graph, and this is what picks the right one.
+    _carry_base_cfg = config
+    if is_terminal and _carry.armed(_carry_base_cfg):
         _carry_container = _carry.container_for_plan(
             config, o_list, _faces_np, _skips_np, partial_specs)
-        _variant = _carry.measurement_env(_carry_container)
+        _variant = _carry.measurement_env(_carry_container, _carry_base_cfg)
         if _variant is not None:
             (o_list, _m_specs, _m_faces, _m_skips, _m_joins) = \
                 _carry.transport_wires(
@@ -8825,7 +8829,8 @@ def _callback_measured(
             # moves per episode exactly as the base draw does.
             if eval_samples:
                 eval_samples = tuple(
-                    _carry.eval_samples_for(_carry_container, eval_samples))
+                    _carry.eval_samples_for(_carry_container, eval_samples,
+                                            _carry_base_cfg))
     _PLAN_CARRY[0] = _carry_container
     _pf("cb.carry_container")
 
