@@ -717,9 +717,14 @@ def _grad_oracle_jobs(records):
         plan_hash = rec.get("plan_hash")
         if not order or not plan_hash:
             continue
-        key = tuple(int(v) for v in order)
+        # ONE JOB PER (ORDER, GRAPH). The record carries `temporal_rule` only
+        # on a run that alternates; two graphs of one target share a vertex
+        # numbering, so the same order can name a plan on either of them and
+        # a job keyed on the order alone would check one graph for both.
+        key = (tuple(int(v) for v in order), rec.get("temporal_rule"))
         jobs.setdefault(key, []).append(str(plan_hash))
-    return [{"order": k, "plan_hashes": v} for k, v in jobs.items()]
+    return [{"order": k[0], "rule": k[1], "plan_hashes": v}
+            for k, v in jobs.items()]
 
 
 def _grad_oracle_write(path, results, checked_at_episode, tol):
@@ -8931,6 +8936,21 @@ def main(args=None):
                   f"{float(args.grad_oracle_timeout):g}s, bar "
                   f"{_GRAD_ORACLE_TOL:.0e}. A check over the timeout kills "
                   f"and recreates the actor.", flush=True)
+        elif _TWO_GRAPH:
+            # THE THREAD MODE IS ONE GRAPH'S. Its check closure reads the
+            # trainer's own live env, which the swap rebinds under it, and the
+            # thread runs asynchronously, so a two-graph run would check
+            # whichever graph the loop happened to hold. The actor mode builds
+            # a config per graph and is what a campaign row uses; a run
+            # without a measurement pool must say which it wants.
+            raise SystemExit(
+                f"--temporal-rule {list(_RULES)} names two graphs and "
+                f"--grad-oracle {args.grad_oracle} has no measurement pool to "
+                f"build its Ray actor with, so it would fall back to the "
+                f"worker THREAD. That thread reads the trainer's live graph "
+                f"while the loop swaps it, so it would check whichever graph "
+                f"it happened to find. Give --ray-measure N, or "
+                f"--grad-oracle off.")
         else:
             _GRAD_ORACLE = _AsyncGradOracle(
                 _grad_oracle_run_check,
