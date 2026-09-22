@@ -131,6 +131,8 @@ TARGET_KL = "0.1"
 #: one executable per plan until the measure GPU refuses.  The
 #: order-only tuning rows and the three sweep rounds keep it off.
 CACHE_CLEAR_EVERY = "100"
+#: What every row `thesis_arm` emits now carries beside its target shape.
+CLEAR_ENV = {"ALPHAGRAD_MEASURE_CACHE_CLEAR_EVERY": CACHE_CLEAR_EVERY}
 #: THE FACE-ENTROPY WEIGHT PER FAMILY (owner ruling 2026-09-21, dsnn-dfw.84
 #: and dsnn-dfw.78): the recurrent target and TLM render the near-zero
 #: bonus; NN256 keeps the campaign's 0.05.
@@ -484,13 +486,14 @@ def test_the_targets_are_the_ones_the_owner_named(gen, matrix):
         if a["thesis_target"] == "nn256":
             assert cli["--example"] == "NeuralNetwork", a["name"]
             assert cli["--dataset"] == "mnist", a["name"]
-            assert a["env"] == {"ALPHAGRAD_NN_HIDDEN": "256"}, a["name"]
+            assert a["env"] == {"ALPHAGRAD_NN_HIDDEN": "256",
+                                **CLEAR_ENV}, a["name"]
             text = gen.render(a)
             assert "export ALPHAGRAD_NN_HIDDEN=256\n" in text, a["name"]
         elif a["thesis_target"] == "tlm":
             assert cli["--example"] == "TransformerLM", a["name"]
             assert cli["--dataset"] == "wikitext2", a["name"]
-            assert a["env"] == {}, a["name"]
+            assert a["env"] == CLEAR_ENV, a["name"]
             text = gen.render(a)
             assert "ALPHAGRAD_NN_HIDDEN" not in text, a["name"]
         else:
@@ -499,7 +502,7 @@ def test_the_targets_are_the_ones_the_owner_named(gen, matrix):
             assert cli["--dataset"] == RSNN_DATASET, a["name"]
             # the recurrent target's shape is module constants of
             # common/rsnn_shd.py, not an environment variable
-            assert a["env"] == {}, a["name"]
+            assert a["env"] == CLEAR_ENV, a["name"]
             text = gen.render(a)
             assert "ALPHAGRAD_NN_HIDDEN" not in text, a["name"]
     # the hidden width really is read from that variable and has no flag
@@ -966,7 +969,8 @@ def test_no_thesis_launcher_exports_an_xla_flag_or_a_promoted_var(gen,
 
 def test_every_export_in_a_thesis_launcher_is_allowed(gen, matrix, smoke):
     allowed = set(gen.THESIS_ENV_ALLOWED)
-    assert allowed == set(gen.CAMPAIGN_ENV_ALLOWED) | {"ALPHAGRAD_NN_HIDDEN"}
+    assert allowed == (set(gen.CAMPAIGN_ENV_ALLOWED)
+                       | {"ALPHAGRAD_NN_HIDDEN"} | set(CLEAR_ENV))
     for a in matrix + smoke:
         exported = set(_EXPORT.findall(gen.render(a)))
         assert exported <= allowed, (a["name"], sorted(exported - allowed))
@@ -1131,7 +1135,7 @@ def test_the_smoke_is_the_three_runs_the_owner_asked_for(gen, smoke):
     assert _cli(gen, cond)["--dataset"] == "mnist"
     assert "--preference-conditioned" in _cli(gen, cond)
     assert _cli(gen, cond)["--reward-mode"] == "lagrangian"
-    assert cond["env"] == {"ALPHAGRAD_NN_HIDDEN": "256"}
+    assert cond["env"] == {"ALPHAGRAD_NN_HIDDEN": "256", **CLEAR_ENV}
 
 
 def test_the_resume_leg_differs_in_resume_alone(gen, smoke):
@@ -1427,11 +1431,12 @@ def test_every_recurrent_row_carries_the_nn256_and_tlm_flags_unchanged(
 def test_no_recurrent_row_carries_an_xla_flag(gen, snn):
     """The same rule the whole matrix runs under, asserted again on the
     recurrent rows on their own: no XLA_*, no JAX_* beyond the shared
-    compilation cache, and no per-arm export at all."""
+    compilation cache, and no per-arm export but the measure actors'
+    retention bound (dsnn-dfw.99), which is an ALPHAGRAD_ variable."""
     jax_cache_exports = {f"export {k}={v}" for k, v in gen.JAX_CACHE_ENV}
     jax_cache_mkdir = f"mkdir -p {gen.JAX_CACHE_DIR_EXPR}"
     for a in snn:
-        assert a["env"] == {}, a["name"]
+        assert a["env"] == CLEAR_ENV, a["name"]
         text = gen.render(a)
         assert "XLA_FLAGS" not in text, a["name"]
         for line in text.splitlines():
