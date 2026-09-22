@@ -4964,6 +4964,27 @@ def _parse_int_list(text: str) -> list[int]:
     return [int(x) for x in text.split(",") if x.strip()]
 
 
+class _TemporalRuleAction(argparse.Action):
+    """`--temporal-rule` stores ONE rule as a string and TWO as a list.
+
+    THE COLLAPSE HAPPENS IN THE PARSER, not after it. `nargs="+"` always
+    hands argparse a list, and a one-rule run's namespace has to be the one it
+    was before two rules existed: the checkpoint's argument namespace, the
+    wandb config and the dict the measure actors are built from are all
+    `dict(vars(args))`, and every launcher test that reads the parsed value
+    compares it against the plain string. Collapsing it in `main` left the
+    parser itself handing back `['tbptt']`, which is what
+    `gen_fq_launchers_thesis_test` caught.
+
+    `choices` still checks every value, because argparse checks each element
+    of an `nargs` value before the action is called.
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        vals = list(values)
+        setattr(namespace, self.dest, vals[0] if len(vals) == 1 else vals)
+
+
 def make_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="PPO trainer for vertex-elimination with sparsification."
@@ -5637,7 +5658,7 @@ def make_argparser() -> argparse.ArgumentParser:
              "different quantity entirely.")
     p.add_argument(
         "--temporal-rule", choices=list(_TEMPORAL_RULES), default=None,
-        nargs="+", metavar="RULE",
+        nargs="+", metavar="RULE", action=_TemporalRuleAction,
         help="HOW TEMPORAL CREDIT ENTERS THE ONE-STEP RECURRENT GRAPH "
              "(--example RSNN_SHD; owner ruling 2026-09-16). The graph is "
              "always ONE recurrent step -- inputs the weights, the carried "
