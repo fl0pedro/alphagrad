@@ -1210,6 +1210,40 @@ _TRUNCATED_PLANS = [0]
 _ZERO_WORK_PLANS = [0]
 
 
+# MEASURE-OOM HANDOFF TO THE ACTOR (dsnn-dfw.100). The truncation below
+# turns a device OOM into a refusal and returns, so the error never reaches
+# the measure actor and pop_oom_flag stayed False. The OOM is recorded here
+# instead: the actor drains the record after every callback and clears its
+# compile caches once per OOM. With no actor registered the clear stays here.
+_MEASURE_OOM_PENDING = [0]
+_MEASURE_OOM_LAST = [""]
+_MEASURE_OOM_CONSUMER = [False]
+
+
+def register_measure_oom_consumer(active: bool = True) -> None:
+    _MEASURE_OOM_CONSUMER[0] = bool(active)
+
+
+def note_measure_oom(where: str, exc: BaseException) -> None:
+    _MEASURE_OOM_PENDING[0] += 1
+    _MEASURE_OOM_LAST[0] = f"{where}: {type(exc).__name__}: {str(exc)[:160]}"
+    if _MEASURE_OOM_CONSUMER[0]:
+        return
+    try:
+        jax.clear_caches()
+        gc.collect()
+    except Exception:
+        pass
+
+
+def pop_measure_oom() -> tuple:
+    n = int(_MEASURE_OOM_PENDING[0])
+    txt = _MEASURE_OOM_LAST[0]
+    _MEASURE_OOM_PENDING[0] = 0
+    _MEASURE_OOM_LAST[0] = ""
+    return n, txt
+
+
 def _record_degenerate_plan() -> None:
     _DEGENERATE_PLANS[0] += 1
 
@@ -9228,13 +9262,8 @@ def _callback_measured(
 
     def _oom_truncate(where: str, exc: BaseException):
         _record_truncated_plan()
-        # Free whatever the failed attempt is still holding before returning,
-        # or the next callback inherits a poisoned allocator.
-        try:
-            jax.clear_caches()
-            gc.collect()
-        except Exception:
-            pass
+        # The actor clears the caches once per OOM and reports it to the pool.
+        note_measure_oom(where, exc)
         print(f"[trunc] OOM during {where} step={int(stop)} order={o_list} "
               f"(excluded from gradient): {type(exc).__name__}: "
               f"{str(exc)[:160]}", flush=True)

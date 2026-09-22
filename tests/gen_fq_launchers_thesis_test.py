@@ -125,6 +125,12 @@ DUAL_CLIP = "3.0"
 #: rollout policy.  The order-only tuning rows and the sweep
 #: sections call `thesis_cli` directly and keep the flag off.
 TARGET_KL = "0.1"
+#: THE MEASURE ACTORS' EXECUTABLE RETENTION BOUND (dsnn-dfw.99): every
+#: row `thesis_arm` emits exports the clear cadence, so the actor drops
+#: its in-process JAX caches every 100 measurements instead of holding
+#: one executable per plan until the measure GPU refuses.  The
+#: order-only tuning rows and the three sweep rounds keep it off.
+CACHE_CLEAR_EVERY = "100"
 #: THE FACE-ENTROPY WEIGHT PER FAMILY (owner ruling 2026-09-21, dsnn-dfw.84
 #: and dsnn-dfw.78): the recurrent target and TLM render the near-zero
 #: bonus; NN256 keeps the campaign's 0.05.
@@ -1554,3 +1560,37 @@ def test_the_four_rules_are_the_four_the_tree_defines(gen, snn):
         assert _cli(gen, a)["--example"] == RSNN_EXAMPLE, a["name"]
         assert rsnn_shd.resolve_temporal_rule(
             RSNN_EXAMPLE, a["thesis_rule"]) == a["thesis_rule"], a["name"]
+
+
+def test_the_retention_bound_reaches_every_row_thesis_arm_emits(
+        gen, matrix, smoke):
+    """dsnn-dfw.99.  The measure actors held one XLA executable per plan
+    and nothing dropped them, so on the recurrent rows the actors' pool
+    climbed to 72.4 GiB of a 96 GB card and refused 5-6 plans of 16 per
+    episode (job 67410, from episode 120).  The bound is an EXPORT, not a
+    flag: ppo.py has none, the actor reads the variable at construction.
+
+    Its footprint is --dual-clip's and --target-kl's: the matrix on every
+    target and the smoke.  It is OFF on the order-only tuning rows and on
+    the three Lagrangian sweep rounds, and the absence is asserted rather
+    than trusted -- they are frozen running comparisons and a launcher
+    that moved under them would invalidate the round."""
+    var = gen.MEASURE_CACHE_CLEAR_EVERY_VAR
+    assert var == "ALPHAGRAD_MEASURE_CACHE_CLEAR_EVERY"
+    assert gen.THESIS_MEASURE_CACHE_CLEAR_EVERY == CACHE_CLEAR_EVERY
+    for a in matrix + smoke:
+        assert a["env"][var] == CACHE_CLEAR_EVERY, a["name"]
+        assert f"export {var}={CACHE_CLEAR_EVERY}" in gen.render(a), \
+            a["name"]
+    off = (gen.orderonly_arms() + gen.orderonly_rsnn_arms()
+           + gen.orderonly_final_arms() + gen.orderonly_tlm_final_arms()
+           + gen.sweepl_arms() + gen.sweepl2_arms() + gen.sweepl3_arms())
+    assert off
+    for a in off:
+        assert var not in (a.get("env") or {}), a["name"]
+        assert var not in gen.render(a), a["name"]
+    # The export is admitted by the thesis allow-list only: a campaign arm
+    # carries no per-arm environment at all.
+    assert var in gen.THESIS_TARGET_ENV_ALLOWED
+    assert var in gen.THESIS_ENV_ALLOWED
+    assert var not in gen.CAMPAIGN_ENV_ALLOWED
