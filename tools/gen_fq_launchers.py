@@ -2296,6 +2296,23 @@ THESIS_MINIBATCHES = "8"
 #: existed.
 THESIS_DUAL_CLIP = "3.0"
 
+#: TARGET-KL TRUST REGION BOUND (dsnn-dfw.98, owner overnight ruling
+#: 2026-09-22).  The face head PPO update on the recurrent target left
+#: the trust region at episode 188 of job 67408 (condC bptt s250199):
+#: kl/approx went 0.01-0.03 for 187 episodes, then 1.09, then 7.46, then
+#: 8.45, each update larger than the last until the run collapsed.
+#: --target-kl T zeroes the policy gradient of any minibatch whose KL to
+#: the rollout policy exceeds T; value and entropy keep training.  Normal
+#: updates sit at 0.01-0.03, so T=0.1 does not touch a healthy update and
+#: stops a runaway at its first minibatch past target.  EVERY ROW
+#: `thesis_arm` EMITS reads this, exactly as THESIS_DUAL_CLIP above: the
+#: A/B/C/C_popart/condC matrix on all targets, the pair launchers and the
+#: smoke.  The three Lagrangian sweep rounds pass `target_kl=None` and
+#: keep the flag OFF, for the same reason dual-clip is off there: they
+#: are FROZEN running comparisons and a launcher that moved under them
+#: would invalidate what they measured.  Off is ppo.py's own default.
+THESIS_TARGET_KL = "0.1"
+
 # ---------------------------------------------------------------------------
 # THE HARDWARE.  Five Blackwell nodes we may use (dsnn-dfw.69, owner ruling
 # 2026-09-20).  pgi15-gpu17 has no matched CUDA 12.9 ptxas or nvlink (job
@@ -2764,6 +2781,10 @@ RUNG1_REQUIRED_FLAGS = ["--face-init-approx-per-plan",
 #: row does not need.
 DUAL_CLIP_REQUIRED_FLAGS = ["--dual-clip"]
 
+#: dsnn-dfw.98's flag, added to the list a row that PASSES it greps for
+#: and to no other row's, exactly as DUAL_CLIP_REQUIRED_FLAGS above.
+TARGET_KL_REQUIRED_FLAGS = ["--target-kl"]
+
 THESIS_HEAD = f"""THE THESIS MATRIX (epic dsnn-dfw, ticket dsnn-dfw.4) under
 the owner's rulings of 2026-09-15 and 2026-09-16.  Data collection, not a
 comparison of reward designs: the campaign's phases 1-5 decided the class set,
@@ -2892,7 +2913,8 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
                face_entropy_floor: str = "0.3",
                face_entropy_weight: str | None = None,
                ppo_epochs: str = "1", minibatches: str = "4",
-               dual_clip: str | None = None) -> dict:
+               dual_clip: str | None = None,
+               target_kl: str | None = None) -> dict:
     """The `cli` override dict of one thesis run.
 
     Everything the owner fixed is HERE, once, so the block and the smoke
@@ -2989,6 +3011,11 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
         # a direct `thesis_cli` caller leaves the flag off, which is ppo.py's
         # own default.
         cli["--dual-clip"] = dual_clip
+    if target_kl is not None:
+        # dsnn-dfw.98.  A row `thesis_arm` emits renders THESIS_TARGET_KL;
+        # a direct `thesis_cli` caller leaves the flag off, which is
+        # ppo.py's own default.
+        cli["--target-kl"] = target_kl
     if auto_stop:
         cli["--auto-stop"] = None
     if form == "L":
@@ -3030,7 +3057,8 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
                face_entropy_weight: str | None = None,
                ppo_epochs: str = THESIS_PPO_EPOCHS,
                minibatches: str = THESIS_MINIBATCHES,
-               dual_clip: str | None = THESIS_DUAL_CLIP) -> dict:
+               dual_clip: str | None = THESIS_DUAL_CLIP,
+               target_kl: str | None = THESIS_TARGET_KL) -> dict:
     """One thesis run -> one `arm(...)`.  Returns the arm."""
     _require(node in THESIS_NODES,
              f"node {node!r} is not one of the permitted thesis nodes "
@@ -3059,7 +3087,8 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
                      face_entropy_floor=face_entropy_floor,
                      face_entropy_weight=face_entropy_weight,
                      ppo_epochs=ppo_epochs, minibatches=minibatches,
-                     dual_clip=dual_clip)
+                     dual_clip=dual_clip,
+                     target_kl=target_kl)
     if extra_cli:
         cli.update(extra_cli)
     gpus = thesis_row_gpus(target, node)
@@ -3075,6 +3104,8 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
         required_flags=(THESIS_REQUIRED_FLAGS
                         + (DUAL_CLIP_REQUIRED_FLAGS
                            if dual_clip is not None else [])
+                        + (TARGET_KL_REQUIRED_FLAGS
+                           if target_kl is not None else [])
                         + (RUNG1_REQUIRED_FLAGS
                            if rung1_row(arm, target)
                            or condc_tlm_init_row(arm, target) else [])),
@@ -3753,6 +3784,8 @@ for _sweepl_tag, _sweepl_overrides in sweepl_configs():
             # dsnn-dfw.95: this round is FROZEN (see the budget note above),
             # so it keeps --dual-clip off and its launchers do not move.
             dual_clip=None,
+            # dsnn-dfw.98: same reason, keeps --target-kl off too.
+            target_kl=None,
         )
         ARMS[-1]["sweepl"] = True
         ARMS[-1]["sweepl_tag"] = _sweepl_tag
@@ -3914,6 +3947,8 @@ for _sweepl2_tag, _sweepl2_overrides in sweepl2_configs():
             # dsnn-dfw.95: this round is FROZEN (see the budget note above),
             # so it keeps --dual-clip off and its launchers do not move.
             dual_clip=None,
+            # dsnn-dfw.98: same reason, keeps --target-kl off too.
+            target_kl=None,
         )
         ARMS[-1]["sweepl2"] = True
         ARMS[-1]["sweepl2_tag"] = _sweepl2_tag
@@ -4062,6 +4097,8 @@ for _sweepl3_tag, _sweepl3_overrides in sweepl3_configs():
             # dsnn-dfw.95: this round is FROZEN (see the budget note above),
             # so it keeps --dual-clip off and its launchers do not move.
             dual_clip=None,
+            # dsnn-dfw.98: same reason, keeps --target-kl off too.
+            target_kl=None,
         )
         ARMS[-1]["sweepl3"] = True
         ARMS[-1]["sweepl3_tag"] = _sweepl3_tag
