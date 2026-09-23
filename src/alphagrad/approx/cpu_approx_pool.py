@@ -230,19 +230,12 @@ class CpuApproxPool:
         self._n_actor_errors = 0
         self._n_other_errors = 0
         self._n_respawn_requested = 0
-        # ---- recycle+retry-on-OOM (ALPHAGRAD_RECYCLE_RETRY_ON_OOM=1) ----
-        # PRIMARY fix for the un-freeable per-measure XLA compile leak: the
-        # memory config was PROVEN unable to bound it (LRU / clear_caches all
-        # climb identically to the cap); only PROCESS TEARDOWN frees the
-        # XLA-internal executable retention. So when a measure OOMs we RECYCLE
-        # the offending actor (kill+respawn -> fresh process, memory freed)
-        # and RETRY that measure ONCE on the fresh actor, keeping the run
-        # progressing with REAL measurements instead of hanging / sentinel-
-        # storming. Exactly one recycle+retry per OOM'd measure; a retry that
-        # also fails returns the sentinel (a neutral no-op downstream).
-        self._recycle_retry_on_oom = (
-            os.environ.get("ALPHAGRAD_RECYCLE_RETRY_ON_OOM", "0") == "1"
-        )
+        # ---- recycle-on-OOM ----
+        # Only PROCESS TEARDOWN frees the XLA-internal executable retention
+        # (LRU / clear_caches climb identically to the cap), so an actor whose
+        # measure OOMs is recycled (kill+respawn). The OOM'd slot stays
+        # refused: the retry on the fresh actor is gone (dsnn-dfw.120: 40 of
+        # 47 retries failed again, jobs 67489-67491).
         # Optional PROACTIVE recycle: recycle an actor before it reaches the
         # ~500-measure OOM point, so the OOM never happens. A/B alternative to
         # the reactive path; 0 = off (reactive-only, the required deliverable).
@@ -257,8 +250,6 @@ class CpuApproxPool:
             id(a): 0 for a in actor_handles
         }
         self._n_oom_recycles = 0
-        self._n_oom_retries = 0
-        self._n_oom_retry_success = 0
         self._n_proactive_recycles = 0
         # ---- the PIPELINED submission (owner ruling 2026-09-14) ----
         # One worker thread, created on first use, and at most ONE batch in
@@ -272,7 +263,7 @@ class CpuApproxPool:
 
         THE MEASUREMENT IS NOT MOVED, ONLY THE WAIT. The thread calls the very
         same ``evaluate_batch`` the blocking path calls -- the same waves, the
-        same per-actor cold/warm timeouts, the same OOM recycle and retry, the
+        same per-actor cold/warm timeouts, the same OOM recycle, the
         same sentinel rows -- so a pipelined measurement and a blocking one
         are the same measurement taken by the same actors. What moves is who
         waits: the caller gets a future and can dispatch device work before it
@@ -439,8 +430,8 @@ class CpuApproxPool:
         Unlike :meth:`_poison` (async, fire-and-forget, drops the actor from
         the rotation and repopulates the pool later) this is the SYNCHRONOUS
         recycle used on the OOM path: process teardown is the ONLY thing that
-        frees the leaked XLA executables, and we need the fresh actor RIGHT
-        NOW to retry the OOM'd measure. The caller owns ``actor`` (it was
+        frees the leaked XLA executables, and the fresh actor takes the
+        OOM'd actor's place in the held set. The caller owns ``actor`` (it was
         popped from the pool and is not in ``self._alive``), so we don't touch
         the alive-queue here — the caller decides whether to put the fresh
         handle back. Mirrors ``recycle_one``'s kill+factory dance but for a
@@ -944,13 +935,13 @@ class CpuApproxPool:
             return tokens_out, eqn_ids_out, rewards_out, sentinel_mask
 
         # Map wave-local actor index j -> list of slots that OOM'd on it,
-        # accumulated across waves. Drives the single post-loop recycle+retry.
+        # accumulated across waves. Drives the single post-loop recycle.
         oom_by_actor: dict[int, list] = {}
 
         # Optional PROACTIVE recycle: swap out any held actor that has served
         # >= ALPHAGRAD_PROACTIVE_RECYCLE_EVERY measures since its last recycle,
         # BEFORE it reaches the OOM point. A/B alternative to the reactive path.
-        if self._recycle_retry_on_oom and self._proactive_recycle_every > 0:
+        if self._proactive_recycle_every > 0:
             for j in range(len(held)):
                 a = held[j]
                 if a is None:
@@ -1052,12 +1043,8 @@ class CpuApproxPool:
                     # the reward magnitude alone can't tell them apart. Query
                     # the actor's one-shot pop_oom_flag: True => this sentinel
                     # was the un-freeable measure-GPU leak filling up; recycle
-                    # this actor and retry the slot on a fresh process. False =>
-                    # benign; a retry would just re-sentinel, so leave it.
-                    if (
-                        self._recycle_retry_on_oom
-                        and self._reward_is_sentinel(reward)
-                    ):
+                    # this actor. False => benign; leave the actor alive.
+                    if self._reward_is_sentinel(reward):
                         try:
                             _was_oom = bool(ray.get(
                                 actor.pop_oom_flag.remote(), timeout=10.0
@@ -1065,10 +1052,8 @@ class CpuApproxPool:
                         except Exception:
                             _was_oom = False
                         if _was_oom:
-                            # Mark the slot as a sentinel NOW (the OOM came back
-                            # through the success branch, so the mask wasn't set)
-                            # — a failed retry then correctly leaves it masked;
-                            # a successful retry clears it below.
+                            # The OOM came back through the success branch, so
+                            # the mask was not set; the slot stays refused.
                             sentinel_mask[i] = True
                             oom_by_actor.setdefault(j, []).append(i)
                 except GetTimeoutError:
@@ -1117,93 +1102,23 @@ class CpuApproxPool:
                     held[j] = None
                     _sentinel_slot(i)
 
-        # ---- reactive recycle+retry-on-OOM pass ----
+        # ---- reactive recycle-on-OOM pass ----
         # For each held actor that OOM'd one or more slots: recycle it ONCE
-        # (process teardown frees the leaked XLA memory) and retry that
-        # actor's OOM'd slots ONCE on the fresh handle. Recycle-once-per-actor
-        # (not once-per-slot) so a capped actor that OOM'd all its slots is
-        # torn down a single time and the whole batch retried. A retry that
-        # ALSO fails keeps the sentinel already written to the output buffers.
-        if self._recycle_retry_on_oom and oom_by_actor:
-            for j, slots in oom_by_actor.items():
-                old_actor = held[j]
-                if old_actor is None:
-                    continue
-                fresh = self._recycle_actor(old_actor)
-                self._n_oom_recycles += 1
-                held[j] = fresh  # replace in-place; may be None on failure
-                if fresh is None:
-                    print(
-                        f"[POOL] oom-recycle actor#{j} slots={slots}: respawn "
-                        f"failed, keeping sentinels "
-                        f"(n_oom_recycles={self._n_oom_recycles})",
-                        flush=True,
-                    )
-                    continue
-                print(
-                    f"[POOL] oom-recycle actor#{j} slots={slots}: fresh actor, "
-                    f"retrying (n_oom_recycles={self._n_oom_recycles})",
-                    flush=True,
-                )
-                for i in slots:
-                    self._n_oom_retries += 1
-                    try:
-                        rf = fresh.evaluate.remote(
-                            np.asarray(order_batch[i]),
-                            np.asarray(specs_batch[i]),
-                            int(step_batch[i]),
-                            eval_samples=samples_arg,
-                            init=bool(init),
-                            episode=(None if episode is None else int(episode)),
-                            env_row=(None if env_rows is None
-                                     else int(env_rows[i])),
-                            rule=(None if rule is None else str(rule)),
-                        )
-                        rto = self._timeout_for(fresh)
-                        _rres = (ray.get(rf) if rto <= 0.0
-                                 else ray.get(rf, timeout=rto))
-                        self._check_arity(_rres)
-                        tk, rw = _rres[0], _rres[-1]
-                        eq = _rres[1] if self._emit_eqn_ids else None
-                    except Exception as _rexc:
-                        print(
-                            f"[POOL] oom-retry slot={i} FAILED on fresh actor: "
-                            f"{type(_rexc).__name__}: {str(_rexc)[:120]} "
-                            f"(keeping sentinel)",
-                            flush=True,
-                        )
-                        continue
-                    self._mark_call(fresh)
-                    with self._lock:
-                        self._measures_since_recycle[id(fresh)] = (
-                            self._measures_since_recycle.get(id(fresh), 0) + 1
-                        )
-                    if self._reward_is_sentinel(rw):
-                        # Retry ALSO sentineled (re-OOM on a fresh process, or a
-                        # genuinely bad action). Do NOT recycle+retry again —
-                        # exactly one recycle+retry per measure. Keep sentinel.
-                        # Drain the fresh actor's OOM flag so it doesn't leak
-                        # into the next batch's detection.
-                        try:
-                            ray.get(fresh.pop_oom_flag.remote(), timeout=10.0)
-                        except Exception:
-                            pass
-                        print(
-                            f"[POOL] oom-retry slot={i} re-sentineled on fresh "
-                            f"actor (keeping sentinel)",
-                            flush=True,
-                        )
-                        continue
-                    # Retry succeeded — overwrite the sentinel with the REAL
-                    # measurement and clear the sentinel mask for this slot.
-                    tokens_out[i] = self._wire(tk, self._token_dtype,
-                                               "tokens")
-                    if self._emit_eqn_ids:
-                        eqn_ids_out[i] = self._wire(eq, self._eqn_dtype,
-                                                    "eqn_ids")
-                    rewards_out[i] = np.asarray(rw, dtype=np.float32)
-                    sentinel_mask[i] = False
-                    self._n_oom_retry_success += 1
+        # (process teardown frees the leaked XLA memory). Its OOM'd slots keep
+        # the sentinel already written to the output buffers.
+        for j, slots in oom_by_actor.items():
+            old_actor = held[j]
+            if old_actor is None:
+                continue
+            fresh = self._recycle_actor(old_actor)
+            self._n_oom_recycles += 1
+            held[j] = fresh  # replace in-place; may be None on failure
+            print(
+                f"[POOL] oom-recycle actor#{j} slots={slots}: "
+                f"{'fresh actor' if fresh is not None else 'respawn failed'}, "
+                f"slots stay refused (n_oom_recycles={self._n_oom_recycles})",
+                flush=True,
+            )
 
         # Return still-alive actors to the pool.
         for a in held:
@@ -1254,8 +1169,6 @@ class CpuApproxPool:
                 "other_errors": self._n_other_errors,
                 "respawn_requested": self._n_respawn_requested,
                 "oom_recycles": self._n_oom_recycles,
-                "oom_retries": self._n_oom_retries,
-                "oom_retry_success": self._n_oom_retry_success,
                 "proactive_recycles": self._n_proactive_recycles,
             }
 

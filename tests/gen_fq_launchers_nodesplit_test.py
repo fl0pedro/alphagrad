@@ -90,7 +90,14 @@ def test_every_nn256_row_renders_the_four_gpu_profile_on_every_node(gen):
         assert cli["--ray-measure"] == NN256_ACTORS, a["name"]
         b = gen.THESIS_CORE_BUDGET[NN256_GPUS]
         assert cli["--reserved-driver-cores"] == str(b["trainer"]), a["name"]
-        assert cli["--cpu-cores-per-actor"] == str(b["per_actor"]), a["name"]
+        # Owner ruling 2026-09-23: 8 on every row `thesis_arm` emits; the
+        # frozen rounds (the order-only baseline, the sweeps) keep the budget.
+        frozen = any(a.get(k) for k in (
+            "orderonly", "orderonly_final", "orderonly_tlm_final",
+            "orderonly_rsnn", "sweepl", "sweepl2", "sweepl3"))
+        want = (str(b["per_actor"]) if frozen
+                else gen.THESIS_CORES_PER_ACTOR)
+        assert cli["--cpu-cores-per-actor"] == want, a["name"]
         text = gen.render(a)
         assert f"#SBATCH --gres={gen.blackwell_gres(NN256_GPUS)}\n" in text, \
             a["name"]
