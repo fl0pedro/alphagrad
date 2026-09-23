@@ -33,12 +33,15 @@ from alphagrad.approx.common.snn_shd import (
 from alphagrad.approx.common.rsnn_shd import (
     RSNN_ARGNUMS,
     RSNN_TARGET,
+    RSNN_VMAP_TARGET,
     RSNN_W2_ARGNUMS,
     RSNN_W2_TARGET,
     is_rsnn,
     resolve_temporal_rule,
     rsnn_args,
+    rsnn_batch,
     rsnn_data_gen,
+    vmapped_step_body,
 )
 
 # ALPHAGRAD_SNN_STEPS and ALPHAGRAD_SNN_TRUNC were the two environment
@@ -172,7 +175,8 @@ def data_gen(fn_str: str, dataset: str | None = None, dataset_size: int | None =
         return rsnn_data_gen(key, dataset=dataset, dataset_size=dataset_size,
                              temporal_rule=resolve_temporal_rule(
                                  fn_str, temporal_rule),
-                             carry_container=carry_container)
+                             carry_container=carry_container,
+                             batch=rsnn_batch(fn_str))
     if fn_str in SHD_TARGETS:
         # THE SAME DEFECT, THE SAME FIX, on the two multi-copy SHD targets.
         # They have no temporal rule and no step position; what moves in a
@@ -421,7 +425,8 @@ def get_args(fn_str: str, key, dataset: str | None = None,
         resolve_grad_window(fn_str, grad_window)
         return rsnn_args(key, dataset=dataset, dataset_size=dataset_size,
                          temporal_rule=rule, step_position=step_position,
-                         carry_container=carry_container)
+                         carry_container=carry_container,
+                         batch=rsnn_batch(fn_str))
     if fn_str in TEMPORAL_TARGETS:
         n = resolve_grad_window(fn_str, grad_window)
         if fn_str in SHD_TARGETS:
@@ -524,6 +529,15 @@ def get_raw_fn(fn_str: str):
     contracts full Jacobians of the model and sweeps test accuracy through it.
     """
     base = fn_str[len("Vmapped"):] if fn_str.startswith("Vmapped") else fn_str
+    if fn_str == RSNN_VMAP_TARGET:
+        # The step body over B recordings. Its in_axes depend on the given
+        # count, which only the call knows, so the generic vmap below cannot
+        # serve it.
+        return vmapped_step_body
+    if fn_str.startswith("Vmapped") and base == RSNN_W2_TARGET:
+        raise ValueError(
+            f"{fn_str} is not a target: the two-copy window is not batched; "
+            f"the batched recurrent target is {RSNN_VMAP_TARGET}.")
     if base.endswith("NeuralNetwork"):
         fn = _neural_network
     elif base == "Perceptron":
@@ -668,6 +682,11 @@ def get_fn(fn_str: str):
     # to the last bit (1.0645949840545654).
     if base in ("LIF_SNN", "ADALIF_SNN"):
         return lambda *a: jnp.mean(raw(*a)[0])
+
+    # THE BATCHED RECURRENT STEP returns B step losses, one per recording;
+    # the loss is their mean, as the batch of a training run is.
+    if batched and base == RSNN_TARGET:
+        return lambda *a: jnp.mean(raw(*a))
 
     # ALREADY THE LOSS. ``LIF_SNN_SHD`` / ``ADALIF_SNN_SEQ`` reduce inside the
     # model and return 0-d. Nothing is added: the model IS the target.
@@ -955,7 +974,7 @@ def infer_argnums(fn_str: str) -> tuple[int, ...]:
     # RECURRENT matrix V is one of them. Without V among the differentiated
     # weights the state-to-state Jacobian would be block diagonal and e-prop
     # would be exact rather than an approximation.
-    if fn_str == RSNN_TARGET:
+    if base_name(fn_str) == RSNN_TARGET:
         return RSNN_ARGNUMS
     # THE TWO-COPY WINDOW carries a second input frame ahead of the label, so
     # its three weights sit one slot further along.
