@@ -24,7 +24,20 @@ approximation face ``f-1`` produced, followed by face ``f``'s contraction. The
 tokens come from graphax's own ``IncrementalPathTokenizer`` -- the same emitters
 and the same vocabulary as the observation stream, not a parallel synthetic one.
 
-WHY IT RE-ELIMINATES PER FACE. graphax exposes no resumable elimination: the
+ONE ELIMINATION PER VERTEX (dsnn-dfw.119). The faces of one vertex do not
+depend on each other (owner ruling 2026-09-23): a face's equations are a
+function of its own two operand edges, its own decision and the vertex's
+approx flag (``graphax.core._is_approx_cfg``). :meth:`LiveFaceStream.chunk_ex`
+therefore eliminates each (prefix, vertex) ONCE with no face decided, and per
+face only re-eliminates face ``f-1``, on a graph cut down to that one face, when
+its decision is not exact. The chunks are then rendered with the tokenizer's own
+emitter on a name state that walks the faces in the order the full run would
+emit them, so the variable names are the ones the per-face re-run would draw.
+:meth:`LiveFaceStream.chunk_ex_per_face` is the re-eliminating path described
+next; the two return identical chunks (``tests/onelim_face_chunk_test.py``).
+
+WHY IT RE-ELIMINATES PER FACE (``chunk_ex_per_face``). graphax exposes no
+resumable elimination: the
 per-face hook is a callback inside ``_eliminate_vertex``, so there is no way to
 stop at face ``f``, return to the caller, and continue. Face ``f``'s chunk is
 therefore produced by re-running the vertex with faces ``0..f-1`` carrying their
@@ -49,6 +62,7 @@ from __future__ import annotations
 import os
 import warnings
 
+from types import SimpleNamespace
 from typing import NamedTuple
 
 import numpy as np
@@ -188,6 +202,89 @@ _FACE_KEY_VERIFY = os.environ.get("ALPHAGRAD_FACE_KEY_VERIFY", "0") == "1"
 # An A/B switch, not a fallback: the two answer identically and differ only in
 # what they cost.
 _FACE_KEY_CHAIN = os.environ.get("ALPHAGRAD_FACE_KEY_CHAIN", "1") == "1"
+
+# ALPHAGRAD_FACE_ONE_ELIM=0 serves every chunk from `chunk_ex_per_face`. An A/B
+# switch: the two paths return identical chunks.
+_ONE_ELIM = os.environ.get("ALPHAGRAD_FACE_ONE_ELIM", "1") == "1"
+
+
+class _Irregular(Exception):
+    pass
+
+
+_MISS = object()
+
+
+class _NameOverlay(dict):
+    # The names drawn on top of the prefix tokenizer's own map. The emitter
+    # reads its maps only through `get` and item assignment.
+    __slots__ = ("base",)
+
+    def get(self, k, d=None):
+        v = dict.get(self, k, _MISS)
+        if v is _MISS:
+            return self.base.get(k, d)
+        return v
+
+
+class _NameCursor:
+    # `tk._namegen` positioned at draw `pos`, over one shared list of names.
+    __slots__ = ("memo", "gen", "pos")
+
+    def __init__(self, memo, gen, pos):
+        self.memo, self.gen, self.pos = memo, gen, pos
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        m = self.memo
+        while len(m) <= self.pos:
+            m.append(next(self.gen))
+        nm = m[self.pos]
+        self.pos += 1
+        return nm
+
+
+class _RenderState:
+    __slots__ = ("names", "fns", "pos", "uid")
+
+    def __init__(self, names, fns, pos, uid):
+        self.names, self.fns, self.pos, self.uid = names, fns, pos, uid
+
+    def fork(self):
+        return _RenderState(_NameOverlay(self.names), _NameOverlay(self.fns),
+                            self.pos, self.uid)
+
+
+class _OneElim:
+    # One (prefix, vertex): the faces of its single undecided elimination, the
+    # faces re-eliminated alone since, and the render cursor.
+    __slots__ = ("tk", "keys", "kidx", "armed0", "order", "pos", "ends",
+                 "traces", "cursor")
+
+
+def _frozen_eqn(tr):
+    # The equation `frame.get_eqns()` would build for this entry, for the
+    # emitter only. A collected weakref shifts every later index of the
+    # per-face path, so that case is left to the per-face path.
+    from weakref import ReferenceType
+    e = tr() if isinstance(tr, ReferenceType) else tr
+    if e is None:
+        raise _Irregular("a traced equation of this face was collected")
+    if hasattr(e, "in_tracers"):
+        return SimpleNamespace(invars=[t.val for t in e.in_tracers],
+                               outvars=e.outvars, primitive=e.primitive,
+                               params=e.params)
+    return e
+
+
+def _vertex_armed(vhooks, ft) -> bool:
+    # `graphax.core._eliminate_vertex`'s `_is_approx_cfg`, from the same inputs.
+    from graphax import core as _gc
+    return (any(isinstance(t, (_gc.Diag, _gc.Compress)) or callable(t)
+                for t in vhooks)
+            or bool(_gc.face_config_is_approx(ft)))
 
 
 def _face_row_key(row, skiprow):
@@ -357,7 +454,17 @@ class LiveFaceStream:
                       # `--approx-add choose`: the entry builder needs a
                       # per-face join BIT this pass does not hold, so the
                       # approx flag is ASSUMED True (the conservative arm).
-                      "vertex_flag_assumed": 0}
+                      "vertex_flag_assumed": 0,
+                      # `chunk_ex`: `elims` counts the one full elimination
+                      # per (prefix, vertex); `face_elims` the one-face
+                      # eliminations of a decided face; `onelim_fallback` the
+                      # chunks served by `chunk_ex_per_face` instead.
+                      "face_elims": 0, "face_renders": 0,
+                      "onelim_fallback": 0}
+        self.one_elim = _ONE_ELIM
+        self.last_onelim_error: str | None = None
+        self._onelim: dict = {}       # (prefix, vertex) -> _OneElim
+        self._namememo: dict = {}     # name alphabet -> (names, generator)
         # The last exception `decide_vertex_faces` swallowed, as text. See the
         # `except` there: a failure COUNT is not a diagnosis.
         self.last_vertex_error: str | None = None
@@ -722,6 +829,131 @@ class LiveFaceStream:
         palimpsa carry where it was, so the head decides on the vertex context
         alone (the old behaviour) for that face only.
         """
+        if not self.one_elim:
+            return self.chunk_ex_per_face(
+                order, specs, n, vertex, vertex_specs, face_rows, face_skips,
+                f, face_rows_hist, face_skips_hist, hist_key=hist_key)
+        W = self.window
+        order = np.asarray(order).reshape(-1)
+        specs = np.asarray(specs)
+        n, vertex, f = int(n), int(vertex), int(f)
+        rows = np.asarray(face_rows, np.int32)
+        skips = np.asarray(face_skips, np.int32)
+        vspecs = np.asarray(vertex_specs, np.int32)
+        _no_edge = (-np.ones((2,), np.int32),
+                    -np.ones((EDGE_CVX_WIDTH,), np.int32),
+                    np.int32(0), np.int32(0))
+        empty = (np.zeros((W,), _TOKEN_DTYPE),
+                 np.int32(0), np.int32(0), np.zeros((2,), np.int32)
+                 ) + _no_edge
+
+        frh, fsh = self._hist(face_rows_hist, face_skips_hist)
+        ck = ((order[:n].tobytes(), specs[:n].tobytes(), vertex,
+               vspecs.tobytes(), rows[:f].tobytes(), skips[:f].tobytes(), f)
+              + (_hist_key_parts(frh, fsh, n) if hist_key is None
+                 else (hist_key,)))
+        hit = self._chunks.get(ck)
+        if hit is not None:
+            self.stats["chunk_hit"] += 1
+            return hit
+
+        try:
+            tk = self._tokenizer_at(order, specs, n, frh, fsh,
+                                    hist_key=hist_key)
+        except Exception:
+            self.stats["failures"] += 1
+            return empty
+        try:
+            keys, ft = self._decided(tk, vertex, rows, skips, f)
+        except Exception:
+            self.stats["failures"] += 1
+            return empty
+        n_faces = len(keys)
+        if f >= n_faces:
+            res = (empty[0], empty[1], np.int32(n_faces),
+                   empty[3]) + _no_edge
+            self._chunks[ck] = res
+            return res
+
+        from alphagrad.approx.env import decode_vertex_rule_specs
+        from alphagrad.approx.common.masks import make_live_masked_hook
+        try:
+            vrules = decode_vertex_rule_specs(
+                self.jaxpr, vertex, vspecs.tolist())
+        except Exception:
+            vrules = ()
+        vhooks = (make_live_masked_hook(tuple(vrules)),) if vrules else ()
+
+        try:
+            ekeys, tail, contr = self._one_elim_parts(
+                tk, ck[:4] + ck[7:], vertex, vhooks, keys, ft, rows, skips, f)
+        except Exception as exc:
+            # A graph the one-face cut cannot serve exactly (a collected
+            # equation, a repeated face key, a trace failure) is served by the
+            # per-face path, which returns what it always returned.
+            self.stats["onelim_fallback"] += 1
+            self.last_onelim_error = f"{type(exc).__name__}: {exc}"
+            return self.chunk_ex_per_face(
+                order, specs, n, vertex, vertex_specs, face_rows, face_skips,
+                f, face_rows_hist, face_skips_hist, hist_key=hist_key)
+
+        if ekeys != keys:
+            self.stats["face_key_seg_mismatch"] += 1
+            if ekeys and not _PARTIAL_DROP_WARNED[0]:
+                _PARTIAL_DROP_WARNED[0] = True
+                warnings.warn(
+                    f"[alphagrad.approx.live_faces] vertex {vertex}: faces_of "
+                    f"enumerated {keys} but the elimination emitted {ekeys} -- "
+                    f"a PARTIAL drop. Chunks are now mapped by face key, so "
+                    f"the head still reads its own face; positional indexing "
+                    f"would have handed it a later face's contraction. See "
+                    f"`face_key_seg_mismatch` in the face-stream health line.",
+                    stacklevel=2)
+
+        _k2i = lambda x: np.int32(int(x) if x is not None else -1)  # noqa: E731
+        _ekey = np.asarray([_k2i(keys[f][0]), _k2i(keys[f][1])], np.int32)
+        _cvx = self._central_vidx(tk, vertex)
+        if contr is None:
+            self.stats["face_dropped"] += 1
+            res = (empty[0], empty[1], np.int32(n_faces),
+                   _ends(keys[f], self._vertex_of(tk)),
+                   _ekey, _cvx, np.int32(0), np.int32(0))
+            self._chunks[ck] = res
+            return res
+
+        chunk: list[int] = list(tail)
+        head = len(chunk)
+        chunk += contr
+
+        cnt = len(chunk)
+        self.stats["tok_total"] += cnt
+        self.stats["tok_max"] = max(self.stats["tok_max"], cnt)
+        self.stats["chunks"] += 1
+        if cnt > W:
+            self.stats["truncated"] += 1
+            head = max(0, head - (cnt - W))
+            chunk, cnt = chunk[-W:], W
+        tok_a = np.zeros((W,), _TOKEN_DTYPE)
+        if cnt:
+            _tk64 = np.asarray(chunk, np.int64)
+            _check_delta_ids(_tk64, where="LiveFaceStream.chunk_ex")
+            tok_a[:cnt] = _tk64.astype(_TOKEN_DTYPE)
+
+        res = (tok_a, np.int32(cnt), np.int32(n_faces),
+               _ends(keys[f], self._vertex_of(tk)),
+               _ekey, _cvx, np.int32(head), np.int32(1))
+        if len(self._chunks) >= 4096:
+            for dk in list(self._chunks)[:1024]:
+                self._chunks.pop(dk, None)
+        self._chunks[ck] = res
+        return res
+
+    # The per-face path: one full elimination of the vertex per face, with faces
+    # 0..f-1 decided. `chunk_ex` returns the same chunks from one elimination.
+    def chunk_ex_per_face(self, order, specs, n, vertex, vertex_specs,
+                          face_rows, face_skips, f,
+                          face_rows_hist=None, face_skips_hist=None, *,
+                          hist_key=None):
         W = self.window
         order = np.asarray(order).reshape(-1)
         specs = np.asarray(specs)
@@ -973,6 +1205,196 @@ class LiveFaceStream:
                 self._chunks.pop(dk, None)
         self._chunks[ck] = res
         return res
+
+    # -- one elimination per vertex (dsnn-dfw.119) --------------------------
+    # The per-face path emits, for face f, the run R_f = every face of the
+    # vertex with faces 0..f-1 decided, and hands out face f-1's approximation
+    # tail and face f's contraction from it. A face's equations depend only on
+    # its own operand edges, its own decision and the vertex's approx flag, so
+    # R_f is rebuilt here face by face: an undecided face comes from the ONE
+    # full elimination of the vertex (or, if a decision armed the vertex's
+    # approx flag, from its own one-face elimination under that flag), a
+    # decided face from its own one-face elimination. The names are drawn by
+    # rendering those faces in R_f's order with the tokenizer's own emitter.
+
+    def _one_elim_parts(self, tk, pk, vertex, vhooks, keys, ft, rows, skips,
+                        f):
+        """``(emitted keys, face f-1's tail, face f's contraction or None)``."""
+        st = self._onelim.get(pk)
+        if st is None or st.tk is not tk or st.keys != keys:
+            st = self._eliminate_once(tk, vertex, vhooks, keys)
+            if len(self._onelim) >= self.cache_cap:
+                for dk in list(self._onelim)[: max(1, self.cache_cap // 4)]:
+                    self._onelim.pop(dk, None)
+            self._onelim[pk] = st
+        gi = st.pos.get(keys[f])
+        if gi is None:
+            return st.order, None, None
+        armed = _vertex_armed(vhooks, ft)
+        sigs = []
+        for k in st.order[:gi]:
+            j = st.kidx[k]
+            sigs.append((rows[j].tobytes(), int(skips[j])) if k in ft
+                        else None)
+        sigs = tuple(sigs)
+        tail = self._advance_cursor(tk, st, vertex, vhooks, ft, armed, sigs)
+        rs = st.cursor[2].fork()
+        toks, split = self._render(
+            tk, rs, self._face_trace(tk, st, vertex, vhooks, ft, keys[f],
+                                     None, armed))
+        return st.order, tail, toks[:split]
+
+    def _eliminate_once(self, tk, vertex, vhooks, keys):
+        st = _OneElim()
+        st.tk = tk
+        st.keys = list(keys)
+        st.kidx = {k: j for j, k in enumerate(keys)}
+        if len(st.kidx) != len(keys):
+            raise _Irregular(f"vertex {vertex}: repeated face keys {keys}")
+        frame = tk.ij.trace.frame
+        if getattr(frame, "auto_dce", False):
+            from weakref import ReferenceType
+            if any(isinstance(r, ReferenceType) and r() is None
+                   for r in frame.tracing_eqns):
+                raise _Irregular("a prefix equation was collected")
+        self.stats["elims"] += 1
+        caps = self._elim_capture(tk, vertex, vhooks, {})
+        sink = tk.ij.face_sink
+        vidx = sink.vidx
+        if vidx is None:
+            from graphax.core import _vidx_for
+            vidx = _vidx_for(tk.ij.jaxpr)
+        st.order, st.pos, st.ends, st.traces = [], {}, {}, {}
+        st.armed0 = _vertex_armed(vhooks, {})
+        for fr, eqns in caps:
+            k = (vidx.get(fr.in_edge), vidx.get(fr.out_edge))
+            if k in st.pos or k not in st.kidx:
+                raise _Irregular(f"vertex {vertex}: emitted face {k} is "
+                                 f"repeated or not enumerated")
+            if st.order and st.kidx[k] < st.kidx[st.order[-1]]:
+                raise _Irregular(f"vertex {vertex}: faces emitted out of "
+                                 f"enumeration order")
+            st.pos[k] = len(st.order)
+            st.order.append(k)
+            st.ends[k] = (fr.central, fr.in_edge, fr.out_edge)
+            st.traces[(k, None, st.armed0)] = (fr, eqns)
+        st.cursor = None
+        return st
+
+    def _face_trace(self, tk, st, vertex, vhooks, ft, k, sig, armed):
+        key = (k, sig, armed)
+        t = st.traces.get(key)
+        if t is None:
+            self.stats["face_elims"] += 1
+            caps = self._elim_capture(tk, vertex, vhooks, ft, only=st.ends[k])
+            if len(caps) != 1:
+                raise _Irregular(f"vertex {vertex}: face {k} alone emitted "
+                                 f"{len(caps)} faces")
+            t = caps[0]
+            st.traces[key] = t
+        return t
+
+    def _advance_cursor(self, tk, st, vertex, vhooks, ft, armed, sigs):
+        # The name state after the emitted faces `st.order[:len(sigs)]` of
+        # R_f, each rendered in full, and the approximation tail of the last.
+        base = (len(tk._names) + len(tk._fns), tk._flatten_uid)
+        cur = st.cursor
+        if (cur is None or cur[0] != armed or cur[4] != base
+                or len(cur[1]) > len(sigs) or sigs[:len(cur[1])] != cur[1]):
+            cur = (armed, (), _RenderState(_NameOverlay(), _NameOverlay(),
+                                           base[0], base[1]), [], base)
+        rs, tail = cur[2], cur[3]
+        for i in range(len(cur[1]), len(sigs)):
+            toks, split = self._render(
+                tk, rs, self._face_trace(tk, st, vertex, vhooks, ft,
+                                         st.order[i], sigs[i], armed))
+            tail = toks[split:]
+        st.cursor = (armed, sigs, rs, tail, base)
+        return tail if sigs else []
+
+    def _elim_capture(self, tk, vertex, vhooks, ft, only=None):
+        """``[(face record, its equations)]`` of one speculative elimination.
+
+        ``only=(central, in_edge, out_edge)`` cuts the vertex down to that one
+        face first. Nothing the elimination touches survives the call.
+        """
+        ij = tk.ij
+        sink = ij.face_sink
+        if sink is None:
+            raise _Irregular("the tokenizer tracks no faces")
+        teq = ij.trace.frame.tracing_eqns
+        g0, t0, vo0 = ij.graph, ij.tgraph, ij.vo
+        n_eq, n_st = len(teq), len(ij.steps)
+        n_fc, n_x = len(sink.faces), len(ij.xlog.records)
+        if only is None:
+            g, t = _copy_graph(g0), _copy_graph(t0)
+        else:
+            central, ie, oe = only
+            g, t = dict(g0), dict(t0)
+            for ov in ij.jaxpr.eqns[int(vertex) - 1].outvars:
+                if ov is not central:
+                    g.pop(ov, None)
+            g[central] = {oe: g0[central][oe]}
+            t[central] = {ie: t0[central][ie]}
+            # The rows the elimination writes: the new edge in_edge -> out_edge
+            # and the removal of the central vertex from both neighbours.
+            if g0.get(ie) is not None:
+                g[ie] = dict(g0[ie])
+            if t0.get(oe) is not None:
+                t[oe] = dict(t0[oe])
+        ij.graph, ij.tgraph = g, t
+        ij.vo = dict(vo0) if isinstance(vo0, dict) else vo0
+        try:
+            ij.eliminate(int(vertex), vhooks, ft)
+            out = []
+            for fr in sink.faces[n_fc:]:
+                s, e = fr.start, fr.end
+                if not n_eq <= s <= e <= len(teq):
+                    raise _Irregular(f"face range {s}..{e} outside the step")
+                apx = []
+                for r in fr.approx:
+                    if not s <= r.start <= r.end <= e:
+                        raise _Irregular(f"approximation range {r.start}.."
+                                         f"{r.end} outside face {s}..{e}")
+                    apx.append(r._replace(start=r.start - s, end=r.end - s))
+                out.append((fr._replace(start=0, end=e - s, approx=apx),
+                            [_frozen_eqn(teq[i]) for i in range(s, e)]))
+        finally:
+            ij.graph, ij.tgraph, ij.vo = g0, t0, vo0
+            del teq[n_eq:]
+            del ij.steps[n_st:]
+            del sink.faces[n_fc:]
+            del ij.xlog.records[n_x:]
+        return out
+
+    def _render(self, tk, rs, trace):
+        """``(tokens, split)`` of one face, emitted on name state ``rs``."""
+        fr, eqns = trace
+        mk = (tk.digit_base, tk._name_alphabet)
+        memo = self._namememo.get(mk)
+        if memo is None:
+            from graphax.jaxpr import name_gen_python_style
+            memo = self._namememo[mk] = (
+                [], name_gen_python_style(tk.digit_base,
+                                          tk.digit_base + tk._name_alphabet))
+        saved = (tk._names, tk._fns, tk._namegen, tk._flatten_uid,
+                 getattr(tk, "_cur_spans", None),
+                 getattr(tk, "_cur_eqn_spans", None))
+        rs.names.base, rs.fns.base = saved[0], saved[1]
+        cur = _NameCursor(memo[0], memo[1], rs.pos)
+        tk._names, tk._fns, tk._namegen, tk._flatten_uid = (
+            rs.names, rs.fns, cur, rs.uid)
+        tk._cur_spans = None
+        tk._cur_eqn_spans = None
+        out: list = []
+        try:
+            split = tk._emit_face(fr, eqns, out)
+        finally:
+            rs.pos, rs.uid = cur.pos, tk._flatten_uid
+            (tk._names, tk._fns, tk._namegen, tk._flatten_uid,
+             tk._cur_spans, tk._cur_eqn_spans) = saved
+        self.stats["face_renders"] += 1
+        return [int(x) for x in out], split
 
     def n_faces(self, order, specs, n, vertex, face_rows_hist=None,
                 face_skips_hist=None, *, hist_key=None):
