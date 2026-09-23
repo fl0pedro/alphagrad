@@ -2345,22 +2345,29 @@ MEASURE_CACHE_CLEAR_EVERY_VAR = "ALPHAGRAD_MEASURE_CACHE_CLEAR_EVERY"
 #: (job 67437, ALPHAGRAD_MEASURE_CACHE_CLEAR_EVERY=100) still hit
 #: RESOURCE_EXHAUSTED in two actors at calls 123/124 and 185/186, and
 #: episode 261 refused 5 of 16.  Only recycling the ACTOR PROCESS frees the
-#: pool.  EVERY ROW `thesis_arm` EMITS reads these two, on the SAME
+#: pool.  EVERY ROW `thesis_arm` EMITS reads this, on the SAME
 #: footprint as THESIS_MEASURE_CACHE_CLEAR_EVERY above: the
 #: A/B/C/C_popart/condC matrix on all targets and the smoke.  The
 #: order-only tuning rows call `thesis_cli` directly and the three
-#: Lagrangian sweep rounds pass `retry_on_oom=None,
-#: proactive_recycle_every=None`, so both keep the exports OFF for the same
-#: reason: they are FROZEN running comparisons.  Unset is
-#: cpu_approx_pool.py's own default (no retry on OOM, no proactive
-#: recycle).
-THESIS_RECYCLE_RETRY_ON_OOM = "1"
+#: Lagrangian sweep rounds pass `proactive_recycle_every=None`, so both
+#: keep the export OFF for the same reason: they are FROZEN running
+#: comparisons.  Unset is cpu_approx_pool.py's own default (no proactive
+#: recycle).  The pool recycles an actor whose measure OOMs on every row;
+#: the retry of the OOM'd plan on the fresh actor is gone (dsnn-dfw.120,
+#: owner ruling 2026-09-23: 40 of 47 retries failed again).
 THESIS_PROACTIVE_RECYCLE_EVERY = "100"
 
-#: dsnn-dfw.99's two further export names, in ONE place each: the arm below
-#: renders them and THESIS_TARGET_ENV_ALLOWED admits them.
-RECYCLE_RETRY_ON_OOM_VAR = "ALPHAGRAD_RECYCLE_RETRY_ON_OOM"
+#: dsnn-dfw.99's further export name, in ONE place: the arm below renders
+#: it and THESIS_TARGET_ENV_ALLOWED admits it.
 PROACTIVE_RECYCLE_EVERY_VAR = "ALPHAGRAD_PROACTIVE_RECYCLE_EVERY"
+
+#: THE MEASURE TIMEOUT OF A THESIS ROW (owner ruling 2026-09-23).  ppo.py
+#: derives the cold timeout as four times this.  Frozen rounds keep
+#: CAMPAIGN_RAY_MEASURE_TIMEOUT.
+THESIS_RAY_MEASURE_TIMEOUT = "120"
+#: THE CORES OF ONE TIMING ACTOR ON A THESIS ROW, on every node class (owner
+#: ruling 2026-09-23).  Frozen rounds keep THESIS_CORE_BUDGET's per_actor.
+THESIS_CORES_PER_ACTOR = "8"
 
 # ---------------------------------------------------------------------------
 # THE HARDWARE.  Five Blackwell nodes we may use (dsnn-dfw.69, owner ruling
@@ -2438,6 +2445,21 @@ for _budget_gpus in sorted(THESIS_CORE_BUDGET):
 #: -c and --mem by node size.  The 8-GPU values are the campaign's.
 BLACKWELL_CPUS = {4: 64, 8: CAMPAIGN_CPUS}
 BLACKWELL_MEM = {4: "400G", 8: CAMPAIGN_MEM}
+
+
+# The layout a matrix row builds: its own -c CPUs and THESIS_CORES_PER_ACTOR.
+def thesis_row_core_layout(gpus: int):
+    from alphagrad.approx.common.core_budget import node_core_layout
+    b = THESIS_CORE_BUDGET[gpus]
+    return node_core_layout(
+        BLACKWELL_CPUS[gpus], int(THESIS_RAY_MEASURE[gpus]),
+        trainer_cores=b["trainer"],
+        cores_per_actor=int(THESIS_CORES_PER_ACTOR),
+        oracle_cores=b["oracle"])
+
+
+for _budget_gpus in sorted(THESIS_CORE_BUDGET):
+    thesis_row_core_layout(_budget_gpus)
 #: The node the smoke runs on (owner: "SMOKE on gpu16").
 THESIS_SMOKE_NODE = "pgi15-gpu16"
 
@@ -2623,8 +2645,7 @@ THESIS_TARGET_ENV = {
 #: any other key, exactly as it refuses every per-arm export on a campaign arm.
 THESIS_TARGET_ENV_ALLOWED = frozenset(
     k for env in THESIS_TARGET_ENV.values() for k in env
-) | {MEASURE_CACHE_CLEAR_EVERY_VAR, RECYCLE_RETRY_ON_OOM_VAR,
-     PROACTIVE_RECYCLE_EVERY_VAR}
+) | {MEASURE_CACHE_CLEAR_EVERY_VAR, PROACTIVE_RECYCLE_EVERY_VAR}
 #: Every `export NAME=` a THESIS launcher may contain: the campaign's allowed
 #: set plus the target-shape variables above.
 THESIS_ENV_ALLOWED = frozenset(CAMPAIGN_ENV_ALLOWED) | THESIS_TARGET_ENV_ALLOWED
@@ -2980,7 +3001,9 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
                face_entropy_weight: str | None = None,
                ppo_epochs: str = "1", minibatches: str = "4",
                dual_clip: str | None = None,
-               target_kl: str | None = None) -> dict:
+               target_kl: str | None = None,
+               ray_measure_timeout: str = CAMPAIGN_RAY_MEASURE_TIMEOUT,
+               cores_per_actor: str | None = None) -> dict:
     """The `cli` override dict of one thesis run.
 
     Everything the owner fixed is HERE, once, so the block and the smoke
@@ -3049,10 +3072,12 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
         "--advantage-norm": advantage_norm,
         # --- the measurement, sized by the node
         "--ray-measure": THESIS_RAY_MEASURE[gpus],
-        "--ray-measure-timeout": CAMPAIGN_RAY_MEASURE_TIMEOUT,
+        "--ray-measure-timeout": ray_measure_timeout,
         # --- the node's core budget, disjoint by construction
         "--reserved-driver-cores": str(THESIS_CORE_BUDGET[gpus]["trainer"]),
-        "--cpu-cores-per-actor": str(THESIS_CORE_BUDGET[gpus]["per_actor"]),
+        "--cpu-cores-per-actor": (
+            str(THESIS_CORE_BUDGET[gpus]["per_actor"])
+            if cores_per_actor is None else cores_per_actor),
         "--measure-pipeline": CAMPAIGN_MEASURE_PIPELINE,
         "--rollout-shards": CAMPAIGN_ROLLOUT_SHARDS,
         # --- the actor's update budget (owner ruling 2026-09-20).  A matrix
@@ -3137,9 +3162,11 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
                target_kl: str | None = THESIS_TARGET_KL,
                cache_clear_every: str | None =
                THESIS_MEASURE_CACHE_CLEAR_EVERY,
-               retry_on_oom: str | None = THESIS_RECYCLE_RETRY_ON_OOM,
                proactive_recycle_every: str | None =
-               THESIS_PROACTIVE_RECYCLE_EVERY) -> dict:
+               THESIS_PROACTIVE_RECYCLE_EVERY,
+               ray_measure_timeout: str = THESIS_RAY_MEASURE_TIMEOUT,
+               cores_per_actor: str | None = THESIS_CORES_PER_ACTOR,
+               jax_cache_fixed_order_only: bool = True) -> dict:
     """One thesis run -> one `arm(...)`.  Returns the arm."""
     _require(node in THESIS_NODES,
              f"node {node!r} is not one of the permitted thesis nodes "
@@ -3169,7 +3196,9 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
                      face_entropy_weight=face_entropy_weight,
                      ppo_epochs=ppo_epochs, minibatches=minibatches,
                      dual_clip=dual_clip,
-                     target_kl=target_kl)
+                     target_kl=target_kl,
+                     ray_measure_timeout=ray_measure_timeout,
+                     cores_per_actor=cores_per_actor)
     if extra_cli:
         cli.update(extra_cli)
     gpus = thesis_row_gpus(target, node)
@@ -3181,14 +3210,16 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
         # coordinate a reader wants and it is DERIVED from the target, never
         # passed in, so the two cannot disagree.
         thesis_rule=thesis_temporal_rule(target),
+        # Owner ruling 2026-09-23: the per-node JAX compile cache is
+        # exported only when the order is fixed; under a free order every
+        # plan is a new program and the cache does not hit.
+        jax_cache_fixed_order_only=jax_cache_fixed_order_only,
         # dsnn-dfw.99: the retention bound and the process recycle ride
-        # with the target shape, and a row that renders `None` for any of
-        # the three drops that one export again.
+        # with the target shape, and a row that renders `None` for either of
+        # the two drops that one export again.
         env=dict(THESIS_TARGET_ENV[target],
                  **({MEASURE_CACHE_CLEAR_EVERY_VAR: cache_clear_every}
                     if cache_clear_every is not None else {}),
-                 **({RECYCLE_RETRY_ON_OOM_VAR: retry_on_oom}
-                    if retry_on_oom is not None else {}),
                  **({PROACTIVE_RECYCLE_EVERY_VAR: proactive_recycle_every}
                     if proactive_recycle_every is not None else {})),
         required_flags=(THESIS_REQUIRED_FLAGS
@@ -3433,6 +3464,7 @@ def thesis_pair_arm(rows: list[dict]) -> dict:
         name=name, job=thesis_job_name(node), kind="train", runtime="scratch",
         node=node, time=a["time"], gpus=gpus, singleton=True, thesis=True,
         paired=True, halves=halves,
+        jax_cache_fixed_order_only=bool(a.get("jax_cache_fixed_order_only")),
         thesis_arm=arm_name, thesis_target=target,
         thesis_rule=thesis_temporal_rule(target),
         env=dict(a["env"]),
@@ -3879,8 +3911,12 @@ for _sweepl_tag, _sweepl_overrides in sweepl_configs():
             # dsnn-dfw.99: same reason, keeps the retention bound off too.
             cache_clear_every=None,
             # dsnn-dfw.99: same reason, keeps the process recycle off too.
-            retry_on_oom=None,
             proactive_recycle_every=None,
+            # Owner ruling 2026-09-23 moves the matrix rows; this round is
+            # frozen and keeps its timeout, cores and compile cache.
+            ray_measure_timeout=CAMPAIGN_RAY_MEASURE_TIMEOUT,
+            cores_per_actor=None,
+            jax_cache_fixed_order_only=False,
         )
         ARMS[-1]["sweepl"] = True
         ARMS[-1]["sweepl_tag"] = _sweepl_tag
@@ -4047,8 +4083,12 @@ for _sweepl2_tag, _sweepl2_overrides in sweepl2_configs():
             # dsnn-dfw.99: same reason, keeps the retention bound off too.
             cache_clear_every=None,
             # dsnn-dfw.99: same reason, keeps the process recycle off too.
-            retry_on_oom=None,
             proactive_recycle_every=None,
+            # Owner ruling 2026-09-23 moves the matrix rows; this round is
+            # frozen and keeps its timeout, cores and compile cache.
+            ray_measure_timeout=CAMPAIGN_RAY_MEASURE_TIMEOUT,
+            cores_per_actor=None,
+            jax_cache_fixed_order_only=False,
         )
         ARMS[-1]["sweepl2"] = True
         ARMS[-1]["sweepl2_tag"] = _sweepl2_tag
@@ -4202,8 +4242,12 @@ for _sweepl3_tag, _sweepl3_overrides in sweepl3_configs():
             # dsnn-dfw.99: same reason, keeps the retention bound off too.
             cache_clear_every=None,
             # dsnn-dfw.99: same reason, keeps the process recycle off too.
-            retry_on_oom=None,
             proactive_recycle_every=None,
+            # Owner ruling 2026-09-23 moves the matrix rows; this round is
+            # frozen and keeps its timeout, cores and compile cache.
+            ray_measure_timeout=CAMPAIGN_RAY_MEASURE_TIMEOUT,
+            cores_per_actor=None,
+            jax_cache_fixed_order_only=False,
         )
         ARMS[-1]["sweepl3"] = True
         ARMS[-1]["sweepl3_tag"] = _sweepl3_tag
@@ -5319,7 +5363,8 @@ def _stack_exists_check() -> list[str]:
     ]
 
 
-def _scratch_stack_block(target_env: dict | None = None) -> list[str]:
+def _scratch_stack_block(target_env: dict | None = None,
+                         jax_cache: bool = True) -> list[str]:
     """The environment of a campaign arm: the stack, the plumbing, the TLM
     shape, the measurement vars, the no-flag knobs.  Nothing else.
 
@@ -5363,20 +5408,15 @@ def _scratch_stack_block(target_env: dict | None = None) -> list[str]:
         L.append("# The on-disk compile cache survives the clear.  ppo.py has no")
         L.append("# flag for it.")
         L.append(f"export {MEASURE_CACHE_CLEAR_EVERY_VAR}={_clear_every}")
-    _retry_on_oom = target_env.pop(RECYCLE_RETRY_ON_OOM_VAR, None)
     _proactive_recycle = target_env.pop(PROACTIVE_RECYCLE_EVERY_VAR, None)
-    if _retry_on_oom is not None or _proactive_recycle is not None:
+    if _proactive_recycle is not None:
         L.append("")
         L.append("# THE MEASURE ACTORS' PROCESS RECYCLE (thesis matrix,")
         L.append("# dsnn-dfw.99 follow-up).  The retention bound above clears the")
         L.append("# in-process JAX caches but does not return the executables'")
         L.append("# device memory to the pool; only recycling the actor PROCESS")
-        L.append("# does.  ppo.py has no flag for either.")
-        if _retry_on_oom is not None:
-            L.append(f"export {RECYCLE_RETRY_ON_OOM_VAR}={_retry_on_oom}")
-        if _proactive_recycle is not None:
-            L.append(
-                f"export {PROACTIVE_RECYCLE_EVERY_VAR}={_proactive_recycle}")
+        L.append("# does.  ppo.py has no flag for it.")
+        L.append(f"export {PROACTIVE_RECYCLE_EVERY_VAR}={_proactive_recycle}")
     if target_env:
         L.append("")
         L.append("# THE TARGET SHAPE (thesis matrix, ticket dsnn-dfw.4).  The")
@@ -5386,7 +5426,11 @@ def _scratch_stack_block(target_env: dict | None = None) -> list[str]:
         for k in sorted(target_env):
             L.append(f"export {k}={target_env[k]}")
     L.append("")
-    L.extend(_jax_cache_lines())
+    if jax_cache:
+        L.extend(_jax_cache_lines())
+    else:
+        L.append("# NO JAX COMPILE CACHE (owner ruling 2026-09-23): under a free")
+        L.append("# order every plan is a new program and the cache does not hit.")
     return L
 
 
@@ -5545,7 +5589,11 @@ def render(a: dict) -> str:
                 f"carry only {sorted(THESIS_TARGET_ENV_ALLOWED)}, the target "
                 f"shape that common/examples.py reads at import time and for "
                 f"which ppo.py has no flag.")
-        L.extend(_scratch_stack_block(a.get("env") or {}))
+        _order = dict(_merge_cli(a.get("cli") or {})).get("--fixed-order")
+        L.extend(_scratch_stack_block(
+            a.get("env") or {},
+            jax_cache=not (a.get("jax_cache_fixed_order_only")
+                           and _order == "free")))
     else:
         # A wave/cpu/tool arm (owner ruling 2026-09-14): the same stack, the
         # same node-local $HOME for wandb, and the same ABORT(66) check as a

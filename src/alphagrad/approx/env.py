@@ -2423,7 +2423,8 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
                           paired_ref: dict | None = None,
                           measure_counts: dict | None = None,
                           measured_from: int | None = None,
-                          face_joins=None, refused: str | None = None) -> None:
+                          face_joins=None, refused: str | None = None,
+                          refusal_detail: dict | None = None) -> None:
     """Append ONE terminal plan to this process's plan log. Never raises.
 
     ``refused`` names the resource limit or fault that stopped the
@@ -2566,6 +2567,8 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
             rec["refused"] = str(refused)
             rec["sentinelled"] = True
             rec["replayable"] = False
+        if refusal_detail:
+            rec.update(refusal_detail)
         _record_plan(rec)
     except Exception as _exc:          # pragma: no cover - telemetry only
         if not _PLAN_LOG_WARNED:
@@ -2610,6 +2613,49 @@ def _memory_analysis_bytes(compiled) -> float | None:
         )
     except Exception:
         return None
+
+
+# THE STATIC PEAK GATE (dsnn-dfw.121, owner ruling 2026-09-23). A candidate
+# whose compiled memory_analysis() (temp + argument + output bytes) exceeds
+# this fraction of its device's memory is refused before its first execution.
+# The trace's stored-byte tally is not a peak: 116 GB stored ran with 17 GB of temporaries.
+STATIC_PEAK_FRACTION = 0.25
+_DEVICE_BYTES_LIMIT: dict = {}
+_STATIC_GATE_OFF_NOTED: list = []
+
+
+def _device_bytes_limit(device) -> int | None:
+    key = repr(device)
+    if key not in _DEVICE_BYTES_LIMIT:
+        stats = device.memory_stats()
+        lim = (stats or {}).get("bytes_limit")
+        _DEVICE_BYTES_LIMIT[key] = int(lim) if lim else None
+    return _DEVICE_BYTES_LIMIT[key]
+
+
+def _static_peak_gate(compiled_list, device) -> dict | None:
+    limit = _device_bytes_limit(device)
+    if limit is None:
+        if not _STATIC_GATE_OFF_NOTED:
+            _STATIC_GATE_OFF_NOTED.append(1)
+            print(f"[measure] NOTE the static peak gate is off: device "
+                  f"{device!r} reports no bytes_limit in its memory stats.",
+                  flush=True)
+        return None
+    peak = 0.0
+    for c in compiled_list:
+        b = _memory_analysis_bytes(c)
+        if b is None:
+            raise RuntimeError(
+                "static peak gate: memory_analysis() returned nothing for the "
+                f"candidate executable on {device!r}")
+        peak = max(peak, b)
+    cap = float(limit) * STATIC_PEAK_FRACTION
+    if peak <= cap:
+        return None
+    return {"static_peak_bytes": float(peak),
+            "static_peak_limit_bytes": float(cap),
+            "device_bytes_limit": int(limit)}
 
 
 def consume_memory_compression_stats() -> dict:
@@ -8518,7 +8564,7 @@ def _callback_measured(
     _joins_np = (None if face_joins is None
                  else np.asarray(face_joins)[: len(o_list)])
 
-    def _log_refused(reason: str, reward_vec):
+    def _log_refused(reason: str, reward_vec, detail: dict | None = None):
         """Record a terminal plan the callback REFUSES to measure.
 
         Every ``return`` between the terminal counter above and the record
@@ -8548,7 +8594,8 @@ def _callback_measured(
             face_joins=_joins_np,
             reward_vec=reward_vec,
             face_before=_plan_pf0, face_after=_PER_FACE_STATS,
-            counts_from_trace=False, refused=reason)
+            counts_from_trace=False, refused=reason,
+            refusal_detail=detail)
     ft_by_vertex = None
     _have_face_actions = bool(
         len(o_list) and (np.any(_skips_np == 1)
@@ -9344,6 +9391,28 @@ def _callback_measured(
             if not _is_oom(_exc):
                 raise
             return _oom_truncate("approx-sparse compile", _exc)
+    # THE STATIC PEAK GATE (dsnn-dfw.121): the candidate only, never the
+    # reference, read after its compile and before its first execution.
+    _gate_dev = callback_device
+    if _gate_dev is None:
+        _gate_dev = next(
+            (d for x in jax.tree_util.tree_leaves(args_for_lower)
+             if hasattr(x, "devices") for d in x.devices()),
+            jax.local_devices()[0])
+    _gate = _static_peak_gate(
+        [compiled_approx] + ([compiled_cost]
+                             if compiled_cost is not compiled_approx else []),
+        _gate_dev)
+    if _gate is not None:
+        _record_truncated_plan()
+        print(f"[trunc] oom-static step={int(stop)} order={o_list} "
+              f"static_peak_bytes={_gate['static_peak_bytes']:.0f} > "
+              f"limit_bytes={_gate['static_peak_limit_bytes']:.0f} "
+              f"(1/4 of {_gate['device_bytes_limit']} on {_gate_dev!r}; "
+              f"refused, excluded from gradient)", flush=True)
+        _tr = _truncated_reward()
+        _log_refused("oom-static", _tr, detail=_gate)
+        return _wire(tokens, eqn_ids, _tr)
     # ``compiled_exact`` is ONLY needed for the quality metrics
     # (cosine_sim, frob_residual). Those are meaningful only when the
     # elimination order is complete — graphax's ``jacve`` returns a
