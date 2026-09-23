@@ -1344,8 +1344,16 @@ class LiveFaceStream:
                 t[oe] = dict(t0[oe])
         ij.graph, ij.tgraph = g, t
         ij.vo = dict(vo0) if isinstance(vo0, dict) else vo0
+        from jax._src import core as _jcore
+        from graphax.core import _eliminate_vertex
         try:
-            ij.eliminate(int(vertex), vhooks, ft)
+            # `IncrementalJaxpr.eliminate` without its return value, which
+            # rebuilds every equation of the trace (`frame.get_eqns`, 2.3 of
+            # 8.0 s on TLM plan 2) to hand back a slice nothing here reads.
+            with _jcore.set_current_trace(ij.trace), sink, ij.xlog:
+                _eliminate_vertex(int(vertex), ij.jaxpr, ij.graph, ij.tgraph,
+                                  ij.vo, False, transforms=tuple(vhooks),
+                                  face_transforms=ft)
             out = []
             for fr in sink.faces[n_fc:]:
                 s, e = fr.start, fr.end
