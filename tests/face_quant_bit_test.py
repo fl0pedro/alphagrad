@@ -164,7 +164,8 @@ def test_the_translator_writes_a_quant_row_on_both_slots(mode, monkeypatch):
     rows = np.asarray(sa.face_rows)
     assert rows.shape == (F, S, 3)
     for s in QUANT_SLOTS:
-        assert rows[0, s].tolist() == [QUANT_SENTINEL, NARROW, 0], rows[0]
+        assert rows[0, s, :2].tolist() == [QUANT_SENTINEL, NARROW], rows[0]
+    assert rows[0, 0, 2] == rows[0, 1, 2]
     assert rows[0, FACE_SLOTS - 1, 0] != QUANT_SENTINEL
     assert not (rows[1, :, 0] == QUANT_SENTINEL).any(), rows[1]
     # the rows pass the seam's own check, face by face

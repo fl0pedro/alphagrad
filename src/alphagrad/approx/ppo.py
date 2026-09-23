@@ -132,6 +132,7 @@ from alphagrad.approx.common.rsnn_shd import (
 )
 from alphagrad.approx.common.schedules import cosine_warmup_exp_decay_lr
 from alphagrad.approx.env import (
+    QUANT_SENTINEL,
     quality_metric as _env_quality_metric,
     grad_oracle_tol as _env_grad_oracle_tol,
     grad_oracle_cadence as _env_grad_oracle_cadence,
@@ -183,7 +184,8 @@ from alphagrad.approx.common.face_driver import (
     make_face_vertex_decide_callback,
     replay_stage1_draw,
 )
-from alphagrad.approx.unified_face_policy import UnifiedFacePolicy
+from alphagrad.approx.unified_face_policy import (
+    UnifiedFacePolicy, _NARROW_SLOT as _FACE_NARROW_SLOT)
 from alphagrad.approx.face_action import FaceAction
 from alphagrad.approx import face_action as _rec
 from alphagrad.approx.common import face_dump as _fdump
@@ -4925,6 +4927,18 @@ class Agent(eqx.Module):
 
         face_rows = jax.vmap(jax.vmap(_one))(
             *(getattr(face_action, k) for k in _TK))
+        # THE FACE'S QUANT BIT (owner ruling 2026-09-23) is written HERE onto
+        # BOTH contraction operand slots: the narrow float's QUANT row on lhs
+        # and rhs, never on one of them. The per-slot columns `_rows` derived
+        # from the bit say the same, so this is the wire's own statement of
+        # the two-sided form rather than a second source of it.
+        from alphagrad.approx.unified_face_head import QUANT_SLOTS as _QS
+        _q = (face_action.quant.astype(jnp.int32) > 0)[:, None]
+        _head = jnp.asarray([QUANT_SENTINEL, int(_FACE_NARROW_SLOT)],
+                            jnp.int32)[None, :]
+        for _s in _QS:
+            face_rows = face_rows.at[:, _s, :2].set(
+                jnp.where(_q, _head, face_rows[:, _s, :2]))
         # THE PER-FACE CHANNELS ride beside the rows, one field each, never
         # packed into another field's bits: `face_skip` means "drop this face's
         # contraction" and `face_join` means "which container the ADD uses",
