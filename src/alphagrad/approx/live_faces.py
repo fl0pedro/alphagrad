@@ -207,6 +207,14 @@ _FACE_KEY_CHAIN = os.environ.get("ALPHAGRAD_FACE_KEY_CHAIN", "1") == "1"
 # switch: the two paths return identical chunks.
 _ONE_ELIM = os.environ.get("ALPHAGRAD_FACE_ONE_ELIM", "1") == "1"
 
+# ALPHAGRAD_SLOT_ONE_ELIM=0 serves `face_slot_legality` from its own recording
+# elimination (`face_slot_legality_probe`). An A/B switch: the two paths
+# return identical masks.
+_SLOT_ONE_ELIM = os.environ.get("ALPHAGRAD_SLOT_ONE_ELIM", "1") == "1"
+
+# The slot sites the one elimination records, in `env.face_slot_sites()` form.
+_ONEELIM_SITES = (("lhs",), ("rhs",), ("res:new",))
+
 
 class _Irregular(Exception):
     pass
@@ -261,7 +269,7 @@ class _OneElim:
     # One (prefix, vertex): the faces of its single undecided elimination, the
     # faces re-eliminated alone since, and the render cursor.
     __slots__ = ("tk", "keys", "kidx", "armed0", "order", "pos", "ends",
-                 "traces", "cursor")
+                 "traces", "cursor", "slots")
 
 
 def _frozen_eqn(tr):
@@ -277,6 +285,10 @@ def _frozen_eqn(tr):
                                outvars=e.outvars, primitive=e.primitive,
                                params=e.params)
     return e
+
+
+def _bare(t) -> bool:
+    return not (t.pre_transforms or t.post_transforms)
 
 
 def _vertex_armed(vhooks, ft) -> bool:
@@ -460,9 +472,17 @@ class LiveFaceStream:
                       # eliminations of a decided face; `onelim_fallback` the
                       # chunks served by `chunk_ex_per_face` instead.
                       "face_elims": 0, "face_renders": 0,
-                      "onelim_fallback": 0}
+                      "onelim_fallback": 0,
+                      # `face_slot_legality` read off the one elimination
+                      # (`slot_onelim`), or off its own recording elimination
+                      # because the one elimination cannot answer exactly
+                      # (`slot_onelim_fallback`).
+                      "slot_onelim": 0, "slot_onelim_fallback": 0,
+                      "count_onelim": 0}
         self.one_elim = _ONE_ELIM
+        self.slot_one_elim = _SLOT_ONE_ELIM
         self.last_onelim_error: str | None = None
+        self.last_slot_onelim_error: str | None = None
         self._onelim: dict = {}       # (prefix, vertex) -> _OneElim
         self._namememo: dict = {}     # name alphabet -> (names, generator)
         # The last exception `decide_vertex_faces` swallowed, as text. See the
@@ -884,9 +904,12 @@ class LiveFaceStream:
             vrules = ()
         vhooks = (make_live_masked_hook(tuple(vrules)),) if vrules else ()
 
+        # Keyed on the decoded rules, not on the spec bytes: with no vertex
+        # rule the elimination is the one `face_slot_legality` shares.
+        pk = ck[:3] + ((vspecs.tobytes() if vrules else None),) + ck[7:]
         try:
             ekeys, tail, contr = self._one_elim_parts(
-                tk, ck[:4] + ck[7:], vertex, vhooks, keys, ft, rows, skips, f)
+                tk, pk, vertex, vhooks, keys, ft, rows, skips, f)
         except Exception as exc:
             # A graph the one-face cut cannot serve exactly (a collected
             # equation, a repeated face key, a trace failure) is served by the
@@ -1220,13 +1243,7 @@ class LiveFaceStream:
     def _one_elim_parts(self, tk, pk, vertex, vhooks, keys, ft, rows, skips,
                         f):
         """``(emitted keys, face f-1's tail, face f's contraction or None)``."""
-        st = self._onelim.get(pk)
-        if st is None or st.tk is not tk or st.keys != keys:
-            st = self._eliminate_once(tk, vertex, vhooks, keys)
-            if len(self._onelim) >= self.cache_cap:
-                for dk in list(self._onelim)[: max(1, self.cache_cap // 4)]:
-                    self._onelim.pop(dk, None)
-            self._onelim[pk] = st
+        st = self._onelim_state(tk, pk, vertex, vhooks, keys)
         gi = st.pos.get(keys[f])
         if gi is None:
             return st.order, None, None
@@ -1244,7 +1261,18 @@ class LiveFaceStream:
                                      None, armed))
         return st.order, tail, toks[:split]
 
+    def _onelim_state(self, tk, pk, vertex, vhooks, keys):
+        st = self._onelim.get(pk)
+        if st is None or st.tk is not tk or st.keys != keys:
+            st = self._eliminate_once(tk, vertex, vhooks, keys)
+            if len(self._onelim) >= self.cache_cap:
+                for dk in list(self._onelim)[: max(1, self.cache_cap // 4)]:
+                    self._onelim.pop(dk, None)
+            self._onelim[pk] = st
+        return st
+
     def _eliminate_once(self, tk, vertex, vhooks, keys):
+        from graphax.core import _factored_outputs_enabled
         st = _OneElim()
         st.tk = tk
         st.keys = list(keys)
@@ -1258,7 +1286,25 @@ class LiveFaceStream:
                    for r in frame.tracing_eqns):
                 raise _Irregular("a prefix equation was collected")
         self.stats["elims"] += 1
-        caps = self._elim_capture(tk, vertex, vhooks, {})
+        # Recorders at lhs, rhs, res:new and res:jres for `face_slot_legality`.
+        # A callable that returns its operand emits nothing and does not arm
+        # the approx flag, so the traces are the ones an unhooked run makes.
+        # A res:new hook disables the deferred output product, so none is
+        # installed while GRAPHAX_FACTORED_OUTPUTS is on.
+        rec: dict = {}
+
+        def _rec(k, site):
+            def r(t):
+                rec.setdefault(k, {}).setdefault(site, t)
+                return t
+            return r
+
+        recording = not _factored_outputs_enabled()
+        ft = ({k: ((_rec(k, "lhs"), _rec(k, "rhs"), _rec(k, "res:new")),
+                   (None, None, _rec(k, "res:jres"))) for k in keys}
+              if recording else {})
+        caps = self._elim_capture(tk, vertex, vhooks, ft)
+        st.slots = rec if recording else None
         sink = tk.ij.face_sink
         vidx = sink.vidx
         if vidx is None:
@@ -1412,10 +1458,24 @@ class LiveFaceStream:
         excess means the bound argument is violated and a silent clamp
         would shrink the action space behind a healthy-looking run."""
         try:
-            tk = self._tokenizer_at(
-                np.asarray(order).reshape(-1), np.asarray(specs), int(n),
-                face_rows_hist, face_skips_hist, hist_key=hist_key)
-            k = len(list(tk.ij.faces(int(vertex))))
+            order = np.asarray(order).reshape(-1)
+            specs = np.asarray(specs)
+            n = int(n)
+            tk = self._tokenizer_at(order, specs, n, face_rows_hist,
+                                    face_skips_hist, hist_key=hist_key)
+            # The enumeration the shared one elimination made, if there is one.
+            st = None
+            if self.slot_one_elim:
+                frh, fsh = self._hist(face_rows_hist, face_skips_hist)
+                st = self._onelim.get(
+                    (order[:n].tobytes(), specs[:n].tobytes(), int(vertex),
+                     None) + (_hist_key_parts(frh, fsh, n) if hist_key is None
+                              else (hist_key,)))
+            if st is not None and st.tk is tk:
+                k = len(st.keys)
+                self.stats["count_onelim"] += 1
+            else:
+                k = len(list(tk.ij.faces(int(vertex))))
         except Exception:
             self.stats["failures"] += 1
             return 0
@@ -1733,7 +1793,28 @@ class LiveFaceStream:
         same prefix path, because this runs a speculative elimination and that
         one runs none (the 7.663 was measured with the two dispatch-mode probes
         of the two-engine era; dsnn-3qm.65 left one).
+
+        Since dsnn-dfw.131 the tensors are read off the chunk stream's one
+        elimination of (prefix, vertex) (:meth:`_slot_tensors_onelim`), which
+        :meth:`chunk_ex` then reuses, so the callback runs no elimination of
+        its own. :meth:`face_slot_legality_probe` is the recording-elimination
+        path, and the fallback where the one elimination cannot answer exactly.
         """
+        return self._slot_legality(
+            order, specs, n, vertex, face_rows_hist, face_skips_hist,
+            hist_key, self.slot_one_elim)
+
+    # The path `face_slot_legality` replaces: its own recording elimination
+    # of the vertex, armed by the per-vertex identity.
+    def face_slot_legality_probe(self, order, specs, n, vertex,
+                                 face_rows_hist=None, face_skips_hist=None, *,
+                                 hist_key=None):
+        return self._slot_legality(
+            order, specs, n, vertex, face_rows_hist, face_skips_hist,
+            hist_key, False)
+
+    def _slot_legality(self, order, specs, n, vertex, face_rows_hist,
+                       face_skips_hist, hist_key, one_elim):
         from alphagrad.approx.common.masks import slot_legality
         from alphagrad.approx.env import face_slot_sites
 
@@ -1772,7 +1853,17 @@ class LiveFaceStream:
             self.stats["failures"] += 1
             return empty
 
-        src = self._probe_faces(tk, vertex, keys, slots=True, stat="slot")
+        src = None
+        if one_elim:
+            try:
+                src = self._slot_tensors_onelim(
+                    tk, ck[:3] + (None,) + ck[3:], vertex, keys, sites)
+                self.stats["slot_onelim"] += 1
+            except Exception as exc:
+                self.stats["slot_onelim_fallback"] += 1
+                self.last_slot_onelim_error = f"{type(exc).__name__}: {exc}"
+        if src is None:
+            src = self._probe_faces(tk, vertex, keys, slots=True, stat="slot")
         n_faces = min(len(keys), F)
         for k in range(n_faces):
             kk = keys[k]
@@ -1803,6 +1894,35 @@ class LiveFaceStream:
                 self._slots.pop(dk, None)
         self._slots[ck] = res
         return res
+
+    # `_probe_faces(slots=True)`'s `{face key: {site: tensor}}`, read off the
+    # chunk stream's one elimination of (prefix, vertex) with no vertex rule.
+    # The probe runs armed (the per-vertex identity) and the one elimination
+    # does not. The flag changes a face only through the reconciler peel and
+    # the post-join drain, and both act only on a tensor with queued
+    # transforms; lhs and rhs are read before either. So when every emitted
+    # face has bare operands and a bare joined edge, the two eliminations make
+    # the same operations face by face and record the same tensors. Anything
+    # else raises and the caller runs the probe.
+    def _slot_tensors_onelim(self, tk, pk, vertex, keys, sites):
+        if tuple(tuple(x) for x in sites) != _ONEELIM_SITES:
+            raise _Irregular(f"slot sites {sites} are not {_ONEELIM_SITES}")
+        if not keys:
+            return {}
+        st = self._onelim_state(tk, pk, vertex, (), keys)
+        if st.slots is None:
+            raise _Irregular("the one elimination recorded no slot tensors")
+        src = {}
+        for k in st.order:
+            got = st.slots.get(k, {})
+            if len(got) != 4:
+                raise _Irregular(f"vertex {vertex}: face {k} recorded "
+                                 f"{sorted(got)}")
+            if not all(_bare(got[s]) for s in ("lhs", "rhs", "res:jres")):
+                raise _Irregular(f"vertex {vertex}: face {k} carries queued "
+                                 f"transforms")
+            src[k] = {s: got[s] for s in ("lhs", "rhs", "res:new")}
+        return src
 
 
     # -- the DYNAMIC per-slot mask (ticket .59 fault 2) ---------------------

@@ -665,8 +665,8 @@ def make_face_slot_legality_callback(live_faces, *, max_faces, max_axes,
     while ``n_faces`` RAISES when a vertex has more faces than the derived
     bound or than the ``--face-wire-faces`` wire carries -- the guard that
     keeps a narrow wire loud instead of silently dropping a vertex's tail.
-    Calling it here costs one enumeration on a tokenizer the legality probe
-    has already built and cached, and it keeps the merged callback's count
+    Calling it here reads the enumeration of the one elimination the legality
+    call has just made (dsnn-dfw.131), and it keeps the merged callback's count
     bit-identical to the unmerged one's.
 
     Both halves keep their own ``prof_sink`` key (``faces.live_count`` and
@@ -685,8 +685,8 @@ def make_face_slot_legality_callback(live_faces, *, max_faces, max_axes,
 
     THESE MASKS ARE STATIC, AND THAT IS STILL A KNOWN DEFECT FOR SLOT 2
     (dsnn-3qm.59 fault 2, finding 75). ``face_slot_legality`` reads every slot's
-    tensor from ONE recording probe per vertex in which no decision has been
-    made. Measured on TLM, minimum Markowitz, 5 seeds, through the real apply
+    tensor from ONE elimination per vertex in which no decision has been made
+    (the chunk stream's, since dsnn-dfw.131). Measured on TLM, minimum Markowitz, 5 seeds, through the real apply
     path: that is EXACT for ``lhs`` and ``rhs`` -- nothing at this vertex moves
     the in-edge and out-edge Jacobians, 0 rejections of 36 requests -- and WRONG
     for ``res:new``, which holds their product: 6 of 26 Diag and 4 of 40 Reduce
@@ -787,9 +787,9 @@ def make_face_slot_legality_callback(live_faces, *, max_faces, max_axes,
                np.asarray(no, np.int32)[:F, :S])
         if not with_count:
             return out
-        # THE SAME CALL THE COUNT CALLBACK MADE, on the tokenizer the probe
-        # above has already built: same arguments, same `hist_key`, so the
-        # same number and the same raise. See the docstring.
+        # THE SAME CALL THE COUNT CALLBACK MADE, on the tokenizer and the one
+        # elimination the call above used: same arguments, same `hist_key`,
+        # so the same number and the same raise. See the docstring.
         _c0 = _perf() if _perf is not None else None
         nf = int(live_faces.n_faces(
             order, spec_hist, int(np.asarray(step_count)),
