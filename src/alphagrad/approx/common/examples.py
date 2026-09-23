@@ -196,7 +196,7 @@ def data_gen(fn_str: str, dataset: str | None = None, dataset_size: int | None =
 
         return fn
 
-    if fn_str in _TLM_BLOCKS:
+    if base_name(fn_str) in _TLM_BLOCKS:
         # Same data path for every depth: the window/embedding are a property
         # of (S, D, V), not of how many encoder blocks consume them.
         from alphagrad.approx.common.datasets import load_wikitext2
@@ -204,6 +204,17 @@ def data_gen(fn_str: str, dataset: str | None = None, dataset_size: int | None =
         ids = jnp.asarray(load_wikitext2(V))
         E = _tlm_embedding(D, V)
         n_start = int(ids.shape[0]) - (S + 1)
+
+        if fn_str.startswith("Vmapped"):
+            # One window per row, NN_VMAP_BATCH rows: x (B, S, D), y (B, S, V).
+            @jax.jit
+            def fn_b(keys):
+                s = jrand.randint(keys[0], (NN_VMAP_BATCH,), 0, n_start)
+                win = jax.vmap(
+                    lambda a: jax.lax.dynamic_slice(ids, (a,), (S + 1,)))(s)
+                return E[win[:, :S]], jax.nn.one_hot(win[:, 1:], V)
+
+            return fn_b
 
         @jax.jit
         def fn(keys):
@@ -433,8 +444,8 @@ def get_args(fn_str: str, key, dataset: str | None = None,
                 shapes = [(_w,), (_w,), (_w, _w), (_w,), (_w, _w), (_w,)]
             else:
                 shapes = [(4,), (4,), (8, 4), (8,), (4, 8), (4,)]
-    elif fn_str in _TLM_BLOCKS:
-        n_blk = _TLM_BLOCKS[fn_str]
+    elif base_name(fn_str) in _TLM_BLOCKS:
+        n_blk = _TLM_BLOCKS[base_name(fn_str)]
         S, D, V = _tlm_dims()
         # Slot layout is per-block-strided (7 slots/block, 4 of them used) so
         # block b of the 3-block target draws the SAME key as block b of the
@@ -531,7 +542,7 @@ def get_raw_fn(fn_str: str):
     if fn_str.startswith("Vmapped"):
         num_args = len(inspect.signature(fn).parameters)
         has_y = ("Encoder" in base or base.endswith(("NeuralNetwork", "Perceptron"))
-                 or base in _VISION_MODELS)
+                 or base in _VISION_MODELS or base in _TLM_BLOCKS)
         mapped_axes = (0, 0) if has_y else (0,)
         static_axes = (None,) * (num_args - len(mapped_axes))
         fn = jax.vmap(fn, in_axes=mapped_axes + static_axes)
@@ -957,9 +968,9 @@ def infer_argnums(fn_str: str) -> tuple[int, ...]:
         # here and were unreachable -- get_fn/get_args build them fine.
         n = len(inspect.signature(getattr(examples, base_name(fn_str))).parameters)
         return tuple(range(2, n))
-    if fn_str in _TLM_BLOCKS:
+    if base_name(fn_str) in _TLM_BLOCKS:
         # (x, y, 7 weights per block, Wout) -> differentiate every weight.
-        return tuple(range(2, 2 + 7 * _TLM_BLOCKS[fn_str] + 1))
+        return tuple(range(2, 2 + 7 * _TLM_BLOCKS[base_name(fn_str)] + 1))
     if fn_str.endswith("NeuralNetwork"):
         return (2, 3, 4, 5)
     if fn_str.endswith("Perceptron"):
