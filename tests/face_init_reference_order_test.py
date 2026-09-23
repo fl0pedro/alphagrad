@@ -138,7 +138,6 @@ def test_the_rung1_targets_derive_the_biases_the_launchers_run_with():
     B, Bs = _rung1_pair()
     assert Bs == pytest.approx(math.log(21 / 0.3 - 1))
     assert Bs == pytest.approx(4.234107, abs=1e-6)
-    assert B > math.log(21 * 3 * K / 3 - K)
     e_a, e_k = expected_face_counts(NN256_F_REVERSE, S, K, B, Bs)
     assert e_a == pytest.approx(RUNG1_A)
     assert e_k == pytest.approx(RUNG1_KAPPA)

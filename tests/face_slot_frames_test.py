@@ -591,6 +591,7 @@ def test_masked_head_equals_pruned_head_per_slot():
         NUM_REDUCE_FNS, OP_BLOCKDIAG, OP_NONE, OP_REDUCE, O_QUANT, QUANT_SLOTS,
         S_AXIS, SLOT_WIDTH, S_I, S_J, S_OP, S_RFN, j_mask_given_i, slot_base)
     from alphagrad.approx.unified_micro import _KIND_MAP
+    from alphagrad.approx.unified_face_policy import _OP_HEAD
     from alphagrad.approx.heads import OP_QUANT as WIRE_QUANT
     kinds = np.asarray(_KIND_MAP)
     # The reference inverts fn -> compress_kind, as evaluate_face does.
@@ -648,6 +649,7 @@ def test_masked_head_equals_pruned_head_per_slot():
                 if q and s in QUANT_SLOTS:
                     assert op == WIRE_QUANT, (k, s, op)
                     continue
+                op = int(_OP_HEAD[op])
                 legal_op = np.asarray(om[s]) > 0.5
                 assert legal_op[op], (s, op)
                 l, e, _ = _pruned_cat(zn[b + S_OP:b + S_I], legal_op, op)

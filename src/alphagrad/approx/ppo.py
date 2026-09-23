@@ -2347,7 +2347,7 @@ class Trajectory(NamedTuple):
     face_sizes: jax.Array = None       # (MAX_FACES, [S,] N) int32
     # BIT-PACKED like the two masks above: uint8 words over the ravelled
     # (MAX_FACES, S, K) (or (MAX_FACES,) without --face-slot-frames) 0/1 mask.
-    face_quant: jax.Array = None       # (ceil(MAX_FACES*S*K / 8),) uint8
+    face_quant_mask: jax.Array = None  # (ceil(MAX_FACES*S*K / 8),) uint8
 
 
 class TrainBatch(NamedTuple):
@@ -2446,7 +2446,7 @@ class TrainBatch(NamedTuple):
     face_heads: jax.Array = None       # (MAX_FACES,) int32 (--face-read)
     # --per-face-masks (see Trajectory): threaded exactly like face_heads.
     face_sizes: jax.Array = None       # (MAX_FACES, N) int32
-    face_quant: jax.Array = None       # (MAX_FACES,) float32
+    face_quant_mask: jax.Array = None  # (MAX_FACES,) float32
 
 
 # THE FOUR USES MUST AGREE, AND THIS IS WHERE THE CARRIERS ARE CHECKED.
@@ -11486,7 +11486,7 @@ def main(args=None):
                 # the two masks above. `face_sizes` is not -- it carries axis
                 # LENGTHS, not bits.
                 _fr_fields = dict(_fr_fields, face_sizes=face_sizes_v,
-                                  face_quant=pack_mask_bits(face_quant_v,
+                                  face_quant_mask=pack_mask_bits(face_quant_v,
                                                             _FM_QUANT_SHAPE))
             # THE FACE STREAM WRITE, the second stream on the same bin. Its
             # span is `sum(face_counts)` -- the chunks the head actually
@@ -11829,7 +11829,7 @@ def main(args=None):
         if args.face_actions:
             _fpv_b = unpack_mask_bits(batch.face_pair_valid, _FM_PAIR_SHAPE)
             _fcv_b = unpack_mask_bits(batch.face_comp_valid, _FM_COMP_SHAPE)
-            _fqt_b = (unpack_mask_bits(batch.face_quant, _FM_QUANT_SHAPE)
+            _fqt_b = (unpack_mask_bits(batch.face_quant_mask, _FM_QUANT_SHAPE)
                       if _PFM_SIZES else None)
         else:
             _fpv_b = _fcv_b = _fqt_b = None
@@ -13692,7 +13692,7 @@ def main(args=None):
             # --per-face-masks: per-step (num_envs, T, MAX_FACES, ...), sliced
             # by the same shuffle as face_counts; None when the flag is off.
             face_sizes=traj.face_sizes,
-            face_quant=traj.face_quant,
+            face_quant_mask=traj.face_quant_mask,
             enc_M=_w_encM,
             enc_I=_w_encI,
             enc_pos=_w_encp,

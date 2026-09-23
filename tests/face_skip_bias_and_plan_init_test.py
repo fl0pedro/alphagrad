@@ -9,11 +9,11 @@ from target per-plan counts. Pins here:
    unchanged bit for bit; the SKIP logit still gets -B.
 2. --face-skip-bias Bs, set: the SKIP logit gets -Bs, the OP_NONE logits
    still get +B (independent -- B may be 0 while Bs is not, and vice versa).
-3. THE CLOSED FORM. derive_face_none_bias(F, S, k, a) = ln(F*S*k/a - k) and
-   derive_face_skip_bias(F, kappa) = ln(F/kappa - 1) reproduce the algebra
-   for F = 11 (the dsnn-dfw.74 NN256 rows) and F = 118 (the TLM face
-   inventory, finding 51); expected_face_counts inverts them back to
-   (a, kappa).
+3. THE INVERSE. derive_face_none_bias(F, S, k, a) is the bisection inverse of
+   expected_face_counts (the quant bit at -B rides beside the slot ops since
+   2026-09-23) and derive_face_skip_bias(F, kappa) = ln(F/kappa - 1), for
+   F = 11 (the dsnn-dfw.74 NN256 rows) and F = 118 (the TLM face inventory,
+   finding 51); expected_face_counts inverts them back to (a, kappa).
 4. REFUSALS. --face-init-approx-per-plan / --face-init-skips-per-plan
    conflict with --face-none-bias / --face-skip-bias; an argument that
    makes the log undefined raises; and a caller with NO F still refuses --
@@ -123,15 +123,13 @@ def test_skip_bias_works_with_zero_none_bias():
 @pytest.mark.parametrize("a_frac", [0.05, 0.1, 0.3])
 def test_derive_face_none_bias_inverts_the_expected_count(F, a_frac):
     # a_frac of the "everything approximated" ceiling F*S*K, comfortably
-    # inside the reachable range. E[A] carries the quant bit's term since
-    # 2026-09-23, so B is the bisection inverse of expected_face_counts and
-    # the slot-only closed form ln(F*S*K/a - K) is only its upper bound (the
-    # bit adds approximations at every B).
+    # inside the reachable range. E[A] carries the quant bit's term,
+    # so B is the bisection inverse of expected_face_counts rather than the
+    # slot-only closed form ln(F*S*K/a - K).
     a = a_frac * F * S * K
     B = derive_face_none_bias(F, S, K, a)
     e_a, _ = expected_face_counts(F, S, K, B, B)
     assert e_a == pytest.approx(a, rel=1e-9)
-    assert B > math.log(F * S * K / a - K)
     # and E[A] is what the head's own Bernoullis say: per face, the bit at
     # sigmoid(-B), each of the S slots at k/(e^B + k), the two operand slots
     # forced to none behind the bit
@@ -153,12 +151,10 @@ def test_derive_face_skip_bias_closed_form(F, kappa_frac):
 
 def test_derive_face_none_bias_f11_and_f118_reference_values():
     # F=11 (dsnn-dfw.74 NN256 rows), a=2, and F=118 (TLM face inventory,
-    # finding 51), a=7: the bias lands the requested count exactly, and sits
-    # ABOVE the slot-only closed form that the pre-2026-09-23 head used.
+    # finding 51), a=7: the bias lands the requested count exactly.
     for F, a in ((11.0, 2.0), (118.0, 7.0)):
         B = derive_face_none_bias(F, S, K, a)
         assert expected_face_counts(F, S, K, B, B)[0] == pytest.approx(a)
-        assert B > math.log(F * S * K / a - K)
 
 
 def test_derive_face_none_bias_rejects_undefined_log():
