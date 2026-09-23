@@ -481,6 +481,7 @@ from alphagrad.approx.common.order_specs import (             # noqa: E402
     build_order_specs, parse_calls, calls_have_skip,
 )
 from alphagrad.approx.env import micro_actions_to_rule_specs  # noqa: E402
+from alphagrad.approx.unified_face_head import QUANT_SLOTS    # noqa: E402
 from graphax.sparse.micro_actions import (                    # noqa: E402
     COMPRESS_KINDS, QUANT_DTYPES,
 )
@@ -1053,12 +1054,23 @@ def build_ladder_plan(env, order, op: str, budget, args):
     unlimited = (budget == "all")
     remaining = (1 << 60) if unlimited else int(budget)
 
-    row = None if op == "skip" else _rule_row(op, args)
+    # `carryquant`: the face's Quant BIT (owner ruling 2026-09-23) on the
+    # faces of the CARRY-SCOPE vertices only -- the QUANT row on lhs and rhs,
+    # never on one of them -- so a plan can put the narrow contraction on the
+    # carried face and nowhere else.
+    carry_only = op == "carryquant"
+    row = None if op == "skip" else _rule_row(
+        "quant" if carry_only else op, args)
     slots = () if op == "skip" else {
         "quant": _slots(args.quant_slots),
+        "carryquant": tuple(QUANT_SLOTS),
         "diag": _slots(args.diag_slots),
         "compress": _slots(args.compress_slots),
     }[op]
+    carry_mask = None
+    if carry_only:
+        from alphagrad.approx.common.carry_plan import carry_scope_mask
+        carry_mask = carry_scope_mask(cfg.jaxpr)
 
     used = 0
     n_slot_rows = 0
@@ -1070,6 +1082,8 @@ def build_ladder_plan(env, order, op: str, budget, args):
         per_vertex_faces.append(nf)
         for f in range(nf):
             if remaining <= 0:
+                break
+            if carry_mask is not None and not bool(carry_mask[v - 1]):
                 break
             if op == "skip":
                 face_skips[k, f] = 1

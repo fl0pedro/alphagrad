@@ -2274,6 +2274,7 @@ def plan_log_attempt() -> int:
 #: `_record_plan`, which is the one choke point every record passes through.
 #: `None` on every target that carries no temporal edge.
 _PLAN_CARRY: list = [None]
+_PLAN_CARRY_BYTES: list = [None]
 
 
 def _record_plan(rec: dict) -> None:
@@ -2307,6 +2308,8 @@ def _record_plan(rec: dict) -> None:
         rec["carry_container"] = str(_PLAN_CARRY[0])
     elif _pos and _pos.get("carry") is not None:
         rec["carry_container"] = str(_pos["carry"])
+    if _PLAN_CARRY_BYTES[0] is not None:
+        rec["carry_bytes"] = int(_PLAN_CARRY_BYTES[0])
     _PLAN_RECORDS.append(rec)
 
 
@@ -7650,6 +7653,38 @@ def face_slot_sites() -> tuple[tuple[str, ...], ...]:
     return tuple(tuple(g) for g in got)
 
 
+def check_face_quant_rows(rows_f, *, where: str = "") -> None:
+    """Raise unless the QUANT rows of ONE face's ``(S, 3)`` wire sit on the
+    lhs AND rhs contraction slots with one dtype, or on neither.
+
+    A face Quant is a narrow contraction (owner ruling 2026-09-23): graphax
+    refuses a Quant on one contraction slot only (``FaceTransformIllegal``),
+    and the head writes its one per-face bit onto both slots. This is the
+    alphagrad side of that contract, at the one seam every wire row passes
+    on its way to a graphax entry, so a one-sided row from a replayed plan,
+    a hand-built plan or a transport raises here with the face named, before
+    a graph is eliminated under it. The ``new`` slot and the learned slots
+    are not the contraction operands and are left alone.
+    """
+    from alphagrad.approx.unified_face_head import QUANT_SLOTS
+    rows_f = np.asarray(rows_f)
+    lhs, rhs = (rows_f[s] for s in QUANT_SLOTS)
+    ql, qr = int(lhs[0]) == QUANT_SENTINEL, int(rhs[0]) == QUANT_SENTINEL
+    if ql != qr:
+        raise ValueError(
+            f"{where}: a QUANT row on the "
+            f"{'lhs' if ql else 'rhs'} contraction slot only "
+            f"(lhs {lhs.tolist()}, rhs {rhs.tolist()}). A face Quant narrows "
+            f"BOTH operands (owner ruling 2026-09-23); the head writes its "
+            f"quant bit on lhs and rhs, and graphax refuses the one-sided "
+            f"form.")
+    if ql and int(lhs[1]) != int(rhs[1]):
+        raise ValueError(
+            f"{where}: the QUANT rows name two dtypes (lhs {lhs.tolist()}, "
+            f"rhs {rhs.tolist()}). A face Quant is ONE dtype on both "
+            f"contraction operands.")
+
+
 def wire_slots_of_rows(rows) -> int:
     """The slot count of a ``(F, S, 3)`` wire-row array, CHECKED.
 
@@ -7776,6 +7811,7 @@ def _face_dict_for_vertex(config, ij, v, face_row, face_skip,
                 make_slot_frame_hook(one_row[0], stats=_PER_FACE_STATS,
                                      gated=True)
                 if one_row[0][0] != -1 else None)
+        check_face_quant_rows(face_row[f], where=f"vertex {v} face {f}")
         if any(sl is not None for sl in slots):
             # THE PER-FACE JOIN BIT (#73, --approx-add choose). `face_join` is
             # the wire's (F,) int32 channel: 0 = lossy, 1 = lossless. Under a
@@ -8855,6 +8891,17 @@ def _callback_measured(
     # `config`. A process that serves two graphs of one target holds a
     # carry-plan entry per graph, and this is what picks the right one.
     _carry_base_cfg = config
+    # THE PAIRED REFERENCE IS THE BASE PROGRAM, WHATEVER THE CONTAINER
+    # (dsnn-biw). The container moves the approximation out of the graph and
+    # into the argument, so the variant's own rev-exact elimination is NOT
+    # the exact rule: on the diag program it reads the compact traces (0.9 MB
+    # against 218 MB), on the quant program it upcasts them (402 MB). A plan
+    # divided by that reads e-prop as 88x the memory of exact RTRL and a
+    # narrow carry as half of it. The reference is compiled from the program
+    # the policy acted on, with its dense carry, its own arguments and its
+    # own eval samples, and every container is divided by that one number.
+    _ref_cfg, _ref_args, _ref_consts, _ref_eval = (
+        config, args, consts, eval_samples)
     if is_terminal and _carry.armed(_carry_base_cfg):
         _carry_container = _carry.container_for_plan(
             config, o_list, _faces_np, _skips_np, partial_specs)
@@ -8893,6 +8940,16 @@ def _callback_measured(
                     _carry.eval_samples_for(_carry_container, eval_samples,
                                             _carry_base_cfg))
     _PLAN_CARRY[0] = _carry_container
+    # THE CONTAINER'S AT-REST BYTES ride on the plan record (owner ruling
+    # 2026-09-23, no new reward channel): the given blocks of the program the
+    # plan is measured on, in the container it implied.
+    _PLAN_CARRY_BYTES[0] = None
+    if _carry_container is not None:
+        _c_entry = _carry._entry(_carry_base_cfg)
+        _c_var = _carry.measurement_env(_carry_container, _carry_base_cfg)
+        _PLAN_CARRY_BYTES[0] = _carry.carry_at_rest_bytes(
+            _c_entry["base"] if _c_var is None else _c_var,
+            _c_entry["spec"]["rule"])
     _pf("cb.carry_container")
 
     # ------------------------------------------------------------------
@@ -9071,6 +9128,16 @@ def _callback_measured(
         if callback_device is not None
         else args
     )
+    # The base program's arguments, for the paired reference. The same
+    # object as the candidate's unless a carry variant replaced them.
+    if _ref_args is args:
+        _ref_args_for_lower = args_for_lower
+    else:
+        _ref_args_for_lower = (
+            jax.device_put(_ref_args, callback_device)
+            if callback_device is not None
+            else _ref_args
+        )
 
     # Per-call jit + lower + compile, wrapped by the cluster-wide
     # cache in ``alphagrad.approx.common.compile_cache``. The
@@ -9246,11 +9313,14 @@ def _callback_measured(
     # cached like every other executable (order, arg shapes, device); the
     # MEASUREMENT is taken anew in every terminal callback, right after the
     # candidate's -- that is what makes it paired.
-    _rev_order = sorted(o_list, reverse=True)
+    # ON THE BASE PROGRAM: the policy's own vertex set (`_rec_order`), the
+    # base jaxpr, its consts and its arguments (see `_ref_cfg` above). With
+    # no carry variant these are the candidate's own, as they always were.
+    _rev_order = sorted(_rec_order, reverse=True)
     h_rf = hashlib.blake2b(digest_size=16)
     h_rf.update(np.asarray(_rev_order, dtype=np.int32).tobytes())
-    h_rf.update(b"sparse" if bool(config.sparse) else b"dense")
-    for a in args_for_lower:
+    h_rf.update(b"sparse" if bool(_ref_cfg.sparse) else b"dense")
+    for a in _ref_args_for_lower:
         if hasattr(a, "shape") and hasattr(a, "dtype"):
             h_rf.update(repr(a.shape).encode())
             h_rf.update(repr(a.dtype).encode())
@@ -9262,20 +9332,22 @@ def _callback_measured(
         return _compile_measure(
             jax.jit(
                 jacve(
-                    config.target_fun,
+                    _ref_cfg.target_fun,
                     list(_rev_order),
-                    argnums=config.argnums,
-                    has_aux=config.has_aux,
-                    sparse_representation=config.sparse,
+                    argnums=_ref_cfg.argnums,
+                    has_aux=_ref_cfg.has_aux,
+                    sparse_representation=_ref_cfg.sparse,
                     transforms=[],
                     face_transforms=None,
-                    # The paired reference walks the SAME graph as the
-                    # candidate, or the ratio is not about the plan.
-                    jaxpr=config.jaxpr,
-                    consts=list(consts),
+                    # The paired reference walks the graph the POLICY acted
+                    # on. A carry variant is that graph with the
+                    # approximation moved into an argument, and the exact
+                    # rule lives on the base program only (dsnn-biw).
+                    jaxpr=_ref_cfg.jaxpr,
+                    consts=list(_ref_consts),
                 ),
                 keep_unused=True,
-            ).lower(*args_for_lower)
+            ).lower(*_ref_args_for_lower)
         )
 
     # RESOURCE-LIMIT TRUNCATION (OOM) — "Time Limits in RL" applied to memory.
@@ -9543,8 +9615,8 @@ def _callback_measured(
     # essentially all of the paired ratio's noise. The inner reps and the
     # warmup stay SHARED; only the points and the reps fork here.
     n_ref_points = max(1, int(getattr(config, "ref_num_data_points", 5)))
-    if eval_samples:
-        n_ref_points = min(n_ref_points, len(eval_samples[0]))
+    if _ref_eval:
+        n_ref_points = min(n_ref_points, len(_ref_eval[0]))
     n_ref_reps = (max(1, int(getattr(config, "ref_reps_per_point", 32)))
                   if config.measure_latency else 1)
 
@@ -9625,6 +9697,24 @@ def _callback_measured(
             if callback_device is not None:
                 _ea = [jax.device_put(d, callback_device) for d in _ea]
             eval_args_all.append(_ea)
+        # THE REFERENCE'S INPUTS are the BASE program's eval samples. They
+        # are the candidate's own unless a carry variant replaced them, and
+        # then the reference cannot read the variant's: the given slots
+        # have the container's shapes and the base program reads the dense
+        # ones. Latency and memory do not move with the step position on
+        # that target, so the two halves need not share a draw.
+        if _ref_eval is eval_samples and _ref_args is args:
+            ref_eval_args_all = eval_args_all
+        else:
+            ref_eval_args_all = []
+            for i in range(n_ref_points):
+                if _ref_eval:
+                    _ea = [arg[i] for arg in _ref_eval]
+                else:
+                    _ea = list(_ref_args)
+                if callback_device is not None:
+                    _ea = [jax.device_put(d, callback_device) for d in _ea]
+                ref_eval_args_all.append(_ea)
         # WARMUP (config.latency_warmup): untimed executions before the
         # first timed rep, matching the elimrl/POMO worker's single warmup
         # call. Runs OUTSIDE every timing and memory window, so it can only
@@ -9724,14 +9814,14 @@ def _callback_measured(
         _ref_windows = 0
         if _paired:
             if config.measure_latency:
-                _t_ref = _probe_one(_ref_ex, eval_args_all[0])
+                _t_ref = _probe_one(_ref_ex, ref_eval_args_all[0])
                 _ref_inner = resolve_measure_inner(
                     _t_ref, _window_s, _cfg_inner)
             else:
                 _t_ref = 0.0
                 _ref_inner = _cfg_inner
                 for _w in range(_warmup):
-                    jax.block_until_ready(_ref_ex(*eval_args_all[0]))
+                    jax.block_until_ready(_ref_ex(*ref_eval_args_all[0]))
             _ref_windows = n_ref_points * n_ref_reps
             _warmed_ref.add(0)
 
@@ -9785,10 +9875,10 @@ def _callback_measured(
                 _p = _ib % n_ref_points
                 if _p not in _warmed_ref:
                     for _w in range(_warmup):
-                        jax.block_until_ready(_ref_ex(*eval_args_all[_p]))
+                        jax.block_until_ready(_ref_ex(*ref_eval_args_all[_p]))
                     _warmed_ref.add(_p)
                 _l, _pk, _s, _o = _time_one_rep(
-                    _ref_ex, eval_args_all[_p], unique_devices, _ref_inner)
+                    _ref_ex, ref_eval_args_all[_p], unique_devices, _ref_inner)
                 del _o, _s
                 _ref_lat_samples.append(_l)
                 _ref_peak_samples.append(_pk)

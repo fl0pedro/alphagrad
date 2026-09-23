@@ -92,8 +92,9 @@ from alphagrad.approx.unified_face_head import (
 #: read it back off the stored record, or the two score different variables.
 SCORED = "scored"
 #: A field the wire encoder DERIVES from the scored ones plus the face's live
-#: sizes -- ``factor`` / ``exponents`` (the gcd factorisation) and the two
-#: quant-scale fields (constants). ``score`` does NOT read these, and must not:
+#: sizes -- ``factor`` / ``exponents`` (the gcd factorisation), the dtype
+#: column (from the face's ``quant`` bit) and the two quant-scale fields
+#: (constants). ``score`` does NOT read these, and must not:
 #: they carry no decision. What the agreement test requires of them instead is
 #: that the REPLAY re-derives them bit-for-bit (round trip in
 #: ``tests/face_action_record_test.py``).
@@ -189,9 +190,19 @@ FACE_ACTION_FIELDS: tuple[FaceField, ...] = (
         doc="1 => this face's contraction is dropped (graphax.SKIP_FACE) and "
             "every slot is forced to its canonical inactive value."),
     FaceField(
+        "quant", "int32", per_slot=False, fill=0, role=SCORED,
+        translator=False,
+        doc="THE FACE'S QUANT BIT (owner ruling 2026-09-23): 1 => both "
+            "contraction operands (lhs AND rhs) are held in the narrow float "
+            "(masks.FACE_QUANT_DTYPES[FACE_QUANT_NARROW]) and their "
+            "structural picks are forced to none. Every per-slot carrier "
+            "of the dtype (op_type = OP_QUANT on the two operand slots, "
+            "quant_dtype) is DERIVED from this bit; nothing else stores it."),
+    FaceField(
         "op_type", "int32", per_slot=True, fill=int(OP_END), role=SCORED,
         translator=True,
-        doc="the slot's approximation op; OP_END/OP_NONE = none."),
+        doc="the slot's approximation op; OP_END/OP_NONE = none. OP_QUANT "
+            "on an operand slot is the wire form of the face's `quant` bit."),
     FaceField(
         "i", "int32", per_slot=True, fill=0, role=SCORED, translator=True,
         doc="DIAG's first axis-pair index, or COMPRESS's axis (the wire "
@@ -216,9 +227,11 @@ FACE_ACTION_FIELDS: tuple[FaceField, ...] = (
         translator=True,
         doc="COMPRESS's reduction fn index."),
     FaceField(
-        "quant_dtype", "int32", per_slot=True, fill=0, role=SCORED,
+        "quant_dtype", "int32", per_slot=True, fill=0, role=DERIVED,
         translator=True,
-        doc="QUANT's target dtype slot."),
+        doc="QUANT's target dtype column, DERIVED from the face's `quant` "
+            "bit: the narrow float's runtime index on lhs and rhs when the "
+            "bit is set, 0 everywhere else. The head draws no dtype."),
     FaceField(
         "quant_scale_sign", "int32", per_slot=True, fill=1, role=DERIVED,
         translator=True,
@@ -232,7 +245,7 @@ FACE_ACTION_FIELDS: tuple[FaceField, ...] = (
         "join", "int32", per_slot=False, fill=int(JOIN_LOSSY), role=SCORED,
         translator=False, modes=("choose",),
         doc="--approx-add choose: ONE Bernoulli per face, 0 = lossy, "
-            "1 = lossless, drawn at logit `1 + 31*n_slots`. PRESENT IFF the "
+            "1 = lossless, drawn at logit `layout.choose_index`. PRESENT IFF the "
             "width has the bit; `None` otherwise, because a width without the "
             "bit has no logit to score it against and substituting JOIN_LOSSY "
             "would measure the plan under a join the policy did not pick."),

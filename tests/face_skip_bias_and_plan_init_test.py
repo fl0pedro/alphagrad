@@ -9,11 +9,11 @@ from target per-plan counts. Pins here:
    unchanged bit for bit; the SKIP logit still gets -B.
 2. --face-skip-bias Bs, set: the SKIP logit gets -Bs, the OP_NONE logits
    still get +B (independent -- B may be 0 while Bs is not, and vice versa).
-3. THE CLOSED FORM. derive_face_none_bias(F, S, k, a) = ln(F*S*k/a - k) and
-   derive_face_skip_bias(F, kappa) = ln(F/kappa - 1) reproduce the algebra
-   for F = 11 (the dsnn-dfw.74 NN256 rows) and F = 118 (the TLM face
-   inventory, finding 51); expected_face_counts inverts them back to
-   (a, kappa).
+3. THE INVERSE. derive_face_none_bias(F, S, k, a) is the bisection inverse of
+   expected_face_counts (the quant bit at -B rides beside the slot ops since
+   2026-09-23) and derive_face_skip_bias(F, kappa) = ln(F/kappa - 1), for
+   F = 11 (the dsnn-dfw.74 NN256 rows) and F = 118 (the TLM face inventory,
+   finding 51); expected_face_counts inverts them back to (a, kappa).
 4. REFUSALS. --face-init-approx-per-plan / --face-init-skips-per-plan
    conflict with --face-none-bias / --face-skip-bias; an argument that
    makes the log undefined raises; and a caller with NO F still refuses --
@@ -51,11 +51,11 @@ from alphagrad.approx.common.agent_factory import (             # noqa: E402
     apply_face_none_bias, derive_face_none_bias, derive_face_skip_bias,
     expected_face_counts, resolve_face_init_bias)
 from alphagrad.approx.unified_face_head import (                # noqa: E402
-    FACE_SLOTS, NUM_APPROX_OPS, OP_NONE, O_SKIP, S_OP, slot_base)
+    FACE_SLOTS, NUM_APPROX_OPS, OP_NONE, O_QUANT, O_SKIP, S_OP, slot_base)
 
 S = FACE_SLOTS
 K = NUM_APPROX_OPS - 1
-assert (S, K) == (3, 3)
+assert (S, K) == (3, 2)
 
 
 # --------------------------------------------------------- 1/2. the flag
@@ -92,12 +92,18 @@ def test_skip_bias_moves_only_skip_none_moves_only_none_logits():
     assert b1[O_SKIP] - b0[O_SKIP] == pytest.approx(-5.0)
     for i in none_idx:
         assert b1[i] - b0[i] == pytest.approx(2.0)
-    keep = [i for i in range(len(b0)) if i not in none_idx | {O_SKIP}]
+    # the face's quant bit is an approximation like a slot's non-none pick,
+    # so the identity init pushes it down by the same B (owner ruling
+    # 2026-09-23: one Bernoulli per face beside the skip)
+    assert b1[O_QUANT] - b0[O_QUANT] == pytest.approx(-2.0)
+    keep = [i for i in range(len(b0))
+            if i not in none_idx | {O_SKIP, O_QUANT}]
     np.testing.assert_array_equal(b1[keep], b0[keep])
 
 
 def test_skip_bias_works_with_zero_none_bias():
-    """B = 0 (off), Bs != 0: OP_NONE logits untouched, SKIP still moves."""
+    """B = 0 (off), Bs != 0: OP_NONE and QUANT logits untouched, SKIP still
+    moves."""
     ns0 = _ns()
     raw, init_key = _raw_agent(ns0)
     from alphagrad.approx.ppo import apply_init_scheme
@@ -108,20 +114,29 @@ def test_skip_bias_works_with_zero_none_bias():
     assert b1[O_SKIP] - b0[O_SKIP] == pytest.approx(-5.0)
     none_idx = [slot_base(s) + S_OP + OP_NONE for s in range(FACE_SLOTS)]
     np.testing.assert_array_equal(b1[none_idx], b0[none_idx])
+    assert b1[O_QUANT] == b0[O_QUANT]
 
 
 # ------------------------------------------------------ 3. the closed form
 
 @pytest.mark.parametrize("F", [11.0, 118.0])
 @pytest.mark.parametrize("a_frac", [0.05, 0.1, 0.3])
-def test_derive_face_none_bias_closed_form(F, a_frac):
+def test_derive_face_none_bias_inverts_the_expected_count(F, a_frac):
     # a_frac of the "everything approximated" ceiling F*S*K, comfortably
-    # inside the domain where F*S*K/a - K > 0.
+    # inside the reachable range. E[A] carries the quant bit's term,
+    # so B is the bisection inverse of expected_face_counts rather than the
+    # slot-only closed form ln(F*S*K/a - K).
     a = a_frac * F * S * K
     B = derive_face_none_bias(F, S, K, a)
-    assert B == pytest.approx(math.log(F * S * K / a - K))
     e_a, _ = expected_face_counts(F, S, K, B, B)
     assert e_a == pytest.approx(a, rel=1e-9)
+    # and E[A] is what the head's own Bernoullis say: per face, the bit at
+    # sigmoid(-B), each of the S slots at k/(e^B + k), the two operand slots
+    # forced to none behind the bit
+    p_q = 1.0 / (1.0 + math.exp(B))
+    p_op = K / (math.exp(B) + K)
+    assert e_a == pytest.approx(
+        F * ((1 - p_q) * S * p_op + p_q * (1 + (S - 2) * p_op)), rel=1e-9)
 
 
 @pytest.mark.parametrize("F", [11.0, 118.0])
@@ -135,16 +150,15 @@ def test_derive_face_skip_bias_closed_form(F, kappa_frac):
 
 
 def test_derive_face_none_bias_f11_and_f118_reference_values():
-    # F=11 (dsnn-dfw.74 NN256 rows): a=2 -> B = ln(11*3*3/2 - 3) = ln(46.5)
-    assert derive_face_none_bias(11.0, S, K, 2.0) == \
-        pytest.approx(math.log(11.0 * 9 / 2.0 - 3.0))
-    # F=118 (TLM face inventory, finding 51): a=7 -> ln(118*9/7 - 3)
-    assert derive_face_none_bias(118.0, S, K, 7.0) == \
-        pytest.approx(math.log(118.0 * 9 / 7.0 - 3.0))
+    # F=11 (dsnn-dfw.74 NN256 rows), a=2, and F=118 (TLM face inventory,
+    # finding 51), a=7: the bias lands the requested count exactly.
+    for F, a in ((11.0, 2.0), (118.0, 7.0)):
+        B = derive_face_none_bias(F, S, K, a)
+        assert expected_face_counts(F, S, K, B, B)[0] == pytest.approx(a)
 
 
 def test_derive_face_none_bias_rejects_undefined_log():
-    # a at/beyond the F*S ceiling: F*S*K/a - K <= 0 there.
+    # a at/beyond the F*S ceiling: unreachable by any finite bias.
     ceiling = 11.0 * S
     with pytest.raises(ValueError, match="unreachable"):
         derive_face_none_bias(11.0, S, K, ceiling)

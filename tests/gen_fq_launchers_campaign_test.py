@@ -164,10 +164,11 @@ def test_the_face_head_width_is_derived_from_head_layout(gen, campaign):
     assert gen.APPROX_ADD == "lossless"
     assert gen.FACE_HEAD_WIDTH == head_layout(gen.APPROX_ADD).width
     assert gen.FACE_QUANT_DTYPES == tuple(FACE_QUANT_DTYPES)
-    assert len(gen.FACE_QUANT_DTYPES) == 4
-    # the head grew from 94 to 103 with the four-dtype set; the number in
-    # the launchers is the library's, not the generator's
-    assert gen.FACE_HEAD_WIDTH == 1 + 3 * (30 + len(FACE_QUANT_DTYPES))
+    assert len(gen.FACE_QUANT_DTYPES) == 2
+    # the head is 89 wide since 2026-09-23 (skip, the quant bit, three
+    # 29-wide slots); the number in the launchers is the library's, not the
+    # generator's
+    assert gen.FACE_HEAD_WIDTH == 2 + 3 * 29
     for a in campaign:
         text = gen.render(a)
         assert f"{gen.FACE_HEAD_WIDTH} logits" in text, a["name"]
@@ -629,7 +630,7 @@ def test_every_contract_field_the_arm_will_emit_is_documented(gen, campaign):
     # the floor is derived from the head the arms run, not from a literal
     geom = gt.face_head_geometry(gen.APPROX_ADD)
     assert geom["width"] == gen.FACE_HEAD_WIDTH
-    assert geom["n_quant_default"] == len(gen.FACE_QUANT_DTYPES) - 1
+    assert geom["n_quant_dtypes"] == len(gen.FACE_QUANT_DTYPES) == 2
 
 
 # ------------------------------------------------- 7. the builder raises

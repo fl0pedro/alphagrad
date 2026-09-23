@@ -69,8 +69,9 @@ def _masks():
 
 def _skip_fields():
     z3 = jnp.zeros((FACE_SLOTS,), jnp.int32)
-    return FaceFields(skip=jnp.asarray(1, jnp.int32), op=z3, i=z3, j=z3,
-                      axis=z3, reduce_fn=z3, dtype_idx=z3)
+    return FaceFields(skip=jnp.asarray(1, jnp.int32),
+                      quant=jnp.asarray(0, jnp.int32), op=z3, i=z3, j=z3,
+                      axis=z3, reduce_fn=z3)
 
 
 def _lp_ent(head, ctx):

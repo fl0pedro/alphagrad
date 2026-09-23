@@ -176,7 +176,7 @@ end.
 | `gate/g3/n_outcomes_max` | count | largest legal joint-outcome count of any face | G3 |
 | `gate/g3/n_slots` | count | slots the floor was summed over: head_layout(--approx-add).n_slots, never a literal | G3 |
 | `gate/g3/head_width` | count | head_layout(--approx-add).width, the logit count the floor describes | G3 |
-| `gate/g3/n_quant_dtypes` | count | len(masks.FACE_QUANT_DTYPES): the QUANT categorical the floor counts leaves of | G3 |
+| `gate/g3/n_quant_dtypes` | count | len(masks.FACE_QUANT_DTYPES): the two-name menu the face quant bit selects from | G3 |
 | `gate/g3/mask_source` | 0/1/2 | where the legality came from: 0 none, 1 the oracle probe, 2 the live per-slot masks | G3 |
 | `gate/g4/n` | count | live records with a finite quality | G4 |
 | `gate/g4/q_zero_frac` | fraction | share of those with quality exactly 0 (destroyed Jacobian) | G4 |

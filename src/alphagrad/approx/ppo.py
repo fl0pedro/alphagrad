@@ -132,6 +132,7 @@ from alphagrad.approx.common.rsnn_shd import (
 )
 from alphagrad.approx.common.schedules import cosine_warmup_exp_decay_lr
 from alphagrad.approx.env import (
+    QUANT_SENTINEL,
     quality_metric as _env_quality_metric,
     grad_oracle_tol as _env_grad_oracle_tol,
     grad_oracle_cadence as _env_grad_oracle_cadence,
@@ -183,7 +184,8 @@ from alphagrad.approx.common.face_driver import (
     make_face_vertex_decide_callback,
     replay_stage1_draw,
 )
-from alphagrad.approx.unified_face_policy import UnifiedFacePolicy
+from alphagrad.approx.unified_face_policy import (
+    UnifiedFacePolicy, _NARROW_SLOT as _FACE_NARROW_SLOT)
 from alphagrad.approx.face_action import FaceAction
 from alphagrad.approx import face_action as _rec
 from alphagrad.approx.common import face_dump as _fdump
@@ -2347,7 +2349,7 @@ class Trajectory(NamedTuple):
     face_sizes: jax.Array = None       # (MAX_FACES, [S,] N) int32
     # BIT-PACKED like the two masks above: uint8 words over the ravelled
     # (MAX_FACES, S, K) (or (MAX_FACES,) without --face-slot-frames) 0/1 mask.
-    face_quant: jax.Array = None       # (ceil(MAX_FACES*S*K / 8),) uint8
+    face_quant_mask: jax.Array = None  # (ceil(MAX_FACES*S*K / 8),) uint8
 
 
 class TrainBatch(NamedTuple):
@@ -2446,7 +2448,7 @@ class TrainBatch(NamedTuple):
     face_heads: jax.Array = None       # (MAX_FACES,) int32 (--face-read)
     # --per-face-masks (see Trajectory): threaded exactly like face_heads.
     face_sizes: jax.Array = None       # (MAX_FACES, N) int32
-    face_quant: jax.Array = None       # (MAX_FACES,) float32
+    face_quant_mask: jax.Array = None  # (MAX_FACES,) float32
 
 
 # THE FOUR USES MUST AGREE, AND THIS IS WHERE THE CARRIERS ARE CHECKED.
@@ -4925,6 +4927,18 @@ class Agent(eqx.Module):
 
         face_rows = jax.vmap(jax.vmap(_one))(
             *(getattr(face_action, k) for k in _TK))
+        # THE FACE'S QUANT BIT (owner ruling 2026-09-23) is written HERE onto
+        # BOTH contraction operand slots: the narrow float's QUANT row on lhs
+        # and rhs, never on one of them. The per-slot columns `_rows` derived
+        # from the bit say the same, so this is the wire's own statement of
+        # the two-sided form rather than a second source of it.
+        from alphagrad.approx.unified_face_head import QUANT_SLOTS as _QS
+        _q = (face_action.quant.astype(jnp.int32) > 0)[:, None]
+        _head = jnp.asarray([QUANT_SENTINEL, int(_FACE_NARROW_SLOT)],
+                            jnp.int32)[None, :]
+        for _s in _QS:
+            face_rows = face_rows.at[:, _s, :2].set(
+                jnp.where(_q, _head, face_rows[:, _s, :2]))
         # THE PER-FACE CHANNELS ride beside the rows, one field each, never
         # packed into another field's bits: `face_skip` means "drop this face's
         # contraction" and `face_join` means "which container the ADD uses",
@@ -4932,19 +4946,25 @@ class Agent(eqx.Module):
         # (env._face_dict_for_vertex says the same where it decodes them).
         # `face_join` is None at every width without the choose bit, which is
         # what `env.resolve_join_mode` then answers from the configuration.
-        # A per-face field the declaration gains needs a StepAction channel of
-        # its own, and there is no way to derive that -- so say it HERE, where
-        # the forwarding is written, instead of letting the new decision be
-        # dropped on the way to the env.
+        # The face's `quant` bit needs no channel of its own: its wire form IS
+        # the pair of QUANT rows on the lhs and rhs slots, which `_rows`
+        # derives from the bit and the translator has just written into
+        # `face_rows` -- the engine reads the decision off the rows it
+        # applies, and `env.check_face_quant_rows` refuses a one-sided pair.
+        # Any OTHER per-face field the declaration gains needs a StepAction
+        # channel of its own, and there is no way to derive that -- so say it
+        # HERE, where the forwarding is written, instead of letting the new
+        # decision be dropped on the way to the env.
         _PF = set(_rec.per_face_names())
-        if _PF != {"skip", "join"}:
+        if _PF != {"skip", "quant", "join"}:
             raise NotImplementedError(
                 f"face_action.FACE_ACTION_FIELDS declares the per-face fields "
-                f"{sorted(_PF)}; this wire forwards 'skip' and 'join' only. A "
-                f"per-face decision needs its own StepAction channel (packing "
-                f"it into another field's bits would make every reader of that "
-                f"field wrong) and its own env.EnvState history array, as "
-                f"`face_join` / `face_joins` have.")
+                f"{sorted(_PF)}; this wire forwards 'skip' and 'join' as "
+                f"channels and 'quant' as the QUANT rows on both contraction "
+                f"slots. A per-face decision needs its own StepAction channel "
+                f"(packing it into another field's bits would make every "
+                f"reader of that field wrong) and its own env.EnvState history "
+                f"array, as `face_join` / `face_joins` have.")
         return StepAction(
             target_vertex=jnp.asarray(vertex_idx + 1, dtype=jnp.int32),
             rule_specs=rule_specs,
@@ -11480,7 +11500,7 @@ def main(args=None):
                 # the two masks above. `face_sizes` is not -- it carries axis
                 # LENGTHS, not bits.
                 _fr_fields = dict(_fr_fields, face_sizes=face_sizes_v,
-                                  face_quant=pack_mask_bits(face_quant_v,
+                                  face_quant_mask=pack_mask_bits(face_quant_v,
                                                             _FM_QUANT_SHAPE))
             # THE FACE STREAM WRITE, the second stream on the same bin. Its
             # span is `sum(face_counts)` -- the chunks the head actually
@@ -11823,7 +11843,7 @@ def main(args=None):
         if args.face_actions:
             _fpv_b = unpack_mask_bits(batch.face_pair_valid, _FM_PAIR_SHAPE)
             _fcv_b = unpack_mask_bits(batch.face_comp_valid, _FM_COMP_SHAPE)
-            _fqt_b = (unpack_mask_bits(batch.face_quant, _FM_QUANT_SHAPE)
+            _fqt_b = (unpack_mask_bits(batch.face_quant_mask, _FM_QUANT_SHAPE)
                       if _PFM_SIZES else None)
         else:
             _fpv_b = _fcv_b = _fqt_b = None
@@ -13686,7 +13706,7 @@ def main(args=None):
             # --per-face-masks: per-step (num_envs, T, MAX_FACES, ...), sliced
             # by the same shuffle as face_counts; None when the flag is off.
             face_sizes=traj.face_sizes,
-            face_quant=traj.face_quant,
+            face_quant_mask=traj.face_quant_mask,
             enc_M=_w_encM,
             enc_I=_w_encI,
             enc_pos=_w_encp,
@@ -13940,7 +13960,7 @@ def main(args=None):
                 _fd_packs.extend((_fd_b[_fd_rows], _fd_b[_fd_o_skip], _fd_b))
             jax.debug.callback(
                 partial(_facediag.grad_cb, _fd_terms,
-                        ("blockdiag", "reduce", "quant", "none")),
+                        ("blockdiag", "reduce", "none")),
                 *_fd_packs)
         (dynamic_carry, final_step), metrics_seq = lax.scan(
             epoch_step_fn,

@@ -45,14 +45,14 @@ from alphagrad.approx.heads import (                            # noqa: E402
     AXIS_TAG_BITS, AxisTokenFeatures, precompute_factor_tables)
 from alphagrad.approx.live_faces import LiveFaceStream          # noqa: E402
 from alphagrad.approx.unified_face_head import (                # noqa: E402
-    LOGIT_CLAMP, OP_BLOCKDIAG, OP_NONE, OP_QUANT, OP_REDUCE, O_SKIP,
+    LOGIT_CLAMP, OP_BLOCKDIAG, OP_NONE, OP_REDUCE, O_QUANT, O_SKIP,
     S_OP, set_logit_clamp, slot_base)
 from alphagrad.approx.unified_face_policy import (              # noqa: E402
     UnifiedFacePolicy)
 
 CLAMP = 15.0
 N_AX = E.MAX_AXES_PER_VERTEX
-OPS = (OP_BLOCKDIAG, OP_REDUCE, OP_QUANT)
+OPS = (OP_BLOCKDIAG, OP_REDUCE)
 
 # The two targets the thesis matrix runs the face head on: the feed-forward
 # one it always agreed on and the recurrent one it did not.
@@ -125,7 +125,7 @@ def _policy(bound, embd=32):
     return pol, tables
 
 
-def _biased(pol, op=None, skip=False):
+def _biased(pol, op=None, skip=False, quant=False):
     """The same head with one op (and optionally SKIP) pushed up, so a
     handful of draws covers every class instead of waiting for a 1-in-378
     event at the thesis row's identity init."""
@@ -136,6 +136,8 @@ def _biased(pol, op=None, skip=False):
             bias = bias.at[slot_base(s, pol.layout) + S_OP + OP_NONE].add(-6.0)
     if skip:
         bias = bias.at[O_SKIP].add(6.0)
+    if quant:
+        bias = bias.at[O_QUANT].add(6.0)
     return eqx.tree_at(
         lambda p: p.head.proj.layers[-1].bias, pol, bias)
 
@@ -146,6 +148,7 @@ def _face_action(row, skip, F):
         return jnp.zeros((F,) + tuple(v.shape), v.dtype).at[0].set(v)
     return FaceAction(
         skip=jnp.zeros((F,), jnp.int32).at[0].set(jnp.asarray(skip)),
+        quant=_pad(row["quant"]),
         op_type=_pad(row["op_type"]), i=_pad(row["i"]), j=_pad(row["j"]),
         exponents=_pad(row["exponents"]), factor=_pad(row["factor"]),
         compress_kind=_pad(row["compress_kind"]),
@@ -163,14 +166,18 @@ def test_the_replay_scores_the_sampled_face(name, cfg):
     feats = _neutral_features()
     ctx = jnp.asarray(np.linspace(-0.5, 0.5, pol.embd_dim, dtype=np.float32))
     seen = {op: 0 for op in OPS}
+    seen_quant = 0
     skips = 0
     worst = 0.0
-    for want_op, want_skip in ([(op, False) for op in OPS] + [(None, True)]):
-        p = _biased(pol, op=want_op, skip=want_skip)
+    cases = ([(op, False, False) for op in OPS]
+             + [(None, True, False), (None, False, True)])
+    for want_op, want_skip, want_quant in cases:
+        p = _biased(pol, op=want_op, skip=want_skip, quant=want_quant)
         for k in range(24):
             sk, row, lp, ent, _ar, _sp, _od = p.sample_face(
-                feats, tables, jrand.PRNGKey(7919 * (want_op or 9) + k), 0,
-                pair, comp, jnp.asarray(1.0), face_context=ctx,
+                feats, tables,
+                jrand.PRNGKey(7919 * (want_op or (9 + 4 * want_quant)) + k),
+                0, pair, comp, jnp.asarray(1.0), face_context=ctx,
                 face_sizes_f=sizes, face_quant_f=quant)
             lp2, ent2 = p.evaluate_face(
                 feats, tables, _face_action(row, sk, bound), 0, pair, comp,
@@ -179,26 +186,29 @@ def test_the_replay_scores_the_sampled_face(name, cfg):
             worst = max(worst, abs(float(lp) - float(lp2)),
                         abs(float(ent) - float(ent2)))
             skips += int(sk)
+            seen_quant += int(row["quant"])
             if int(sk) == 0:
+                # the wire's op codes for DIAG and COMPRESS coincide with the
+                # head's blockdiag and reduce
                 for o in np.asarray(row["op_type"]).tolist():
                     if int(o) in seen:
                         seen[int(o)] += 1
     assert worst < 1e-5, (name, worst)
     assert skips > 0, name
+    om, qm = _op_legal(pol, feats, tables, sizes, quant, pair, comp)
     for op in OPS:
         # A class the target's own legality forbids cannot be drawn, and a
         # forced draw would score a rule the engine refuses. Coverage is
         # therefore "every class this layout admits".
-        assert seen[op] > 0 or float(_op_legal(pol, feats, tables, sizes,
-                                               quant, pair, comp)[op]) == 0.0, (
-            name, op, seen)
+        assert seen[op] > 0 or float(om[op]) == 0.0, (name, op, seen)
+    assert seen_quant > 0 or float(qm) == 0.0, (name, seen_quant, float(qm))
 
 
 def _op_legal(pol, feats, tables, sizes, quant, pair, comp):
-    om = pol._face_masks(
+    out = pol._face_masks(
         [pol._face_feats_1(feats, sizes[s]) for s in range(pol.n_slots)],
-        pair, comp, quant, None, tables)[0]
-    return jnp.max(om, axis=0)
+        pair, comp, quant, None, tables)
+    return jnp.max(out[0], axis=0), out[5]
 
 
 @pytest.mark.parametrize("name,cfg", TARGETS, ids=[t[0] for t in TARGETS])

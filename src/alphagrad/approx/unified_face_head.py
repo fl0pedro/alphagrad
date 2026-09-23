@@ -11,18 +11,20 @@ not use is not gated off -- IT DOES NOT EXIST, so it cannot be indexed, cannot
 hold a parameter and cannot take a gradient:
 
     --approx-add   width              contents           (W = SLOT_WIDTH)
-    lossy          W*3 + 1            skip + the three contraction slots
-    lossless       W*3 + 1            skip + the three contraction slots
-    choose         W*3 + 2            + ONE Bernoulli, lossy vs lossless per face
-    learned1       W*4 + 1            + slot 3: the OLD EDGE's own approximation
-    learned2       W*5 + 1            + slot 4: the ADD OUTPUT's own approximation
+    lossy          W*3 + 2            skip + quant + the three contraction slots
+    lossless       W*3 + 2            skip + quant + the three contraction slots
+    choose         W*3 + 3            + ONE Bernoulli, lossy vs lossless per face
+    learned1       W*4 + 2            + slot 3: the OLD EDGE's own approximation
+    learned2       W*5 + 2            + slot 4: the ADD OUTPUT's own approximation
 
-``SLOT_WIDTH = 30 + len(masks.FACE_QUANT_DTYPES)``: 31 while the dtype field
-was a Bernoulli over {float32, bfloat16} (widths 94 / 94 / 95 / 125 / 156),
-34 with the four-float set (103 / 103 / 104 / 137 / 171).
+``SLOT_WIDTH = 29`` since the owner ruling of 2026-09-23: the per-slot dtype
+field is gone and the op softmax is {blockdiag, reduce, none}; the Quant is
+ONE Bernoulli per face beside the skip (widths 89 / 89 / 90 / 118 / 147). It
+was 31 with a per-slot two-dtype Bernoulli (94 / 94 / 95 / 125 / 156) and 34
+with the four-float set (103 / 103 / 104 / 137 / 171).
 
-READ THE ARITHMETIC: ``learned1`` and ``learned2`` are ``W*N + 1``, NOT
-``+2``. THEY HAVE NO CHOOSE BIT. Under those values the model does not pick
+READ THE ARITHMETIC: ``learned1`` and ``learned2`` are ``W*N + 2``, NOT
+``+3``. THEY HAVE NO CHOOSE BIT. Under those values the model does not pick
 lossy-or-lossless; it picks the old edge's (and, under ``learned2``, the sum's)
 approximation DIRECTLY, and that pick is what answers the container question.
 
@@ -36,24 +38,33 @@ the model's decision and the right place for the loss.
 LAYOUT
 ------
     [0:1)   skip        Bernoulli -- ONE for the whole face
+    [1:2)   quant       Bernoulli -- ONE for the whole face: both contraction
+                        operands (lhs AND rhs) in the narrow float
 
-    then slot s at ``1 + SLOT_WIDTH*s`` -- ONE multiply, at EVERY width:
-      +0 :+4    op          softmax {blockdiag, reduce, quant, none}
-      +4 :+10   i           softmax over 1..6
-      +10:+16   j           softmax over 1..6
-      +16:+25   reduce axis softmax over 9
-      +25:+30   reduce fn   softmax {mean, min, max, abs_min, abs_max}
-      +30:+30+K dtype       softmax over ``masks.FACE_QUANT_DTYPES`` (K names)
+    then slot s at ``2 + SLOT_WIDTH*s`` -- ONE multiply, at EVERY width:
+      +0 :+3    op          softmax {blockdiag, reduce, none}
+      +3 :+9    i           softmax over 1..6
+      +9 :+15   j           softmax over 1..6
+      +15:+24   reduce axis softmax over 9
+      +24:+29   reduce fn   softmax {mean, min, max, abs_min, abs_max}
 
     and, under ``choose`` ONLY, the join bit immediately after the last slot
-    block, at ``1 + SLOT_WIDTH*n_slots``.
+    block, at ``2 + SLOT_WIDTH*n_slots``.
 
-The slot blocks TILE from 1 upwards with no hole, so slot ``s``'s base is
-``1 + SLOT_WIDTH*s`` whatever the width is -- slot 3 sits where ``choose``'s
+The slot blocks TILE from 2 upwards with no hole, so slot ``s``'s base is
+``2 + SLOT_WIDTH*s`` whatever the width is -- slot 3 sits where ``choose``'s
 bit sits under ``choose``. The two never coexist: ``choose`` has three slots
 and ``learned1`` has no bit. An earlier layout put the bit after slot 2 under
 EVERY value and started the join slots one later, which is why ``slot_base``
 used to need a branch. That justification is GONE, and so is the branch.
+
+THE QUANT BIT (owner ruling 2026-09-23). A face Quant is a narrow
+CONTRACTION: both operands bfloat16, float32 sums, bfloat16 result, and graphax
+refuses a Quant on one contraction slot only. So the decision is one bit per
+face, and the wire writes it as a QUANT row on lhs AND rhs. A wire row holds
+one rule, so under ``quant == 1`` the lhs and rhs structural picks are forced
+to ``none`` and contribute exactly zero, the way every slot does behind
+``skip == 1``; the ``new`` slot and the learned slots stay free.
 
 WHAT CHANGED, AND WHY
 ---------------------
@@ -76,8 +87,8 @@ face; the slot is a position in the output vector, not a separate query.
 BRANCH MASKING
 --------------
 Only the fields the chosen op CONSUMES contribute to log-prob and entropy:
-DIAG reads (i, j), COMPRESS reads (axis, fn), QUANT reads (dtype), END reads
-nothing. Unused sub-heads otherwise take gradient from rewards they had no part
+DIAG reads (i, j), COMPRESS reads (axis, fn), END reads nothing. Unused
+sub-heads otherwise take gradient from rewards they had no part
 in and drift. A padding face, and every slot behind ``skip == 1``, is forced to
 a canonical no-op contributing exactly zero -- which is also what keeps
 sample() and evaluate() scoring the same variable, and hence the PPO ratio at 1
@@ -94,28 +105,28 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import NamedTuple
 
-from alphagrad.approx.common.masks import (
-    FACE_QUANT_DTYPES, NUM_FACE_QUANT_DTYPES)
-
-OP_BLOCKDIAG, OP_REDUCE, OP_QUANT, OP_NONE = 0, 1, 2, 3
-NUM_APPROX_OPS = 4
+OP_BLOCKDIAG, OP_REDUCE, OP_NONE = 0, 1, 2
+NUM_APPROX_OPS = 3
 MAX_PAIR_IDX = 6
 NUM_REDUCE_AXES = 9
 REDUCE_FNS = ("mean", "min", "max", "abs_min", "abs_max")
 NUM_REDUCE_FNS = len(REDUCE_FNS)
 FACE_SLOTS = 3
+#: The two CONTRACTION OPERAND slots (lhs, rhs). The face's Quant bit lands
+#: on exactly these, and on both.
+QUANT_SLOTS = (0, 1)
 
 # per-slot offsets, relative to the slot base
 S_OP = 0
-S_I = S_OP + NUM_APPROX_OPS                 # 4
-S_J = S_I + MAX_PAIR_IDX                    # 10
-S_AXIS = S_J + MAX_PAIR_IDX                 # 16
-S_RFN = S_AXIS + NUM_REDUCE_AXES            # 25
-S_DTYPE = S_RFN + NUM_REDUCE_FNS            # 30
-SLOT_WIDTH = S_DTYPE + NUM_FACE_QUANT_DTYPES  # 30 + K (34 for the four floats)
+S_I = S_OP + NUM_APPROX_OPS                 # 3
+S_J = S_I + MAX_PAIR_IDX                    # 9
+S_AXIS = S_J + MAX_PAIR_IDX                 # 15
+S_RFN = S_AXIS + NUM_REDUCE_AXES            # 24
+SLOT_WIDTH = S_RFN + NUM_REDUCE_FNS         # 29
 
 O_SKIP = 0
-O_SLOT0 = 1
+O_QUANT = 1
+O_SLOT0 = 2
 
 #: ``choose`` encoding. 0 = ``lossy``, 1 = ``lossless``. 0 is the value a
 #: golden that zeroes the field reproduces, and it is the only value the bit
@@ -123,7 +134,7 @@ O_SLOT0 = 1
 #: layout refuses the field entirely.
 JOIN_LOSSY, JOIN_LOSSLESS = 0, 1
 
-#: ``--approx-add`` value -> (number of 31-wide slot blocks, has a choose bit).
+#: ``--approx-add`` value -> (number of SLOT_WIDTH-wide slot blocks, has a choose bit).
 #: THE ONE TABLE the width, the slot count and the bit's presence come from;
 #: :func:`head_layout` is the only reader. See the module docstring for the
 #: arithmetic and for why the learned values carry no bit.
@@ -158,7 +169,7 @@ class FaceHeadLayout:
 
     @property
     def width(self) -> int:
-        """The number of logits. ``1 + SLOT_WIDTH*n_slots (+1 under ``choose``)``."""
+        """The number of logits. ``2 + SLOT_WIDTH*n_slots (+1 under ``choose``)``."""
         return O_SLOT0 + SLOT_WIDTH * self.n_slots + int(self.has_choose)
 
     @property
@@ -167,10 +178,10 @@ class FaceHeadLayout:
         return self.n_slots - FACE_SLOTS
 
     def slot_base(self, s: int) -> int:
-        """Logit offset of slot ``s``'s ``SLOT_WIDTH``-wide block: ``1 + SLOT_WIDTH*s``.
+        """Logit offset of slot ``s``'s ``SLOT_WIDTH``-wide block: ``2 + SLOT_WIDTH*s``.
 
         ONE MULTIPLY, at every width, because the slot blocks tile upwards from
-        1 with no hole -- ``choose``'s bit sits AFTER the last block, not
+        2 with no hole -- ``choose``'s bit sits AFTER the last block, not
         between blocks 2 and 3.
         """
         if not (0 <= int(s) < self.n_slots):
@@ -186,13 +197,13 @@ class FaceHeadLayout:
     def choose_index(self) -> int:
         """Logit index of the per-face ``lossy``/``lossless`` Bernoulli.
 
-        ``1 + SLOT_WIDTH*n_slots``, i.e. immediately after the last slot block.
+        ``2 + SLOT_WIDTH*n_slots``, i.e. immediately after the last slot block.
         Raises unless the running value is ``choose``.
         """
         if not self.has_choose:
             raise IndexError(
                 f"--approx-add {self.mode!r} has NO choose bit: its head is "
-                f"{self.width} logits = {SLOT_WIDTH}*{self.n_slots} + 1. Only 'choose' "
+                f"{self.width} logits = {SLOT_WIDTH}*{self.n_slots} + 2. Only 'choose' "
                 f"carries one. Under the learned values the model picks the "
                 f"old edge's approximation directly and the ADD reconciles "
                 f"with the UNION (env.resolve_join_mode), so there is no bit "
@@ -221,7 +232,7 @@ def head_layout(mode: str) -> FaceHeadLayout:
     return FaceHeadLayout(mode=mode, n_slots=n_slots, has_choose=has_choose)
 
 
-#: The layout of the CONTRACTION-ONLY head -- ``lossy`` / ``lossless``, 94
+#: The layout of the CONTRACTION-ONLY head -- ``lossy`` / ``lossless``, 89
 #: logits, three slots, no bit. It is the default for a caller that names no
 #: value, and the bound :func:`slot_base` checks against.
 CONTRACTION_LAYOUT = head_layout("lossless")
@@ -278,13 +289,13 @@ def face_logit_offset():
 
 
 def slot_base(s: int, layout: FaceHeadLayout | None = None) -> int:
-    """Logit offset of slot ``s``'s 31-wide block: ``1 + 31*s``.
+    """Logit offset of slot ``s``'s ``SLOT_WIDTH``-wide block: ``2 + SLOT_WIDTH*s``.
 
     ``layout`` defaults to :data:`CONTRACTION_LAYOUT`, so a bare
-    ``slot_base(s)`` answers for the three contraction slots -- 1, 32, 63 --
+    ``slot_base(s)`` answers for the three contraction slots -- 2, 31, 60 --
     and raises ``IndexError`` for anything beyond them. That default is SAFE
     rather than convenient: the three contraction bases are the SAME at every
-    width (the blocks tile from 1 with no hole), which is exactly what the
+    width (the blocks tile from 2 with no hole), which is exactly what the
     2026-09-11 layout buys, so a caller looping ``range(FACE_SLOTS)`` is right
     under every value. A caller that wants a JOIN slot must say which layout it
     is indexing, because whether that slot exists at all is a property of the
@@ -300,6 +311,10 @@ class FaceFields(NamedTuple):
     rhs, new), then -- only at a width that HAS them -- learned1 on the old
     edge and learned2 on the summed edge.
 
+    ``quant`` is the per-face Quant bit: 1 puts the narrow float on BOTH
+    contraction operands, and forces the lhs and rhs structural picks to
+    ``none`` (a wire row holds one rule). Present at every width.
+
     ``join`` is the per-face ``choose`` bit and is PRESENT IFF the running
     layout has one. ``None`` is not "the default value of the bit", it is "this
     decision has no bit", which is the only honest reading now that a layout
@@ -308,12 +323,12 @@ class FaceFields(NamedTuple):
     under ``choose``) rather than substituting a value the head never drew.
     """
     skip: jax.Array          # () int32
+    quant: jax.Array         # () int32, 1 = narrow lhs AND rhs
     op: jax.Array            # (S,) int32
     i: jax.Array             # (S,) int32, 0-based 0..5
     j: jax.Array             # (S,) int32, 0-based 0..5
     axis: jax.Array          # (S,) int32, 0..8
     reduce_fn: jax.Array     # (S,) int32
-    dtype_idx: jax.Array     # (S,) int32, index into masks.FACE_QUANT_DTYPES
     join: jax.Array = None   # () int32 under `choose`, else None
 
 
@@ -523,8 +538,8 @@ class UnifiedFaceHead(eqx.Module):
                 raise ValueError(
                     f"FaceFields carries a join bit but --approx-add "
                     f"{self.layout.mode!r} has no choose logit to score it "
-                    f"against ({self.layout.width} logits = 31*"
-                    f"{self.layout.n_slots} + 1). Under the learned values the "
+                    f"against ({self.layout.width} logits = {SLOT_WIDTH}*"
+                    f"{self.layout.n_slots} + 2). Under the learned values the "
                     f"model picks the old edge's approximation directly and "
                     f"the ADD reconciles with the UNION; there is no bit.")
             return None
@@ -538,13 +553,16 @@ class UnifiedFaceHead(eqx.Module):
         return fields.join
 
     def score(self, z, fields: FaceFields, *, op_mask, i_mask, j_mask,
-              axis_mask, dtype_mask=None, pair_ok=None, face_valid=True,
+              axis_mask, quant_mask=None, pair_ok=None, face_valid=True,
               approx_ok=True):
         """(log_prob, entropy, arity) of ``fields`` under logits ``z``.
 
         Masks are ``(S, ...)`` so each slot can carry its own legality; the
         caller passes the oracle's per-face masks. ``S`` must be exactly
         ``self.layout.n_slots`` -- see :meth:`_check_mask_slots`.
+        ``quant_mask`` is the ONE per-face legality of the Quant bit (a
+        scalar 0/1: the narrow float is a legal, non-idempotent cast on lhs
+        AND rhs); ``None`` means legal.
 
         ``face_valid`` / ``approx_ok`` are the gates that force a padding face
         or a disallowed variant to contribute exactly zero. There are no gates
@@ -601,6 +619,20 @@ class UnifiedFaceHead(eqx.Module):
 
         active = gate_face * (fields.skip == 0).astype(jnp.float32)
         _act = active > 0.5
+
+        # THE QUANT BIT: one Bernoulli per face, scored behind the skip gate
+        # (a skipped face has no contraction to narrow) and behind its own
+        # legality. An illegal bit is forced to 0 by sample() and contributes
+        # exactly zero here, so the two score the same variable.
+        q_ok = (jnp.ones((), jnp.float32) if quant_mask is None
+                else jnp.asarray(quant_mask, jnp.float32).reshape(()))
+        _qact = _act & (q_ok > 0.5)
+        lp_q, e_q = _bern_logp_ent(z[O_QUANT], fields.quant > 0)
+        logp = logp + jnp.where(_qact, lp_q, _z)
+        ent = ent + jnp.where(_qact, e_q, _z)
+        quant_on = _act & (fields.quant > 0)
+        arity = arity + jnp.where(quant_on, 1.0, 0.0)
+
         for s in range(n_slots):
             b = self.layout.slot_base(s)
             op = fields.op[s]
@@ -609,7 +641,6 @@ class UnifiedFaceHead(eqx.Module):
             # Branch masks: exactly the fields this op consumes.
             is_bd = op == OP_BLOCKDIAG
             is_rd = op == OP_REDUCE
-            is_qt = op == OP_QUANT
 
             lp_i, e_i = _cat_logp_ent(
                 z[b + S_I:b + S_J], i_mask[s], fields.i[s])
@@ -619,12 +650,8 @@ class UnifiedFaceHead(eqx.Module):
             lp_ax, e_ax = _cat_logp_ent(
                 z[b + S_AXIS:b + S_RFN], axis_mask[s], fields.axis[s])
             lp_fn, e_fn = _cat_logp_ent(
-                z[b + S_RFN:b + S_DTYPE],
+                z[b + S_RFN:b + SLOT_WIDTH],
                 jnp.ones((NUM_REDUCE_FNS,), jnp.float32), fields.reduce_fn[s])
-            dm = (jnp.ones((NUM_FACE_QUANT_DTYPES,), jnp.float32)
-                  if dtype_mask is None else dtype_mask[s])
-            z_dt = z[b + S_DTYPE:b + SLOT_WIDTH]
-            lp_dt, e_dt = _cat_logp_ent(z_dt, dm, fields.dtype_idx[s])
 
             # SELECT, never multiply. A branch mask of 0.0 times a -inf
             # log-prob is NaN, and the unused branches genuinely are -inf:
@@ -636,20 +663,23 @@ class UnifiedFaceHead(eqx.Module):
             _z0 = jnp.zeros_like(lp_op)
             slot_lp = (lp_op
                        + jnp.where(is_bd, lp_i + lp_j, _z0)
-                       + jnp.where(is_rd, lp_ax + lp_fn, _z0)
-                       + jnp.where(is_qt, lp_dt, _z0))
+                       + jnp.where(is_rd, lp_ax + lp_fn, _z0))
             slot_e = (e_op
                       + jnp.where(is_bd, e_i + e_j, _z0)
-                      + jnp.where(is_rd, e_ax + e_fn, _z0)
-                      + jnp.where(is_qt, e_dt, _z0))
-            logp = logp + jnp.where(_act, slot_lp, _z)
-            ent = ent + jnp.where(_act, slot_e, _z)
-            arity = arity + active * (op != OP_NONE).astype(jnp.float32)
+                      + jnp.where(is_rd, e_ax + e_fn, _z0))
+            # A contraction operand slot behind the quant bit holds the QUANT
+            # row, so its structural pick is forced to none and contributes
+            # exactly zero, as every slot does behind the skip.
+            _slot_act = (_act & ~quant_on) if s in QUANT_SLOTS else _act
+            logp = logp + jnp.where(_slot_act, slot_lp, _z)
+            ent = ent + jnp.where(_slot_act, slot_e, _z)
+            arity = arity + jnp.where(
+                _slot_act & (op != OP_NONE), 1.0, 0.0)
         return logp, ent, arity
 
     # ----------------------------------------------------------------- sample
     def sample(self, ctx, key, *, op_mask, i_mask, j_mask, axis_mask,
-               dtype_mask=None, pair_ok=None, face_valid=True, approx_ok=True):
+               quant_mask=None, pair_ok=None, face_valid=True, approx_ok=True):
         """Draw one face decision. Returns ``(z, FaceFields, lp, ent, arity)``.
 
         Every field is drawn from the SINGLE forward pass ``z`` -- nothing is
@@ -659,22 +689,18 @@ class UnifiedFaceHead(eqx.Module):
         """
         z = self.logits(ctx)
         n_slots = self._check_mask_slots(op_mask, i_mask, j_mask, axis_mask)
-        # One skip key, five per slot (op, i, j, axis, reduce_fn), then one
-        # dtype key per slot, then -- only under `choose` -- the bit's. The
-        # dtype Bernoulli used to share k[4] with the reduce_fn categorical:
-        # under threefry a scalar uniform and the first Gumbel of a categorical
-        # read the same counter word of the key, so the pair was coupled
-        # (P(bf16 | mean) 0.01-0.04 against 0.6 for every other fn, finding 56
-        # D8) while score() adds lp_fn + lp_dt as independent terms.
+        # One skip key, five per slot (op, i, j, axis, reduce_fn), then the
+        # quant bit's key, then -- only under `choose` -- the join bit's.
+        # Every draw has its own key: under threefry a scalar uniform and the
+        # first Gumbel of a categorical read the same counter word of a shared
+        # key, which once coupled the dtype draw to reduce_fn (finding 56 D8).
         #
         # THE BUDGET IS WIDTH-DEPENDENT AND THAT MOVES NO DRAW.
         # `split(key, n)[i]` does not depend on n under
         # jax_threefry_partitionable, so the skip and slots 0-2 draw EXACTLY
-        # what they draw at every other width -- and at the 94-logit width the
-        # budget is `1 + 3*6` = 19 keys with the dtype keys at 16, 17, 18,
-        # which is byte for byte the pre-join-slot head's budget.
-        keys = jrand.split(key, 1 + n_slots * 6 + int(self.layout.has_choose))
-        dt_keys = keys[1 + n_slots * 5:]
+        # what they draw at every other width.
+        keys = jrand.split(key, 2 + n_slots * 5 + int(self.layout.has_choose))
+        q_key = keys[1 + n_slots * 5]
 
         p_skip = jnn.sigmoid(z[O_SKIP])
         skip = (jrand.uniform(keys[0]) < p_skip).astype(jnp.int32)
@@ -688,38 +714,49 @@ class UnifiedFaceHead(eqx.Module):
         # `FaceFields.join` stays None, which is what score() then scores.
         join = None
         if self.layout.has_choose:
-            join = (jrand.uniform(keys[1 + n_slots * 6])
+            join = (jrand.uniform(keys[2 + n_slots * 5])
                     < jnn.sigmoid(z[self.layout.choose_index])
                     ).astype(jnp.int32)
             join = join * jnp.asarray(face_valid, jnp.int32)
 
-        ops, iis, jjs, axs, fns, dts = [], [], [], [], [], []
+        # THE QUANT BIT, forced to 0 wherever score() gates it off: a padding
+        # face, a forbidden variant, a skipped face, an illegal cast.
+        q_ok = (jnp.ones((), jnp.float32) if quant_mask is None
+                else jnp.asarray(quant_mask, jnp.float32).reshape(()))
+        quant = (jrand.uniform(q_key) < jnn.sigmoid(z[O_QUANT])
+                 ).astype(jnp.int32)
+        quant = (quant * jnp.asarray(approx_ok, jnp.int32)
+                 * jnp.asarray(face_valid, jnp.int32)
+                 * (1 - skip) * (q_ok > 0.5).astype(jnp.int32))
+
+        ops, iis, jjs, axs, fns = [], [], [], [], []
         for s in range(n_slots):
             b = self.layout.slot_base(s)
             k = keys[1 + 5 * s:1 + 5 * (s + 1)]
             op = _sample_cat(z[b + S_OP:b + S_I], op_mask[s], k[0])
+            if s in QUANT_SLOTS:
+                # The operand slot's row IS the QUANT row when the bit is set:
+                # the structural pick is forced to none, and score() gates the
+                # slot off, so the two agree on what was drawn.
+                op = jnp.where(quant > 0, OP_NONE, op).astype(jnp.int32)
             i_idx = _sample_cat(z[b + S_I:b + S_J], i_mask[s], k[1])
             jm = j_mask_given_i(i_idx, j_mask[s],
                                 None if pair_ok is None else pair_ok[s])
             j_idx = _sample_cat(z[b + S_J:b + S_AXIS], jm, k[2])
             ax = _sample_cat(z[b + S_AXIS:b + S_RFN], axis_mask[s], k[3])
-            fn = _sample_cat(z[b + S_RFN:b + S_DTYPE],
+            fn = _sample_cat(z[b + S_RFN:b + SLOT_WIDTH],
                              jnp.ones((NUM_REDUCE_FNS,), jnp.float32), k[4])
-            dm = (jnp.ones((NUM_FACE_QUANT_DTYPES,), jnp.float32)
-                  if dtype_mask is None else dtype_mask[s])
-            z_dt = z[b + S_DTYPE:b + SLOT_WIDTH]
-            dt = _sample_cat(z_dt, dm, dt_keys[s])
             ops.append(op); iis.append(i_idx); jjs.append(j_idx)
-            axs.append(ax); fns.append(fn); dts.append(dt)
+            axs.append(ax); fns.append(fn)
 
         fields = FaceFields(
-            skip=skip,
+            skip=skip, quant=quant,
             op=jnp.stack(ops), i=jnp.stack(iis), j=jnp.stack(jjs),
             axis=jnp.stack(axs), reduce_fn=jnp.stack(fns),
-            dtype_idx=jnp.stack(dts), join=join,
+            join=join,
         )
         lp, ent, arity = self.score(
             z, fields, op_mask=op_mask, i_mask=i_mask, j_mask=j_mask,
-            axis_mask=axis_mask, dtype_mask=dtype_mask, pair_ok=pair_ok,
+            axis_mask=axis_mask, quant_mask=quant_mask, pair_ok=pair_ok,
             face_valid=face_valid, approx_ok=approx_ok)
         return z, fields, lp, ent, arity

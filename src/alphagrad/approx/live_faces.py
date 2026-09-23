@@ -2437,7 +2437,8 @@ class LiveFaceStream:
         stays readable and so the ``except`` there covers exactly this."""
         from jax._src import core as _jcore
         from graphax import SKIP_FACE
-        from graphax.core import (_apply_face_transform, contract_face_operands,
+        from graphax.core import (_apply_face_transform, _check_face_quant,
+                                  contract_face_operands,
                                   face_config_is_approx, prepare_face_operands,
                                   _force)
         from alphagrad.approx.common.masks import slot_legality
@@ -2570,6 +2571,7 @@ class LiveFaceStream:
                 # it. Not a second copy of the decode: `make_slot_frame_hook`
                 # is the object `env._face_dict_for_vertex` installs.
                 a, b = lhs, rhs
+                chosen = {0: [], 1: []}
                 for s in (0, 1):
                     if int(rows[f, s, 0]) == -1:
                         continue
@@ -2589,12 +2591,20 @@ class LiveFaceStream:
                     # kind this pass exists to remove.
                     if s == 0:
                         a = _apply_face_transform(a, h, "lhs", int(vertex),
-                                                  None)
+                                                  None, chosen=chosen[0])
                     else:
                         b = _apply_face_transform(b, h, "rhs", int(vertex),
-                                                  None)
+                                                  None, chosen=chosen[1])
                     if seen.get("skipped"):
                         self.stats["vertex_self_skip"] += 1
+                # THE ENGINE'S OWN TWO-SIDED RULE, at the one site that
+                # applies the operand hooks itself instead of through
+                # `_eliminate_vertex`: a Quant chosen on lhs or rhs alone is
+                # refused here exactly as the measurement refuses it.
+                _check_face_quant(
+                    chosen[0][0] if chosen[0] else None,
+                    chosen[1][0] if chosen[1] else None,
+                    int(vertex), sp.key)
                 # ``contract_face_operands(prepare_face_operands(...))`` IS
                 # ``_eliminate_vertex``'s contraction -- the same two functions,
                 # in the same order, with the same flags. `post` is the

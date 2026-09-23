@@ -3,11 +3,12 @@
 Deliverables tested:
   1. Bottom-up hierarchical legality in flat face head: parent op masked out
      if all child choices are illegal (Diag iff valid pair_ok, Reduce iff valid
-     comp_valid, Quant iff non-identity dtype legal, None unconditionally legal).
-  2. Per-slot D4 identity Quant masking: tensors only permit non-identity casts
-     (f32 -> bf16, bf16 -> f32). Implemented via 2-class masked categorical on
-     [0.0, z[b + S_DTYPE]] matching _bern_logp_ent when unrestricted, and producing
-     0.0 logp/entropy when deterministic.
+     comp_valid, None unconditionally legal); the face QUANT BIT (owner ruling
+     2026-09-23) iff the narrow float is a legal non-identity cast on lhs AND rhs.
+  2. The quant bit is ONE Bernoulli per face: its log-prob is the Bernoulli at
+     z[O_QUANT], the two operand slots contribute nothing behind it, and the
+     new slot stays free (D4 identity masking now lives in the bit's legality:
+     a no-op cast on either operand makes the bit illegal).
   3. Approximation profile flag (--approx-profile {all,skip,reduce,quant,diag,none})
      applied via _op_legality_for_variant; none is order-only arm (--no-approx-head).
   4. Parity test: masked head and pruned reference head give identical logp and
@@ -52,14 +53,18 @@ from alphagrad.approx.ppo import (
     _apply_variant_preset, _op_legality_for_variant, make_argparser,
 )
 from alphagrad.approx.unified_face_head import (
-    FACE_SLOTS, MAX_PAIR_IDX, NUM_APPROX_OPS, NUM_REDUCE_AXES, NUM_REDUCE_FNS,
-    OP_BLOCKDIAG, OP_NONE, OP_QUANT, OP_REDUCE, S_AXIS, S_DTYPE, S_I, S_J,
-    SLOT_WIDTH, S_OP, S_RFN, UnifiedFaceHead, _cat_logp_ent, _bern_logp_ent,
-    j_mask_given_i, slot_base,
+    FACE_SLOTS, FaceFields, MAX_PAIR_IDX, NUM_APPROX_OPS, NUM_REDUCE_AXES,
+    NUM_REDUCE_FNS, OP_BLOCKDIAG, OP_NONE, OP_REDUCE, O_QUANT, QUANT_SLOTS,
+    S_AXIS, S_I, S_J, SLOT_WIDTH, S_OP, S_RFN, UnifiedFaceHead, _cat_logp_ent,
+    _bern_logp_ent, j_mask_given_i, slot_base,
 )
-from alphagrad.approx.unified_face_policy import UnifiedFacePolicy
-from alphagrad.approx.unified_micro import face_dtype_idx_of, _KIND_MAP
-from alphagrad.approx.common.masks import NUM_FACE_QUANT_DTYPES
+from alphagrad.approx.unified_face_policy import UnifiedFacePolicy, _OP_HEAD
+from alphagrad.approx.unified_micro import FACE_DTYPE_SLOTS, _KIND_MAP
+from alphagrad.approx.heads import (
+    OP_COMPRESS as W_COMPRESS, OP_DIAG as W_DIAG, OP_END as W_END,
+    OP_QUANT as W_QUANT)
+from alphagrad.approx.common.masks import (
+    FACE_QUANT_NARROW, NUM_FACE_QUANT_DTYPES)
 from alphagrad.elimrl.baselines import tlm_target
 
 N_AX = 8
@@ -95,9 +100,10 @@ def _slot_inputs():
     comp[1, 0] = 1.0
     comp[2, 0] = 1.0
     quant = np.zeros((S, NUM_FACE_QUANT_DTYPES), np.float32)
-    quant[0, 1] = 1.0   # slot 0: bf16 legal
-    quant[1, 1] = 1.0   # slot 1: bf16 legal
-    # slot 2: neither legal (quant[2] = [0, 0])
+    quant[0, FACE_QUANT_NARROW] = 1.0   # slot 0: bf16 legal
+    quant[1, FACE_QUANT_NARROW] = 1.0   # slot 1: bf16 legal
+    # slot 2: neither legal (quant[2] = [0, 0]); the face bit reads slots
+    # 0 and 1 only, so it is legal here
     return (jnp.asarray(sizes), jnp.asarray(quant), jnp.asarray(pair),
             jnp.asarray(comp))
 
@@ -110,6 +116,7 @@ def _as_face_action(row, skip, F=MAX_F):
 
     return FaceAction(
         skip=jnp.zeros((F,), jnp.int32).at[0].set(jnp.asarray(skip)),
+        quant=_pad(row["quant"]),
         op_type=_pad(row["op_type"]), i=_pad(row["i"]), j=_pad(row["j"]),
         exponents=_pad(row["exponents"]), factor=_pad(row["factor"]),
         compress_kind=_pad(row["compress_kind"]),
@@ -132,7 +139,9 @@ def _pruned_cat(logits, legal, idx):
 # 1. BOTTOM-UP HIERARCHICAL LEGALITY
 # ==============================================================================
 def test_bottom_up_hierarchical_op_legality():
-    """A parent op is legal only if at least one child choice is legal."""
+    """A parent op is legal only if at least one child choice is legal; the
+    face's quant bit is legal only if the narrow float is legal on BOTH
+    contraction operand slots."""
     pol, tables = _policy()
     feats = _features()
     sizes, quant, pair, comp = _slot_inputs()
@@ -141,35 +150,48 @@ def test_bottom_up_hierarchical_op_legality():
     # Slot 1 has no pair valid, comp valid, quant valid:
     # Slot 2 has no pair valid, comp valid, no quant valid:
     ff = [pol._face_feats_1(feats, sizes[s]) for s in range(FACE_SLOTS)]
-    om, im, jm, am, pair_ok, dm = pol._face_masks(
+    om, im, jm, am, pair_ok, qm = pol._face_masks(
         ff, pair, comp, quant, None, tables)
 
-    # Slot 0: Diag, Reduce, Quant, None are all legal
+    assert om.shape == (FACE_SLOTS, NUM_APPROX_OPS)
+    # Slot 0: Diag, Reduce, None are all legal
     assert float(om[0, OP_BLOCKDIAG]) == 1.0
     assert float(om[0, OP_REDUCE]) == 1.0
-    assert float(om[0, OP_QUANT]) == 1.0
     assert float(om[0, OP_NONE]) == 1.0
 
-    # Slot 1: Diag illegal (no pairs), Reduce and Quant legal, None legal
+    # Slot 1: Diag illegal (no pairs), Reduce legal, None legal
     assert float(om[1, OP_BLOCKDIAG]) == 0.0
     assert float(om[1, OP_REDUCE]) == 1.0
-    assert float(om[1, OP_QUANT]) == 1.0
     assert float(om[1, OP_NONE]) == 1.0
 
-    # Slot 2: Diag illegal, Reduce legal, Quant illegal, None legal
+    # Slot 2: Diag illegal, Reduce legal, None legal
     assert float(om[2, OP_BLOCKDIAG]) == 0.0
     assert float(om[2, OP_REDUCE]) == 1.0
-    assert float(om[2, OP_QUANT]) == 0.0
     assert float(om[2, OP_NONE]) == 1.0
+
+    # THE FACE BIT: legal because bf16 is a legal cast on lhs and rhs
+    assert float(qm) == 1.0
+    # ... and illegal as soon as ONE operand slot refuses the narrow float:
+    # the hook on that slot would decline and graphax refuses the one-sided
+    # face (FaceTransformIllegal), so the mask must refuse it first.
+    for s in QUANT_SLOTS:
+        q1 = quant.at[s, FACE_QUANT_NARROW].set(0.0)
+        assert float(pol._face_masks(ff, pair, comp, q1, None, tables)[5]) \
+            == 0.0, s
+    # the exact entry (float32) on both slots is not the bit's business
+    q2 = quant.at[:, 1 - FACE_QUANT_NARROW].set(1.0).at[
+        :, FACE_QUANT_NARROW].set(0.0)
+    assert float(pol._face_masks(ff, pair, comp, q2, None, tables)[5]) == 0.0
 
     # Now verify: when all sub-arguments are illegal, parent op is completely illegal
     all_zero_pair = jnp.zeros_like(pair)
     all_zero_comp = jnp.zeros_like(comp)
     all_zero_quant = jnp.zeros_like(quant)
-    om_none, _, _, _, _, _ = pol._face_masks(
+    om_none, _, _, _, _, qm_none = pol._face_masks(
         ff, all_zero_pair, all_zero_comp, all_zero_quant, None, tables)
     for s in range(FACE_SLOTS):
-        assert np.array_equal(np.asarray(om_none[s]), [0.0, 0.0, 0.0, 1.0]), s
+        assert np.array_equal(np.asarray(om_none[s]), [0.0, 0.0, 1.0]), s
+    assert float(qm_none) == 0.0
 
     # Verify column/row projection of pair_ok
     # pair_ok[0, 0, 1] is 1, so im[0, 0] == 1, jm[0, 1] == 1
@@ -180,67 +202,94 @@ def test_bottom_up_hierarchical_op_legality():
 
 
 def test_bottom_up_sampling_never_draws_illegal_ops():
-    """Sampling under hierarchical masks never selects an illegal parent op or sub-arg."""
+    """Sampling under hierarchical masks never selects an illegal parent op or
+    sub-arg, and a face whose bit is set carries the QUANT row on BOTH operand
+    slots and on neither otherwise."""
     pol, tables = _policy()
     feats = _features()
     sizes, quant, pair, comp = _slot_inputs()
     ctx = jnp.asarray(np.linspace(-1, 1, pol.embd_dim, dtype=np.float32))
 
+    seen_bit = 0
     for k in range(30):
         key = jrand.PRNGKey(1000 + k)
         skip, row, lp, ent, ar, _, _ = pol.sample_face(
             feats, tables, key, 0, pair, comp, jnp.asarray(1.0),
             face_context=ctx, face_sizes_f=sizes, face_quant_f=quant)
+        ops = [int(x) for x in np.asarray(row["op_type"])]
+        q = int(row["quant"])
+        seen_bit += q
+        if q:
+            assert ops[0] == W_QUANT and ops[1] == W_QUANT, (k, ops)
+            assert (int(row["quant_dtype"][0]) == int(row["quant_dtype"][1])
+                    == int(FACE_DTYPE_SLOTS[FACE_QUANT_NARROW])), row
+        else:
+            assert W_QUANT not in ops, (k, ops)
         # Slot 1 must NEVER have Diag
-        assert int(row["op_type"][1]) != OP_BLOCKDIAG, (k, row["op_type"][1])
-        # Slot 2 must NEVER have Diag or Quant
-        assert int(row["op_type"][2]) not in (OP_BLOCKDIAG, OP_QUANT), (k, row["op_type"][2])
+        assert ops[1] != W_DIAG, (k, ops[1])
+        # Slot 2 must NEVER have Diag or a Quant
+        assert ops[2] not in (W_DIAG, W_QUANT), (k, ops[2])
+    assert seen_bit > 0, "the legal bit never fired in 30 draws"
+
+    # with the bit illegal on one operand slot it is never drawn
+    q1 = quant.at[1, FACE_QUANT_NARROW].set(0.0)
+    for k in range(30):
+        _sk, row, *_ = pol.sample_face(
+            feats, tables, jrand.PRNGKey(2000 + k), 0, pair, comp,
+            jnp.asarray(1.0), face_context=ctx, face_sizes_f=sizes,
+            face_quant_f=q1)
+        assert int(row["quant"]) == 0
+        assert W_QUANT not in [int(x) for x in np.asarray(row["op_type"])]
 
 
 # ==============================================================================
-# 2. D4 IDENTITY QUANT MASKING (finding 56)
+# 2. THE QUANT BIT IS ONE BERNOULLI PER FACE (owner ruling 2026-09-23)
 # ==============================================================================
-def test_d4_identity_quant_masking():
-    """Tensors only permit non-identity casts; categorical gives 0 logp/ent when deterministic."""
+def test_the_quant_bit_is_the_faces_own_bernoulli():
+    """The bit's log-prob is the Bernoulli at logit ``z[O_QUANT]``; behind
+    it the two operand slots contribute nothing (their rows ARE the QUANT
+    rows) and the ``new`` slot is scored as usual."""
     head = UnifiedFaceHead(embd_dim=32, in_dim=32, key=jrand.PRNGKey(42))
     ctx = jnp.zeros((32,), jnp.float32)
     z = head.logits(ctx)
+    op_m = jnp.ones((3, NUM_APPROX_OPS), jnp.float32)
+    im = jnp.ones((3, MAX_PAIR_IDX), jnp.float32)
+    jm = jnp.ones((3, MAX_PAIR_IDX), jnp.float32)
+    am = jnp.ones((3, NUM_REDUCE_AXES), jnp.float32)
+    kw = dict(op_mask=op_m, i_mask=im, j_mask=jm, axis_mask=am)
+    z3 = jnp.zeros((3,), jnp.int32)
 
-    # float32 operand: only bf16 is legal (dm = [0, 1])
-    # an f32 operand with ONLY bfloat16 legal: the draw is then deterministic
-    dm_f32 = jnp.zeros((3, NUM_FACE_QUANT_DTYPES), jnp.float32).at[:, 1].set(1.0)
-    op_m = jnp.array([[0.0, 0.0, 1.0, 1.0]] * 3, jnp.float32)  # Quant or None legal
-    im = jnp.zeros((3, MAX_PAIR_IDX), jnp.float32)
-    jm = jnp.zeros((3, MAX_PAIR_IDX), jnp.float32)
-    am = jnp.zeros((3, NUM_REDUCE_AXES), jnp.float32)
+    def _f(quant, ops):
+        return FaceFields(skip=jnp.asarray(0), quant=jnp.asarray(quant),
+                          op=jnp.asarray(ops, jnp.int32), i=z3,
+                          j=jnp.ones((3,), jnp.int32), axis=z3,
+                          reduce_fn=z3)
 
-    for k in range(15):
-        key = jrand.PRNGKey(2000 + k)
-        _, fields, lp, ent, ar = head.sample(
-            ctx, key, op_mask=op_m, i_mask=im, j_mask=jm, axis_mask=am,
-            dtype_mask=dm_f32, approx_ok=True)
-        for s in range(FACE_SLOTS):
-            if int(fields.op[s]) == OP_QUANT:
-                # Deterministically drawn as bfloat16 (index 1)
-                assert int(fields.dtype_idx[s]) == 1, (s, int(fields.dtype_idx[s]))
-
-    # Test deterministic score has 0 logp and 0 entropy for the dtype component
-    z_dt = jnp.stack([0.0, z[slot_base(0) + S_DTYPE]])
-    lp_dt_det, e_dt_det = _cat_logp_ent(z_dt, jnp.array([0.0, 1.0]), jnp.array(1))
-    assert abs(float(lp_dt_det)) < 1e-7
-    assert abs(float(e_dt_det)) < 1e-7
-
-    # bfloat16 operand: only f32 is legal (dm = [1, 0])
-    lp_dt_det0, e_dt_det0 = _cat_logp_ent(z_dt, jnp.array([1.0, 0.0]), jnp.array(0))
-    assert abs(float(lp_dt_det0)) < 1e-7
-    assert abs(float(e_dt_det0)) < 1e-7
-
-    # Unrestricted (dm = [1, 1]): matches _bern_logp_ent
-    dm_both = jnp.array([1.0, 1.0], jnp.float32)
+    lp1, e1, ar1 = head.score(z, _f(1, [OP_NONE, OP_NONE, OP_NONE]), **kw)
+    lp0, e0, ar0 = head.score(z, _f(0, [OP_NONE, OP_NONE, OP_NONE]), **kw)
+    lq1, eq = _bern_logp_ent(z[O_QUANT], jnp.array(True))
+    lq0, _ = _bern_logp_ent(z[O_QUANT], jnp.array(False))
+    none_terms = sum(
+        _cat_logp_ent(z[slot_base(s) + S_OP:slot_base(s) + S_I], op_m[s],
+                      jnp.asarray(OP_NONE))[0] for s in QUANT_SLOTS)
+    assert abs(float(lp1 - lp0) - float(lq1 - lq0 - none_terms)) < 1e-6
+    assert float(ar1) == 2.0 and float(ar0) == 1.0
+    # an operand slot's op does not matter once the bit is set
+    lp1b, e1b, _ = head.score(
+        z, _f(1, [OP_BLOCKDIAG, OP_REDUCE, OP_NONE]), **kw)
+    assert float(lp1b) == float(lp1) and float(e1b) == float(e1)
+    # the bit's own legality gate: illegal -> the bit scores exactly zero
+    lp_m, e_m, ar_m = head.score(z, _f(0, [OP_NONE] * 3),
+                                 quant_mask=jnp.asarray(0.0), **kw)
+    assert abs(float(lp0 - lp_m) - float(lq0)) < 1e-6
+    assert abs(float(e0 - e_m) - float(eq)) < 1e-6
+    assert float(ar_m) == float(ar0)
+    # 2-class masked categorical over [0, logit] matches the Bernoulli
     for test_logit in [-2.5, 0.0, 1.8]:
         z_test = jnp.stack([0.0, test_logit])
         for target_idx in (0, 1):
-            lp_cat, e_cat = _cat_logp_ent(z_test, dm_both, jnp.array(target_idx))
+            lp_cat, e_cat = _cat_logp_ent(z_test, jnp.array([1.0, 1.0]),
+                                          jnp.array(target_idx))
             lp_bern, e_bern = _bern_logp_ent(test_logit, target_idx > 0)
             assert abs(float(lp_cat) - float(lp_bern)) < 1e-6
             assert abs(float(e_cat) - float(e_bern)) < 1e-6
@@ -273,6 +322,22 @@ def test_approx_profiles_op_legality_and_presets():
     with pytest.raises(ValueError, match="Unknown approx_profile"):
         _op_legality_for_variant("custom", True, True, approx_profile="invalid_profile")
 
+    # THE PROFILE MASKS THE FACE BIT (owner ruling 2026-09-23): `quant`
+    # leaves the bit and none, every other profile switches the bit off.
+    pol, tables = _policy()
+    feats = _features()
+    sizes, quant, pair, comp = _slot_inputs()
+    ff = [pol._face_feats_1(feats, sizes[s]) for s in range(FACE_SLOTS)]
+    for profile, want_bit, want_ops in (
+            ("all", 1.0, [1.0, 1.0, 1.0]), ("quant", 1.0, [0.0, 0.0, 1.0]),
+            ("diag", 0.0, [1.0, 0.0, 1.0]), ("reduce", 0.0, [0.0, 1.0, 1.0]),
+            ("skip", 0.0, [0.0, 0.0, 1.0]), ("none", 0.0, [0.0, 0.0, 1.0])):
+        oo = _op_legality_for_variant("custom", True, True,
+                                      approx_profile=profile)
+        om, *_rest, qm = pol._face_masks(ff, pair, comp, quant, oo, tables)
+        assert float(qm) == want_bit, profile
+        assert np.array_equal(np.asarray(om[0]), want_ops), (profile, om[0])
+
     # Test argparser
     parser = make_argparser()
     args = parser.parse_args(["--approx-profile", "diag"])
@@ -303,7 +368,7 @@ def test_masked_equals_pruned_head_across_all_profiles(profile):
 
     op_override = _op_legality_for_variant("custom", True, True, approx_profile=profile)
     ff = [pol._face_feats_1(feats, sizes[s]) for s in range(FACE_SLOTS)]
-    om, im, jm, am, pair_ok, dm = pol._face_masks(
+    om, im, jm, am, pair_ok, qm = pol._face_masks(
         ff, pair, comp, quant, op_override, tables)
 
     z = pol.head.logits(ctx)
@@ -331,9 +396,19 @@ def test_masked_equals_pruned_head_across_all_profiles(profile):
         ref_lp = np.log(p_skip if int(skip) else 1.0 - p_skip)
         ref_e = -(p_skip * np.log(p_skip) + (1 - p_skip) * np.log(1 - p_skip))
         if int(skip) == 0:
+            q = int(row["quant"])
+            assert q == 0 or float(qm) == 1.0, (profile, k)
+            if float(qm) == 1.0:
+                p_q = 1.0 / (1.0 + np.exp(-zn[O_QUANT]))
+                ref_lp += np.log(p_q if q else 1.0 - p_q)
+                ref_e += -(p_q * np.log(p_q) + (1 - p_q) * np.log(1 - p_q))
             for s in range(FACE_SLOTS):
                 b = slot_base(s)
                 op = int(row["op_type"][s])
+                if q and s in QUANT_SLOTS:
+                    assert op == W_QUANT, (profile, k, s, op)
+                    continue
+                op = int(_OP_HEAD[op])
                 legal_op = np.asarray(om[s]) > 0.5
                 assert legal_op[op], (profile, s, op)
                 l, e, _ = _pruned_cat(zn[b + S_OP:b + S_I], legal_op, op)
@@ -360,16 +435,8 @@ def test_masked_equals_pruned_head_across_all_profiles(profile):
                     ref_lp += l
                     ref_e += e
                     fidx = int(np.flatnonzero(kinds == int(row["compress_kind"][s]))[0])
-                    l, e, _ = _pruned_cat(zn[b + S_RFN:b + S_DTYPE],
+                    l, e, _ = _pruned_cat(zn[b + S_RFN:b + SLOT_WIDTH],
                                           np.ones(NUM_REDUCE_FNS, bool), fidx)
-                    ref_lp += l
-                    ref_e += e
-                elif op == OP_QUANT:
-                    legal_dt = np.asarray(dm[s]) > 0.5
-                    assert legal_dt.any()
-                    dti = int(face_dtype_idx_of(int(row["quant_dtype"][s])))
-                    l, e, _ = _pruned_cat(zn[b + S_DTYPE:b + SLOT_WIDTH],
-                                          legal_dt, dti)
                     ref_lp += l
                     ref_e += e
                 else:
@@ -424,27 +491,32 @@ def test_tlm_sampled_action_zero_rejection():
                     pair[f], comp[f], jnp.asarray(1.0),
                     face_context=ctx, face_sizes_f=sizes[f], face_quant_f=quant[f])
 
+                if int(row["quant"]):
+                    # the bit lands on BOTH operand slots, and only where
+                    # the narrow float is a legal cast on both
+                    requested_ops["quant"] += 1
+                    for s in QUANT_SLOTS:
+                        assert int(row["op_type"][s]) == W_QUANT, (v, f, s)
+                        assert bool(quant[f, s, FACE_QUANT_NARROW] > 0.5), (
+                            v, f, s)
+                    applied_ops["quant"] += 1
                 for s in range(FACE_SLOTS):
                     op = int(row["op_type"][s])
-                    if op == OP_BLOCKDIAG:
+                    if op == W_DIAG:
                         i = int(row["i"][s])
                         j = int(row["j"][s])
                         requested_ops["diag"] += 1
                         assert bool(pair[f, s, i, j] > 0.5), (v, f, s, i, j)
                         applied_ops["diag"] += 1
-                    elif op == OP_REDUCE:
+                    elif op == W_COMPRESS:
                         a = int(row["i"][s])
                         requested_ops["reduce"] += 1
                         assert bool(comp[f, s, a] > 0.5), (v, f, s, a)
                         applied_ops["reduce"] += 1
-                    elif op == OP_QUANT:
-                        dt = int(row["quant_dtype"][s])
-                        dt_idx = int(face_dtype_idx_of(dt))
-                        requested_ops["quant"] += 1
-                        assert bool(quant[f, s, dt_idx] > 0.5), (v, f, s, dt, dt_idx)
-                        applied_ops["quant"] += 1
+                    elif op == W_QUANT:
+                        assert int(row["quant"]) == 1 and s in QUANT_SLOTS
                     else:
-                        assert op == OP_NONE
+                        assert op == W_END
 
     assert tested_faces > 0
     for op_name in ("diag", "reduce", "quant"):

@@ -540,7 +540,7 @@ def test_the_offset_lands_on_the_same_logits_the_init_bias_writes():
     import numpy as _np
     from alphagrad.approx.common.agent_factory import face_logit_offset_vector
     from alphagrad.approx.unified_face_head import (
-        FACE_SLOTS, OP_NONE, O_SKIP, S_OP, slot_base)
+        FACE_SLOTS, OP_NONE, O_QUANT, O_SKIP, S_OP, slot_base)
 
     agent, head = _tiny_agent()
     vec = _np.asarray(face_logit_offset_vector(agent, 1.25, 0.75))
@@ -548,6 +548,7 @@ def test_the_offset_lands_on_the_same_logits_the_init_bias_writes():
     want = {slot_base(s, head.layout) + S_OP + OP_NONE: 1.25
             for s in range(FACE_SLOTS)}
     want[O_SKIP] = -0.75
+    want[O_QUANT] = -1.25
     for i, v in enumerate(vec):
         assert abs(float(v) - want.get(i, 0.0)) < 1e-6, (i, v)
     # zero deltas mean no offset at all, which is a one-graph run

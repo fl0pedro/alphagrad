@@ -125,11 +125,14 @@ def apply_face_none_bias(agent, bias: float, skip_bias: float | None = None):
         return agent
     import equinox as _eqx
     from alphagrad.approx.unified_face_head import (
-        FACE_SLOTS as _FS, OP_NONE as _NONE, O_SKIP as _SKIP,
-        S_OP as _SOP, slot_base as _slot_base)
+        FACE_SLOTS as _FS, OP_NONE as _NONE, O_QUANT as _QUANT,
+        O_SKIP as _SKIP, S_OP as _SOP, slot_base as _slot_base)
     _bias = _fpp.head.proj.layers[-1].bias
     for _s in range(_FS):
         _bias = _bias.at[_slot_base(_s) + _SOP + _NONE].add(_nb)
+    # The per-face quant bit is an approximation like a slot's non-none pick,
+    # so the identity init pushes it down by the same B.
+    _bias = _bias.at[_QUANT].add(-_nb)
     _bias = _bias.at[_SKIP].add(-_skb)
     agent = _eqx.tree_at(
         lambda a: a.face_path_policy.head.proj.layers[-1].bias,
@@ -165,8 +168,8 @@ def face_logit_offset_vector(agent, d_none: float, d_skip: float):
     """
     import jax.numpy as _jnp
     from alphagrad.approx.unified_face_head import (
-        FACE_SLOTS as _FS, OP_NONE as _NONE, O_SKIP as _SKIP,
-        S_OP as _SOP, slot_base as _slot_base)
+        FACE_SLOTS as _FS, OP_NONE as _NONE, O_QUANT as _QUANT,
+        O_SKIP as _SKIP, S_OP as _SOP, slot_base as _slot_base)
     _dn, _ds = float(d_none), float(d_skip)
     if _dn == 0.0 and _ds == 0.0:
         return None
@@ -181,31 +184,57 @@ def face_logit_offset_vector(agent, d_none: float, d_skip: float):
     _v = _jnp.zeros((_width,), _jnp.float32)
     for _s in range(_FS):
         _v = _v.at[_slot_base(_s, _fpp.head.layout) + _SOP + _NONE].add(_dn)
+    _v = _v.at[_QUANT].add(-_dn)
     _v = _v.at[_SKIP].add(-_ds)
     return _v
 
 
+def _expected_approx(F: float, S: int, k: int, B: float) -> float:
+    """E[A] under none-bias ``B``: per face, the quant bit fires with
+    ``sigmoid(-B)`` and then counts one approximation while forcing the two
+    operand slots to none; every other slot picks a non-none op with
+    ``k / (e^B + k)``."""
+    import math
+    from alphagrad.approx.unified_face_head import QUANT_SLOTS
+    p_q = 1.0 / (1.0 + math.exp(B))
+    p_op = k / (math.exp(B) + k)
+    n_free = S - len(QUANT_SLOTS)
+    return F * ((1.0 - p_q) * S * p_op + p_q * (1.0 + n_free * p_op))
+
+
 def derive_face_none_bias(F: float, S: int, k: int, a: float) -> float:
-    """B = ln(F*S*k/a - k), the none-logit bias whose expected requested
-    approximations per plan is ``a`` (--face-init-approx-per-plan), given
-    ``F`` live faces, ``S`` slots/face and ``k`` non-none ops/slot. Raises
-    when ``a`` makes the log undefined (a <= 0, or a >= F*S -- more
-    approximations than there are slots to hold them, one non-none pick
-    per slot being the ceiling no finite bias can exceed)."""
+    """The none-logit bias ``B`` whose expected requested approximations per
+    plan is ``a`` (--face-init-approx-per-plan), given ``F`` live faces,
+    ``S`` slots/face and ``k`` non-none ops/slot -- the inverse of
+    :func:`expected_face_counts`' E[A], found by bisection because the quant
+    bit's term makes the closed form ``ln(F*S*k/a - k)`` the slot-only
+    approximation. Raises when ``a`` is unreachable (a <= 0, or a >= F*S --
+    more approximations than there are slots to hold them, one non-none
+    pick per slot being the ceiling no finite bias can exceed)."""
     F, a = float(F), float(a)
     if a <= 0.0:
         raise ValueError(
             f"--face-init-approx-per-plan {a!r} must be > 0.")
-    x = F * S * k / a - k
-    if x <= 0.0:
+    if a >= F * S:
         raise ValueError(
             f"--face-init-approx-per-plan {a!r} is unreachable at F={F:g} "
-            f"faces, S={S} slots, k={k} ops: F*S*k/a - k = {x:g} <= 0, so "
-            f"ln(x) is undefined. a must be < F*S (={F * S:g} here); a "
-            "this large asks for more approximations than there are "
-            "slots to offer them in.")
-    import math
-    return math.log(x)
+            f"faces, S={S} slots, k={k} ops: a must be < F*S (={F * S:g} "
+            "here); a this large asks for more approximations than there "
+            "are slots to offer them in.")
+    lo, hi = -60.0, 60.0
+    if not (_expected_approx(F, S, k, hi) < a < _expected_approx(F, S, k, lo)):
+        raise ValueError(
+            f"--face-init-approx-per-plan {a!r} is unreachable at F={F:g} "
+            f"faces, S={S} slots, k={k} ops: E[A] spans "
+            f"[{_expected_approx(F, S, k, hi):g}, "
+            f"{_expected_approx(F, S, k, lo):g}] over B in [{lo:g}, {hi:g}].")
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        if _expected_approx(F, S, k, mid) > a:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
 
 
 def derive_face_skip_bias(F: float, kappa: float) -> float:
@@ -231,10 +260,10 @@ def expected_face_counts(F: float, S: int, k: int, B: float,
                          Bs: float) -> tuple[float, float]:
     """``(E[A], E[K])`` -- expected requested approximations and skips per
     plan under none-bias ``B`` and skip-bias ``Bs``, F live faces, S
-    slots/face, k non-none ops/slot. The closed forms
+    slots/face, k non-none ops/slot, the per-face quant bit at ``-B``.
     :func:`derive_face_none_bias` / :func:`derive_face_skip_bias` invert."""
     import math
-    e_a = F * S * k / (math.exp(B) + k)
+    e_a = _expected_approx(float(F), S, k, float(B))
     e_k = F / (1.0 + math.exp(Bs))
     return e_a, e_k
 
@@ -346,14 +375,16 @@ def face_init_start_block(args, F, order_name: str, B, Bs, order=None):
          f"--face-init-skips-per-plan kappa = "
          f"{'unset' if kappa is None else f'{float(kappa):g}'}"),
         (f"{FACE_INIT_TAG} B  = "
-         + ("ln(F*S*k/a - k)" if a is not None else "--face-none-bias")
-         + f" = {_B:.6f}   (the +B on each slot's OP_NONE logit)"),
+         + ("E[A]^-1(a)" if a is not None else "--face-none-bias")
+         + f" = {_B:.6f}   (the +B on each slot's OP_NONE logit, the -B "
+         f"on the face's QUANT logit)"),
         (f"{FACE_INIT_TAG} Bs = "
          + ("ln(F/kappa - 1)" if kappa is not None else
             "--face-skip-bias" if getattr(args, "face_skip_bias", None)
             is not None else "B (unset: SKIP gets -B)")
          + f" = {_Bs:.6f}   (the -Bs on the face's SKIP logit)"),
-        (f"{FACE_INIT_TAG} E[A] = F*S*k/(exp(B)+k) = "
+        (f"{FACE_INIT_TAG} E[A] = F*((1-q)*S*p + q*(1+(S-2)*p)), "
+         f"p = k/(exp(B)+k), q = 1/(1+exp(B)) = "
          + ("not defined without F" if e_a is None else f"{e_a:.6f}")
          + " requested approximations/plan"),
         (f"{FACE_INIT_TAG} E[K] = F/(1+exp(Bs)) = "
