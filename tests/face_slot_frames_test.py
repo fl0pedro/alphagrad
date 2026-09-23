@@ -516,7 +516,12 @@ def test_the_slot_probe_is_a_pure_read_and_memoized():
         lf.face_slot_legality(order, specs, n, total_v)
     st = lf.consume_stats()
     # ONE probe: the single engine has one dispatch mode (dsnn-3qm.65).
-    assert st["slot_probe"] == 1, st
+    # Since dsnn-dfw.131 that one elimination is the chunk stream's, which the
+    # chunk above already made, or one probe on the fallback path. The three
+    # later calls are memo hits and eliminate nothing.
+    assert st["slot_onelim"] + st["slot_onelim_fallback"] == 1, st
+    assert st["slot_probe"] == st["slot_onelim_fallback"], st
+    assert st["elims"] == 0, st
     assert st["slot_hit"] == 3, st
     after = lf.chunk(order, specs, n, total_v, vspecs, rows, skips, 0)
     for a, b in zip(before, after):

@@ -87,3 +87,33 @@ def test_perceptron_random_skip_and_quant_identical(kind):
     assert sn.stats["slot_probe"] == sn.stats["slot_onelim_fallback"]
     assert sn.stats["count_onelim"] > 0
     assert sn.stats["elims"] <= so.stats["elims"]
+
+
+def test_the_shared_count_still_refuses_a_vertex_wider_than_the_wire():
+    from types import SimpleNamespace
+    from alphagrad.approx import live_faces as LF
+    from alphagrad.approx.env import wire_slots
+
+    tk = SimpleNamespace(ij=SimpleNamespace(faces=lambda v: []))
+    s = LF.LiveFaceStream.__new__(LF.LiveFaceStream)
+    s.max_faces = 64
+    s.stats = {"failures": 0}
+    s.slot_one_elim = True
+    s._tokenizer_at = lambda *a, **k: tk
+    order, specs = np.zeros((3,), np.int32), np.zeros((3, 1, 3), np.int32)
+
+    def hist(w):
+        return (-np.ones((3, w, wire_slots(), 3), np.int32),
+                np.zeros((3, w), np.int32))
+
+    frh, fsh = hist(3)
+    st = SimpleNamespace(tk=tk, keys=[(i, i + 1) for i in range(5)])
+    key = ((order[:2].tobytes(), specs[:2].tobytes(), 1, None)
+           + LF._hist_key_parts(frh, fsh, 2))
+    s._onelim = {key: st}
+    with pytest.raises(RuntimeError, match="face wire"):
+        s.n_faces(order, specs, 2, 1, frh, fsh)
+    frh8, fsh8 = hist(8)
+    s._onelim = {key[:4] + LF._hist_key_parts(frh8, fsh8, 2): st}
+    assert s.n_faces(order, specs, 2, 1, frh8, fsh8) == 5
+    assert s.stats["count_onelim"] == 2
