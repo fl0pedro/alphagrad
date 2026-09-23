@@ -9698,12 +9698,15 @@ def main(args=None):
 
     # ---- per-FACE token chunks (--live-faces) -------------------------
     # One callback per face. It replays the elimination prefix (cached) and
-    # re-eliminates the CURRENT vertex with faces 0..f-1 carrying their
-    # decided approximations, returning the tokens emitted between the
-    # previous decision and this one. graphax has no resumable elimination,
-    # so re-running is the only way to reach face f's contraction with face
-    # f-1's approximation in place; the prefix is replayed once per distinct
-    # prefix, so the cost is n_faces eliminations per env step.
+    # returns the tokens emitted between the previous decision and this one:
+    # face f-1's approximation followed by face f's contraction, as the full
+    # elimination with faces 0..f-1 decided would emit them. The faces of one
+    # vertex do not depend on each other (owner ruling 2026-09-23), so the
+    # stream eliminates the CURRENT vertex once per environment and step with
+    # no face decided, and per face only eliminates face f-1 alone again when
+    # its decision is not exact (live_faces "ONE ELIMINATION PER VERTEX",
+    # dsnn-dfw.119). The prefix is replayed once per distinct prefix.
+    # ALPHAGRAD_FACE_ONE_ELIM=0 restores one full elimination per face.
     _LIVE_FACES = None
     _live_face = _live_face_count = None
     _live_face_for = None
