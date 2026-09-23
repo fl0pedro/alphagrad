@@ -66,7 +66,7 @@ from init_scheme_test import _agent, _ns                         # noqa: E402
 
 from alphagrad.approx import unified_face_head as _ufh           # noqa: E402
 from alphagrad.approx.unified_face_head import (                 # noqa: E402
-    FACE_SLOTS, NUM_APPROX_OPS, OP_NONE, O_SKIP, S_OP, set_logit_clamp,
+    FACE_SLOTS, NUM_APPROX_OPS, OP_NONE, O_QUANT, O_SKIP, S_OP, set_logit_clamp,
     slot_base)
 
 #: The campaign arm's own values (fq_smoke_C_tlm.sbatch, job 66201).
@@ -157,7 +157,7 @@ def test_none_probability_is_the_softmax_tilt_under_the_campaign_clamp(
     agent = _campaign_agent(bias)
     _, p_none = _skip_and_none(agent, _ctx(agent))
     b = CAMPAIGN_CLAMP * np.tanh(bias / CAMPAIGN_CLAMP)
-    want = float(np.exp(b) / (np.exp(b) + 3.0))
+    want = float(np.exp(b) / (np.exp(b) + 2.0))
     for s, p in enumerate(p_none):
         assert p == pytest.approx(want, rel=1e-4), (bias, s, p)
         # Never a point mass: the head must keep mass on the three classes.
@@ -170,8 +170,9 @@ def test_none_probability_is_the_softmax_tilt_under_the_campaign_clamp(
 def test_the_bias_shifts_the_logits_by_exactly_b_on_a_real_latent(
         bias, clamp):
     """The bias is ADDITIVE, so on ONE context the only difference between
-    the bias-0 head and the bias-B head is +B on the three OP_NONE logits and
-    -B on the skip logit. Asserted on a real (non-zero) latent, with the
+    the bias-0 head and the bias-B head is +B on the three OP_NONE logits,
+    -B on the skip logit and -B on the quant bit. Asserted on a real
+    (non-zero) latent, with the
     clamp OFF so the comparison is on the raw head.
 
     This is the assertion the run falsifies at the level of behaviour: at
@@ -186,6 +187,7 @@ def test_the_bias_shifts_the_logits_by_exactly_b_on_a_real_latent(
     zb = np.asarray(ab.face_path_policy.head.logits(ctx))
     want = np.zeros_like(z0)
     want[O_SKIP] = -bias
+    want[O_QUANT] = -bias
     for s in range(FACE_SLOTS):
         want[slot_base(s) + S_OP + OP_NONE] = bias
     np.testing.assert_allclose(zb - z0, want, atol=1e-4)

@@ -72,7 +72,7 @@ def _carry_first_order(env):
             + sorted((v for v in valid if not mask[v - 1]), reverse=True))
 
 
-def _carry_wires(lm, env, order, row=None, skip=False):
+def _carry_wires(lm, env, order, row=None, skip=False, slots=(0,)):
     jx = env.config.jaxpr
     mask = CP.carry_scope_mask(jx)
     inv = lm.face_inventory(env, np.asarray(order, dtype=np.int32))
@@ -83,8 +83,8 @@ def _carry_wires(lm, env, order, row=None, skip=False):
     if skip:
         return [{"k": int(e["k"]), "f": int(e["f"]), "kind": "SKIP"}
                 for e in picked]
-    return [{"k": int(e["k"]), "f": int(e["f"]), "slot": 0,
-             "row": list(row), "kind": "X"} for e in picked]
+    return [{"k": int(e["k"]), "f": int(e["f"]), "slot": int(s),
+             "row": list(row), "kind": "X"} for e in picked for s in slots]
 
 
 def _plans(lm, env, order):
@@ -94,7 +94,8 @@ def _plans(lm, env, order):
         "diag": _carry_wires(lm, env, order, [0, 0, -1]),
         "quant": _carry_wires(lm, env, order,
                               [envmod.QUANT_SENTINEL,
-                               QUANT_DTYPES.index("bfloat16"), 0]),
+                               QUANT_DTYPES.index("bfloat16"), 0],
+                              slots=(0, 1)),
         "skip": _carry_wires(lm, env, order, skip=True),
     }
 

@@ -105,11 +105,12 @@ def _n_faces(jaxpr, consts, args, vertex):
     return len(list(tk.ij.faces(int(vertex))))
 
 
-def _first_applied_site(jaxpr, consts, args, row, slot=0):
-    """``(vertex, face)`` of the first site where ``row`` in ``slot`` really
+def _first_applied_site(jaxpr, consts, args, row, slots=(0, 1)):
+    """``(vertex, face)`` of the first site where ``row`` in ``slots`` really
     applies, i.e. really emits a block. Skipped when the target offers none --
     a test that silently passes on a vertex where nothing applied would be
-    asserting nothing."""
+    asserting nothing. A QUANT row sits on BOTH contraction slots (owner
+    ruling 2026-09-23: a face Quant is two-sided)."""
     from alphagrad.approx.env import wire_slots
 
     S = wire_slots()
@@ -120,7 +121,8 @@ def _first_applied_site(jaxpr, consts, args, row, slot=0):
             continue
         for f in range(nf):
             rows = _exact_rows(max(nf, 1), S)
-            rows[f, slot] = row
+            for s in slots:
+                rows[f, s] = row
             skips = np.zeros((max(nf, 1),), np.int32)
             try:
                 _tk, _toks, segs = _step(jaxpr, consts, args, v, rows, skips)
@@ -136,27 +138,30 @@ def _first_applied_site(jaxpr, consts, args, row, slot=0):
 # --------------------------------------------------------------------------
 
 def test_an_applied_slot_rule_emits_exactly_one_approximation_block():
-    """The decision reaches the stream: one block, on the slot it hit, with the
-    type and the arguments the wire asked for."""
+    """The decision reaches the stream: one block on the face, with the type
+    and the arguments the wire asked for. A face QUANT is two-sided, so it is
+    recorded on lhs and rhs and read once as the face's ``~ <dtype>``."""
+    from graphax.sparse.micro_actions import QUANT_DTYPE_INDEX
+
     jaxpr, consts, args = _perceptron()
     site = _first_applied_site(jaxpr, consts, args, _quant_row())
     assert site is not None, (
-        "no vertex of this graph applied a QUANT on the lhs slot, so there is "
-        "no applied rule to read a block off")
+        "no vertex of this graph applied a QUANT on both contraction slots, "
+        "so there is no applied rule to read a block off")
     vertex, f, rows, skips = site
 
     tk, toks, segs = _step(jaxpr, consts, args, vertex, rows, skips)
     recs = list(tk.ij.step_faces(0))[f].approx
-    assert len(recs) == 1, (
-        f"vertex {vertex} face {f} recorded {len(recs)} approximations for one "
-        f"wire row: {[(r.atype, r.slot) for r in recs]}")
-    assert recs[0].atype == "QUANT"
-    assert recs[0].params == {"dtype": "bfloat16"}
-    assert recs[0].slot == "lhs"
+    assert [(r.atype, r.slot) for r in recs] == [
+        ("QUANT", "lhs"), ("QUANT", "rhs")], (
+        f"vertex {vertex} face {f} recorded {len(recs)} approximations for "
+        f"one two-sided wire row: {[(r.atype, r.slot) for r in recs]}")
+    assert all(r.params == {"dtype": "bfloat16"} for r in recs)
 
     start, split, end = segs[f]
     assert end > split, "the applied rule left no approximation part"
-    assert tk.decode(toks[split:end]).startswith("approxQUANTd#bfloat16^^")
+    assert tk.decode(toks[split:end]).startswith(
+        f"approx~{QUANT_DTYPE_INDEX['bfloat16']}^^")
 
     # Every OTHER face of the same vertex stays silent: the row was placed on
     # one face and a block on a second one would mean a rule leaked sideways.
@@ -217,7 +222,7 @@ def test_an_identity_decision_counts_as_a_no_op_skip_and_emits_no_block():
     nf = _n_faces(jaxpr, consts, args, vertex)
     S = wire_slots()
     rows = _exact_rows(nf, S)
-    rows[f, 0] = _quant_row("float32")      # the dtype it already carries
+    rows[f, 0] = rows[f, 1] = _quant_row("float32")   # the dtype it carries
     skips = np.zeros((nf,), np.int32)
 
     _PER_FACE_STATS.clear()
@@ -317,7 +322,7 @@ def test_the_stored_chunk_of_the_next_face_opens_on_the_decided_rules_block():
         if nf < 2:
             continue
         rows = _exact_rows(max(nf, 8), S)
-        rows[0, 0] = row
+        rows[0, 0] = rows[0, 1] = row
         skips = np.zeros((max(nf, 8),), np.int32)
         try:
             _tk, _toks, segs = _step(jaxpr, consts, args, v, rows, skips)
