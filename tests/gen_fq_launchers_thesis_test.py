@@ -1001,9 +1001,11 @@ def test_every_export_in_a_thesis_launcher_is_allowed(gen, matrix, smoke):
     for a in matrix + smoke:
         exported = set(_EXPORT.findall(gen.render(a)))
         assert exported <= allowed, (a["name"], sorted(exported - allowed))
-        # the campaign's whole set is always there; the target shape only on
-        # the NeuralNetwork arms
-        assert set(gen.CAMPAIGN_ENV_ALLOWED) <= exported, a["name"]
+        # the campaign's whole set is always there but the compile cache,
+        # which a free-order row does not export (owner ruling 2026-09-23);
+        # the target shape only on the NeuralNetwork arms
+        assert (set(gen.CAMPAIGN_ENV_ALLOWED)
+                - {k for k, _ in gen.JAX_CACHE_ENV}) <= exported, a["name"]
         if a.get("thesis_target") == "nn256":
             assert "ALPHAGRAD_NN_HIDDEN" in exported, a["name"]
         else:
