@@ -2619,7 +2619,8 @@ def _memory_analysis_bytes(compiled) -> float | None:
 # whose compiled memory_analysis() (temp + argument + output bytes) exceeds
 # this fraction of its device's memory is refused before its first execution.
 # The trace's stored-byte tally is not a peak: 116 GB stored ran with 17 GB of temporaries.
-STATIC_PEAK_FRACTION = 0.25
+# 1.0 of bytes_limit is three fourths of the card: XLA preallocates 75 percent (job 67639: 76.5 of 102.6 GB).
+STATIC_PEAK_FRACTION = 1.0
 _DEVICE_BYTES_LIMIT: dict = {}
 _STATIC_GATE_OFF_NOTED: list = []
 
@@ -8426,6 +8427,19 @@ def _decode_vertex_transforms(config, o_list, specs_list):
     return transforms, tok_rules_by_v
 
 
+def _is_oom(exc: BaseException) -> bool:
+    if isinstance(exc, MemoryError):
+        return True
+    txt = f"{type(exc).__name__}: {exc}".upper()
+    # A kernel over the SM's shared-memory budget is a compile failure, not device memory (dsnn-dfw.127).
+    if "SHARED MEMORY SIZE LIMIT EXCEEDED" in txt:
+        return False
+    return any(k in txt for k in (
+        "RESOURCE_EXHAUSTED", "OUT OF MEMORY", "OUT_OF_MEMORY",
+        "OOM WHEN ALLOCATING", "CUDA_ERROR_OUT_OF_MEMORY",
+    ))
+
+
 def _callback(
     config: EnvConfig,
     args,
@@ -9277,15 +9291,6 @@ def _callback_measured(
     # Caught here (compile) and around execution below. `_is_oom` matches on
     # the XLA error text because jaxlib raises a generic XlaRuntimeError for
     # RESOURCE_EXHAUSTED rather than a dedicated class.
-    def _is_oom(exc: BaseException) -> bool:
-        if isinstance(exc, MemoryError):
-            return True
-        txt = f"{type(exc).__name__}: {exc}".upper()
-        return any(k in txt for k in (
-            "RESOURCE_EXHAUSTED", "OUT OF MEMORY", "OUT_OF_MEMORY",
-            "OOM WHEN ALLOCATING", "CUDA_ERROR_OUT_OF_MEMORY",
-        ))
-
     def _is_graphax_trace_failure(exc: BaseException) -> bool:
         """True when the exception was RAISED INSIDE graphax.
 
@@ -9408,7 +9413,7 @@ def _callback_measured(
         print(f"[trunc] oom-static step={int(stop)} order={o_list} "
               f"static_peak_bytes={_gate['static_peak_bytes']:.0f} > "
               f"limit_bytes={_gate['static_peak_limit_bytes']:.0f} "
-              f"(1/4 of {_gate['device_bytes_limit']} on {_gate_dev!r}; "
+              f"(bytes_limit {_gate['device_bytes_limit']} on {_gate_dev!r}; "
               f"refused, excluded from gradient)", flush=True)
         _tr = _truncated_reward()
         _log_refused("oom-static", _tr, detail=_gate)
