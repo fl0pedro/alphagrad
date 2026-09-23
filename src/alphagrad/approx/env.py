@@ -2274,6 +2274,7 @@ def plan_log_attempt() -> int:
 #: `_record_plan`, which is the one choke point every record passes through.
 #: `None` on every target that carries no temporal edge.
 _PLAN_CARRY: list = [None]
+_PLAN_CARRY_BYTES: list = [None]
 
 
 def _record_plan(rec: dict) -> None:
@@ -2307,6 +2308,8 @@ def _record_plan(rec: dict) -> None:
         rec["carry_container"] = str(_PLAN_CARRY[0])
     elif _pos and _pos.get("carry") is not None:
         rec["carry_container"] = str(_pos["carry"])
+    if _PLAN_CARRY_BYTES[0] is not None:
+        rec["carry_bytes"] = int(_PLAN_CARRY_BYTES[0])
     _PLAN_RECORDS.append(rec)
 
 
@@ -7650,6 +7653,38 @@ def face_slot_sites() -> tuple[tuple[str, ...], ...]:
     return tuple(tuple(g) for g in got)
 
 
+def check_face_quant_rows(rows_f, *, where: str = "") -> None:
+    """Raise unless the QUANT rows of ONE face's ``(S, 3)`` wire sit on the
+    lhs AND rhs contraction slots with one dtype, or on neither.
+
+    A face Quant is a narrow contraction (owner ruling 2026-09-23): graphax
+    refuses a Quant on one contraction slot only (``FaceTransformIllegal``),
+    and the head writes its one per-face bit onto both slots. This is the
+    alphagrad side of that contract, at the one seam every wire row passes
+    on its way to a graphax entry, so a one-sided row from a replayed plan,
+    a hand-built plan or a transport raises here with the face named, before
+    a graph is eliminated under it. The ``new`` slot and the learned slots
+    are not the contraction operands and are left alone.
+    """
+    from alphagrad.approx.unified_face_head import QUANT_SLOTS
+    rows_f = np.asarray(rows_f)
+    lhs, rhs = (rows_f[s] for s in QUANT_SLOTS)
+    ql, qr = int(lhs[0]) == QUANT_SENTINEL, int(rhs[0]) == QUANT_SENTINEL
+    if ql != qr:
+        raise ValueError(
+            f"{where}: a QUANT row on the "
+            f"{'lhs' if ql else 'rhs'} contraction slot only "
+            f"(lhs {lhs.tolist()}, rhs {rhs.tolist()}). A face Quant narrows "
+            f"BOTH operands (owner ruling 2026-09-23); the head writes its "
+            f"quant bit on lhs and rhs, and graphax refuses the one-sided "
+            f"form.")
+    if ql and int(lhs[1]) != int(rhs[1]):
+        raise ValueError(
+            f"{where}: the QUANT rows name two dtypes (lhs {lhs.tolist()}, "
+            f"rhs {rhs.tolist()}). A face Quant is ONE dtype on both "
+            f"contraction operands.")
+
+
 def wire_slots_of_rows(rows) -> int:
     """The slot count of a ``(F, S, 3)`` wire-row array, CHECKED.
 
@@ -7776,6 +7811,7 @@ def _face_dict_for_vertex(config, ij, v, face_row, face_skip,
                 make_slot_frame_hook(one_row[0], stats=_PER_FACE_STATS,
                                      gated=True)
                 if one_row[0][0] != -1 else None)
+        check_face_quant_rows(face_row[f], where=f"vertex {v} face {f}")
         if any(sl is not None for sl in slots):
             # THE PER-FACE JOIN BIT (#73, --approx-add choose). `face_join` is
             # the wire's (F,) int32 channel: 0 = lossy, 1 = lossless. Under a
@@ -8893,6 +8929,16 @@ def _callback_measured(
                     _carry.eval_samples_for(_carry_container, eval_samples,
                                             _carry_base_cfg))
     _PLAN_CARRY[0] = _carry_container
+    # THE CONTAINER'S AT-REST BYTES ride on the plan record (owner ruling
+    # 2026-09-23, no new reward channel): the given blocks of the program the
+    # plan is measured on, in the container it implied.
+    _PLAN_CARRY_BYTES[0] = None
+    if _carry_container is not None:
+        _c_entry = _carry._entry(_carry_base_cfg)
+        _c_var = _carry.measurement_env(_carry_container, _carry_base_cfg)
+        _PLAN_CARRY_BYTES[0] = _carry.carry_at_rest_bytes(
+            _c_entry["base"] if _c_var is None else _c_var,
+            _c_entry["spec"]["rule"])
     _pf("cb.carry_container")
 
     # ------------------------------------------------------------------

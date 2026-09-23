@@ -209,12 +209,10 @@ def test_the_new_slot_hook_is_installed_at_exactly_one_site(monkeypatch, cfg):
 
 
 from alphagrad.approx.unified_face_head import SLOT_WIDTH as _SW  # noqa: E402
-
-
 @pytest.mark.parametrize("cfg,width,n_slots", [
-    ("lossy", 3 * _SW + 1, 3), ("lossless", 3 * _SW + 1, 3),
-    ("choose", 3 * _SW + 2, 3),
-    ("learned1", 4 * _SW + 1, 4), ("learned2", 5 * _SW + 1, 5)])
+    ("lossy", 3 * _SW + 2, 3), ("lossless", 3 * _SW + 2, 3),
+    ("choose", 3 * _SW + 3, 3),
+    ("learned1", 4 * _SW + 2, 4), ("learned2", 5 * _SW + 2, 5)])
 def test_the_wire_width_is_the_head_width(monkeypatch, cfg, width, n_slots):
     """ONE source of truth for the width, and a mismatch RAISES.
 

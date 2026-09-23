@@ -1621,6 +1621,55 @@ def test_the_wires_travel_by_position_and_the_carry_rows_are_exact(container):
         assert int(k2[pos2[int(v)]].max()) == 0, v
 
 
+@pytest.mark.parametrize("container", ["quant", "diag+quant"])
+def test_the_carry_faces_keep_the_plans_quant_bit(container):
+    """A Quant on the carried face is the narrow container AND the narrow
+    contraction (owner ruling 2026-09-23): every carry vertex of the measured
+    graph gets the plan's own QUANT row on lhs and rhs of every face, while
+    its Diag stays in the value and every body row travels by position."""
+    import alphagrad.approx.env as envmod
+    from alphagrad.approx.unified_face_head import QUANT_SLOTS
+    from alphagrad.approx.unified_face_policy import _NARROW_SLOT
+    lm, CP, env = _env_for("rtrl")
+    valid = sorted(int(v) for v in env.valid_vertices)
+    order = [int(v) for v in sorted(valid, reverse=True)]
+    T = len(order)
+    mf = envmod.MAX_FACES
+    specs = np.full((T, envmod.MAX_RULES_PER_VERTEX, 3), -1, dtype=np.int32)
+    specs[:, :, 2] = 0
+    faces = np.full((T, mf, envmod.FACE_SLOTS, 3), -1, dtype=np.int32)
+    skips = np.zeros((T, mf), dtype=np.int32)
+    q_row = np.array([envmod.QUANT_SENTINEL, int(_NARROW_SLOT), 0], np.int32)
+    for s in QUANT_SLOTS:
+        faces[:, 0, s] = q_row                # face 0 of EVERY vertex
+    if container.startswith("diag"):
+        faces[:, 1, 2] = np.array([0, 0, -1], dtype=np.int32)
+    assert CP.container_for_plan(env.config, order, faces, skips) == container
+    var = CP.measurement_env(container)
+    o2, s2, f2, k2, j2 = CP.transport_wires(order, var, specs, faces, skips,
+                                            None)
+    vmap = var["vertex_map"]
+    pos2 = {int(v): i for i, v in enumerate(o2)}
+    for k, v in enumerate(order):
+        j = vmap.get(v)
+        if j is None:
+            continue
+        np.testing.assert_array_equal(f2[pos2[j]], faces[k])
+    n_carry = 0
+    for v in var["alt_carry"]:
+        if int(v) not in pos2:
+            continue
+        n_carry += 1
+        rows = f2[pos2[int(v)]]
+        for f in range(mf):
+            for s in QUANT_SLOTS:
+                np.testing.assert_array_equal(rows[f, s], q_row)
+            assert rows[f, 2, 0] == -1
+            envmod.check_face_quant_rows(rows[f], where=f"carry {v} face {f}")
+        assert int(k2[pos2[int(v)]].max()) == 0
+    assert n_carry > 0
+
+
 # ---------------------------------------------------------------------------
 # 16. ONE JAXPR FOR BOTH PATHS (ticket dsnn-dfw.24)
 # ---------------------------------------------------------------------------

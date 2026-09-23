@@ -98,10 +98,11 @@ _SENTINEL_EDGE = SENTINEL_COST * 0.99
 # the floor describe a head that is not running, and G3 then compares the
 # entropy against the wrong number in a direction nobody notices.
 from alphagrad.approx.unified_face_head import (  # noqa: E402
-    FACE_SLOTS, MAX_PAIR_IDX, NUM_REDUCE_AXES, NUM_REDUCE_FNS, SLOT_WIDTH,
+    FACE_SLOTS, MAX_PAIR_IDX, NUM_REDUCE_AXES, NUM_REDUCE_FNS, O_SLOT0,
+    QUANT_SLOTS, SLOT_WIDTH,
     head_layout)
 from alphagrad.approx.common.masks import (  # noqa: E402
-    FACE_QUANT_DTYPES, NUM_FACE_QUANT_DTYPES)
+    FACE_QUANT_DTYPES, FACE_QUANT_NARROW, NUM_FACE_QUANT_DTYPES)
 
 #: The ``--approx-add`` value whose layout the floor is computed under when
 #: the caller names none.  ``lossless`` is the one value every 2026-09-13
@@ -168,7 +169,7 @@ FIELD_TABLE: tuple[tuple[str, str, str, str], ...] = (
     ("gate/g3/n_outcomes_max", "count", "largest legal joint-outcome count of any face", "G3"),
     ("gate/g3/n_slots", "count", "slots the floor was summed over: head_layout(--approx-add).n_slots, never a literal", "G3"),
     ("gate/g3/head_width", "count", "head_layout(--approx-add).width, the logit count the floor describes", "G3"),
-    ("gate/g3/n_quant_dtypes", "count", "len(masks.FACE_QUANT_DTYPES): the QUANT categorical the floor counts leaves of", "G3"),
+    ("gate/g3/n_quant_dtypes", "count", "len(masks.FACE_QUANT_DTYPES): the two-name menu the face quant bit selects from", "G3"),
     ("gate/g3/mask_source", "0/1/2", "where the legality came from: 0 none, 1 the oracle probe, 2 the live per-slot masks", "G3"),
     # G4
     ("gate/g4/n", "count", "live records with a finite quality", "G4"),
@@ -661,25 +662,25 @@ def face_head_geometry(approx_add: str = APPROX_ADD_DEFAULT) -> dict:
     Every number here comes from ``unified_face_head`` (the layout table
     ``_LAYOUT_SPEC``, the per-slot field offsets) or from
     ``common.masks.FACE_QUANT_DTYPES``.  Nothing is typed, so a width change
-    -- a fourth QUANT dtype, a join slot, another reduce fn -- moves the G3
-    floor with it instead of leaving G3 comparing the head's entropy against
-    the arithmetic of a head that stopped running.
+    -- a join slot, another reduce fn -- moves the G3 floor with it instead
+    of leaving G3 comparing the head's entropy against the arithmetic of a
+    head that stopped running.
 
-    ``n_quant_default`` is the number of legal QUANT dtypes on a face whose
-    mask says only "QUANT is legal here" without saying which casts: the
-    operand's own dtype is masked (ticket .40 D4; finding 62 measured
-    ``slot_legality.quant == [False, True, True, True]`` over the four
-    floats), so it is ``K - 1``, not 1.
+    The Quant is ONE bit per face (owner ruling 2026-09-23), not a per-slot
+    leaf: a face's outcomes are its slot picks with the bit clear, plus the
+    slot picks of the slots the bit does not force to none with the bit set.
     """
     layout = head_layout(approx_add)
-    if layout.width != O_SLOT0_OFFSET + SLOT_WIDTH * layout.n_slots + int(
+    if layout.width != O_SLOT0 + SLOT_WIDTH * layout.n_slots + int(
             layout.has_choose):
         raise ValueError(
             f"head_layout({approx_add!r}) reports width {layout.width}, which "
-            f"is not 1 + {SLOT_WIDTH}*{layout.n_slots}"
+            f"is not {O_SLOT0} + {SLOT_WIDTH}*{layout.n_slots}"
             f"{' + 1' if layout.has_choose else ''}. The G3 floor counts the "
             f"leaves of THAT arithmetic; a width that does not match it would "
             f"make the floor describe a different head.")
+    leaves = (1 + MAX_PAIR_IDX * (MAX_PAIR_IDX - 1)
+              + NUM_REDUCE_AXES * NUM_REDUCE_FNS)
     return {
         "mode": layout.mode,
         "width": int(layout.width),
@@ -689,20 +690,15 @@ def face_head_geometry(approx_add: str = APPROX_ADD_DEFAULT) -> dict:
         "n_reduce_axes": int(NUM_REDUCE_AXES),
         "n_reduce_fns": int(NUM_REDUCE_FNS),
         "n_quant_dtypes": int(NUM_FACE_QUANT_DTYPES),
-        "n_quant_default": int(NUM_FACE_QUANT_DTYPES) - 1,
         "quant_dtypes": tuple(FACE_QUANT_DTYPES),
+        "quant_slots": tuple(int(s) for s in QUANT_SLOTS),
         # The number of legal joint outcomes per face if EVERY choice of
-        # every slot were legal, skip included.  The upper bound the live
-        # masks cut down; logged so a run states the head it ran.
-        "max_outcomes_per_face": 1 + (
-            1 + MAX_PAIR_IDX * (MAX_PAIR_IDX - 1)
-            + NUM_REDUCE_AXES * NUM_REDUCE_FNS
-            + (NUM_FACE_QUANT_DTYPES - 1)) ** int(layout.n_slots),
+        # every slot were legal, skip and the quant bit included.  The upper
+        # bound the live masks cut down; logged so a run states the head it
+        # ran.
+        "max_outcomes_per_face": 1 + leaves ** int(layout.n_slots)
+        + leaves ** (int(layout.n_slots) - len(QUANT_SLOTS)),
     }
-
-
-#: ``unified_face_head.O_SLOT0`` under a name that says what it is here.
-O_SLOT0_OFFSET = 1
 
 
 def legal_counts_from_slot_masks(pair, comp, quant, n_faces, *,
@@ -723,7 +719,10 @@ def legal_counts_from_slot_masks(pair, comp, quant, n_faces, *,
     ``env.face_slot_sites()``, which follows ``--approx-add``; ``K`` comes
     from the array too.  Nothing here is a literal.
 
-    Returns ``(n_choices (F_live, S) int64, skip_legal (F_live,) bool)``.
+    Returns ``(n_choices (F_live, S) int64, skip_legal (F_live,) bool,
+    quant_legal (F_live,) bool)``: the per-slot structural leaves, and the
+    face's Quant bit legal iff the narrow float is a legal cast on lhs AND
+    rhs -- the same test ``UnifiedFacePolicy._face_masks`` applies.
     """
     geom = face_head_geometry(approx_add)
     pair = np.asarray(pair, dtype=np.float64)
@@ -746,6 +745,7 @@ def legal_counts_from_slot_masks(pair, comp, quant, n_faces, *,
             f"would go uncounted in the G3 floor.")
     d_ok, r_ok, q_ok = _op_override_flags(op_override)
     n = np.ones((nf, S), dtype=np.int64)
+    ql = np.zeros((nf,), dtype=bool)
     for f in range(nf):
         for s in range(S):
             per_slot = 1                      # the None leaf
@@ -755,11 +755,11 @@ def legal_counts_from_slot_masks(pair, comp, quant, n_faces, *,
                 per_slot += int(pm.sum())
             if r_ok:
                 per_slot += int((comp[f, s] > 0.5).sum()) * geom["n_reduce_fns"]
-            if q_ok:
-                per_slot += int((quant[f, s] > 0.5).sum())
             n[f, s] = per_slot
+        ql[f] = q_ok and all(
+            quant[f, s, FACE_QUANT_NARROW] > 0.5 for s in QUANT_SLOTS)
     skip_legal = np.full(nf, bool(face_head_on), dtype=bool)
-    return n, skip_legal
+    return n, skip_legal, ql
 
 
 def _op_override_flags(op_override):
@@ -785,23 +785,24 @@ def legal_counts_from_masks(fpair, fcomp, fvalid, fquant=None,
 
     ``fpair`` (F, N, N) pair legality (already gcd-screened by the env),
     ``fcomp`` (F, N) reduce-axis legality, ``fvalid`` (F,) live faces,
-    ``fquant`` (F,) per-face non-identity Quant legality (None = the
-    hardware default of one legal cast), ``op_override`` the (NUM_OPS,)
-    profile mask in (DIAG, COMPRESS, QUANT, END) order (None = all legal).
+    ``fquant`` (F,) per-face non-identity Quant legality or (F, K) per-dtype
+    legality (None = the hardware default: the narrow cast is legal),
+    ``op_override`` the (NUM_OPS,) profile mask in (DIAG, COMPRESS, QUANT,
+    END) order (None = all legal).
 
     Returns ``(n_choices (F_live, FACE_SLOTS) int64, skip_legal (F_live,)
-    bool)``. Per slot: 1 (None) + Diag pairs (ordered, i != j) + reduce
-    axes x reduce fns + Quant dtypes, each term present only when its op
-    is legal -- exactly the leaves ``UnifiedFaceHead.score`` can reach.
-    The three slots share the face's legality here (the static oracle
-    path); under --face-slot-frames each slot has its own live masks and
-    the floor logged is the static one.
+    bool, quant_legal (F_live,) bool)``. Per slot: 1 (None) + Diag pairs
+    (ordered, i != j) + reduce axes x reduce fns, each term present only
+    when its op is legal -- exactly the leaves ``UnifiedFaceHead.score`` can
+    reach; the Quant bit is a per-FACE leaf beside them. The three slots
+    share the face's legality here (the static oracle path); under
+    --face-slot-frames each slot has its own live masks and the floor logged
+    is the static one.
     """
     geom = face_head_geometry(approx_add)
     n_reduce_fns = (geom["n_reduce_fns"] if n_reduce_fns is None
                     else int(n_reduce_fns))
     n_slots = geom["n_slots"]
-    n_quant_default = geom["n_quant_default"]
     fpair = np.asarray(fpair, dtype=np.float64)
     fcomp = np.asarray(fcomp, dtype=np.float64)
     fvalid = np.asarray(fvalid, dtype=np.float64).reshape(-1)
@@ -816,6 +817,7 @@ def legal_counts_from_masks(fpair, fcomp, fvalid, fquant=None,
         else:
             fq1 = fq.reshape(-1)   # (F,): "QUANT is legal on this face"
     n = np.ones((live.size, n_slots), dtype=np.int64)
+    ql = np.zeros((live.size,), dtype=bool)
     for row, f in enumerate(live):
         per_slot = 1
         if d_ok and fpair.ndim == 3 and f < fpair.shape[0]:
@@ -824,46 +826,50 @@ def legal_counts_from_masks(fpair, fcomp, fvalid, fquant=None,
             per_slot += int(pm.sum())
         if r_ok and fcomp.ndim == 2 and f < fcomp.shape[0]:
             per_slot += int((fcomp[f] > 0.5).sum()) * n_reduce_fns
+        n[row, :] = per_slot
         if q_ok:
             if fq2 is not None:
-                per_slot += int((fq2[f] > 0.5).sum()) if f < fq2.shape[0] else 0
+                ql[row] = bool(f < fq2.shape[0]
+                               and fq2[f, FACE_QUANT_NARROW] > 0.5)
             elif fq1 is not None:
-                # A LEGALITY BIT IS NOT A COUNT.  The oracle's per-face QUANT
-                # array is (F,) -- "some cast is legal here" -- and the head
-                # then offers every dtype but the operand's own, i.e. K - 1
-                # of the four floats.  Adding 1 here (the pre-2026-09-13
-                # code, written when the set was {float32, bfloat16}) states
-                # a floor for a two-dtype head.
-                per_slot += (n_quant_default
-                             if (f < fq1.size and fq1[f] > 0.5) else 0)
+                ql[row] = bool(f < fq1.size and fq1[f] > 0.5)
             else:
-                per_slot += n_quant_default
-        n[row, :] = per_slot
+                ql[row] = True
     skip_legal = np.full(live.size, bool(face_head_on), dtype=bool)
-    return n, skip_legal
+    return n, skip_legal, ql
 
 
-def uniform_floor(n_choices, skip_legal) -> dict:
+def uniform_floor(n_choices, skip_legal, quant_legal=None) -> dict:
     """The face-head entropy at the uniform distribution over legal joint
     outcomes, in the two normalisations the trainer uses.
 
-    Per face f with per-slot counts n_s and P = prod_s n_s, the legal joint
-    outcomes number N_f = [skip legal] + P. The per-face floor is log N_f.
-    The trainer's ``entropy/approx_head`` divides the summed face entropy
-    by the ARITY (one per valid face plus one per non-None slot), so the
-    comparable floor is sum_f log N_f / sum_f E[arity_f] with, under the
-    uniform law, E[arity_f] = 1 + (P / N_f) * sum_s (1 - 1 / n_s).
+    Per face f with per-slot counts n_s, P = prod_s n_s and P' the product
+    over the slots the quant bit does not force to none, the legal joint
+    outcomes number N_f = [skip legal] + P + [quant legal] * P'. The
+    per-face floor is log N_f. The trainer's ``entropy/approx_head`` divides
+    the summed face entropy by the ARITY (one per valid face, one per
+    non-None slot, one for the quant bit), so the comparable floor is
+    sum_f log N_f / sum_f E[arity_f] with, under the uniform law,
+    E[arity_f] = (1 [skip] + P (1 + sum_s (1 - 1/n_s))
+    + [quant] P' (2 + sum_{s free} (1 - 1/n_s))) / N_f.
     """
     n = np.asarray(n_choices, dtype=np.float64)
     if n.ndim != 2 or n.shape[0] == 0:
         return {"per_face": NAN, "arity_norm": NAN, "n_faces": 0,
                 "n_outcomes_max": 0}
     sk = np.asarray(skip_legal, dtype=bool).reshape(-1)
+    ql = (np.zeros(n.shape[0], dtype=bool) if quant_legal is None
+          else np.asarray(quant_legal, dtype=bool).reshape(-1))
     n = np.maximum(n, 1.0)
+    free = np.asarray([s not in QUANT_SLOTS for s in range(n.shape[1])])
     P = np.prod(n, axis=1)
-    N = P + sk.astype(np.float64)
+    Pq = np.prod(n[:, free], axis=1) if free.any() else np.ones(n.shape[0])
+    N = P + sk.astype(np.float64) + ql.astype(np.float64) * Pq
     logN = np.log(N)
-    arity = 1.0 + (P / N) * np.sum(1.0 - 1.0 / n, axis=1)
+    a_plain = P * (1.0 + np.sum(1.0 - 1.0 / n, axis=1))
+    a_quant = ql.astype(np.float64) * Pq * (
+        2.0 + np.sum(1.0 - 1.0 / n[:, free], axis=1))
+    arity = (sk.astype(np.float64) + a_plain + a_quant) / N
     return {"per_face": float(logN.mean()),
             "arity_norm": float(logN.sum() / arity.sum()),
             "n_faces": int(n.shape[0]),
@@ -874,7 +880,8 @@ def uniform_floor(n_choices, skip_legal) -> dict:
 MASK_SOURCE_NONE, MASK_SOURCE_ORACLE, MASK_SOURCE_LIVE_SLOTS = 0, 1, 2
 
 
-def g3_face_entropy(face_entropy_nats, n_choices=None, skip_legal=None, *,
+def g3_face_entropy(face_entropy_nats, n_choices=None, skip_legal=None,
+                    quant_legal=None, *,
                     approx_add: str = APPROX_ADD_DEFAULT,
                     mask_source: int = MASK_SOURCE_NONE) -> dict:
     """G3: the head's entropy against the floor of the head that ran.
@@ -885,7 +892,7 @@ def g3_face_entropy(face_entropy_nats, n_choices=None, skip_legal=None, *,
     looking valid.
     """
     geom = face_head_geometry(approx_add)
-    fl = (uniform_floor(n_choices, skip_legal)
+    fl = (uniform_floor(n_choices, skip_legal, quant_legal)
           if n_choices is not None and skip_legal is not None
           else {"per_face": NAN, "arity_norm": NAN, "n_faces": 0,
                 "n_outcomes_max": 0})
@@ -1465,9 +1472,10 @@ def episode_fields(records, *, head_names, all_rets=None, reward_names=None,
     out.update(explained_variance_per_head(
         None if not critic else critic.get("targets"),
         None if not critic else critic.get("predictions"), head_names))
-    n_choices, skip_legal = (legal if legal is not None else (None, None))
+    n_choices, skip_legal, quant_legal = (
+        legal if legal is not None else (None, None, None))
     out.update(g3_face_entropy(face_entropy_nats, n_choices, skip_legal,
-                               approx_add=approx_add,
+                               quant_legal, approx_add=approx_add,
                                mask_source=mask_source))
     out.update(g4_quality_fractions(pr["quality"][live], quality_floor))
     prefs = env_preferences(critic)

@@ -2040,6 +2040,7 @@ class FacePathPolicy(eqx.Module):
         from alphagrad.approx.face_action import FaceAction
         fa = FaceAction(
             skip=jnp.stack(skips),
+            quant=jnp.zeros((F,), jnp.int32),
             op_type=_stack("op_type"), i=_stack("i"), j=_stack("j"),
             exponents=_stack("exponents"), factor=_stack("factor"),
             compress_kind=_stack("compress_kind"),

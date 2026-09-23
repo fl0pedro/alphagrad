@@ -534,20 +534,29 @@ def transport_wires(o_list, variant, rule_specs, face_specs, face_skips,
     51, and the compact container's graph has no such pair.
 
     So the wires travel by POSITION. Each step-body vertex keeps its own rows
-    at its new position in the transported order, and the variant's carry
-    vertices get all-exact rows -- their approximation is what chose the
-    container, and it is realized in the value and in the store. The caller
-    then enumerates the faces on the VARIANT's own replay, which is what
+    at its new position in the transported order. The variant's carry
+    vertices keep ONE decision of the plan's carry faces: the Quant bit
+    (owner ruling 2026-09-23). A Quant on the carried face is the narrow
+    container AND the narrow contraction, so every face of every carry vertex
+    gets the plan's own QUANT row on lhs and rhs -- the row is copied, dtype
+    column and all -- whenever the plan put a Quant on any carried face. Diag
+    and Reduce keep travelling in the value only: their rows on the carry
+    vertices stay exact, because they are what chose the container and the
+    container realizes them in the store. The caller then enumerates the
+    faces on the VARIANT's own replay, which is what
     ``_face_transforms_for_order`` does on the policy's graph.
 
     Returns ``(order, rule_specs, face_specs, face_skips, face_joins)``, the
     last four as arrays of the same widths they came in with.
     """
+    from alphagrad.approx.env import QUANT_SENTINEL
+    from alphagrad.approx.unified_face_head import QUANT_SLOTS
     order = transport_order(o_list, variant)
     pos = {}
     for k, v in enumerate(order):
         pos.setdefault(int(v), k)
     vmap = variant["vertex_map"]
+    valid = variant["valid"]
 
     rs = np.asarray(rule_specs)
     fs = np.asarray(face_specs)
@@ -560,10 +569,21 @@ def transport_wires(o_list, variant, rule_specs, face_specs, face_skips,
     sk2 = np.zeros((T,) + sk.shape[1:], dtype=np.int32)
     jn2 = None if jn is None else np.zeros((T,) + jn.shape[1:], dtype=np.int32)
 
+    quant_row = None
     for k, v in enumerate(o_list):
         j = vmap.get(int(v))
         if j is None:
-            continue                       # a carry vertex: nothing travels
+            # A CARRY VERTEX OF THE POLICY'S GRAPH. Its Diag / Reduce / Skip
+            # chose the container and travel in the value; its Quant is the
+            # narrow contraction too, and the plan's own row carries it.
+            if k < fs.shape[0]:
+                for f in range(fs.shape[1]):
+                    if k < sk.shape[0] and int(sk[k][f]) == 1:
+                        continue
+                    lhs = fs[k][f][QUANT_SLOTS[0]]
+                    if int(lhs[0]) == QUANT_SENTINEL and quant_row is None:
+                        quant_row = tuple(int(x) for x in lhs)
+            continue
         k2 = pos.get(j)
         if k2 is None:
             # A STEP-BODY VERTEX THE VARIANT DOES NOT ELIMINATE. The
@@ -585,4 +605,28 @@ def transport_wires(o_list, variant, rule_specs, face_specs, face_skips,
         sk2[k2] = sk[k]
         if jn2 is not None:
             jn2[k2] = jn[k]
+    if quant_row is not None:
+        for j in variant["alt_carry"]:
+            if j not in valid:
+                continue
+            k2 = pos[int(j)]
+            for s in QUANT_SLOTS:
+                fs2[k2, :, s] = quant_row
     return order, rs2, fs2, sk2, jn2
+
+
+def carry_at_rest_bytes(variant_or_entry, rule: str) -> int:
+    """The bytes the carried value occupies in its container: the given
+    blocks of the measured program, the way they arrive at the step.
+
+    The given tuple LEADS with the reference weights under ``rtrl``
+    (``rsnn_shd.carry_under_plan``: three weights, then the blocks); those
+    are the run's own weights in every container and are not part of the
+    carry, so they are not counted.
+    """
+    from alphagrad.approx.common.rsnn_shd import RSNN_HEAD_SLOTS
+    args = tuple(variant_or_entry["args"])
+    given = args[RSNN_HEAD_SLOTS:]
+    if str(rule) == "rtrl":
+        given = given[3:]
+    return int(sum(int(np.asarray(x).nbytes) for x in given))

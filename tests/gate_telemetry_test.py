@@ -351,33 +351,33 @@ def test_g2_appended_head_and_non_finite_rows():
 # ---------------------------------------------------------------------------
 def test_g3_legal_counts_mirror_the_head_leaves():
     ep = _fake_episode()
-    n, skip_legal = ep["legal"]
+    n, skip_legal, quant_legal = ep["legal"]
     G = gt.face_head_geometry()
-    # face 0: 1 (None) + 2 ordered pairs + 2 axes x REDUCE_FNS + the legal
-    # QUANT casts; face 1: 1 + 0 + 1 axis x REDUCE_FNS + 0; face 2 not live.
-    # EVERY TERM IS DERIVED.  A fourth QUANT dtype or a sixth reduce fn moves
-    # both the head and this expectation; a literal here would let the floor
-    # go on describing the head that stopped running.
-    f0 = 1 + 2 + 2 * G["n_reduce_fns"] + G["n_quant_default"]
-    f1 = 1 + 0 + 1 * G["n_reduce_fns"] + 0
+    # face 0: 1 (None) + 2 ordered pairs + 2 axes x REDUCE_FNS; face 1: 1 +
+    # 0 + 1 axis x REDUCE_FNS; face 2 not live. The QUANT is ONE bit per face
+    # (owner ruling 2026-09-23), legal on face 0 and not on face 1.
+    # EVERY TERM IS DERIVED.  A sixth reduce fn moves both the head and this
+    # expectation; a literal here would let the floor go on describing the
+    # head that stopped running.
+    f0 = 1 + 2 + 2 * G["n_reduce_fns"]
+    f1 = 1 + 0 + 1 * G["n_reduce_fns"]
     assert n.tolist() == [[f0] * G["n_slots"], [f1] * G["n_slots"]]
     assert skip_legal.tolist() == [True, True]
+    assert quant_legal.tolist() == [True, False]
 
 
 def test_g3_geometry_is_derived_from_the_head_layout_not_typed():
-    from alphagrad.approx.unified_face_head import head_layout, _LAYOUT_SPEC
+    from alphagrad.approx.unified_face_head import (
+        QUANT_SLOTS, head_layout, _LAYOUT_SPEC)
     from alphagrad.approx.common.masks import FACE_QUANT_DTYPES
     for mode in sorted(_LAYOUT_SPEC):
         G = gt.face_head_geometry(mode)
         lay = head_layout(mode)
         assert G["width"] == lay.width
         assert G["n_slots"] == lay.n_slots
-        assert G["n_quant_dtypes"] == len(FACE_QUANT_DTYPES)
-        # The owner's 2026-09-13 ruling: the dtype field is a FOUR-way
-        # categorical and the operand's own dtype is masked, so a face whose
-        # mask says only "QUANT is legal" offers K - 1 casts.
-        assert G["n_quant_default"] == len(FACE_QUANT_DTYPES) - 1
+        assert G["n_quant_dtypes"] == len(FACE_QUANT_DTYPES) == 2
         assert G["quant_dtypes"] == tuple(FACE_QUANT_DTYPES)
+        assert G["quant_slots"] == tuple(QUANT_SLOTS)
     with pytest.raises(ValueError):
         gt.face_head_geometry("no-such-approx-add")
 
@@ -392,50 +392,68 @@ def test_g3_floor_follows_the_slot_count_of_the_running_width():
     fpair = np.ones((1, N, N))
     fcomp = np.ones((1, 9))
     for mode in ("lossless", "learned1", "learned2"):
-        n, sk = gt.legal_counts_from_masks(
-            fpair, fcomp, np.ones(1), np.ones(1), None, approx_add=mode)
+        n, sk, ql = gt.legal_counts_from_masks(
+            fpair, fcomp, np.ones(1), np.zeros(1), None, approx_add=mode)
         G = gt.face_head_geometry(mode)
         assert n.shape == (1, G["n_slots"])
-        fl = gt.uniform_floor(n, sk)
+        assert ql.tolist() == [False]
+        fl = gt.uniform_floor(n, sk, ql)
         assert fl["n_outcomes_max"] == 1 + int(n[0, 0]) ** G["n_slots"]
+        # with the bit legal the outcomes with it set come on top: the slots
+        # it does not force to none, freely chosen
+        n, sk, ql = gt.legal_counts_from_masks(
+            fpair, fcomp, np.ones(1), np.ones(1), None, approx_add=mode)
+        assert ql.tolist() == [True]
+        fl = gt.uniform_floor(n, sk, ql)
+        assert fl["n_outcomes_max"] == (
+            1 + int(n[0, 0]) ** G["n_slots"]
+            + int(n[0, 0]) ** (G["n_slots"] - len(G["quant_slots"])))
 
 
-def test_g3_a_quant_legality_bit_is_not_a_count():
-    """The oracle's per-face QUANT array is (F,) -- 'some cast is legal' --
-    and the head then offers every dtype but the operand's own.  Counting it
-    as ONE choice is the K = 2 arithmetic; under the four floats it
-    understates the floor on every face that allows QUANT."""
+def test_g3_a_quant_legality_bit_is_one_leaf_per_face():
+    """The face's Quant is ONE bit: the oracle's (F,) array says whether it
+    is legal, an (F, K) row says so through the narrow float's column, and
+    neither adds a per-slot leaf."""
+    from alphagrad.approx.common.masks import FACE_QUANT_NARROW
     N = 6
     fpair = np.zeros((1, N, N))
     fcomp = np.zeros((1, N))
     G = gt.face_head_geometry()
-    n, _ = gt.legal_counts_from_masks(fpair, fcomp, np.ones(1), np.ones(1))
-    assert n[0, 0] == 1 + G["n_quant_default"]
-    # An explicit (F, K) row is taken literally: two legal casts, not K - 1.
+    n, _, ql = gt.legal_counts_from_masks(fpair, fcomp, np.ones(1), np.ones(1))
+    assert n[0, 0] == 1 and ql.tolist() == [True]
     per_dtype = np.zeros((1, G["n_quant_dtypes"]))
-    per_dtype[0, 1] = per_dtype[0, 2] = 1.0
-    n, _ = gt.legal_counts_from_masks(fpair, fcomp, np.ones(1), per_dtype)
-    assert n[0, 0] == 1 + 2
+    per_dtype[0, FACE_QUANT_NARROW] = 1.0
+    n, _, ql = gt.legal_counts_from_masks(fpair, fcomp, np.ones(1), per_dtype)
+    assert n[0, 0] == 1 and ql.tolist() == [True]
+    per_dtype[0, FACE_QUANT_NARROW] = 0.0
+    per_dtype[0, 1 - FACE_QUANT_NARROW] = 1.0      # the exact entry only
+    n, _, ql = gt.legal_counts_from_masks(fpair, fcomp, np.ones(1), per_dtype)
+    assert n[0, 0] == 1 and ql.tolist() == [False]
     # QUANT illegal on this face: nothing added.
-    n, _ = gt.legal_counts_from_masks(fpair, fcomp, np.ones(1), np.zeros(1))
-    assert n[0, 0] == 1
+    n, _, ql = gt.legal_counts_from_masks(fpair, fcomp, np.ones(1), np.zeros(1))
+    assert n[0, 0] == 1 and ql.tolist() == [False]
 
 
-def test_g3_live_slot_masks_count_each_slot_and_each_dtype():
+def test_g3_live_slot_masks_count_each_slot_and_the_bit_on_both_operands():
     """The live path (--live-faces, every campaign arm) hands per-SLOT,
-    per-DTYPE masks; the floor reads both axes off the array."""
+    per-DTYPE masks; the floor reads the structural leaves per slot and the
+    face bit off the narrow float's column on lhs AND rhs."""
+    from alphagrad.approx.common.masks import FACE_QUANT_NARROW
     G = gt.face_head_geometry()
-    F, S, N, K = 2, G["n_slots"], 6, G["n_quant_dtypes"]
+    F, S, N, K = 3, G["n_slots"], 6, G["n_quant_dtypes"]
     pair = np.zeros((F, S, N, N))
     comp = np.zeros((F, S, N))
     quant = np.zeros((F, S, K))
     pair[0, 0, 0, 1] = 1.0                 # one ordered pair, slot 0 only
     comp[0, 1, :2] = 1.0                   # two reduce axes, slot 1 only
-    quant[0, 2, 1:] = 1.0                  # K - 1 casts, slot 2 only
-    n, sk = gt.legal_counts_from_slot_masks(pair, comp, quant, F)
-    assert n[0].tolist()[:3] == [2, 1 + 2 * G["n_reduce_fns"], 1 + (K - 1)]
+    quant[0, :, FACE_QUANT_NARROW] = 1.0   # bf16 legal on every slot: bit on
+    quant[1, 0, FACE_QUANT_NARROW] = 1.0   # lhs only: bit off
+    quant[2, 2, FACE_QUANT_NARROW] = 1.0   # the new slot only: bit off
+    n, sk, ql = gt.legal_counts_from_slot_masks(pair, comp, quant, F)
+    assert n[0].tolist()[:3] == [2, 1 + 2 * G["n_reduce_fns"], 1]
     assert n[1].tolist() == [1] * S        # face 1: nothing legal but None
-    assert sk.tolist() == [True, True]
+    assert sk.tolist() == [True, True, True]
+    assert ql.tolist() == [True, False, False]
     with pytest.raises(ValueError):
         gt.legal_counts_from_slot_masks(pair[0], comp, quant, F)
 
@@ -446,11 +464,17 @@ def test_g3_profile_override_removes_classes():
     fcomp = np.zeros((1, N)); fcomp[0, 0] = 1.0
     fvalid = np.ones(1)
     only_reduce = np.array([0.0, 1.0, 0.0, 1.0])        # DIAG, COMPRESS, QUANT, END
-    n, _ = gt.legal_counts_from_masks(fpair, fcomp, fvalid, np.ones(1), only_reduce)
+    n, _, ql = gt.legal_counts_from_masks(fpair, fcomp, fvalid, np.ones(1), only_reduce)
     assert n.tolist() == [[6, 6, 6]]                    # 1 + 1 axis x 5 fns
+    assert ql.tolist() == [False]
     skip_only = np.array([0.0, 0.0, 0.0, 1.0])
-    n, _ = gt.legal_counts_from_masks(fpair, fcomp, fvalid, np.ones(1), skip_only)
+    n, _, ql = gt.legal_counts_from_masks(fpair, fcomp, fvalid, np.ones(1), skip_only)
     assert n.tolist() == [[1, 1, 1]]
+    assert ql.tolist() == [False]
+    only_quant = np.array([0.0, 0.0, 1.0, 1.0])
+    n, _, ql = gt.legal_counts_from_masks(fpair, fcomp, fvalid, np.ones(1), only_quant)
+    assert n.tolist() == [[1, 1, 1]]
+    assert ql.tolist() == [True]
 
 
 def test_g3_uniform_floor_arithmetic():
@@ -468,28 +492,42 @@ def test_g3_uniform_floor_arithmetic():
     fl = gt.uniform_floor(np.array([[1, 1, 1]]), np.array([True]))
     assert fl["per_face"] == pytest.approx(math.log(2))
     assert fl["arity_norm"] == pytest.approx(math.log(2))
+    # THE QUANT BIT: (2, 2, 2), skip legal, bit legal. The outcomes with the
+    # bit set leave only the new slot free: N = 1 + 8 + 2 = 11. Arity: the
+    # skip 1, the 8 plain outcomes 1 + 3/2 each, the 2 quant outcomes
+    # 2 + 1/2 each (the face, the bit, the new slot half the time).
+    fl = gt.uniform_floor(np.array([[2, 2, 2]]), np.array([True]),
+                          np.array([True]))
+    assert fl["n_outcomes_max"] == 11
+    assert fl["per_face"] == pytest.approx(math.log(11))
+    e_ar = (1 + 8 * 2.5 + 2 * 2.5) / 11
+    assert fl["arity_norm"] == pytest.approx(math.log(11) / e_ar)
 
 
 def test_g3_everything_legal_floor_is_the_width_s_own_arithmetic():
     """The floor of a face on which every choice is legal, stated from the
-    LAYOUT.  Under the 2026-09-13 head (103 logits = 1 + 34*3, the four-float
-    QUANT categorical) that is 1 + 30 ordered pairs + 9 x 5 reduce + 3 casts
-    = 79 per slot, N = 1 + 79^3.  The assertion is written against
-    ``face_head_geometry`` so it MOVES WITH THE LAYOUT: if the table changes
-    and the floor code does not, ``max_outcomes_per_face`` and the counted
-    floor disagree and this test fails."""
+    LAYOUT.  Under the 2026-09-23 head (89 logits = 2 + 29*3, one quant bit
+    per face) that is 1 + 30 ordered pairs + 9 x 5 reduce = 76 per slot,
+    N = 1 + 76^3 + 76^1 (the bit set leaves the new slot free).  The
+    assertion is written against ``face_head_geometry`` so it MOVES WITH THE
+    LAYOUT: if the table changes and the floor code does not,
+    ``max_outcomes_per_face`` and the counted floor disagree and this test
+    fails."""
     N = 6
     fpair = np.ones((1, N, N))
     fcomp = np.ones((1, 9))
     G = gt.face_head_geometry()
-    n, sk = gt.legal_counts_from_masks(fpair, fcomp, np.ones(1), np.ones(1), None)
+    n, sk, ql = gt.legal_counts_from_masks(
+        fpair, fcomp, np.ones(1), np.ones(1), None)
     per_slot = (1 + G["n_pair_idx"] * (G["n_pair_idx"] - 1)
-                + G["n_reduce_axes"] * G["n_reduce_fns"] + G["n_quant_default"])
+                + G["n_reduce_axes"] * G["n_reduce_fns"])
     assert n.tolist() == [[per_slot] * G["n_slots"]]
-    fl = gt.uniform_floor(n, sk)
+    assert ql.tolist() == [True]
+    fl = gt.uniform_floor(n, sk, ql)
     assert fl["n_outcomes_max"] == G["max_outcomes_per_face"]
-    assert fl["per_face"] == pytest.approx(
-        math.log(1 + per_slot ** G["n_slots"]))
+    assert fl["per_face"] == pytest.approx(math.log(
+        1 + per_slot ** G["n_slots"]
+        + per_slot ** (G["n_slots"] - len(G["quant_slots"]))))
 
 
 def test_g3_fields_compare_entropy_to_the_floor():

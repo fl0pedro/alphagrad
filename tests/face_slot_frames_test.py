@@ -37,6 +37,7 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("ALPHAGRAD_SKIP_COST_ANALYSIS", "1")
 os.environ.setdefault("ALPHAGRAD_SKIP_COUNT_OPS", "1")
 
+import equinox as eqx                                           # noqa: E402
 import jax                                                      # noqa: E402
 import jax.numpy as jnp                                         # noqa: E402
 import jax.random as jrand                                      # noqa: E402
@@ -582,12 +583,15 @@ def test_masked_head_equals_pruned_head_per_slot():
     The reference re-derives every categorical from the raw logits ``z`` and
     the per-slot legal sets ``face_slot_legality`` would supply; the head's
     branch rule (only the fields the chosen op consumes count) is applied on
-    both sides.
+    both sides. The face's quant bit is ONE Bernoulli behind the skip, legal
+    iff the narrow float is legal on lhs AND rhs; with it set the two operand
+    slots contribute nothing (their rows ARE the QUANT rows).
     """
     from alphagrad.approx.unified_face_head import (
-        NUM_REDUCE_FNS, OP_BLOCKDIAG, OP_NONE, OP_QUANT, OP_REDUCE, S_AXIS,
-        SLOT_WIDTH, S_DTYPE, S_I, S_J, S_OP, S_RFN, j_mask_given_i, slot_base)
-    from alphagrad.approx.unified_micro import face_dtype_idx_of, _KIND_MAP
+        NUM_REDUCE_FNS, OP_BLOCKDIAG, OP_NONE, OP_REDUCE, O_QUANT, QUANT_SLOTS,
+        S_AXIS, SLOT_WIDTH, S_I, S_J, S_OP, S_RFN, j_mask_given_i, slot_base)
+    from alphagrad.approx.unified_micro import _KIND_MAP
+    from alphagrad.approx.heads import OP_QUANT as WIRE_QUANT
     kinds = np.asarray(_KIND_MAP)
     # The reference inverts fn -> compress_kind, as evaluate_face does.
     assert len(set(kinds.tolist())) == len(kinds), kinds
@@ -596,21 +600,27 @@ def test_masked_head_equals_pruned_head_per_slot():
     feats = _features()
     sizes, quant, pair, comp = _slot_inputs()
     ctx = jnp.asarray(np.linspace(-1, 1, pol.embd_dim, dtype=np.float32))
-    om, im, jm, am, pair_ok, dm = pol._face_masks(
+    om, im, jm, am, pair_ok, qm = pol._face_masks(
         [pol._face_feats_1(feats, sizes[s]) for s in range(FACE_SLOTS)],
         pair, comp, quant, None, tables)
     # Slot-dependent legal sets: what D3 is about.
     assert not np.array_equal(np.asarray(om[0]), np.asarray(om[1]))
     assert float(om[1][OP_BLOCKDIAG]) == 0.0 and float(om[0][OP_BLOCKDIAG]) == 1.0
-    assert float(om[2][OP_QUANT]) == 0.0 and float(om[1][OP_QUANT]) == 1.0
+    # the bit is legal: bf16 is a legal cast on lhs (slot 0) and rhs (slot 1)
+    assert float(qm) == 1.0
     for s in range(FACE_SLOTS):      # axis head is NUM_REDUCE_AXES (9) wide
         assert np.array_equal(np.asarray(am[s] > 0.5)[:N_AX],
                               np.asarray(comp[s] > 0.5)), s
         assert not bool(am[s][N_AX:].any())
 
+    # push the bit up so both arms are covered in 24 draws
+    pol = eqx.tree_at(
+        lambda p: p.head.proj.layers[-1].bias, pol,
+        pol.head.proj.layers[-1].bias.at[O_QUANT].add(1.5))
     z = pol.head.logits(ctx)
     zn = np.asarray(z, np.float64)
     checked = 0
+    n_quant = 0
     for k in range(24):
         (skip, row, lp, ent, _ar, _sp, _od) = pol.sample_face(
             feats, tables, jrand.PRNGKey(100 + k), 0,
@@ -627,9 +637,17 @@ def test_masked_head_equals_pruned_head_per_slot():
         ref_lp = np.log(p_skip if int(skip) else 1.0 - p_skip)
         ref_e = -(p_skip * np.log(p_skip) + (1 - p_skip) * np.log(1 - p_skip))
         if int(skip) == 0:
+            q = int(row["quant"])
+            n_quant += q
+            p_q = 1.0 / (1.0 + np.exp(-zn[O_QUANT]))
+            ref_lp += np.log(p_q if q else 1.0 - p_q)
+            ref_e += -(p_q * np.log(p_q) + (1 - p_q) * np.log(1 - p_q))
             for s in range(FACE_SLOTS):
                 b = slot_base(s)
                 op = int(row["op_type"][s])
+                if q and s in QUANT_SLOTS:
+                    assert op == WIRE_QUANT, (k, s, op)
+                    continue
                 legal_op = np.asarray(om[s]) > 0.5
                 assert legal_op[op], (s, op)
                 l, e, _ = _pruned_cat(zn[b + S_OP:b + S_I], legal_op, op)
@@ -657,16 +675,8 @@ def test_masked_head_equals_pruned_head_per_slot():
                     ref_e += e
                     fidx = int(np.flatnonzero(
                         kinds == int(row["compress_kind"][s]))[0])
-                    l, e, _ = _pruned_cat(zn[b + S_RFN:b + S_DTYPE],
+                    l, e, _ = _pruned_cat(zn[b + S_RFN:b + SLOT_WIDTH],
                                           np.ones(NUM_REDUCE_FNS, bool), fidx)
-                    ref_lp += l
-                    ref_e += e
-                elif op == OP_QUANT:
-                    legal_dt = np.asarray(dm[s]) > 0.5
-                    assert legal_dt.any()
-                    dti = int(face_dtype_idx_of(int(row["quant_dtype"][s])))
-                    l, e, _ = _pruned_cat(zn[b + S_DTYPE:b + SLOT_WIDTH],
-                                          legal_dt, dti)
                     ref_lp += l
                     ref_e += e
                 else:
@@ -675,6 +685,7 @@ def test_masked_head_equals_pruned_head_per_slot():
         assert abs(float(ent) - ref_e) < 2e-4, (k, float(ent), ref_e)
         checked += 1
     assert checked == 24
+    assert 0 < n_quant < 24, n_quant
 
 
 def _as_face_action(row, skip, F=4):
@@ -687,6 +698,7 @@ def _as_face_action(row, skip, F=4):
 
     return FaceAction(
         skip=jnp.zeros((F,), jnp.int32).at[0].set(jnp.asarray(skip)),
+        quant=_pad(row["quant"]),
         op_type=_pad(row["op_type"]), i=_pad(row["i"]), j=_pad(row["j"]),
         exponents=_pad(row["exponents"]), factor=_pad(row["factor"]),
         compress_kind=_pad(row["compress_kind"]),
@@ -752,7 +764,7 @@ def test_rank_2_inputs_take_the_pre_ticket_broadcast_path():
     assert pol._slot_inputs(feats, fpv, fcv, qhw, None, None) is None
     single = pol._face_masks(pol._face_feats_1(feats, sz), fpv, fcv, qhw,
                              None, tables)
-    for m in single:
+    for m in single[:5]:
         for s in range(1, FACE_SLOTS):
             assert bool(jnp.all(m[s] == m[0]))
     per = pol._slot_inputs(feats, jnp.broadcast_to(fpv, (FACE_SLOTS, n, n)),

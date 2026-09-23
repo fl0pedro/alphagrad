@@ -90,8 +90,9 @@ from alphagrad.approx.env import FACE_SLOTS, MAX_FACES, _face_dict_for_vertex
 from alphagrad.approx.heads import AXIS_TAG_BITS, AxisTokenFeatures, \
     precompute_factor_tables
 from alphagrad.approx.live_faces import LiveFaceStream, _SLOT_SITES
-from alphagrad.approx.unified_face_head import (
-    OP_BLOCKDIAG, OP_NONE, OP_QUANT, OP_REDUCE)
+from alphagrad.approx.heads import (
+    OP_COMPRESS as W_COMPRESS, OP_DIAG as W_DIAG, OP_END as W_END,
+    OP_QUANT as W_QUANT)
 from alphagrad.approx.unified_face_policy import UnifiedFacePolicy
 from alphagrad.approx.common.masks import NUM_FACE_QUANT_DTYPES
 from alphagrad.elimrl.baselines import tlm_target
@@ -99,7 +100,7 @@ from alphagrad.elimrl.baselines import tlm_target
 N_AX = 8
 N_SAMPLES = 5
 KINDS = ("diag", "compress", "quant")
-_OP_KIND = {OP_BLOCKDIAG: "diag", OP_REDUCE: "compress", OP_QUANT: "quant"}
+_OP_KIND = {W_DIAG: "diag", W_COMPRESS: "compress", W_QUANT: "quant"}
 
 
 def _closed(fn, xs):
@@ -225,12 +226,12 @@ def _row_to_wire(op, i, j, axis, dtype_idx, n_out):
     """The (op, fields) the head chose -> the ``[bi1, bi2, factor]`` wire row.
     ``None`` when the head's pair has no wire form, which is NOT a rejection:
     the engine marks the row unused too (``diag_used & ~same_side``)."""
-    if op == OP_BLOCKDIAG:
+    if op == W_DIAG:
         bi = _diag_wire(i, j, n_out)
         return None if bi is None else (bi[0], bi[1], -1)
-    if op == OP_REDUCE:
+    if op == W_COMPRESS:
         return (int(envmod.COMPRESS_SENTINEL), int(axis), 0)
-    if op == OP_QUANT:
+    if op == W_QUANT:
         return (int(envmod.QUANT_SENTINEL), int(dtype_idx), 0)
     return (-1, -1, 0)
 
@@ -340,6 +341,11 @@ def _walk_one_graph(target, seed, slots_on=None, pass_="vertex"):
             if slots_on is not None and _SLOT_SITES[s] not in slots_on:
                 return None
             key = jrand.PRNGKey(seed * 1000003 + _n * 97 + f)
+            # THE FACE QUANT BIT IS OFF in the per-slot walks: it reads the
+            # lhs AND rhs rows (owner ruling 2026-09-23) and this harness has
+            # only the current slot's row in hand, so a bit drawn here would
+            # land on one operand slot and the env refuses that. The bit is
+            # exercised by the joint-draw tests (face_quant_bit_test).
             # SLICED TO THE CONTRACTION BAND, like face_driver does: the policy
             # builds per-slot features for the three contraction slots only.
             _skip, op_t, ii, jj, dt = draw_jit(
@@ -347,9 +353,9 @@ def _walk_one_graph(target, seed, slots_on=None, pass_="vertex"):
                 jnp.asarray(pair[f][:FACE_SLOTS]),
                 jnp.asarray(comp[f][:FACE_SLOTS]),
                 jnp.asarray(sizes[f][:FACE_SLOTS]),
-                jnp.asarray(quant[f][:FACE_SLOTS]))
+                jnp.zeros_like(jnp.asarray(quant[f][:FACE_SLOTS])))
             op = int(np.asarray(op_t)[s])
-            if op == OP_NONE:
+            if op == W_END:
                 return None
             ii, jj, dt = np.asarray(ii), np.asarray(jj), np.asarray(dt)
             w = _row_to_wire(op, ii[s], jj[s], ii[s], dt[s], L.n_out)
@@ -493,9 +499,9 @@ def _walk(target, seed, slots_on=None):
                 jnp.asarray(pair[f][:FACE_SLOTS]),
                 jnp.asarray(comp[f][:FACE_SLOTS]),
                 jnp.asarray(sizes[f][:FACE_SLOTS]),
-                jnp.asarray(quant[f][:FACE_SLOTS]))
+                jnp.zeros_like(jnp.asarray(quant[f][:FACE_SLOTS])))
             op = int(np.asarray(op_t)[s])
-            if op == OP_NONE:
+            if op == W_END:
                 return None
             ii, jj, dt = np.asarray(ii), np.asarray(jj), np.asarray(dt)
             w = _row_to_wire(op, ii[s], jj[s], ii[s], dt[s], L.n_out)
@@ -747,9 +753,9 @@ def _walk_join_slots(target, seed, arm):
             _sk, op_t, ii, jj, dt = draw_jit(
                 key, f, _rep(L.pair.astype(np.float32)),
                 _rep(L.comp.astype(np.float32)), _rep(L.sizes),
-                _rep(L.quant.astype(np.float32)))
+                _rep(np.zeros_like(L.quant, np.float32)))
             op = int(np.asarray(op_t)[0])
-            if op == OP_NONE:
+            if op == W_END:
                 return None
             ii, jj, dt = np.asarray(ii), np.asarray(jj), np.asarray(dt)
             w = _row_to_wire(op, ii[0], jj[0], ii[0], dt[0], L.n_out)
@@ -1383,9 +1389,9 @@ def test_the_structural_contraction_is_the_apply_paths_own(target_name, tlm,
             key = jrand.PRNGKey(_n * 97 + f)
             _sk, op_t, ii, jj, dt = draw_jit(
                 key, f, jnp.asarray(pair[f]), jnp.asarray(comp[f]),
-                jnp.asarray(sizes[f]), jnp.asarray(quant[f]))
+                jnp.asarray(sizes[f]), jnp.zeros_like(jnp.asarray(quant[f])))
             op = int(np.asarray(op_t)[s])
-            if op == OP_NONE:
+            if op == W_END:
                 return None
             ii, jj, dt = np.asarray(ii), np.asarray(jj), np.asarray(dt)
             return _row_to_wire(op, ii[s], jj[s], ii[s], dt[s], L.n_out)

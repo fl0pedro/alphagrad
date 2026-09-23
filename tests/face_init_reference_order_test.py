@@ -123,14 +123,22 @@ def test_nn256_reference_order_face_count(nn256_env):
     assert F == NN256_F_REVERSE
 
 
+def _rung1_pair():
+    return (derive_face_none_bias(NN256_F_REVERSE, S, K, RUNG1_A),
+            derive_face_skip_bias(NN256_F_REVERSE, RUNG1_KAPPA))
+
+
 def test_the_rung1_targets_derive_the_biases_the_launchers_run_with():
-    """a = 3 approximations and kappa = 0.3 skips per plan at F = 21."""
-    B = derive_face_none_bias(NN256_F_REVERSE, S, K, RUNG1_A)
-    Bs = derive_face_skip_bias(NN256_F_REVERSE, RUNG1_KAPPA)
-    assert B == pytest.approx(math.log(21 * 3 * 3 / 3 - 3))
+    """a = 3 approximations and kappa = 0.3 skips per plan at F = 21.
+
+    Since the owner ruling of 2026-09-23 the head has k = 2 non-none ops per
+    slot and ONE quant bit per face at -B, so B is the bisection inverse of
+    E[A] rather than ln(F*S*k/a - k) (4.094345 on the four-way head); Bs is
+    untouched."""
+    B, Bs = _rung1_pair()
     assert Bs == pytest.approx(math.log(21 / 0.3 - 1))
-    assert B == pytest.approx(4.094345, abs=1e-6)
     assert Bs == pytest.approx(4.234107, abs=1e-6)
+    assert B > math.log(21 * 3 * K / 3 - K)
     e_a, e_k = expected_face_counts(NN256_F_REVERSE, S, K, B, Bs)
     assert e_a == pytest.approx(RUNG1_A)
     assert e_k == pytest.approx(RUNG1_KAPPA)
@@ -142,7 +150,9 @@ def test_resolve_returns_those_biases_when_f_is_passed():
                    face_init_skips_per_plan=RUNG1_KAPPA,
                    face_none_bias=0.0, face_skip_bias=None)
     B, Bs = resolve_face_init_bias(ns, F=float(NN256_F_REVERSE))
-    assert B == pytest.approx(4.094345, abs=1e-6)
+    B1, Bs1 = _rung1_pair()
+    assert B == pytest.approx(B1, abs=1e-9)
+    assert Bs == pytest.approx(Bs1, abs=1e-9)
     assert Bs == pytest.approx(4.234107, abs=1e-6)
 
 
@@ -175,9 +185,11 @@ def test_the_start_block_carries_every_input_on_the_derived_path():
     assert f"S = {S} slots/face, k = {K} non-none ops/slot" in text
     assert "--face-init-approx-per-plan a = 3, " \
            "--face-init-skips-per-plan kappa = 0.3" in text
-    assert "B  = ln(F*S*k/a - k) = 4.094345" in text
+    assert f"B  = E[A]^-1(a) = {B:.6f}" in text
+    assert "the -B on the face's QUANT logit" in text
     assert "Bs = ln(F/kappa - 1) = 4.234107" in text
-    assert "E[A] = F*S*k/(exp(B)+k) = 3.000000 " \
+    assert "E[A] = F*((1-q)*S*p + q*(1+(S-2)*p)), p = k/(exp(B)+k), " \
+           "q = 1/(1+exp(B)) = 3.000000 " \
            "requested approximations/plan" in text
     assert "E[K] = F/(1+exp(Bs)) = 0.300000 requested skips/plan" in text
     assert f"the order: {NN256_VALID_VERTICES} vertices, " \
@@ -190,7 +202,7 @@ def test_the_start_block_carries_every_input_on_the_derived_path():
         "face_init_ops_k": K,
         "face_init_a": RUNG1_A,
         "face_init_kappa": RUNG1_KAPPA,
-        "face_init_B": pytest.approx(4.094345, abs=1e-6),
+        "face_init_B": pytest.approx(B, abs=1e-9),
         "face_init_Bs": pytest.approx(4.234107, abs=1e-6),
         "face_init_expected_approx_per_plan": pytest.approx(RUNG1_A),
         "face_init_expected_skips_per_plan": pytest.approx(RUNG1_KAPPA),
@@ -211,13 +223,18 @@ def test_the_start_block_reports_the_same_counts_on_the_raw_path():
     assert "B  = --face-none-bias = 2.000000" in text
     assert "Bs = B (unset: SKIP gets -B) = 2.000000" in text
     e_a, e_k = expected_face_counts(NN256_F_REVERSE, S, K, 2.0, 2.0)
-    assert f"E[A] = F*S*k/(exp(B)+k) = {e_a:.6f}" in text
+    assert (f"q = 1/(1+exp(B)) = {e_a:.6f} requested approximations/plan"
+            in text)
     assert f"E[K] = F/(1+exp(Bs)) = {e_k:.6f}" in text
     assert cfg["face_init_path"] == "raw"
     assert cfg["face_init_a"] is None and cfg["face_init_kappa"] is None
     assert cfg["face_init_B"] == 2.0 and cfg["face_init_Bs"] == 2.0
-    # the number the collapsed rows started at, named
-    assert e_a == pytest.approx(21 * 3 * 3 / (math.exp(2.0) + 3))
+    # the number a bias-2 start means on this head, named: the slot ops at
+    # k/(e^B + k) and the face's quant bit at sigmoid(-B)
+    p_q = 1.0 / (1.0 + math.exp(2.0))
+    p_op = K / (math.exp(2.0) + K)
+    assert e_a == pytest.approx(
+        21 * ((1 - p_q) * 3 * p_op + p_q * (1 + 1 * p_op)))
 
 
 def test_the_start_block_names_the_skip_bias_flag_when_it_is_set():

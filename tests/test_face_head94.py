@@ -8,20 +8,21 @@ layout claim here is parametrised over all five values rather than restated
 for one:
 
     --approx-add   width            contents
-    lossy          W*3 + 1          skip + the three contraction slots
-    lossless       W*3 + 1          skip + the three contraction slots
-    choose         W*3 + 2          + ONE Bernoulli, lossy vs lossless per face
-    learned1       W*4 + 1          + slot 3, the OLD EDGE's approximation
-    learned2       W*5 + 1          + slot 4, the ADD OUTPUT's approximation
+    lossy          W*3 + 2          skip + quant + the three contraction slots
+    lossless       W*3 + 2          skip + quant + the three contraction slots
+    choose         W*3 + 3          + ONE Bernoulli, lossy vs lossless per face
+    learned1       W*4 + 2          + slot 3, the OLD EDGE's approximation
+    learned2       W*5 + 2          + slot 4, the ADD OUTPUT's approximation
 
-with ``W = SLOT_WIDTH = 30 + len(masks.FACE_QUANT_DTYPES)``: 31 (94 logits)
-while the dtype field was a Bernoulli over {float32, bfloat16}, 34 (103) with
-the four-float set. The filename keeps the historical 94.
+with ``W = SLOT_WIDTH = 29`` since the owner ruling of 2026-09-23 (the quant is
+ONE bit per face at logit 1, no per-slot dtype, op softmax {blockdiag, reduce,
+none}; 89 logits). It was 31 (94) with a per-slot two-dtype Bernoulli and 34
+(103) with the four-float set. The filename keeps the historical 94.
 
 The properties that matter are the ones whose violation is SILENT:
 
-  A. the slot blocks TILE from 1 upwards with no gap or overlap, at every
-     width, so slot ``s`` is at ``1 + W*s`` whatever the value is. An
+  A. the slot blocks TILE from 2 upwards with no gap or overlap, at every
+     width, so slot ``s`` is at ``2 + W*s`` whatever the value is. An
      off-by-one here reads another field's logit and nothing ever raises.
   A2. A FIELD A WIDTH DOES NOT CONTAIN CANNOT BE INDEXED AT ALL. This replaced
      the older "a gated-off field contributes exactly zero" test: at a narrower
@@ -52,21 +53,20 @@ import jax, jax.numpy as jnp, jax.random as jrand
 import numpy as np
 import pytest
 
-from alphagrad.approx.common.masks import NUM_FACE_QUANT_DTYPES
 from alphagrad.approx.unified_face_head import (
     CONTRACTION_LAYOUT, UnifiedFaceHead, FaceFields, SLOT_WIDTH, FACE_SLOTS,
     NUM_APPROX_OPS, MAX_PAIR_IDX, NUM_REDUCE_AXES, NUM_REDUCE_FNS,
-    head_layout, slot_base, S_OP, S_I, S_J, S_AXIS, S_RFN, S_DTYPE,
-    OP_BLOCKDIAG, OP_REDUCE, OP_QUANT, OP_NONE, O_SKIP, O_SLOT0,
+    QUANT_SLOTS, head_layout, slot_base, S_OP, S_I, S_J, S_AXIS, S_RFN,
+    OP_BLOCKDIAG, OP_REDUCE, OP_NONE, O_SKIP, O_QUANT, O_SLOT0,
     JOIN_LOSSY, JOIN_LOSSLESS, _bern_logp_ent,
 )
 
 #: THE OWNER'S ARITHMETIC, restated as a literal so a change to the layout
-#: table has to change this number too. `W*N + 1` for the learned values --
-#: NOT `+2`: they have no choose bit.
+#: table has to change this number too. `W*N + 2` for the learned values --
+#: NOT `+3`: they have no choose bit. The 2 is the skip and the quant bit.
 _W = SLOT_WIDTH
-WIDTHS = {"lossy": 3 * _W + 1, "lossless": 3 * _W + 1, "choose": 3 * _W + 2,
-          "learned1": 4 * _W + 1, "learned2": 5 * _W + 1}
+WIDTHS = {"lossy": 3 * _W + 2, "lossless": 3 * _W + 2, "choose": 3 * _W + 3,
+          "learned1": 4 * _W + 2, "learned2": 5 * _W + 2}
 MODES = list(WIDTHS)
 E = 32
 
@@ -86,14 +86,14 @@ def _masks(n, all_legal=True):
             jnp.ones((n, NUM_REDUCE_AXES), jnp.float32))
 
 
-def _fields(n, op_val, *, skip=0, join=None):
+def _fields(n, op_val, *, skip=0, quant=0, join=None):
     return FaceFields(
         skip=jnp.array(skip, jnp.int32),
+        quant=jnp.array(quant, jnp.int32),
         op=jnp.full((n,), op_val, jnp.int32),
         i=jnp.zeros((n,), jnp.int32), j=jnp.ones((n,), jnp.int32),
         axis=jnp.zeros((n,), jnp.int32),
         reduce_fn=jnp.zeros((n,), jnp.int32),
-        dtype_idx=jnp.zeros((n,), jnp.int32),
         join=join)
 
 
@@ -103,13 +103,17 @@ def test_width_is_the_owners_arithmetic(mode):
     lay = head_layout(mode)
     assert lay.width == WIDTHS[mode], (mode, lay.width)
     assert lay.width == O_SLOT0 + SLOT_WIDTH * lay.n_slots + int(lay.has_choose)
-    assert SLOT_WIDTH == S_DTYPE + NUM_FACE_QUANT_DTYPES
-    assert SLOT_WIDTH == 34, "the four-float set: 30 + 4"
-    assert O_SKIP == 0 and O_SLOT0 == 1
-    # The learned values are W*N + 1, NOT +2: no choose bit.
+    assert SLOT_WIDTH == S_RFN + NUM_REDUCE_FNS
+    assert SLOT_WIDTH == 29, ("the owner ruling of 2026-09-23: no per-slot "
+                              "dtype, op softmax {blockdiag, reduce, none}: "
+                              "3 + 6 + 6 + 9 + 5")
+    assert NUM_APPROX_OPS == 3
+    assert O_SKIP == 0 and O_QUANT == 1 and O_SLOT0 == 2
+    assert QUANT_SLOTS == (0, 1)
+    # The learned values are W*N + 2, NOT +3: no choose bit.
     if mode in ("learned1", "learned2"):
         assert not lay.has_choose
-        assert lay.width == SLOT_WIDTH * lay.n_slots + 1
+        assert lay.width == SLOT_WIDTH * lay.n_slots + 2
 
 
 @pytest.mark.parametrize("mode", MODES)
@@ -120,7 +124,7 @@ def test_slot_bases_are_one_multiply_at_every_width(mode):
     # The three CONTRACTION bases are the same number at every width -- that
     # width-independence is what the 2026-09-11 layout buys, and it is why a
     # bare `slot_base(s)` over range(FACE_SLOTS) is right under every value.
-    assert bases[:FACE_SLOTS] == [1, 1 + _W, 1 + 2 * _W]
+    assert bases[:FACE_SLOTS] == [2, 2 + _W, 2 + 2 * _W]
     assert bases[:FACE_SLOTS] == [slot_base(s) for s in range(FACE_SLOTS)]
 
 
@@ -129,17 +133,17 @@ def test_the_logits_tile_exactly_once(mode):
     lay = head_layout(mode)
     covered = np.zeros(lay.width, int)
     covered[O_SKIP] += 1
+    covered[O_QUANT] += 1
     if lay.has_choose:
         covered[lay.choose_index] += 1
     for s in range(lay.n_slots):
         b = lay.slot_base(s)
         for lo, hi in ((S_OP, S_I), (S_I, S_J), (S_J, S_AXIS),
-                       (S_AXIS, S_RFN), (S_RFN, S_DTYPE),
-                       (S_DTYPE, SLOT_WIDTH)):
+                       (S_AXIS, S_RFN), (S_RFN, SLOT_WIDTH)):
             covered[b + lo:b + hi] += 1
     assert (covered == 1).all(), (mode, covered.min(), covered.max())
     assert ((S_I - S_OP) + (S_J - S_I) + (S_AXIS - S_J) + (S_RFN - S_AXIS)
-            + (S_DTYPE - S_RFN) + NUM_FACE_QUANT_DTYPES == SLOT_WIDTH)
+            + NUM_REDUCE_FNS == SLOT_WIDTH)
 
 
 @pytest.mark.parametrize("mode", MODES)
@@ -148,16 +152,16 @@ def test_proj_emits_exactly_the_layout_width(mode):
 
 
 def test_the_collision_at_94_is_the_design_not_an_accident():
-    """``choose``'s bit and ``learned1``'s slot 4 BOTH sit at index 94.
+    """``choose``'s bit and ``learned1``'s slot 4 BOTH sit at the same index.
 
-    That is the consequence of the slot blocks tiling from 1: the bit goes
-    immediately after the last block. The two never coexist -- ``choose`` has
-    three slots and no fourth block, the learned values have no bit -- so one
-    index can carry both meanings without ambiguity, and ``slot_base`` needs no
-    branch. The earlier layout reserved 94 for the bit at EVERY value and
-    started the join slots at 95, which is the branch that is gone.
+    That is the consequence of the slot blocks tiling from O_SLOT0: the bit
+    goes immediately after the last block. The two never coexist -- ``choose``
+    has three slots and no fourth block, the learned values have no bit -- so
+    one index can carry both meanings without ambiguity, and ``slot_base``
+    needs no branch. The earlier layout reserved 94 for the bit at EVERY value
+    and started the join slots at 95, which is the branch that is gone.
     """
-    after_contraction = O_SLOT0 + SLOT_WIDTH * FACE_SLOTS     # 94 at W=31, 103 at W=34
+    after_contraction = O_SLOT0 + SLOT_WIDTH * FACE_SLOTS     # 94 at W=31, 89 at W=29
     assert head_layout("choose").choose_index == after_contraction
     assert head_layout("learned1").slot_base(FACE_SLOTS) == after_contraction
     assert head_layout("learned2").slot_base(FACE_SLOTS) == after_contraction
@@ -335,7 +339,7 @@ def test_the_key_budget_moves_no_existing_draw():
     """``split(key, n)[i]`` does not depend on ``n``.
 
     That is the whole reason the key budget can be width-dependent
-    (``1 + 6*n_slots`` plus one under ``choose``) without moving the skip's or
+    (``2 + 5*n_slots`` plus one under ``choose``) without moving the skip's or
     any contraction slot's draw. Stated on jax itself, since the head's own
     parameters differ across widths and so cannot be compared directly.
     """
@@ -367,14 +371,13 @@ def test_one_axis_per_compress(mode):
 @pytest.mark.parametrize("op_val,unused_lo", [
     (OP_BLOCKDIAG, S_AXIS),      # DIAG ignores the reduce axis
     (OP_REDUCE, S_I),            # COMPRESS ignores i
-    (OP_QUANT, S_J),             # QUANT ignores j
     (OP_NONE, S_I),              # END ignores everything
 ])
 def test_branch_masking_on_every_slot(mode, op_val, unused_lo):
     """Only the fields the chosen op consumes carry log-prob.
 
     Checked on EVERY slot the width has, not just slot 0: a learned join slot
-    is the same 31-wide block and must mask the same way.
+    is the same SLOT_WIDTH-wide block and must mask the same way.
     """
     lay = head_layout(mode)
     head = _head(mode)
@@ -415,6 +418,98 @@ def test_every_slot_the_width_has_is_LIVE(mode):
         z1 = z0.at[lay.choose_index].add(17.0)
         lp_b, e_b, _ = head.score(z1, f, **kw)
         assert float(lp_a) != float(lp_b)
+    # and the quant bit's logit is live on every width
+    z1 = z0.at[O_QUANT].add(17.0)
+    lp_b, e_b, _ = head.score(z1, f, **kw)
+    assert float(lp_a) != float(lp_b)
+
+
+# ================================================================ QUANT
+@pytest.mark.parametrize("mode", MODES)
+def test_the_quant_bit_forces_the_operand_slots_to_none_and_scores_once(mode):
+    """One bit per face (owner ruling 2026-09-23): with it set, the lhs and
+    rhs structural picks contribute exactly zero and count nothing, the bit
+    itself counts ONE approximation, and the ``new`` and learned slots stay
+    live."""
+    lay = head_layout(mode)
+    head = _head(mode)
+    z0 = head.logits(_ctx())
+    om, im, jm, am = _masks(lay.n_slots)
+    join = (jnp.array(JOIN_LOSSY, jnp.int32) if lay.has_choose else None)
+    kw = dict(op_mask=om, i_mask=im, j_mask=jm, axis_mask=am)
+    on = _fields(lay.n_slots, OP_NONE, quant=1, join=join)
+    lp_on, e_on, ar_on = head.score(z0, on, **kw)
+    # every non-none op on the operand slots scores the same under the bit
+    for op_val in (OP_BLOCKDIAG, OP_REDUCE):
+        f2 = on._replace(op=on.op.at[jnp.asarray(QUANT_SLOTS)].set(op_val))
+        lp2, e2, ar2 = head.score(z0, f2, **kw)
+        assert float(lp2) == float(lp_on) and float(e2) == float(e_on)
+        assert float(ar2) == float(ar_on)
+    # and moving an operand slot's op logit moves nothing
+    for s in QUANT_SLOTS:
+        z1 = z0.at[lay.slot_base(s) + S_OP + OP_BLOCKDIAG].add(5.0)
+        lp2, e2, _ = head.score(z1, on, **kw)
+        assert float(lp2) == float(lp_on) and float(e2) == float(e_on)
+    # the new slot is still live under the bit
+    z1 = z0.at[lay.slot_base(FACE_SLOTS - 1) + S_OP + OP_BLOCKDIAG].add(5.0)
+    lp2, _, _ = head.score(z1, on, **kw)
+    assert float(lp2) != float(lp_on)
+    # arity: the face, the bit, and the live non-operand slots (all none here)
+    assert float(ar_on) == 2.0
+    off = _fields(lay.n_slots, OP_NONE, quant=0, join=join)
+    lp_off, _, ar_off = head.score(z0, off, **kw)
+    assert float(ar_off) == 1.0
+    lp_q1, _ = _bern_logp_ent(z0[O_QUANT], jnp.array(True))
+    lp_q0, _ = _bern_logp_ent(z0[O_QUANT], jnp.array(False))
+    # the two differ by the bit's own log-odds plus the two operand slots'
+    # (none) terms that the bit gates off
+    z_none = sum(
+        float(_cat(z0, lay.slot_base(s) + S_OP, om[s], OP_NONE))
+        for s in QUANT_SLOTS)
+    assert abs((float(lp_on) - float(lp_off))
+               - (float(lp_q1) - float(lp_q0) - z_none)) < 1e-5
+
+
+def _cat(z, base, mask, idx):
+    from alphagrad.approx.unified_face_head import _cat_logp_ent
+    return _cat_logp_ent(z[base:base + NUM_APPROX_OPS], mask, idx)[0]
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_an_illegal_quant_bit_is_never_drawn_and_contributes_zero(mode):
+    lay = head_layout(mode)
+    head = _head(mode)
+    om, im, jm, am = _masks(lay.n_slots)
+    kw = dict(op_mask=om, i_mask=im, j_mask=jm, axis_mask=am)
+    ctx = _ctx()
+    drawn = 0
+    for s in range(60):
+        _, f, lp, ent, _ = head.sample(ctx, jrand.PRNGKey(300 + s),
+                                       quant_mask=jnp.asarray(0.0), **kw)
+        assert int(f.quant) == 0
+        z = head.logits(ctx)
+        # the bit's logit moves nothing while it is illegal
+        z1 = z.at[O_QUANT].add(9.0)
+        lp1, e1, _ = head.score(z1, f, quant_mask=jnp.asarray(0.0), **kw)
+        assert float(lp1) == float(lp) and float(e1) == float(ent)
+        _, g, *_ = head.sample(ctx, jrand.PRNGKey(300 + s),
+                               quant_mask=jnp.asarray(1.0), **kw)
+        drawn += int(g.quant)
+    assert drawn > 0, "the legal bit never fired in 60 draws"
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_a_skipped_face_draws_no_quant_bit(mode):
+    lay = head_layout(mode)
+    head = _head(mode)
+    om, im, jm, am = _masks(lay.n_slots)
+    big = eqx.tree_at(lambda h: h.proj.layers[-1].bias, head,
+                      head.proj.layers[-1].bias.at[O_SKIP].add(30.0).at[
+                          O_QUANT].add(30.0))
+    for s in range(20):
+        _, f, *_ = big.sample(_ctx(), jrand.PRNGKey(s), op_mask=om,
+                              i_mask=im, j_mask=jm, axis_mask=am)
+        assert int(f.skip) == 1 and int(f.quant) == 0
 
 
 # ===================================================================== E
@@ -451,14 +546,15 @@ def test_masks_are_respected(mode):
     lay = head_layout(mode)
     head = _head(mode)
     om = jnp.zeros((lay.n_slots, NUM_APPROX_OPS),
-                   jnp.float32).at[:, OP_QUANT].set(1.0)
+                   jnp.float32).at[:, OP_REDUCE].set(1.0)
     am = jnp.zeros((lay.n_slots, NUM_REDUCE_AXES), jnp.float32).at[:, 3].set(1.0)
     im = jnp.ones((lay.n_slots, MAX_PAIR_IDX), jnp.float32)
     bad_op = bad_ax = 0
     for s in range(120):
         _, f, *_ = head.sample(_ctx(), jrand.PRNGKey(2000 + s), op_mask=om,
-                               i_mask=im, j_mask=im, axis_mask=am)
-        bad_op += int(np.sum(np.asarray(f.op) != OP_QUANT))
+                               i_mask=im, j_mask=im, axis_mask=am,
+                               quant_mask=jnp.asarray(0.0))
+        bad_op += int(np.sum(np.asarray(f.op) != OP_REDUCE))
         bad_ax += int(np.sum(np.asarray(f.axis) != 3))
     assert bad_op == 0 and bad_ax == 0
 
@@ -546,7 +642,7 @@ def test_gradients_are_finite_where_the_forward_is(mode, tag, fv, skip):
             i=jnp.zeros((n,), jnp.int32), j=jnp.ones((n,), jnp.int32),
             axis=jnp.zeros((n,), jnp.int32),
             reduce_fn=jnp.zeros((n,), jnp.int32),
-            dtype_idx=jnp.zeros((n,), jnp.int32), join=join)
+            quant=jnp.array(0, jnp.int32), join=join)
         lp, ent, _ar = h.score(
             z, fields, op_mask=om, i_mask=im, j_mask=jm, axis_mask=am,
             pair_ok=None, face_valid=jnp.array(fv),
@@ -591,7 +687,7 @@ def test_gradient_finite_with_a_masked_logit_far_above_the_live_max(mode):
             i=jnp.zeros((n,), jnp.int32), j=jnp.ones((n,), jnp.int32),
             axis=jnp.zeros((n,), jnp.int32),
             reduce_fn=jnp.zeros((n,), jnp.int32),
-            dtype_idx=jnp.zeros((n,), jnp.int32), join=join)
+            quant=jnp.array(0, jnp.int32), join=join)
         lp, ent, _ = h.score(z, fields, op_mask=om, i_mask=im, j_mask=jm,
                              axis_mask=am, pair_ok=None,
                              face_valid=jnp.array(True),

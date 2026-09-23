@@ -629,7 +629,7 @@ def test_every_contract_field_the_arm_will_emit_is_documented(gen, campaign):
     # the floor is derived from the head the arms run, not from a literal
     geom = gt.face_head_geometry(gen.APPROX_ADD)
     assert geom["width"] == gen.FACE_HEAD_WIDTH
-    assert geom["n_quant_default"] == len(gen.FACE_QUANT_DTYPES) - 1
+    assert geom["n_quant_dtypes"] == len(gen.FACE_QUANT_DTYPES) == 2
 
 
 # ------------------------------------------------- 7. the builder raises

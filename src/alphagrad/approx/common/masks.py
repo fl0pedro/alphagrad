@@ -801,19 +801,17 @@ def reduce_axes_physical() -> bool:
     return _REDUCE_AXIS_SPACE[0] == "physical"
 
 
-# The 94-slot face head's dtype field is a BERNOULLI over exactly these two
-# (``unified_face_policy._rows``: ``_BF16_SLOT`` / ``_F32_SLOT``), so this --
-# not the full ``QUANT_DTYPES`` catalog -- is the QUANT action set a face can
-# actually request. Kept here rather than imported from ``heads`` so this
-# module stays importable inside the measure actors without pulling equinox.
-#: The face head's QUANT choices, index = the head's ``dtype_idx``. The same
-#: names as graphax's ``POLICY_QUANT_DTYPES`` (its strict guard). float32 is
-#: the exact entry; the three narrow floats are the ones with a whole-graph
-#: temp-memory win on Blackwell (bf16 -28%, e5m2 -27%, e4m3fn -11%; sweep64).
-#: No integer target (int8 q 0.91 used widely, int16 no memory win) and no
-#: float16 / float4 (+33% / +5% temp).
-FACE_QUANT_DTYPES = ("float32", "bfloat16", "float8_e5m2", "float8_e4m3fn")
+# The face head's Quant is ONE Bernoulli per face (owner ruling 2026-09-23):
+# set, both contraction operands are held in the narrow float; clear, the
+# exact one. This two-name menu -- not the full ``QUANT_DTYPES`` catalog --
+# is the QUANT action set a face can request. Kept here rather than imported
+# from ``heads`` so this module stays importable inside the measure actors
+# without pulling equinox.
+FACE_QUANT_DTYPES = ("float32", "bfloat16")
 NUM_FACE_QUANT_DTYPES = len(FACE_QUANT_DTYPES)
+#: Index of the narrow float in :data:`FACE_QUANT_DTYPES`: the dtype the face
+#: bit selects, on lhs and rhs alike.
+FACE_QUANT_NARROW = FACE_QUANT_DTYPES.index("bfloat16")
 
 
 class ReduceAxisSpaces(NamedTuple):

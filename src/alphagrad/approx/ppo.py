@@ -4932,19 +4932,25 @@ class Agent(eqx.Module):
         # (env._face_dict_for_vertex says the same where it decodes them).
         # `face_join` is None at every width without the choose bit, which is
         # what `env.resolve_join_mode` then answers from the configuration.
-        # A per-face field the declaration gains needs a StepAction channel of
-        # its own, and there is no way to derive that -- so say it HERE, where
-        # the forwarding is written, instead of letting the new decision be
-        # dropped on the way to the env.
+        # The face's `quant` bit needs no channel of its own: its wire form IS
+        # the pair of QUANT rows on the lhs and rhs slots, which `_rows`
+        # derives from the bit and the translator has just written into
+        # `face_rows` -- the engine reads the decision off the rows it
+        # applies, and `env.check_face_quant_rows` refuses a one-sided pair.
+        # Any OTHER per-face field the declaration gains needs a StepAction
+        # channel of its own, and there is no way to derive that -- so say it
+        # HERE, where the forwarding is written, instead of letting the new
+        # decision be dropped on the way to the env.
         _PF = set(_rec.per_face_names())
-        if _PF != {"skip", "join"}:
+        if _PF != {"skip", "quant", "join"}:
             raise NotImplementedError(
                 f"face_action.FACE_ACTION_FIELDS declares the per-face fields "
-                f"{sorted(_PF)}; this wire forwards 'skip' and 'join' only. A "
-                f"per-face decision needs its own StepAction channel (packing "
-                f"it into another field's bits would make every reader of that "
-                f"field wrong) and its own env.EnvState history array, as "
-                f"`face_join` / `face_joins` have.")
+                f"{sorted(_PF)}; this wire forwards 'skip' and 'join' as "
+                f"channels and 'quant' as the QUANT rows on both contraction "
+                f"slots. A per-face decision needs its own StepAction channel "
+                f"(packing it into another field's bits would make every "
+                f"reader of that field wrong) and its own env.EnvState history "
+                f"array, as `face_join` / `face_joins` have.")
         return StepAction(
             target_vertex=jnp.asarray(vertex_idx + 1, dtype=jnp.int32),
             rule_specs=rule_specs,
@@ -13940,7 +13946,7 @@ def main(args=None):
                 _fd_packs.extend((_fd_b[_fd_rows], _fd_b[_fd_o_skip], _fd_b))
             jax.debug.callback(
                 partial(_facediag.grad_cb, _fd_terms,
-                        ("blockdiag", "reduce", "quant", "none")),
+                        ("blockdiag", "reduce", "none")),
                 *_fd_packs)
         (dynamic_carry, final_step), metrics_seq = lax.scan(
             epoch_step_fn,

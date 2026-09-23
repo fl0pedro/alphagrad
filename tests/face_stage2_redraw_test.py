@@ -205,7 +205,8 @@ def test_the_redraw_keeps_every_skip_bit_the_loop_drew(rollout):
 
 def test_the_redraw_keeps_the_two_exact_slots(rollout):
     # Slots 0 (lhs) and 1 (rhs) read masks nothing at this vertex moves, so
-    # stage 2 must reproduce them; only slot 2 (res:new) may differ.
+    # stage 2 must reproduce them; only slot 2 (res:new) may differ. The
+    # face's quant bit reads the SAME two masks, so it is reproduced too.
     _case, rows = rollout
     for t, (fa1, fa2, fv) in enumerate(rows):
         live = fv > 0.5
@@ -214,6 +215,9 @@ def test_the_redraw_keeps_the_two_exact_slots(rollout):
             b = np.asarray(getattr(fa2, field))[live][:, :2]
             np.testing.assert_array_equal(
                 b, a, err_msg=f"step {t}: stage 2 moved {field} on slot 0/1")
+        np.testing.assert_array_equal(
+            np.asarray(fa2.quant)[live], np.asarray(fa1.quant)[live],
+            err_msg=f"step {t}: stage 2 moved the face quant bit")
 
 
 def test_the_redraw_leaves_the_padding_faces_canonical(rollout):
