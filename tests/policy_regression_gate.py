@@ -428,6 +428,7 @@ def run_trace(case=None, steps=None):
                 "wires": [
                     {
                         "skip": int(np.asarray(fa.skip)[f]),
+                        "quant": int(np.asarray(fa.quant)[f]),
                         "op_type": [int(x) for x in np.asarray(fa.op_type)[f]],
                         "i": [int(x) for x in np.asarray(fa.i)[f]],
                         "j": [int(x) for x in np.asarray(fa.j)[f]],
