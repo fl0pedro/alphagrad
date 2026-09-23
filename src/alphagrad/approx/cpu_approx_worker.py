@@ -361,13 +361,9 @@ class CpuApproximationServer:
             # RuntimeError("measure-oom: ..."); also match raw XLA/CUDA OOM
             # text in case an OOM slips past that wrapper. This one-shot flag
             # is consumed by CpuApproxPool.pop_oom_flag to drive recycle+retry.
-            _exc_txt = f"{type(exc).__name__}: {exc!s}"
-            _is_oom = (
-                "measure-oom" in _exc_txt
-                or "RESOURCE_EXHAUSTED" in _exc_txt
-                or "out of memory" in _exc_txt.lower()
-                or "XlaRuntimeError" in type(exc).__name__
-            )
+            # Same classifier as env: a shared-memory kernel limit or a bare XlaRuntimeError is not an OOM (dsnn-dfw.127).
+            from alphagrad.approx.env import _is_oom as _env_is_oom
+            _is_oom = _env_is_oom(exc)
             if _is_oom:
                 self._last_was_oom = True
                 self._n_oom += 1
@@ -478,7 +474,7 @@ class CpuApproximationServer:
             # so a run of failures actively reclaims memory rather than piling
             # more partially-compiled executables on the saturated GPU.
             self._n_calls += 1
-            self._maybe_clear_compile_caches(force_on_oom=str(exc))
+            self._maybe_clear_compile_caches(oom=_is_oom)
             if _delta:
                 return sentinel_tokens, sentinel_reward
             return sentinel_tokens, sentinel_eqn_ids, sentinel_reward
