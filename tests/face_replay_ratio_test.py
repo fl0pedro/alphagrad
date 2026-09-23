@@ -68,7 +68,12 @@ TARGETS = (
 @pytest.fixture(autouse=True)
 def _row_settings():
     """The thesis row's mask settings and logit bound, restored after."""
+    from alphagrad.approx.common import masks as _M
     keep = LOGIT_CLAMP[0]
+    masks = (_M._PER_FACE_MASKS[0], _M._PER_FACE_REPAIR_AXIS[0])
+    diag = (_M._DIAG_PER_FACE[0], _M._DIAG_PER_FACE_RULE[0],
+            _M._DIAG_PER_FACE_REPAIR_PAIR[0])
+    space = _M._REDUCE_AXIS_SPACE[0]
     set_logit_clamp(CLAMP)
     set_diag_per_face(False)
     set_per_face_masks(True)
@@ -77,6 +82,9 @@ def _row_settings():
         yield
     finally:
         set_logit_clamp(keep)
+        set_diag_per_face(*diag)
+        set_per_face_masks(*masks)
+        set_reduce_axis_space(space)
 
 
 def _neutral_features(n=N_AX):

@@ -748,9 +748,10 @@ def build_singleton_plan(env, order, k: int, f: int, op: str, slot: int = 0,
         wires = [{"k": k, "f": f, "kind": "SKIP"}]
         n_slot_rows = 0
     else:
-        wires = [{"k": k, "f": f, "slot": slot, "row": list(row),
-                  "kind": f"{op.upper()}@slot{slot}"}]
-        n_slot_rows = 1
+        slots = (slot,) if isinstance(slot, int) else tuple(slot)
+        wires = [{"k": k, "f": f, "slot": int(s), "row": list(row),
+                  "kind": f"{op.upper()}@slot{s}"} for s in slots]
+        n_slot_rows = len(wires)
     return {
         "specs": None,
         "face_specs": None,
@@ -776,7 +777,9 @@ def build_singleton_sweep_plans(env, order, inv, quant_dtypes=("bfloat16",),
                                 ops=_SINGLETON_OPS):
     """Exhaustive singletons over all live faces on order:
     - SKIP: 1 per face
-    - QUANT: one per legal slot per dtype in ``quant_dtypes``
+    - QUANT: one two-sided contraction singleton (lhs and rhs) per face per
+      dtype in ``quant_dtypes`` where both operands admit it, plus one on
+      the new slot
     - REDUCE: mean per legal axis per slot
     - DIAG: explicit gcd per legal out-primal axis pair per slot (never -1)
 
@@ -818,6 +821,28 @@ def build_singleton_sweep_plans(env, order, inv, quant_dtypes=("bfloat16",),
             plans[pid_skip] = pl_skip
             plan_orders[pid_skip] = order
 
+        # 2a. QUANT on the contraction: a face Quant narrows BOTH operands
+        # (owner ruling 2026-09-23; graphax refuses the one-sided form).
+        if "quant" in ops:
+            pair = [tensors.get(s) for s in QUANT_SLOTS]
+            if all(st is not None for st in pair):
+                legal = np.logical_and.reduce([
+                    np.asarray(quant_valid_mask(st, quant_dtypes), bool)
+                    for st in pair])
+                for di, dtype in enumerate(quant_dtypes):
+                    if not legal[di]:
+                        continue
+                    pid_q = (f"singleton:quant:k{k}.f{f}:face:"
+                             f"{_quant_pid_suffix(dtype)}")
+                    row_q = [QUANT_SENTINEL, quant_idx[dtype], 0]
+                    pl_q = build_singleton_plan(env, order, k, f, op="quant",
+                                                slot=tuple(QUANT_SLOTS),
+                                                row=row_q)
+                    pl_q["op"] = "quant"
+                    pl_q["budget"] = f"{face_tag}:face:{dtype}"
+                    plans[pid_q] = pl_q
+                    plan_orders[pid_q] = order
+
         # For slots lhs(0), rhs(1), new(2):
         for s in range(3):
             st = tensors.get(s)
@@ -825,8 +850,9 @@ def build_singleton_sweep_plans(env, order, inv, quant_dtypes=("bfloat16",),
                 continue
             sname = slot_names[s]
 
-            # 2. QUANT (one per legal dtype)
-            if "quant" in ops:
+            # 2b. QUANT on the new slot (one per legal dtype; not a
+            # contraction operand, so it stays one-sided)
+            if "quant" in ops and s not in QUANT_SLOTS:
                 legal = quant_valid_mask(st, quant_dtypes)
                 for di, dtype in enumerate(quant_dtypes):
                     if not legal[di]:
