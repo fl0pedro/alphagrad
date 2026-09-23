@@ -2,7 +2,7 @@
 
 After the candidate's compile and before its first execution the callback
 reads ``memory_analysis()`` (temp + argument + output bytes) and refuses the
-plan above one quarter of the device's ``bytes_limit``: reason
+plan above the device's ``bytes_limit`` (three fourths of the card): reason
 ``oom-static``, counted as refused, the sentinel reward, both numbers in the
 refusal line and in the plan-log record. The paired reference is not gated.
 """
@@ -20,7 +20,8 @@ import pytest                                                   # noqa: E402
 from alphagrad.approx import env as env_mod                     # noqa: E402
 
 LIMIT = 16_000_000_000
-SWELL = 10_000_000_000
+SWELL = 20_000_000_000
+BETWEEN = 10_000_000_000
 
 
 class _SwollenAnalysis:
@@ -120,7 +121,7 @@ def _is_sentinel(reward):
                        <= env_mod.SENTINEL_COST * 0.99))
 
 
-def test_a_candidate_above_a_quarter_of_the_device_is_refused(
+def test_a_candidate_above_the_bytes_limit_is_refused(
         measure, capsys):
     reward, counts, recs, wrapped = measure({b"approx:": SWELL})
     assert counts.get("oom-static", 0) == 1, counts
@@ -131,17 +132,26 @@ def test_a_candidate_above_a_quarter_of_the_device_is_refused(
     assert rec["refused"] == "oom-static"
     assert rec["sentinelled"] is True
     assert rec["static_peak_bytes"] > SWELL
-    assert rec["static_peak_limit_bytes"] == LIMIT / 4
+    assert rec["static_peak_limit_bytes"] == LIMIT
     assert rec["device_bytes_limit"] == LIMIT
     line = [ln for ln in capsys.readouterr().out.splitlines()
             if "oom-static" in ln]
     assert line, "no refusal line"
-    assert f"limit_bytes={LIMIT // 4}" in line[0]
+    assert f"limit_bytes={LIMIT}" in line[0]
+    assert "1/4 of" not in line[0]
     assert f"static_peak_bytes={int(rec['static_peak_bytes'])}" in line[0]
 
 
 def test_a_candidate_below_the_gate_is_measured(measure):
     reward, counts, recs, wrapped = measure({b"approx:": 0})
+    assert counts.get("total", 0) == 0, counts
+    assert not _is_sentinel(reward)
+    assert wrapped[b"approx:"].calls > 0
+    assert "refused" not in recs[-1]
+
+
+def test_a_candidate_between_a_quarter_and_the_limit_is_measured(measure):
+    reward, counts, recs, wrapped = measure({b"approx:": BETWEEN})
     assert counts.get("total", 0) == 0, counts
     assert not _is_sentinel(reward)
     assert wrapped[b"approx:"].calls > 0
