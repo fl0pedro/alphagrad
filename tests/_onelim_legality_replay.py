@@ -58,10 +58,13 @@ def walk(s, cb, order, specs, fspecs, fskips, decide=None):
         if decide is not None:
             decide(n, nf)
         t0 = time.perf_counter()
+        # The chunk callback passes the environment's chain key, as the
+        # legality callback did (`face_driver._hk_kw`).
+        hk = s.hist_key(0, fspecs, fskips, n)
         f = 0
         while True:
             r = s.chunk_ex(order, specs, n, v, specs[n], fspecs[n], fskips[n],
-                           f, fspecs, fskips)
+                           f, fspecs, fskips, hist_key=hk)
             chunks.append((n, v, f, tuple(np.array(x, copy=True) for x in r)))
             f += 1
             if f >= int(r[2]):
@@ -123,7 +126,8 @@ def main(plans_path):
         if stn["slot_onelim_fallback"]:
             print(f"[plan {pi}] last fallback: {s.last_slot_onelim_error}",
                   flush=True)
-        if dl is not None or dc is not None or not stn["slot_onelim"]:
+        if (dl is not None or dc is not None or not stn["slot_onelim"]
+                or stn["elims"] > sto["elims"]):
             bad += 1
     if bad:
         print(f"REPLAY-FAIL {bad} of {len(recs)} plans", flush=True)

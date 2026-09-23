@@ -1299,11 +1299,12 @@ class LiveFaceStream:
                 return t
             return r
 
-        ft = ({} if _factored_outputs_enabled() else
-              {k: ((_rec(k, "lhs"), _rec(k, "rhs"), _rec(k, "res:new")),
-                   (None, None, _rec(k, "res:jres"))) for k in keys})
+        recording = not _factored_outputs_enabled()
+        ft = ({k: ((_rec(k, "lhs"), _rec(k, "rhs"), _rec(k, "res:new")),
+                   (None, None, _rec(k, "res:jres"))) for k in keys}
+              if recording else {})
         caps = self._elim_capture(tk, vertex, vhooks, ft)
-        st.slots = rec if ft else None
+        st.slots = rec if recording else None
         sink = tk.ij.face_sink
         vidx = sink.vidx
         if vidx is None:
@@ -1906,6 +1907,8 @@ class LiveFaceStream:
     def _slot_tensors_onelim(self, tk, pk, vertex, keys, sites):
         if tuple(tuple(x) for x in sites) != _ONEELIM_SITES:
             raise _Irregular(f"slot sites {sites} are not {_ONEELIM_SITES}")
+        if not keys:
+            return {}
         st = self._onelim_state(tk, pk, vertex, (), keys)
         if st.slots is None:
             raise _Irregular("the one elimination recorded no slot tensors")

@@ -43,8 +43,8 @@ def test_three_tlm_plans_every_vertex_identical():
         f"--- stderr ---\n{r.stderr[-6000:]}")
 
 
-@pytest.mark.parametrize("reverse", [False, True])
-def test_perceptron_random_skip_and_quant_identical(reverse):
+@pytest.mark.parametrize("kind", ["forward", "reverse", "shuffled"])
+def test_perceptron_random_skip_and_quant_identical(kind):
     import _onelim_legality_replay as R
     from onelim_face_chunk_test import _decisions, _perceptron
     from alphagrad.approx.env import MAX_FACES, wire_slots
@@ -54,8 +54,11 @@ def test_perceptron_random_skip_and_quant_identical(reverse):
     V = len(jaxpr.eqns)
     F, S, MR = MAX_FACES, wire_slots(), 16
     order = np.arange(1, V + 1, dtype=np.int32)
-    if reverse:
+    seed = 131 + ("forward", "reverse", "shuffled").index(kind)
+    if kind == "reverse":
         order = order[::-1].copy()
+    elif kind == "shuffled":
+        order = np.random.default_rng(seed).permutation(order)
     specs = -np.ones((V, MR, 3), np.int32)
 
     walks = []
@@ -65,7 +68,7 @@ def test_perceptron_random_skip_and_quant_identical(reverse):
         fspecs = -np.ones((V, F, S, 3), np.int32)
         fspecs[..., 2] = 0
         fskips = np.zeros((V, F), np.int32)
-        rng = np.random.default_rng(131 + int(reverse))
+        rng = np.random.default_rng(seed)
 
         def decide(n, nf, fspecs=fspecs, fskips=fskips, rng=rng):
             fspecs[n], fskips[n] = _decisions(rng, F, S, nf)
@@ -74,11 +77,13 @@ def test_perceptron_random_skip_and_quant_identical(reverse):
                                        decide=decide)
         walks.append((leg, chunks, s, fskips))
 
-    (lo, co, _so, _ko), (ln, cn, sn, kn) = walks
+    (lo, co, so, _ko), (ln, cn, sn, kn) = walks
     assert R.first_difference(lo, ln, R.LEG_FIELDS) is None
     assert R.first_difference(co, cn, R.CHUNK_FIELDS) is None
-    assert sum(int(out[5]) >= 2 for _n, _v, out in ln) >= 2
+    if kind == "forward":
+        assert sum(int(out[5]) >= 2 for _n, _v, out in ln) >= 2
     assert int(kn.sum()) > 0
     assert sn.stats["slot_onelim"] > 0, sn.last_slot_onelim_error
     assert sn.stats["slot_probe"] == sn.stats["slot_onelim_fallback"]
     assert sn.stats["count_onelim"] > 0
+    assert sn.stats["elims"] <= so.stats["elims"]
