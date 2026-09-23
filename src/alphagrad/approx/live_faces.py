@@ -1465,15 +1465,16 @@ class LiveFaceStream:
                                     face_skips_hist, hist_key=hist_key)
             # The enumeration the shared one elimination made, if there is one.
             st = None
-            if self.slot_one_elim:
+            if getattr(self, "slot_one_elim", False):
                 frh, fsh = self._hist(face_rows_hist, face_skips_hist)
-                st = self._onelim.get(
+                st = getattr(self, "_onelim", {}).get(
                     (order[:n].tobytes(), specs[:n].tobytes(), int(vertex),
                      None) + (_hist_key_parts(frh, fsh, n) if hist_key is None
                               else (hist_key,)))
             if st is not None and st.tk is tk:
                 k = len(st.keys)
-                self.stats["count_onelim"] += 1
+                self.stats["count_onelim"] = (
+                    self.stats.get("count_onelim", 0) + 1)
             else:
                 k = len(list(tk.ij.faces(int(vertex))))
         except Exception:
