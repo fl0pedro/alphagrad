@@ -136,13 +136,11 @@ CLEAR_ENV = {"ALPHAGRAD_MEASURE_CACHE_CLEAR_EVERY": CACHE_CLEAR_EVERY}
 #: THE ACTOR PROCESS RECYCLE (dsnn-dfw.99 follow-up, owner ruling
 #: 2026-09-22, 08:58): the in-process clear above does not return the
 #: executables' device memory to the pool, so every row `thesis_arm` emits
-#: also exports these two, on the SAME footprint as CACHE_CLEAR_EVERY
-#: above.  The order-only tuning rows and the three sweep rounds keep both
-#: off too.
-RECYCLE_RETRY_ON_OOM = "1"
+#: also exports the proactive recycle, on the SAME footprint as
+#: CACHE_CLEAR_EVERY above.  The order-only tuning rows and the three sweep
+#: rounds keep it off too.  The retry of an OOM'd plan is gone (dsnn-dfw.120).
 PROACTIVE_RECYCLE_EVERY = "100"
 RECYCLE_ENV = {
-    "ALPHAGRAD_RECYCLE_RETRY_ON_OOM": RECYCLE_RETRY_ON_OOM,
     "ALPHAGRAD_PROACTIVE_RECYCLE_EVERY": PROACTIVE_RECYCLE_EVERY,
 }
 #: What every row `thesis_arm` emits now carries beside its target shape:
@@ -428,7 +426,7 @@ def test_every_arm_carries_the_shared_thesis_flags(gen, matrix):
         assert cli["--face-wire-faces"] == want_faces, a["name"]
         assert gen.CAMPAIGN_FACE_WIRE_FACES == FACE_WIRE_FACES
         assert gen.THESIS_TLM_FACE_WIRE_FACES == TLM_FACE_WIRE_FACES
-        assert cli["--ray-measure-timeout"] == "600", a["name"]
+        assert cli["--ray-measure-timeout"] == "120", a["name"]
         assert cli["--rollout-shards"] == "1", a["name"]
         # the gate inputs, resolved from THIS arm's order
         assert (cli["--gate-winners-table"]
@@ -1099,7 +1097,8 @@ def test_the_core_budget_is_the_ruling_and_is_disjoint(gen, matrix, smoke):
         b = gen.THESIS_CORE_BUDGET[gpus]
         cli = _cli(gen, a)
         assert cli["--reserved-driver-cores"] == str(b["trainer"]), a["name"]
-        assert cli["--cpu-cores-per-actor"] == str(b["per_actor"]), a["name"]
+        assert cli["--cpu-cores-per-actor"] == gen.THESIS_CORES_PER_ACTOR, \
+            a["name"]
 
 
 def test_the_first_block_spreads_over_every_released_node(gen):
@@ -1650,40 +1649,103 @@ def test_the_retention_bound_reaches_every_row_thesis_arm_emits(
 
 def test_the_process_recycle_reaches_every_row_thesis_arm_emits(
         gen, matrix, smoke):
-    """dsnn-dfw.99, follow-up ruling 2026-09-22 (08:58 cluster time).  The
-    in-process cache clear tested above did not return the executables'
-    device memory to the BFC pool: the resumed cadence test (job 67437)
-    still hit RESOURCE_EXHAUSTED at calls 123/124 and 185/186.  Recycling
-    the ACTOR PROCESS is the fallback, on the SAME footprint as the
-    retention bound: the matrix on every target and the smoke, off on the
-    order-only tuning rows and the three Lagrangian sweep rounds."""
-    retry_var = gen.RECYCLE_RETRY_ON_OOM_VAR
+    """dsnn-dfw.99, follow-up ruling 2026-09-22 (08:58 cluster time), and
+    dsnn-dfw.120 (owner ruling 2026-09-23).  The proactive recycle rides on
+    the SAME footprint as the retention bound: the matrix on every target
+    and the smoke, off on the order-only tuning rows and the three
+    Lagrangian sweep rounds.  The retry of an OOM'd plan on a fresh actor
+    is gone: no row exports its switch and the generator names it nowhere."""
     every_var = gen.PROACTIVE_RECYCLE_EVERY_VAR
-    assert retry_var == "ALPHAGRAD_RECYCLE_RETRY_ON_OOM"
+    retry_var = "ALPHAGRAD_RECYCLE_RETRY_ON_OOM"
     assert every_var == "ALPHAGRAD_PROACTIVE_RECYCLE_EVERY"
-    assert gen.THESIS_RECYCLE_RETRY_ON_OOM == RECYCLE_RETRY_ON_OOM
     assert gen.THESIS_PROACTIVE_RECYCLE_EVERY == PROACTIVE_RECYCLE_EVERY
+    assert not hasattr(gen, "RECYCLE_RETRY_ON_OOM_VAR")
+    assert not hasattr(gen, "THESIS_RECYCLE_RETRY_ON_OOM")
+    for a in gen.ARMS:
+        assert retry_var not in (a.get("env") or {}), a["name"]
+        assert retry_var not in gen.render(a), a["name"]
     for a in matrix + smoke:
-        assert a["env"][retry_var] == RECYCLE_RETRY_ON_OOM, a["name"]
         assert a["env"][every_var] == PROACTIVE_RECYCLE_EVERY, a["name"]
-        text = gen.render(a)
-        assert f"export {retry_var}={RECYCLE_RETRY_ON_OOM}" in text, a["name"]
         assert (f"export {every_var}={PROACTIVE_RECYCLE_EVERY}"
-               in text), a["name"]
+               in gen.render(a)), a["name"]
     off = (gen.orderonly_arms() + gen.orderonly_rsnn_arms()
            + gen.orderonly_final_arms() + gen.orderonly_tlm_final_arms()
            + gen.sweepl_arms() + gen.sweepl2_arms() + gen.sweepl3_arms())
     assert off
     for a in off:
-        env = a.get("env") or {}
-        assert retry_var not in env, a["name"]
-        assert every_var not in env, a["name"]
+        assert every_var not in (a.get("env") or {}), a["name"]
+        assert every_var not in gen.render(a), a["name"]
+    assert every_var in gen.THESIS_TARGET_ENV_ALLOWED
+    assert every_var in gen.THESIS_ENV_ALLOWED
+    assert retry_var not in gen.THESIS_ENV_ALLOWED
+    assert every_var not in set(gen.CAMPAIGN_ENV_ALLOWED)
+
+
+def _frozen_rounds(gen):
+    return (gen.orderonly_arms() + gen.orderonly_rsnn_arms()
+            + gen.orderonly_final_arms() + gen.orderonly_tlm_final_arms()
+            + gen.sweepl_arms() + gen.sweepl2_arms() + gen.sweepl3_arms())
+
+
+def test_the_measure_timeout_and_the_actor_cores_of_a_thesis_row(
+        gen, matrix, smoke, pairs):
+    """Owner ruling 2026-09-23: every row `thesis_arm` emits measures under
+    --ray-measure-timeout 120 (ppo.py makes the cold timeout four times
+    that) and gives each timing actor 8 cores, on every node class.  The
+    frozen rounds keep 600 and the budget's per-actor width."""
+    assert gen.THESIS_RAY_MEASURE_TIMEOUT == "120"
+    assert gen.THESIS_CORES_PER_ACTOR == "8"
+    for a in matrix + smoke + pairs:
+        cli = _cli(gen, a)
+        assert cli["--ray-measure-timeout"] == "120", a["name"]
+        assert cli["--cpu-cores-per-actor"] == "8", a["name"]
         text = gen.render(a)
-        assert retry_var not in text, a["name"]
-        assert every_var not in text, a["name"]
-    assert {retry_var, every_var} <= gen.THESIS_TARGET_ENV_ALLOWED
-    assert {retry_var, every_var} <= gen.THESIS_ENV_ALLOWED
-    assert not ({retry_var, every_var} & set(gen.CAMPAIGN_ENV_ALLOWED))
+        assert "--ray-measure-timeout 120" in text, a["name"]
+        assert "--cpu-cores-per-actor 8" in text, a["name"]
+    for a in _frozen_rounds(gen):
+        cli = _cli(gen, a)
+        gpus = gen.thesis_row_gpus(a["thesis_target"], a["node"])
+        assert cli["--ray-measure-timeout"] == \
+            gen.CAMPAIGN_RAY_MEASURE_TIMEOUT, a["name"]
+        assert cli["--cpu-cores-per-actor"] == \
+            str(gen.THESIS_CORE_BUDGET[gpus]["per_actor"]), a["name"]
+    from alphagrad.approx.common.core_budget import check_disjoint
+    for gpus in (4, 8):
+        lay = gen.thesis_row_core_layout(gpus)
+        check_disjoint(lay)
+        assert lay.n_logical == gen.BLACKWELL_CPUS[gpus]
+        assert all(w == 8 for _, w in lay.timing_actors)
+        assert len(lay.timing_actors) == int(gen.THESIS_RAY_MEASURE[gpus])
+
+
+def _jax_cache_lines_in(gen, text):
+    lines = [f"mkdir -p {gen.JAX_CACHE_DIR_EXPR}"] + [
+        f"export {k}={v}" for k, v in gen.JAX_CACHE_ENV]
+    return [ln for ln in lines if ln + "\n" in text]
+
+
+def test_the_compile_cache_is_exported_only_under_a_fixed_order(
+        gen, matrix, smoke, pairs):
+    """Owner ruling 2026-09-23: under a free order every plan is a new
+    program and the per-node compile cache does not hit, so a thesis row
+    with --fixed-order free exports none of JAX_COMPILATION_CACHE_DIR and
+    its JAX_PERSISTENT_CACHE_* siblings; a fixed order exports all four.
+    The frozen rounds keep what they ran with."""
+    import copy
+    for a in matrix + smoke + pairs:
+        assert _cli(gen, a)["--fixed-order"] == "free", a["name"]
+        text = gen.render(a)
+        assert _jax_cache_lines_in(gen, text) == [], a["name"]
+        assert "JAX_COMPILATION_CACHE_DIR" not in text, a["name"]
+        assert "JAX_PERSISTENT_CACHE_" not in text, a["name"]
+    for order in ("markowitz", "reverse"):
+        for a in (matrix[0], smoke[0], pairs[0]):
+            b = copy.deepcopy(a)
+            b["cli"]["--fixed-order"] = order
+            text = gen.render(b)
+            assert len(_jax_cache_lines_in(gen, text)) == 5, (a["name"], order)
+    for a in _frozen_rounds(gen):
+        assert len(_jax_cache_lines_in(gen, gen.render(a))) == 5, a["name"]
 
 
 def test_the_tlm_face_wire_budget_reaches_every_tlm_row_and_no_other(
