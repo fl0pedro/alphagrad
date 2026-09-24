@@ -356,10 +356,13 @@ def _build_variant(container: str, entry: dict) -> dict:
         # scoring against it would read 1.0 for a plan that threw the whole
         # prefix away. The reference is the base program -- the arm's rule
         # with the exact carry -- and the generator says so.
+        from alphagrad.approx.env import _loss_target
         base_gen = base_cfg.data_gen
         gen.reference_oracle = {
             "draw": base_gen,
-            "target": base_cfg.target_fun,
+            # The base rtrl target returns (loss, *state); the oracle is
+            # jax.grad of the LOSS (owner ruling 2026-09-24, Q27b).
+            "target": _loss_target(base_cfg),
             "argnums": tuple(base_cfg.argnums),
             "args": tuple(base["args"]),
             "slots": tuple(getattr(base_gen, "data_slots",
