@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import jax
+import jax.numpy as jnp
 import jax.random as jrand
 
 
@@ -67,4 +68,9 @@ def generate_eval_samples(env_obj, key, num_samples: int = 10):
         return tuple(e_args)
 
     keys = jrand.split(key, num_samples)
+    if getattr(config.data_gen, "host_draw", False):
+        # A draw that runs a compiled program from the host cannot be vmapped.
+        samples = [get_one_sample(k) for k in keys]
+        return tuple(jnp.stack([s[i] for s in samples])
+                     for i in range(len(samples[0])))
     return jax.vmap(get_one_sample)(keys)

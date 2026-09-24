@@ -254,8 +254,13 @@ def test_on_the_toy_the_reference_gradient_is_the_rev_exact_gradient():
 def test_the_reference_gradient_is_the_rev_exact_gradient(
         monkeypatch, example, dataset, rule):
     env = _lm_env(monkeypatch, example, dataset, rule)
-    assert envmod.reference_kind(env.config) == "jax.grad"
+    # the rtrl target carries its state as outputs, so its reference is
+    # jax.jacrev in the one-call layout (owner ruling 2026-09-24, Q11a)
+    assert envmod.reference_kind(env.config) == (
+        "jax.jacrev" if rule == "rtrl" else "jax.grad")
     out_rev, out_ref = _rev_exact_and_reference(env)
+    out_rev = envmod._loss_rows(env.config, out_rev)
+    out_ref = envmod._loss_rows(env.config, out_ref)
     rows = _leaves_agree(out_ref, out_rev, f"{example} {rule or ''}")
     assert any(nx > 0.0 for _c, nx, _ny in rows)
 

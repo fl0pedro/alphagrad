@@ -318,7 +318,7 @@ def valid_vertices(jaxpr, args, consts, argnums) -> tuple:
     _, _, _, vo_vertices = _build_graph(jaxpr, args, consts, argnums)
     out = []
     for i, eqn in enumerate(jaxpr.eqns, 1):
-        if eqn.outvars[0] not in jaxpr.outvars or i in vo_vertices:
+        if eqn.outvars[0] not in jaxpr.outvars or eqn.outvars[0] in vo_vertices:
             out.append(i)
     return tuple(out)
 
@@ -356,17 +356,23 @@ def _build_variant(container: str, entry: dict) -> dict:
         # scoring against it would read 1.0 for a plan that threw the whole
         # prefix away. The reference is the base program -- the arm's rule
         # with the exact carry -- and the generator says so.
+        from alphagrad.approx.env import _loss_target
         base_gen = base_cfg.data_gen
         gen.reference_oracle = {
             "draw": base_gen,
-            "target": base_cfg.target_fun,
+            # The base rtrl target returns (loss, *state); the oracle is
+            # jax.grad of the LOSS (owner ruling 2026-09-24, Q27b).
+            "target": _loss_target(base_cfg),
             "argnums": tuple(base_cfg.argnums),
             "args": tuple(base["args"]),
             "slots": tuple(getattr(base_gen, "data_slots",
                                    range(len(base["args"])))),
         }
+    # THE VARIANT'S OWN OUTPUT COUNT: the skip variant is the truncated
+    # graph with the loss alone, the others carry the five state rows.
     cfg = base_cfg._replace(jaxpr=cj.jaxpr, argnums=tuple(argnums),
-                            target_fun=fn, data_gen=gen)
+                            target_fun=fn, data_gen=gen,
+                            carried_outputs=max(len(cj.jaxpr.outvars) - 1, 0))
     consts = tuple(cj.literals)
     args = tuple(xs)
     vmap, alt_carry = _alignment(base_cfg.jaxpr, cj.jaxpr)
@@ -402,31 +408,43 @@ def measurement_env(container: str, config=None) -> dict | None:
     return v
 
 
-def eval_samples_for(container: str, eval_samples, config=None):
+def eval_samples_for(container: str, eval_samples, config=None,
+                     generator=None):
     """This episode's eval samples, redrawn in ``container``.
 
     Keyed by a digest of the base draw (:func:`_eval_key`), so every process
     that measures this plan builds the same ones, and cached per (container,
     digest) INSIDE the graph's own entry, so two graphs in one process never
     read each other's draw. ``config`` names which graph.
+
+    With ``generator`` -- the plan's own draw through its measured
+    executable -- the samples are drawn through it on the container's program
+    (the base program for ``exact``) and are NOT cached: they belong to one
+    plan.
     """
     if not eval_samples:
         return None
-    var = measurement_env(container, config)
-    if var is None:
+    entry = _entry(config)
+    if entry is None:
         return None
-    cache = _entry(config)["eval_samples"]
+    var = measurement_env(container, config)
+    if var is None and generator is None:
+        return None
     n = int(len(eval_samples[0]))
+    from alphagrad.approx.common.eval_samples import generate_eval_samples
+
+    class _Shim:
+        config = entry["base"]["config"] if var is None else var["config"]
+        args = entry["base"]["args"] if var is None else var["args"]
+
+    if generator is not None:
+        _Shim.config = _Shim.config._replace(data_gen=generator)
+        return generate_eval_samples(_Shim, _eval_key(eval_samples), n)
+    cache = entry["eval_samples"]
     tag = (container, _eval_tag(eval_samples), n)
     hit = cache.get(tag)
     if hit is not None:
         return hit
-    from alphagrad.approx.common.eval_samples import generate_eval_samples
-
-    class _Shim:
-        config = var["config"]
-        args = var["args"]
-
     out = generate_eval_samples(_Shim, _eval_key(eval_samples), n)
     if len(cache) > 64:
         cache.clear()
@@ -511,6 +529,13 @@ def transport_order(o_list, variant) -> list:
     while emitted < n_a:
         out.append(alt_carry[emitted])
         emitted += 1
+    # A VERTEX ELIMINABLE ON THE VARIANT ONLY. The eliminable set is a
+    # property of the graph: on the rtrl graph the ``a`` output's add is a
+    # pure output and not eliminable, while on the truncated (skip) variant
+    # the same equation is a dead vertex and is. The policy never chose a
+    # position for it, so it carries no decision and goes last.
+    seen = set(out)
+    out.extend(j for j in sorted(valid) if j not in seen)
     if sorted(out) != sorted(valid):
         raise ValueError(
             f"the transported order has {len(out)} vertices and the measured "
@@ -620,7 +645,7 @@ def carry_at_rest_bytes(variant_or_entry, rule: str) -> int:
     blocks of the measured program, the way they arrive at the step.
 
     Under ``rtrl`` the given tuple is the five stacked tensors
-    ``rsnn_shd.carry_under_plan`` builds, nothing else; under ``bptt`` the
+    ``rsnn_shd.carry_from_executable`` builds, nothing else; under ``bptt`` the
     five adjoints.
     """
     from alphagrad.approx.common.rsnn_shd import RSNN_HEAD_SLOTS

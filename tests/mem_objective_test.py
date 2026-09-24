@@ -341,7 +341,7 @@ def test_a_weight_under_the_absolute_form_is_refused(_restore_head_globals):
     assert ppo.MEM_OBJECTIVE_HEAD not in ppo.VALUE_HEAD_ATTRS
 
 
-# ------------------- 7. RSNN_SHD: a Diag on the carried face moves args only
+# ------------ 7. RSNN_SHD: a Diag on the carried face moves args and out
 T_PIN = 7
 _RSNN: dict = {}
 
@@ -416,16 +416,14 @@ def test_on_rsnn_shd_a_diag_on_the_carried_face_moves_the_args_term():
     assert exact["ref_args_bytes"] == diag["ref_args_bytes"]
     assert exact["ref_temp_bytes"] == diag["ref_temp_bytes"]
     assert exact["ref_output_bytes"] == diag["ref_output_bytes"]
-    # Measured on RSNN_SHD rtrl at step 7 (job 67781): the compact carry
-    # container reads 2,569,128 B of arguments against 226,177,960 B dense
-    # (ratio 0.01136, -4.478 nats); the output is byte-identical; the temp
-    # moved by 432 B on 425,552 B (+0.0010 nats), which is the one place the
-    # ruling's "moves only the args term" holds to a tenth of a percent
-    # rather than exactly.
+    # Measured on RSNN_SHD rtrl at step 7 (job 67781), on the loss-only
+    # program: the compact carry container reads 2,569,128 B of arguments
+    # against 226,177,960 B dense, the output byte-identical. Since the
+    # one-call step (owner rulings 2026-09-24 Q1c, Q11a) the program also
+    # writes its next carry in its container, so the Diag carry moves the
+    # output term by the same factor as the args term.
     assert diag["mem_objective_eps"] == exact["mem_objective_eps"]
-    assert diag["mem_ratios"]["out"] == exact["mem_ratios"]["out"]
-    assert abs(math.log(diag["mem_ratios"]["temp"]
-                        / exact["mem_ratios"]["temp"])) < 0.002
+    assert diag["mem_ratios"]["out"] < exact["mem_ratios"]["out"] / 50.0
     assert diag["mem_ratios"]["args"] < exact["mem_ratios"]["args"] / 50.0
     assert diag["rewards"][MSLOT] == -(math.log(diag["mem_ratios"]["temp"])
                                        + math.log(diag["mem_ratios"]["args"])
