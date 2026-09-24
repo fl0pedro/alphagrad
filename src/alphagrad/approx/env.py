@@ -4296,22 +4296,26 @@ def _gradient_similarity(jac_exact, jac_approx, site: str):
 
 
 # ---------------------------------------------------------------------------
-# THE PAIRED REFERENCE (ticket dsnn-3qm.9). Under ``--cost-form paired-log``
-# every terminal measurement also measures REV-EXACT -- the reverse order,
-# every face None, the jax.grad-equivalent -- in the same callback,
-# INTERLEAVED with the candidate window by window since 2026-09-14 (it used
-# to run as a second block right after it), through the same executable path
-# and the same instrument (`_time_one_rep`, same eval args, same warmup, same
-# median). Its POINTS x REPS are its own (`EnvConfig.ref_num_data_points`)
-# and so is its INNER, which the window rule derives from its own execution
-# time (`EnvConfig.measure_budget_secs`). The cost
-# channels then carry the LOG-DIFFERENCE ``Delta_c = log cost_c(candidate)
-# - log cost_c(rev-exact)`` (stored negated like every cost slot), so
-# rev-exact scores 0 by construction and a GPU-state drift of 18-20 % between
-# processes cancels instead of masquerading as a win. One record per
-# reference measurement is kept here and drained with the plan records
-# (`consume_plan_records` -> ``"paired_ref"``), so the trainer can log the
-# reference in positive units (ref/latency_ns, ref/temp_bytes; ticket .45).
+# THE PAIRED REFERENCE (ticket dsnn-3qm.9; dsnn-xta). Under ``--cost-form
+# paired-log`` every terminal measurement also measures THE REFERENCE --
+# ``jax.grad`` of the target function with respect to ``config.argnums``, on
+# the base program's inputs, compiled with the measurement's compiler options
+# (owner rulings 2026-09-24 Q39-Q41; until then the graphax rev-exact
+# elimination, which `rev_exact_telemetry_enabled` keeps as telemetry) -- in
+# the same callback, INTERLEAVED with the candidate window by window since
+# 2026-09-14 (it used to run as a second block right after it), through the
+# same executable path and the same instrument (`_time_one_rep`, same eval
+# args, same warmup, same median). Its POINTS x REPS are its own
+# (`EnvConfig.ref_num_data_points`) and so is its INNER, which the window
+# rule derives from its own execution time (`EnvConfig.measure_budget_secs`).
+# The cost channels then carry the LOG-DIFFERENCE ``Delta_c = log
+# cost_c(candidate) - log cost_c(reference)`` (stored negated like every cost
+# slot), so the reference scores 0 by construction and a GPU-state drift of
+# 18-20 % between processes cancels instead of masquerading as a win. One
+# record per reference measurement is kept here and drained with the plan
+# records (`consume_plan_records` -> ``"paired_ref"``), so the trainer can
+# log the reference in positive units (ref/latency_ns, ref/temp_bytes;
+# ticket .45).
 #
 # Until 2026-09-04 this block held the additive quality gate
 # (ALPHAGRAD_QUALITY_GATE_MIN, `_apply_quality_gate`, the per-order floor
@@ -4323,6 +4327,50 @@ def _gradient_similarity(jac_exact, jac_approx, site: str):
 _PAIRED_REF: list = []
 _PAIRED_REF_DROPPED = [0]
 _PAIRED_REF_CAP = 65536
+
+
+def reference_kind(config) -> str:
+    if bool(config.has_aux):
+        return "jax.value_and_grad"
+    outs = list(config.jaxpr.outvars)
+    if len(outs) == 1 and tuple(getattr(outs[0].aval, "shape", ())) == ():
+        return "jax.grad"
+    return "jax.jacrev"
+
+
+def reference_program(config):
+    if config.target_fun is None:
+        raise ValueError(
+            "the paired reference is jax.grad of the target function and "
+            "this configuration has no target_fun")
+    argnums = tuple(int(i) for i in config.argnums)
+    kind = reference_kind(config)
+    if kind == "jax.value_and_grad":
+        # ``((loss, aux), grads)``: the layout jacve's has_aux output has, so
+        # every consumer reads the gradient of the loss at index 1.
+        return jax.value_and_grad(config.target_fun, argnums=argnums,
+                                  has_aux=True)
+    if kind == "jax.grad":
+        return jax.grad(config.target_fun, argnums=argnums)
+    return jax.jacrev(config.target_fun, argnums=argnums)
+
+
+def rev_exact_telemetry_enabled() -> bool:
+    return os.environ.get("ALPHAGRAD_REV_EXACT_TELEMETRY", "0") not in (
+        "0", "", "false", "False", "no")
+
+
+_REV_TELEMETRY: dict = {"episode": None, "keys": set()}
+
+
+def _rev_telemetry_due(episode_key, ref_key) -> bool:
+    if _REV_TELEMETRY["episode"] != episode_key:
+        _REV_TELEMETRY["episode"] = episode_key
+        _REV_TELEMETRY["keys"] = set()
+    if ref_key in _REV_TELEMETRY["keys"]:
+        return False
+    _REV_TELEMETRY["keys"].add(ref_key)
+    return True
 
 # THE FLOOR UNDER log(temp). ``memory_analysis().temp_size_in_bytes`` is an
 # exact integer count of bytes and a plan whose gradient graph dead-code
@@ -4700,12 +4748,12 @@ def _paired_log_delta(candidate: float, reference: float,
 def paired_log_costs(latency_ns: float, peak_memory: float,
                      ref_latency_ns: float, ref_memory: float
                      ) -> tuple[float, float, int]:
-    """The two cost channels as PAIRED LOG-DIFFERENCES against rev-exact.
+    """The two cost channels as PAIRED LOG-DIFFERENCES against the reference.
 
     ``(Delta_lat, Delta_mem, n_floored)``. ``Delta_c = log cost_c(candidate)
-    - log cost_c(rev-exact)``: negative = the candidate is cheaper. The
+    - log cost_c(reference)``: negative = the candidate is cheaper. The
     caller stores both negated, like every cost slot, so a cheaper plan
-    scores above 0 and rev-exact scores exactly 0.
+    scores above 0 and the reference scores exactly 0.
 
     Latency ``0.0`` means NOT MEASURED (``config.measure_latency`` off) and
     passes through as 0.0 -- for the pair, since candidate and reference
@@ -4820,7 +4868,7 @@ def consume_paired_refs() -> dict:
 
 def paired_ref_summary(records) -> dict:
     """Per-period reference numbers for the log dict, in POSITIVE units
-    (ticket .45): the mean rev-exact latency in ns and static temp bytes
+    (ticket .45): the mean reference latency in ns and static temp bytes
     (and watermark bytes), how many references were taken, and how many
     memory readings (candidate or reference) the log floor replaced."""
     _lat = [float(r["latency_ns"]) for r in records
@@ -6056,7 +6104,8 @@ def _grad_cosine_quality(config, compiled_approx, ref_ex, ref_key, base_args,
     """THE GRADIENT COSINE: cos(g_approx, g_exact) at the INITIAL weights,
     averaged over ``k_batches`` fixed probe batches of REAL data.
 
-    ``ref_ex`` is the REV-EXACT reference of the paired cost channel, keyed by
+    ``ref_ex`` is the paired reference (`reference_program`: jax.grad of the
+    target on the base program's inputs, dsnn-xta), keyed by
     ``ref_key``; its gradient is the ``g_exact`` of the cosine and it is
     executed once per probe batch, not once per plan (see ``_cosine_reference``
     and the owner's ruling of 2026-09-18).
@@ -6092,7 +6141,7 @@ def _grad_cosine_quality(config, compiled_approx, ref_ex, ref_key, base_args,
         for slot, d in zip(_slots, data):
             a[slot] = jax.device_put(jnp.asarray(d), device)
         # THE REFERENCE, when the DRAW ITSELF is approximated. The in-band
-        # cosine scores the plan against the rev-exact plan ON THE SAME
+        # cosine scores the plan against the reference ON THE SAME
         # ARGUMENTS, so an approximation that lives in an ARGUMENT -- the
         # temporal carry a rule accumulated over a whole recording -- is
         # invisible to it: both sides read the same approximated value and the
@@ -8628,10 +8677,10 @@ def _callback_measured(
     if _plan_log_on:
         _PLAN_LOG_TERMINALS[0] += 1
     # THE COST FORM (ticket .9): under ``paired-log`` the terminal step
-    # measures rev-exact beside the candidate and the two cost slots become
-    # log-differences (see `_PAIRED_REF`). Terminal only, like slots 6/8/10:
-    # a partial order's cost against rev-exact is not a statement about a
-    # plan, so non-terminal steps carry 0.0 in slots 2 and 5 under this form
+    # measures the reference beside the candidate and the two cost slots
+    # become log-differences (see `_PAIRED_REF`). Terminal only, like slots
+    # 6/8/10: a partial order's cost against the reference is not a statement
+    # about a plan, so non-terminal steps carry 0.0 in slots 2 and 5 under this form
     # (training uses terminal rewards strictly; ruling 2026-09-01).
     _paired = bool(is_terminal) and cost_form() == "paired-log"
     _paired_ref_rec = None
@@ -9337,24 +9386,24 @@ def _callback_measured(
         h_ex.update(repr(callback_device).encode())
     exact_cache_key = h_ex.digest()
 
-    # THE PAIRED REFERENCE (ticket .9): rev-exact = the reverse order over
-    # the SAME vertex set the candidate eliminated, no rule on any vertex,
-    # no action on any face. Built through the same ``jacve`` call shape an
-    # identity candidate gets from `_jacve_fn(approx=True)` -- ``transforms``
-    # is the empty list and ``face_transforms`` None whenever a plan has no
-    # rule and no face action -- so an identity plan and its reference are
-    # the SAME executable and land on the same lowering path (ticket .24's
-    # armed-vs-unarmed question is thereby moot for the pair; its GPU
-    # landing test still stands). Descending vertex ids IS graphax's
-    # ``"rev"`` over these vertices (core._checkify_order). The COMPILE is
-    # cached like every other executable (order, arg shapes, device); the
-    # MEASUREMENT is taken anew in every terminal callback, right after the
-    # candidate's -- that is what makes it paired.
-    # ON THE BASE PROGRAM: the policy's own vertex set (`_rec_order`), the
-    # base jaxpr, its consts and its arguments (see `_ref_cfg` above). With
-    # no carry variant these are the candidate's own, as they always were.
+    # THE PAIRED REFERENCE (ticket .9; dsnn-xta): ``jax.grad`` of the target
+    # function with respect to ``argnums`` (`reference_program`), on the base
+    # program's inputs, through `_compile_measure` like the candidate. Until
+    # 2026-09-24 it was graphax's rev-exact elimination over the candidate's
+    # vertex set; that program is now `_do_compile_rev_exact`, telemetry only
+    # (`rev_exact_telemetry_enabled`), and no longer scores 0. The COMPILE is
+    # cached like every other executable (graph, arg shapes, device); the
+    # MEASUREMENT is taken anew in every terminal callback, interleaved with
+    # the candidate's -- that is what makes it paired.
+    # ON THE BASE PROGRAM: the base target, its arguments and, for the
+    # telemetry, the policy's own vertex set, the base jaxpr and its consts
+    # (see `_ref_cfg` above). With no carry variant these are the
+    # candidate's own, as they always were.
     _rev_order = sorted(_rec_order, reverse=True)
+    _ref_kind = reference_kind(_ref_cfg)
     h_rf = hashlib.blake2b(digest_size=16)
+    h_rf.update(_ref_kind.encode())
+    h_rf.update(np.asarray(tuple(_ref_cfg.argnums), dtype=np.int32).tobytes())
     h_rf.update(np.asarray(_rev_order, dtype=np.int32).tobytes())
     h_rf.update(b"sparse" if bool(_ref_cfg.sparse) else b"dense")
     for a in _ref_args_for_lower:
@@ -9367,6 +9416,12 @@ def _callback_measured(
 
     def _do_compile_paired_ref():
         return _compile_measure(
+            jax.jit(reference_program(_ref_cfg), keep_unused=True)
+            .lower(*_ref_args_for_lower)
+        )
+
+    def _do_compile_rev_exact():
+        return _compile_measure(
             jax.jit(
                 jacve(
                     _ref_cfg.target_fun,
@@ -9376,10 +9431,6 @@ def _callback_measured(
                     sparse_representation=_ref_cfg.sparse,
                     transforms=[],
                     face_transforms=None,
-                    # The paired reference walks the graph the POLICY acted
-                    # on. A carry variant is that graph with the
-                    # approximation moved into an argument, and the exact
-                    # rule lives on the base program only (dsnn-biw).
                     jaxpr=_ref_cfg.jaxpr,
                     consts=list(_ref_consts),
                 ),
@@ -9560,9 +9611,9 @@ def _callback_measured(
             return _oom_truncate("exact compile", _exc)
     else:
         compiled_exact = None
-    # THE REV-EXACT REFERENCE, compiled here because BOTH consumers are here:
-    # the paired cost channel's timing windows below and, since 2026-09-18,
-    # the gradient cosine. One executable per (vertex set, shapes, device) and
+    # THE REFERENCE, compiled here because BOTH consumers are here: the
+    # paired cost channel's timing windows below and, since 2026-09-18, the
+    # gradient cosine. One executable per (graph, shapes, device) and
     # therefore one compile per process, cached on ``paired_ref_key``.
     _ref_ex = None
     if _paired or (is_terminal and _qmetric == "grad_cosine"):
@@ -9706,6 +9757,7 @@ def _callback_measured(
     # WHICH quantity the peak samples hold (see _record_mem_parity): the
     # measured runtime delta, the substituted static estimate, or nothing.
     _peak_src = "not_measured"
+    _rev_tel_raw = None
 
     # OOM during EXECUTION is truncation too (see _oom_truncate): the
     # measurement allocates the full approximated Jacobian, so a graph that
@@ -9920,6 +9972,48 @@ def _callback_measured(
                 _ref_lat_samples.append(_l)
                 _ref_peak_samples.append(_pk)
                 _ib += 1
+        # THE GRAPHAX REV-EXACT, TELEMETRY ONLY (dsnn-xta): one paired ratio
+        # per episode against the reference, behind
+        # ALPHAGRAD_REV_EXACT_TELEMETRY (off by default). Its windows are
+        # interleaved with fresh reference windows here, after the
+        # candidate's loop, so none of them lands in a window a plan is
+        # scored on; point 0 only, since latency does not move with the point.
+        if _paired and rev_exact_telemetry_enabled() and _rev_telemetry_due(
+                _MEASURE_EPISODE["key"], paired_ref_key):
+            try:
+                _rev_ex = cached_compile(
+                    b"rev-exact:" + paired_ref_key, _do_compile_rev_exact)
+            except Exception as _exc:
+                if _is_graphax_trace_failure(_exc):
+                    return _trace_truncate("rev-exact telemetry compile",
+                                           _exc)
+                if not _is_oom(_exc):
+                    raise
+                return _oom_truncate("rev-exact telemetry compile", _exc)
+            _rv_lat: list[float] = []
+            _tl_lat: list[float] = []
+            if config.measure_latency:
+                _rv_inner = resolve_measure_inner(
+                    _probe_one(_rev_ex, ref_eval_args_all[0]), _window_s,
+                    _cfg_inner)
+                for _w in range(_ref_windows):
+                    _l, _pk, _s, _o = _time_one_rep(
+                        _rev_ex, ref_eval_args_all[0], unique_devices,
+                        _rv_inner)
+                    del _o, _s
+                    _rv_lat.append(_l)
+                    _l, _pk, _s, _o = _time_one_rep(
+                        _ref_ex, ref_eval_args_all[0], unique_devices,
+                        _ref_inner)
+                    del _o, _s
+                    _tl_lat.append(_l)
+            _rev_tel_raw = (
+                _static_memory_bytes(_rev_ex),
+                float(_aggregate_samples(_rv_lat, want_top_quartile=True))
+                if _rv_lat else 0.0,
+                float(_aggregate_samples(_tl_lat, want_top_quartile=True))
+                if _tl_lat else 0.0,
+                len(_rv_lat))
         # SECONDS OF EXECUTION actually spent inside timed windows, per half.
         # Window w of a half took ``latency_ns[w] * inner`` nanoseconds, which
         # is the quantity the budget is a target for. Warm-ups, probes and the
@@ -10045,7 +10139,7 @@ def _callback_measured(
                     print(
                         "[measure] WARNING quality channel: the GRADIENT "
                         "COSINE HAS NO CHANNEL for this configuration (no "
-                        "data_gen, or the rev-exact reference failed to build "
+                        "data_gen, or the reference failed to build "
                         "or to execute on the probe batch). The channel reads "
                         "0.0 for every plan of this run; ask for "
                         "ALPHAGRAD_QUALITY_METRIC=jac_cosine to score at the "
@@ -10215,7 +10309,7 @@ def _callback_measured(
                 if _ref_temp is None:
                     raise MemChannelFault(
                         "paired reference: memory_analysis() returned "
-                        "nothing for the rev-exact executable, so its static "
+                        "nothing for the reference executable, so its static "
                         "temp bytes cannot be read")
                 _ref_mem = float(_ref_temp)
             else:
@@ -10248,6 +10342,29 @@ def _callback_measured(
                 "memory": window_ratio_record(paired_window_log_ratios(
                     _mem_c, _mem_r, _MEM_LOG_FLOOR_BYTES, _mem_fb)),
             }
+            _rev_tel = None
+            if _rev_tel_raw is not None:
+                _rv_static, _rv_med, _tl_med, _rv_n = _rev_tel_raw
+                _rev_tel = {
+                    "latency_ratio": (_rv_med / _tl_med
+                                      if _rv_med > 0.0 and _tl_med > 0.0
+                                      else None),
+                    "temp_ratio": (_rv_static[0] / _ref_static[0]
+                                   if _rv_static is not None
+                                   and _ref_static is not None
+                                   and _ref_static[0] > 0.0 else None),
+                    "latency_ns": float(_rv_med),
+                    "reference_latency_ns": float(_tl_med),
+                    "temp_bytes": (None if _rv_static is None
+                                   else _rv_static[0]),
+                    "windows": int(_rv_n),
+                }
+                print(f"[rev-exact] episode {_MEASURE_EPISODE['label']}: "
+                      f"rev-exact/reference latency ratio "
+                      f"{_rev_tel['latency_ratio']} over {_rv_n} paired "
+                      f"windows, static temp ratio {_rev_tel['temp_ratio']} "
+                      f"(rev-exact {_rv_med/1e3:.1f}us, reference "
+                      f"{_tl_med/1e3:.1f}us)", flush=True)
             _paired_ref_rec = {
                 "ratio_log": _ratio_log,
                 # POSITIVE units (ticket .45 logs these as ref/*).
@@ -10265,11 +10382,12 @@ def _callback_measured(
                 "delta_latency": float(latency_ns),
                 "delta_memory": float(peak_memory),
                 "mem_floored": int(_n_floored),
-                "order": list(_rev_order),
+                "reference": _ref_kind,
+                "rev_exact": _rev_tel,
             }
             _record_paired_ref(_paired_ref_rec)
             if os.environ.get("ALPHAGRAD_DEBUG_MEASURE", "0") == "1":
-                print(f"[paired-ref] rev-exact lat={_ref_lat_ns/1e3:.1f}us "
+                print(f"[paired-ref] {_ref_kind} lat={_ref_lat_ns/1e3:.1f}us "
                       f"mem={_ref_mem:.0f}B | candidate "
                       f"lat={_abs_lat/1e3:.1f}us mem={_abs_mem:.0f}B | "
                       f"Delta_lat={latency_ns:+.4f} Delta_mem={peak_memory:+.4f}"
@@ -10278,7 +10396,7 @@ def _callback_measured(
             latency_ns, peak_memory = 0.0, 0.0
     # ---- THE MEMORY OBJECTIVE, reward slot 11 (dsnn-xvi) -------------
     # Static values, so no windows and no pairing noise: the timed
-    # executable's three memory_analysis() numbers against the rev-exact
+    # executable's three memory_analysis() numbers against the
     # reference's, as one log sum. A refused plan never reaches this line.
     mem_obj = 0.0
     _mem_obj_rec = None
@@ -10291,7 +10409,7 @@ def _callback_measured(
         if _ref_static is None:
             raise MemChannelFault(
                 "memory objective: memory_analysis() returned nothing for "
-                "the rev-exact executable, so its static bytes cannot be "
+                "the reference executable, so its static bytes cannot be "
                 "read")
         mem_obj, _mem_obj_rec = mem_objective(
             (_mp["static_temp_bytes"], _mp["static_output_bytes"],

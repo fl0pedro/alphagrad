@@ -133,19 +133,19 @@ def test_every_container_is_divided_by_the_base_programs_reference(
             "key": next(iter(ref_ex)),
             "args": int(ma.argument_size_in_bytes),
             "temp": int(ma.temp_size_in_bytes),
-            "order": list(recs[0]["order"]),
+            "reference": recs[0]["reference"],
         }
 
     base = got["exact"]
-    assert base["order"] == sorted(order, reverse=True)
+    assert base["reference"] == "jax.grad"
     for name, g in got.items():
-        # ONE executable, one vertex set, one argument tuple: the dense
-        # carry of the graph the policy acted on, whatever this plan's
-        # container made of it.
+        # ONE executable, one target, one argument tuple: jax.grad of the
+        # base target on the dense carry of the graph the policy acted on,
+        # whatever this plan's container made of it.
         assert g["key"] == base["key"], (name, got)
         assert g["args"] == base["args"], (name, got)
         assert g["temp"] == base["temp"], (name, got)
-        assert g["order"] == base["order"], (name, got)
+        assert g["reference"] == base["reference"], (name, got)
 
 
 def test_the_candidate_is_still_the_containers_own_program(monkeypatch):

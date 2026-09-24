@@ -1,7 +1,8 @@
 # THE MEMORY OBJECTIVE, reward slot 11 (dsnn-xvi, owner ruling 2026-09-24):
 #   r_mem = -(log(temp/temp*) + log(args/args*) + log(out/out*))
-# from memory_analysis() of the timed executable and of the rev-exact
-# reference (*), under --cost-form paired-log, one PopArt channel, no symlog.
+# from memory_analysis() of the timed executable and of the reference (*),
+# jax.grad of the target (dsnn-xta; the graphax rev-exact until 2026-09-24),
+# under --cost-form paired-log, one PopArt channel, no symlog.
 from __future__ import annotations
 
 import math
@@ -160,9 +161,24 @@ def test_mem_objective_is_the_negated_log_sum_of_three_ratios():
 
 
 # ------------------------------------------ 3. the reference scores exactly 0
-def test_the_rev_exact_reference_scores_exactly_zero():
+def _the_reference_as_the_candidate(monkeypatch, env):
+    real = _cc.cached_compile
+    _cc._LOCAL_CACHE.clear()
+
+    def _substitute(key, fn):
+        if bytes(key).startswith(b"approx:"):
+            fn = lambda: envmod._compile_measure(                # noqa: E731
+                jax.jit(envmod.reference_program(env.config),
+                        keep_unused=True).lower(*env.args))
+        return real(key, fn)
+    monkeypatch.setattr(_cc, "cached_compile", _substitute)
+
+
+def test_the_reference_scores_exactly_zero(monkeypatch):
     env = _make_env()
+    _the_reference_as_the_candidate(monkeypatch, env)
     r = _run_plan(env, _rev_order(env))
+    _cc._LOCAL_CACHE.clear()
     assert float(r[MSLOT]) == 0.0
     rec = _last_record()
     assert rec["rewards"][MSLOT] == 0.0
@@ -379,9 +395,17 @@ def test_on_rsnn_shd_a_diag_on_the_carried_face_moves_the_args_term():
     exact = _measure_rsnn(lm, env, eval_samples, order, [], "exact")
     diag = _measure_rsnn(lm, env, eval_samples, order,
                          _diag_on_the_carried_face(lm, env, order), "diag")
-    # The rev-exact plan IS the reference program: every ratio exactly 1.
-    assert exact["mem_ratios"] == {"temp": 1.0, "args": 1.0, "out": 1.0}
-    assert exact["rewards"][MSLOT] == 0.0
+    # The reference is jax.grad of the target (dsnn-xta), so the rev-exact
+    # plan is a candidate like any other: its three ratios are what the two
+    # programs' memory_analysis() say, and the diag plan's move is read
+    # AGAINST THE EXACT PLAN, both being divided by one reference.
+    assert exact["mem_objective_floored"] == 0
+    assert exact["rewards"][MSLOT] == -(math.log(exact["mem_ratios"]["temp"])
+                                        + math.log(exact["mem_ratios"]["args"])
+                                        + math.log(exact["mem_ratios"]["out"]))
+    assert exact["ref_args_bytes"] == diag["ref_args_bytes"]
+    assert exact["ref_temp_bytes"] == diag["ref_temp_bytes"]
+    assert exact["ref_output_bytes"] == diag["ref_output_bytes"]
     # Measured on RSNN_SHD rtrl at step 7 (job 67781): the compact carry
     # container reads 2,569,128 B of arguments against 226,177,960 B dense
     # (ratio 0.01136, -4.478 nats); the output is byte-identical; the temp
@@ -389,10 +413,11 @@ def test_on_rsnn_shd_a_diag_on_the_carried_face_moves_the_args_term():
     # ruling's "moves only the args term" holds to a tenth of a percent
     # rather than exactly.
     assert diag["mem_objective_floored"] == 0
-    assert diag["mem_ratios"]["out"] == 1.0
-    assert abs(math.log(diag["mem_ratios"]["temp"])) < 0.002
-    assert diag["mem_ratios"]["args"] < 1.0 / 50.0
+    assert diag["mem_ratios"]["out"] == exact["mem_ratios"]["out"]
+    assert abs(math.log(diag["mem_ratios"]["temp"]
+                        / exact["mem_ratios"]["temp"])) < 0.002
+    assert diag["mem_ratios"]["args"] < exact["mem_ratios"]["args"] / 50.0
     assert diag["rewards"][MSLOT] == -(math.log(diag["mem_ratios"]["temp"])
                                        + math.log(diag["mem_ratios"]["args"])
                                        + math.log(diag["mem_ratios"]["out"]))
-    assert diag["rewards"][MSLOT] > 4.0
+    assert diag["rewards"][MSLOT] - exact["rewards"][MSLOT] > 4.0
