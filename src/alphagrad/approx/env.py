@@ -7315,8 +7315,8 @@ def make_slot_frame_hook(one_row, *, stats: dict | None = None,
     post-apply identity test that decides whether a block is emitted at all.
     """
     from alphagrad.approx.common.masks import (
-        face_counts_armed, make_live_masked_chooser, reduce_axes_physical,
-        reduce_axis_spaces)
+        face_counts_armed, make_live_masked_chooser, quant_is_noop,
+        reduce_axes_physical, reduce_axis_spaces)
     from alphagrad.approx.common.plan_log import kind_of_slot
 
     row = tuple(int(x) for x in one_row)
@@ -7354,6 +7354,9 @@ def make_slot_frame_hook(one_row, *, stats: dict | None = None,
                 stats["skipped"] = stats.get("skipped", 0) + 1
                 stats[f"skipped_{kind}"] = stats.get(f"skipped_{kind}", 0) + 1
             return None
+        if kind == "quant" and quant_is_noop(st, _rules[0].dtype):
+            # Already narrow or no value: the face Quant holds without a cast.
+            return _rules[0]
         return inner(st)
 
     def _chosen_applied(action, applied):

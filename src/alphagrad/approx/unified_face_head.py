@@ -562,7 +562,8 @@ class UnifiedFaceHead(eqx.Module):
         ``self.layout.n_slots`` -- see :meth:`_check_mask_slots`.
         ``quant_mask`` is the ONE per-face legality of the Quant bit (a
         scalar 0/1: the narrow float is a legal, non-idempotent cast on lhs
-        AND rhs); ``None`` means legal.
+        or rhs, and the other operand holds it as an identity cast);
+        ``None`` means legal.
 
         ``face_valid`` / ``approx_ok`` are the gates that force a padding face
         or a disallowed variant to contribute exactly zero. There are no gates

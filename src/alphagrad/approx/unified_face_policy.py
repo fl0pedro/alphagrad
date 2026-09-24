@@ -308,11 +308,10 @@ class UnifiedFacePolicy(eqx.Module):
                                    comp_valid_f[s], quant_legality_mask[s],
                                    op_override)
                 for s in range(self.n_slots)]
-        # The bit narrows lhs AND rhs, so it is legal iff the narrow float is
-        # a legal, non-idempotent cast on BOTH operand slots -- the same test
-        # each slot's hook applies, so a bit the mask admits is a bit graphax
-        # sees on both sides.
-        qm = jnp.prod(jnp.stack([outs[s][5] for s in QUANT_SLOTS]))
+        # The bit narrows lhs AND rhs and is legal iff the narrow float is a
+        # real cast on at least one of them: the slot hook holds it as an
+        # identity cast on an operand that is narrow already or has no value.
+        qm = jnp.max(jnp.stack([outs[s][5] for s in QUANT_SLOTS]))
         return tuple(jnp.stack([o[k] for o in outs]) for k in range(5)) + (qm,)
 
     def _slot_masks_1(self, features, pair_valid, comp_valid,
@@ -327,9 +326,10 @@ class UnifiedFacePolicy(eqx.Module):
             axis fallbacks.
           - Reduce is legal only if at least one reduce axis is valid.
           - None is unconditionally legal.
-          - ``q_narrow`` is this slot's half of the face's Quant bit: the
+          - ``q_narrow`` is this slot's share of the face's Quant bit: the
             narrow float is a legal, non-idempotent cast here (D4 identity
-            quant masking), and the profile admits QUANT.
+            quant masking), and the profile admits QUANT. The bit is legal
+            when one operand slot's share is set.
         The resulting op_legal mask is composed with op_override.
         """
         sz = self._pair_sizes(features)

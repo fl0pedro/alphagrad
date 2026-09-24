@@ -589,7 +589,7 @@ def test_masked_head_equals_pruned_head_per_slot():
     the per-slot legal sets ``face_slot_legality`` would supply; the head's
     branch rule (only the fields the chosen op consumes count) is applied on
     both sides. The face's quant bit is ONE Bernoulli behind the skip, legal
-    iff the narrow float is legal on lhs AND rhs; with it set the two operand
+    iff the narrow float is legal on lhs OR rhs; with it set the two operand
     slots contribute nothing (their rows ARE the QUANT rows).
     """
     from alphagrad.approx.unified_face_head import (
