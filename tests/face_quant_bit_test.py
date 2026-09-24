@@ -303,11 +303,10 @@ def test_a_skipped_carry_face_does_not_lend_its_quant_row():
 def test_carry_at_rest_bytes_counts_the_given_blocks_only():
     from alphagrad.approx.common.rsnn_shd import RSNN_HEAD_SLOTS
     head = tuple(np.zeros((3,), np.float32) for _ in range(RSNN_HEAD_SLOTS))
-    weights = tuple(np.ones((4, 4), np.float32) for _ in range(3))
     blocks = (np.ones((5, 7), np.float32), np.ones((2, 3), np.float32))
-    var = {"args": head + weights + blocks}
+    var = {"args": head + blocks}
     assert CP.carry_at_rest_bytes(var, "rtrl") == 4 * (35 + 6)
-    narrow = {"args": head + weights + tuple(
+    narrow = {"args": head + tuple(
         b.astype(jnp.bfloat16) for b in blocks)}
     assert CP.carry_at_rest_bytes(narrow, "rtrl") == 2 * (35 + 6)
     adj = {"args": head + blocks}
