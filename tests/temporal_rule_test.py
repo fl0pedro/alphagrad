@@ -1743,76 +1743,89 @@ def test_the_carry_faces_keep_the_plans_quant_bit(container):
     assert n_carry > 0
 
 
-# Two refused plans of the RTRL rerun (dsnn-wua), as their plan-log records.
-_REFUSED_CARRY_QUANT = {
-    "67851-ep1-env8": (
-        [80, 34, 32, 51, 48, 28, 44, 13, 81, 27, 61, 43, 7, 77, 66, 8, 14, 67,
-         5, 63, 74, 64, 3, 12, 53, 45, 35, 39, 62, 18, 40, 2, 1, 38, 58, 50,
-         22, 41, 20, 47, 70, 36, 65, 46, 72, 54, 30, 10, 75, 26, 37, 31, 15,
-         33, 29, 78, 59, 52, 76, 56, 60, 9, 49, 73, 16, 4, 79, 6, 17, 68, 24,
-         25, 69, 55, 71, 57, 42, 11, 21, 19, 23],
-        [[65, 2, 0, -3, "bfloat16", 1, -3, "bfloat16", 1, -1, -1, 0]],
-        "quant", (4, (7, 27))),
-    "67852-ep4-env14": (
-        [61, 62, 77, 11, 53, 34, 6, 31, 19, 12, 39, 38, 14, 76, 54, 15, 57,
-         66, 48, 3, 42, 17, 56, 30, 33, 1, 69, 26, 68, 78, 9, 59, 29, 50, 43,
-         20, 72, 36, 37, 70, 81, 21, 46, 5, 63, 23, 35, 16, 55, 60, 80, 52, 2,
-         64, 28, 74, 44, 4, 25, 71, 32, 51, 7, 24, 67, 18, 49, 27, 8, 58, 73,
-         22, 79, 45, 75, 40, 47, 13, 41, 65, 10],
-        [[38, 0, 0, -1, -1, 0, -1, -1, 0, 0, 0, 20],
-         [43, 4, 0, -3, "bfloat16", 1, -3, "bfloat16", 1, -1, -1, 0]],
-        "diag+quant", (8, (7, 29))),
-}
-
-
-@pytest.mark.parametrize("job", sorted(_REFUSED_CARRY_QUANT))
-def test_a_refused_carry_quant_plan_is_two_sided_on_the_container_program(
-        job, monkeypatch):
+# The plan the RTRL rerun refused (dsnn-wua): one Quant bit on a carried face.
+@pytest.mark.parametrize("container", ["quant", "diag+quant"])
+def test_a_carry_quant_plan_is_two_sided_on_the_container_program(
+        container, monkeypatch):
     import alphagrad.approx.env as envmod
     import graphax.core as gxc
-    from graphax.sparse.micro_actions import Quant
+    from graphax.sparse.micro_actions import Quant, QUANT_DTYPES
     from alphagrad.approx.common import masks as M
-    from alphagrad.approx.common.plan_log import decode_wires
-    order, faces, container, (vertex, key) = _REFUSED_CARRY_QUANT[job]
-    o_list, specs, fs, sk = decode_wires({
-        "shape": {"n": len(order), "max_rules": envmod.MAX_RULES_PER_VERTEX,
-                  "max_faces": 64, "face_slots": 3},
-        "order": order, "rules": [], "faces": faces, "replayable": True})
-    o_list = [int(v) for v in o_list]
+    lm, CP, env = _env_for("rtrl")
+    cfg = env.config
+    monkeypatch.setattr(envmod, "MAX_FACES", envmod.derived_max_faces(
+        cfg.jaxpr, cfg.argnums, env.consts, env.args))
     monkeypatch.setenv("ALPHAGRAD_APPROX_ADD", "lossless")
     for name in ("ALPHAGRAD_PER_FACE_MASKS", "ALPHAGRAD_PER_FACE_REPAIR_AXIS"):
         monkeypatch.setenv(name, os.environ.get(name, "0"))
     monkeypatch.setattr(envmod, "_LIVE_CHAINS", [])
     flags = (M._PER_FACE_MASKS[0], M._PER_FACE_REPAIR_AXIS[0])
-    seen = []
-    check = gxc._check_face_quant
+    last, seen = {}, []
+    apply0, check0 = gxc._apply_face_transform, gxc._check_face_quant
 
-    def _spy(lhs, rhs, v, k):
-        seen.append((int(v), tuple(k), lhs, rhs))
-        return check(lhs, rhs, v, k)
+    def _dtype(st):
+        val = getattr(st, "val", None)
+        return None if val is None else str(val.dtype)
+
+    def _casts(st):
+        return st is not None and bool(M.quant_valid_mask(
+            st, M.FACE_QUANT_DTYPES)[M.FACE_QUANT_NARROW])
+
+    def _apply_spy(val, t, slot, *a, **kw):
+        if slot in ("lhs", "rhs"):
+            last[slot] = _dtype(val)
+        return apply0(val, t, slot, *a, **kw)
+
+    def _check_spy(lq, rq, v, k):
+        seen.append((int(v), tuple(k), lq, rq, last.get("lhs"),
+                     last.get("rhs")))
+        return check0(lq, rq, v, k)
 
     M.set_per_face_masks(True)
     try:
-        lm, CP, env = _env_for("rtrl")
+        valid = sorted(int(v) for v in env.valid_vertices)
+        mask = CP.carry_scope_mask(cfg.jaxpr)
+        order = [int(v) for v in sorted(valid, reverse=True)]
+        inv = lm.face_inventory(env, np.asarray(order, np.int32),
+                                capture_tensors=True)
+        carried = [e for e in inv if mask[int(e["vertex"]) - 1]
+                   and _casts(e["tensors"].get(0))
+                   and _casts(e["tensors"].get(1))]
+        assert carried, "no carried face takes the Quant bit"
+        k, f = int(carried[0]["k"]), int(carried[0]["f"])
+        T, W = len(order), envmod.MAX_FACES
+        specs = np.full((T, envmod.MAX_RULES_PER_VERTEX, 3), -1, np.int32)
+        specs[:, :, 2] = 0
+        faces = np.full((T, W, envmod.FACE_SLOTS, 3), -1, np.int32)
+        faces[..., 2] = 0
+        skips = np.zeros((T, W), np.int32)
+        faces[k, f, 0] = faces[k, f, 1] = (
+            envmod.QUANT_SENTINEL, QUANT_DTYPES.index("bfloat16"), 0)
+        if container == "diag+quant":
+            faces[k, f, 2] = (0, 0, -1)
         envmod._face_transforms_for_order(
-            env.config, env.consts, env.args, o_list, specs.tolist(), fs, sk)
-        assert CP.container_for_plan(env.config, o_list, fs, sk,
+            cfg, env.consts, env.args, order, specs.tolist(), faces, skips)
+        assert CP.container_for_plan(cfg, order, faces, skips,
                                      specs) == container
-        var = CP.measurement_env(container, env.config)
+        var = CP.measurement_env(container, cfg)
         assert var["args"][R.RSNN_HEAD_SLOTS].dtype == jnp.bfloat16
-        o2, s2, f2, k2, _j2 = CP.transport_wires(o_list, var, specs, fs, sk,
-                                                 None)
-        monkeypatch.setattr(gxc, "_check_face_quant", _spy)
+        o2, s2, f2, k2, _j2 = CP.transport_wires(order, var, specs, faces,
+                                                 skips, None)
+        monkeypatch.setattr(gxc, "_apply_face_transform", _apply_spy)
+        monkeypatch.setattr(gxc, "_check_face_quant", _check_spy)
         envmod._face_transforms_for_order(
             var["config"], var["consts"], var["args"], list(o2),
             s2.tolist(), f2, k2)
     finally:
         M._PER_FACE_MASKS[0], M._PER_FACE_REPAIR_AXIS[0] = flags
-    hit = [(lq, rq) for v, k, lq, rq in seen if (v, k) == (vertex, key)]
-    assert hit, f"{job}: vertex {vertex} never met face {key}"
-    for lq, rq in hit:
-        assert isinstance(lq, Quant) and isinstance(rq, Quant), (job, lq, rq)
-        assert str(lq.dtype) == str(rq.dtype) == "bfloat16", (job, lq, rq)
+    quant = [s for s in seen
+             if isinstance(s[2], Quant) or isinstance(s[3], Quant)]
+    assert quant, f"{container}: no Quant face reached graphax"
+    for v, key, lq, rq, _l, _r in quant:
+        assert isinstance(lq, Quant) and isinstance(rq, Quant), (v, key)
+        assert str(lq.dtype) == str(rq.dtype) == "bfloat16", (v, key)
+    assert any("bfloat16" in (lhs, rhs) for *_s, lhs, rhs in quant), (
+        f"{container}: no Quant face met an operand already bfloat16")
 
 
 # ---------------------------------------------------------------------------
