@@ -368,8 +368,11 @@ def _build_variant(container: str, entry: dict) -> dict:
             "slots": tuple(getattr(base_gen, "data_slots",
                                    range(len(base["args"])))),
         }
+    # THE VARIANT'S OWN OUTPUT COUNT: the skip variant is the truncated
+    # graph with the loss alone, the others carry the five state rows.
     cfg = base_cfg._replace(jaxpr=cj.jaxpr, argnums=tuple(argnums),
-                            target_fun=fn, data_gen=gen)
+                            target_fun=fn, data_gen=gen,
+                            carried_outputs=max(len(cj.jaxpr.outvars) - 1, 0))
     consts = tuple(cj.literals)
     args = tuple(xs)
     vmap, alt_carry = _alignment(base_cfg.jaxpr, cj.jaxpr)
