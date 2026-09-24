@@ -28,9 +28,14 @@ from alphagrad.approx.common import compile_cache as _cc        # noqa: E402
 from alphagrad.approx.env import (                              # noqa: E402
     REWARD_INDEX,
     mem_objective,
-    memory_sentinel,
     paired_log_costs,
 )
+
+
+# Resolved per call, so a tree without it fails the one test that needs it.
+def memory_sentinel(reference, bytes_limit):
+    return env_mod.memory_sentinel(reference, bytes_limit)
+
 
 # captured at import: a test that runs two plans patches the same attribute
 # twice, and the second fake must wrap the real cache, not the first fake

@@ -29,9 +29,14 @@ from alphagrad.approx.env import (                              # noqa: E402
     NUM_REWARDS,
     REWARD_INDEX,
     mem_objective,
-    memory_sentinel,
     paired_log_costs,
 )
+
+
+# Resolved per call, so a tree without it fails the one test that needs it.
+def memory_sentinel(reference, bytes_limit):
+    return env_mod.memory_sentinel(reference, bytes_limit)
+
 
 _REAL_CACHED_COMPILE = _cc.cached_compile
 
@@ -675,6 +680,10 @@ def test_the_trainer_scores_a_refused_plan_at_its_own_deadline(
 
 
 def test_the_sweep_writes_a_row_for_a_refused_plan(tmp_path, monkeypatch):
+    # The sweep rewrites the face width and exports its knobs at import; both
+    # are put back so no later module of this worker inherits them.
+    saved_env = dict(os.environ)
+    monkeypatch.setattr(env_mod, "MAX_FACES", env_mod.MAX_FACES)
     import alphagrad.approx.tools.landscape_map as lm
     monkeypatch.delenv("ALPHAGRAD_COST_FORM", raising=False)
     monkeypatch.setattr(env_mod, "_device_bytes_limit", lambda d: 1)
@@ -694,6 +703,9 @@ def test_the_sweep_writes_a_row_for_a_refused_plan(tmp_path, monkeypatch):
         env_mod.set_measure_timeout_s(None)
         env_mod.consume_refused_counts()
         env_mod.consume_plan_records()
+        for key in set(os.environ) - set(saved_env):
+            del os.environ[key]
+        os.environ.update(saved_env)
     with open(tmp_path / "rows.csv", newline="") as fh:
         rows = list(csv.DictReader(fh))
     assert {r["role"] for r in rows} == {"reference", "candidate"}
