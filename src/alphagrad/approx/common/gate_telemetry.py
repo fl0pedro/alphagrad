@@ -721,7 +721,7 @@ def legal_counts_from_slot_masks(pair, comp, quant, n_faces, *,
 
     Returns ``(n_choices (F_live, S) int64, skip_legal (F_live,) bool,
     quant_legal (F_live,) bool)``: the per-slot structural leaves, and the
-    face's Quant bit legal iff the narrow float is a legal cast on lhs AND
+    face's Quant bit legal iff the narrow float is a legal cast on lhs OR
     rhs -- the same test ``UnifiedFacePolicy._face_masks`` applies.
     """
     geom = face_head_geometry(approx_add)
@@ -756,7 +756,7 @@ def legal_counts_from_slot_masks(pair, comp, quant, n_faces, *,
             if r_ok:
                 per_slot += int((comp[f, s] > 0.5).sum()) * geom["n_reduce_fns"]
             n[f, s] = per_slot
-        ql[f] = q_ok and all(
+        ql[f] = q_ok and any(
             quant[f, s, FACE_QUANT_NARROW] > 0.5 for s in QUANT_SLOTS)
     skip_legal = np.full(nf, bool(face_head_on), dtype=bool)
     return n, skip_legal, ql

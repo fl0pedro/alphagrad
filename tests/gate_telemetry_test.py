@@ -437,7 +437,7 @@ def test_g3_a_quant_legality_bit_is_one_leaf_per_face():
 def test_g3_live_slot_masks_count_each_slot_and_the_bit_on_both_operands():
     """The live path (--live-faces, every campaign arm) hands per-SLOT,
     per-DTYPE masks; the floor reads the structural leaves per slot and the
-    face bit off the narrow float's column on lhs AND rhs."""
+    face bit off the narrow float's column on lhs OR rhs."""
     from alphagrad.approx.common.masks import FACE_QUANT_NARROW
     G = gt.face_head_geometry()
     F, S, N, K = 3, G["n_slots"], 6, G["n_quant_dtypes"]
@@ -447,13 +447,13 @@ def test_g3_live_slot_masks_count_each_slot_and_the_bit_on_both_operands():
     pair[0, 0, 0, 1] = 1.0                 # one ordered pair, slot 0 only
     comp[0, 1, :2] = 1.0                   # two reduce axes, slot 1 only
     quant[0, :, FACE_QUANT_NARROW] = 1.0   # bf16 legal on every slot: bit on
-    quant[1, 0, FACE_QUANT_NARROW] = 1.0   # lhs only: bit off
+    quant[1, 0, FACE_QUANT_NARROW] = 1.0   # lhs only: bit on, rhs holds it
     quant[2, 2, FACE_QUANT_NARROW] = 1.0   # the new slot only: bit off
     n, sk, ql = gt.legal_counts_from_slot_masks(pair, comp, quant, F)
     assert n[0].tolist()[:3] == [2, 1 + 2 * G["n_reduce_fns"], 1]
     assert n[1].tolist() == [1] * S        # face 1: nothing legal but None
     assert sk.tolist() == [True, True, True]
-    assert ql.tolist() == [True, False, False]
+    assert ql.tolist() == [True, True, False]
     with pytest.raises(ValueError):
         gt.legal_counts_from_slot_masks(pair[0], comp, quant, F)
 

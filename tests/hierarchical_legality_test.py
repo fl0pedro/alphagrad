@@ -140,8 +140,8 @@ def _pruned_cat(logits, legal, idx):
 # ==============================================================================
 def test_bottom_up_hierarchical_op_legality():
     """A parent op is legal only if at least one child choice is legal; the
-    face's quant bit is legal only if the narrow float is legal on BOTH
-    contraction operand slots."""
+    face's quant bit is legal only if the narrow float is a legal cast on at
+    least one contraction operand slot."""
     pol, tables = _policy()
     feats = _features()
     sizes, quant, pair, comp = _slot_inputs()
@@ -171,13 +171,19 @@ def test_bottom_up_hierarchical_op_legality():
 
     # THE FACE BIT: legal because bf16 is a legal cast on lhs and rhs
     assert float(qm) == 1.0
-    # ... and illegal as soon as ONE operand slot refuses the narrow float:
-    # the hook on that slot would decline and graphax refuses the one-sided
-    # face (FaceTransformIllegal), so the mask must refuse it first.
+    # ... and still legal when ONE operand slot takes no real cast (its
+    # operand is narrow already or has no value): that slot's hook holds the
+    # face Quant as an identity cast, so graphax sees it on both sides (owner
+    # ruling 2026-09-24 Q8 b).
     for s in QUANT_SLOTS:
         q1 = quant.at[s, FACE_QUANT_NARROW].set(0.0)
         assert float(pol._face_masks(ff, pair, comp, q1, None, tables)[5]) \
-            == 0.0, s
+            == 1.0, s
+    # ... and illegal when NO operand slot casts: the bit would change nothing
+    q0 = quant.at[jnp.asarray(QUANT_SLOTS), FACE_QUANT_NARROW].set(0.0)
+    assert float(pol._face_masks(ff, pair, comp, q0, None, tables)[5]) == 0.0
+    q3 = q0.at[2, FACE_QUANT_NARROW].set(1.0)
+    assert float(pol._face_masks(ff, pair, comp, q3, None, tables)[5]) == 0.0
     # the exact entry (float32) on both slots is not the bit's business
     q2 = quant.at[:, 1 - FACE_QUANT_NARROW].set(1.0).at[
         :, FACE_QUANT_NARROW].set(0.0)
