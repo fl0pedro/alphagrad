@@ -505,6 +505,11 @@ FIDELITY_HEAD = "value_head_fid"
 # head is not constructed, contributes no pytree leaves, and every saved
 # checkpoint keeps loading. INDICES ARE ONLY EVER APPENDED.
 SPARSITY_HEAD = "value_head_spars"
+# --mem-objective-weight != 0 APPENDS a head on reward slot 11
+# (``mem_objective``, dsnn-xvi: the three static memory_analysis() log ratios
+# against rev-exact as one sum). Same discipline: default 0 => no head, no
+# pytree leaf, every checkpoint keeps loading. INDICES ARE ONLY EVER APPENDED.
+MEM_OBJECTIVE_HEAD = "value_head_memobj"
 # Resolved from --quality-metric in `main`; names the quantity reward slot 6
 # actually holds, for every human-readable log line and the wandb
 # ``quality/metric`` key.
@@ -600,6 +605,26 @@ def configure_sparsity(args) -> float:
             int(REWARD_INDEX["sparsity"]),)
         HEAD_NAMES = tuple(HEAD_NAMES) + ("sparsity",)
         VALUE_HEAD_ATTRS = tuple(VALUE_HEAD_ATTRS) + (SPARSITY_HEAD,)
+        NUM_VALUE_HEADS = len(HEAD_REWARD_INDICES)
+        _HEAD_REWARD_INDICES_ARR = jnp.asarray(
+            HEAD_REWARD_INDICES, dtype=jnp.int32)
+    return weight
+
+
+def configure_mem_objective(args) -> float:
+    global HEAD_REWARD_INDICES, NUM_VALUE_HEADS, HEAD_NAMES
+    global VALUE_HEAD_ATTRS, _HEAD_REWARD_INDICES_ARR
+    weight = float(getattr(args, "mem_objective_weight", 0.0) or 0.0)
+    if weight != 0.0 and getattr(args, "cost_form", "paired-log") != "paired-log":
+        raise ValueError(
+            "--mem-objective-weight needs --cost-form paired-log: reward "
+            "slot 11 is measured against the paired rev-exact reference and "
+            "reads 0.0 under the absolute form.")
+    if weight != 0.0 and MEM_OBJECTIVE_HEAD not in VALUE_HEAD_ATTRS:
+        HEAD_REWARD_INDICES = tuple(HEAD_REWARD_INDICES) + (
+            int(REWARD_INDEX["mem_objective"]),)
+        HEAD_NAMES = tuple(HEAD_NAMES) + ("mem_objective",)
+        VALUE_HEAD_ATTRS = tuple(VALUE_HEAD_ATTRS) + (MEM_OBJECTIVE_HEAD,)
         NUM_VALUE_HEADS = len(HEAD_REWARD_INDICES)
         _HEAD_REWARD_INDICES_ARR = jnp.asarray(
             HEAD_REWARD_INDICES, dtype=jnp.int32)
@@ -1088,6 +1113,10 @@ def configure_symlog(args) -> str:
     # mask-is-bit-identical caveat.
     if float(getattr(args, "sparsity_weight", 0.0) or 0.0) != 0.0:
         _exempt = _exempt + (int(REWARD_INDEX["sparsity"]),)
+    # THE MEMORY OBJECTIVE (slot 11) is a log sum already; symlog on top
+    # would bend it a second time. Same conditional, same flag-off caveat.
+    if float(getattr(args, "mem_objective_weight", 0.0) or 0.0) != 0.0:
+        _exempt = _exempt + (int(REWARD_INDEX["mem_objective"]),)
     # THE QUALITY FLOOR (ticket .9): the hinge channel is bounded like the
     # lagrangian violation slot and needs the same carve-out, for the same
     # reason (symlog would discount the per-unit price of a shortfall).
@@ -2835,6 +2864,9 @@ class Agent(eqx.Module):
     # Value head for reward slot 10 (``sparsity``). ``None`` unless
     # --sparsity-weight != 0; a ``None`` field contributes NO leaves.
     value_head_spars: MLP | None
+    # Value head for reward slot 11 (``mem_objective``). ``None`` unless
+    # --mem-objective-weight != 0; a ``None`` field contributes NO leaves.
+    value_head_memobj: MLP | None
     op_embedding: eqx.nn.Embedding
     # NO identity_pool and NO ctx_proj. A vertex's identity is palimpsa's rows
     # for its own equation, scattered into its own slot by `carry_stream`;
@@ -2878,6 +2910,7 @@ class Agent(eqx.Module):
         face_path_policy=None,
         value_head_fid=None,
         value_head_spars=None,
+        value_head_memobj=None,
     ):
         self.embedding = embedding
         self.pos_enc = pos_enc
@@ -2891,6 +2924,7 @@ class Agent(eqx.Module):
         self.value_head_cos = value_head_cos
         self.value_head_fid = value_head_fid
         self.value_head_spars = value_head_spars
+        self.value_head_memobj = value_head_memobj
         self.op_embedding = op_embedding
         self.pref_proj = pref_proj
         self.num_vertices = num_vertices
@@ -2948,6 +2982,8 @@ class Agent(eqx.Module):
             _vs.append(self.value_head_fid(summary))
         if self.value_head_spars is not None:
             _vs.append(self.value_head_spars(summary))
+        if self.value_head_memobj is not None:
+            _vs.append(self.value_head_memobj(summary))
         value = jnp.concatenate(_vs, axis=-1)
         return vertex_logits, vertex_contexts, value
 
@@ -3473,6 +3509,8 @@ class Agent(eqx.Module):
             _vs.append(self.value_head_fid(summary))
         if self.value_head_spars is not None:
             _vs.append(self.value_head_spars(summary))
+        if self.value_head_memobj is not None:
+            _vs.append(self.value_head_memobj(summary))
         value = jnp.concatenate(_vs, axis=-1)
         return vertex_logits, vertex_contexts, value
 
@@ -5308,6 +5346,17 @@ def make_argparser() -> argparse.ArgumentParser:
              "traced and emits no HLO, so it rides compiles the run pays "
              "for anyway; the residual price is reported as "
              "sparsity/wall_amortised_s. Exports ALPHAGRAD_SPARSITY.")
+    # ---- THE MEMORY OBJECTIVE, reward slot 11 (dsnn-xvi) ----------
+    p.add_argument(
+        "--mem-objective-weight", type=float, default=0.0,
+        dest="mem_objective_weight",
+        help="Weight on the MEMORY OBJECTIVE value head (reward slot 11): "
+             "-(log(temp/temp*) + log(args/args*) + log(out/out*)) from "
+             "memory_analysis() of the timed executable against the "
+             "rev-exact reference (*), static, measured on every terminal "
+             "plan under --cost-form paired-log and normalised once by "
+             "PopArt as one channel. DEFAULT 0 = no head; the channel is "
+             "still measured and logged. Needs --cost-form paired-log.")
     # ---- A6: THE PLAN LOG (every terminal plan, losers included) --
     p.add_argument(
         "--plan-log", type=str, default=None, metavar="PATH",
@@ -7079,6 +7128,12 @@ def _build_agent(
     if SPARSITY_HEAD in VALUE_HEAD_ATTRS:
         value_head_spars = MLP(args.embd_dim, 1, value_dims,
                                key=jrand.fold_in(encoder_keys[12], 9))
+    # MEMORY OBJECTIVE value head, key folded in with its own tag for the
+    # same reason as the two above.
+    value_head_memobj = None
+    if MEM_OBJECTIVE_HEAD in VALUE_HEAD_ATTRS:
+        value_head_memobj = MLP(args.embd_dim, 1, value_dims,
+                                key=jrand.fold_in(encoder_keys[12], 10))
     op_embedding = eqx.nn.Embedding(
         OP_TYPE_VOCAB_SIZE,
         args.op_embd_dim,
@@ -7192,6 +7247,7 @@ def _build_agent(
         value_head_cos=value_head_cos,
         value_head_fid=value_head_fid,
         value_head_spars=value_head_spars,
+        value_head_memobj=value_head_memobj,
         op_embedding=op_embedding,
         pref_proj=pref_proj,
         num_vertices=total_v,
@@ -7592,6 +7648,11 @@ def _build_head_weights(args) -> np.ndarray:
     if SPARSITY_HEAD in VALUE_HEAD_ATTRS:
         weights[HEAD_NAMES.index("sparsity")] = np.float32(
             getattr(args, "sparsity_weight", 0.0) or 0.0)
+    # --mem-objective-weight W adds ``+ W*mem_objective``, RAW (a log sum
+    # already, never symlogged). The head exists only when W != 0.
+    if MEM_OBJECTIVE_HEAD in VALUE_HEAD_ATTRS:
+        weights[HEAD_NAMES.index("mem_objective")] = np.float32(
+            getattr(args, "mem_objective_weight", 0.0) or 0.0)
     return weights
 
 
@@ -8029,6 +8090,15 @@ def main(args=None):
                  else "  [TRAINED -- an all-SKIP plan scores the +1 "
                       "ceiling and NOTHING refuses it; read the "
                       "hackability warning]"), flush=True)
+
+    # THE MEMORY OBJECTIVE (reward slot 11, dsnn-xvi) -- after
+    # configure_sparsity so the appended head order stays deterministic.
+    _memobj_weight = configure_mem_objective(args)
+    if _memobj_weight != 0.0:
+        print(f"[cfg] memory objective (three static log ratios vs "
+              f"rev-exact, slot 11): weight={_memobj_weight:g} "
+              f"heads={NUM_VALUE_HEADS} ({', '.join(HEAD_NAMES)})",
+              flush=True)
 
     # THE PALIMPSA READ PAIR, AND THE GUARD ON IT (owner ruling 2026-09-15).
     # The rollout and the loss each have their own read flag, because the

@@ -5,7 +5,7 @@ Gradient coverage -- the per-leaf census, the frozen-gradient HARD GUARD
 and the optional fourth value head -- was removed from the env, the trainer,
 the launcher generator and the plan log. What is pinned here:
 
-1. THE 11-SLOT LAYOUT DID NOT MOVE. Both channel tables are identical; slot 7
+1. THE 12-SLOT LAYOUT DID NOT MOVE. Both channel tables are identical; slot 7
    keeps its NAME (``grad_coverage``) and its ``frob_residual`` alias so
    archived plan logs and the index-keyed reward_scaling mirror keep their
    indices -- the convention slot 9 (``bkstep_acc``) already uses.
@@ -52,15 +52,15 @@ SLOT7 = 7
 LAYOUT = (
     "muls_adds_fmas", "flops", "latency_ns", "max_io_sum", "bytes_accessed",
     "peak_memory", "quality", "grad_coverage", "fidelity", "bkstep_acc",
-    "sparsity",
+    "sparsity", "mem_objective",
 )
 _HERE = pathlib.Path(__file__).resolve().parent
 _ALPHAGRAD = _HERE.parent
 
 
 # ------------------------------------------------------------- 1. the layout
-def test_eleven_slot_layout_is_pinned_in_both_tables():
-    assert NUM_REWARDS == 11
+def test_twelve_slot_layout_is_pinned_in_both_tables():
+    assert NUM_REWARDS == 12
     assert REWARD_NAMES == LAYOUT
     assert rs.REWARD_NAMES == LAYOUT
     for name in LAYOUT:

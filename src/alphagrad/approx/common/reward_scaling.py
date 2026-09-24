@@ -86,6 +86,11 @@ REWARD_NAMES: tuple[str, ...] = (
     # the same channel of the other. See env.py's slot-10 entry, and its
     # hackability warning, before putting a weight here.
     "sparsity",
+    # index 11: THE MEMORY OBJECTIVE (dsnn-xvi, owner ruling 2026-09-24):
+    # -(log(temp/temp*) + log(args/args*) + log(out/out*)) from
+    # memory_analysis() of the timed executable against the rev-exact
+    # reference. A cost, stored negated, already logarithmic. APPENDED.
+    "mem_objective",
 )
 NUM_REWARDS: int = len(REWARD_NAMES)
 REWARD_INDEX: dict[str, int] = {n: i for i, n in enumerate(REWARD_NAMES)}
@@ -112,6 +117,7 @@ FROB_RESIDUAL_IDX: int = GRAD_COVERAGE_IDX
 FIDELITY_IDX: int = REWARD_INDEX["fidelity"]
 BKSTEP_ACC_IDX: int = REWARD_INDEX["bkstep_acc"]
 SPARSITY_IDX: int = REWARD_INDEX["sparsity"]
+MEM_OBJECTIVE_IDX: int = REWARD_INDEX["mem_objective"]
 
 # Channels whose values are bounded / quality-signal, NOT raw cost — they
 # bypass symlog wherever a symlog transform would otherwise apply (gate
@@ -123,8 +129,10 @@ SPARSITY_IDX: int = REWARD_INDEX["sparsity"]
 # SPARSITY joins them for the same reason as FIDELITY: `clip(1 - ratio,
 # -1, 1)` is bounded by construction, so symlog would only discount its
 # per-unit price against the ~1e5..1e10 cost channels.
+# MEM_OBJECTIVE is a log sum already; symlog on top would bend it twice.
 NO_SYMLOG_REWARD_INDICES: tuple[int, ...] = (
-    COSINE_SIM_IDX, FIDELITY_IDX, BKSTEP_ACC_IDX, SPARSITY_IDX)
+    COSINE_SIM_IDX, FIDELITY_IDX, BKSTEP_ACC_IDX, SPARSITY_IDX,
+    MEM_OBJECTIVE_IDX)
 NO_SYMLOG_MASK_NP: np.ndarray = np.zeros((NUM_REWARDS,), dtype=bool)
 NO_SYMLOG_MASK_NP[list(NO_SYMLOG_REWARD_INDICES)] = True
 
@@ -429,6 +437,12 @@ def build_reward_weights(args) -> np.ndarray:
     lam_sparsity = float(getattr(args, "sparsity_weight", 0.0) or 0.0)
     if lam_sparsity != 0.0:
         w[SPARSITY_IDX] = lam_sparsity
+
+    # --mem-objective-weight W weights reward slot 11 (dsnn-xvi); the slot
+    # reads 0.0 under --cost-form absolute.
+    lam_memobj = float(getattr(args, "mem_objective_weight", 0.0) or 0.0)
+    if lam_memobj != 0.0:
+        w[MEM_OBJECTIVE_IDX] = lam_memobj
 
     # Capped-cossim GUIDE weight (anti flat-zero-basin). When the acc channel
     # is routed to B_kstep (ALPHAGRAD_ACC_PROXY=bkstep), cosine_sim (idx 6) is

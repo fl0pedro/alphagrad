@@ -192,7 +192,7 @@ def test_terminal_plan_is_recorded_and_replays_to_the_same_reward():
         assert len(recs) == 1, [r["order"] for r in recs]
         rec = recs[0]
         assert rec["schema"] == plog.SCHEMA
-        assert len(rec["rewards"]) == NUM_REWARDS == 11
+        assert len(rec["rewards"]) == NUM_REWARDS == 12
         assert rec["requested"]["skip"] == 1
         assert rec["requested"]["total"] == 0     # a skip is not a rule
         # The recorded slots ARE the emitted reward vector.

@@ -2427,7 +2427,8 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
                           measure_counts: dict | None = None,
                           measured_from: int | None = None,
                           face_joins=None, refused: str | None = None,
-                          refusal_detail: dict | None = None) -> None:
+                          refusal_detail: dict | None = None,
+                          mem_objective_rec: dict | None = None) -> None:
     """Append ONE terminal plan to this process's plan log. Never raises.
 
     ``refused`` names the resource limit or fault that stopped the
@@ -2498,6 +2499,16 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
             "ref_latency_ns": (paired_ref or {}).get("latency_ns"),
             "ref_temp_bytes": (paired_ref or {}).get("temp_bytes"),
             "ref_watermark_bytes": (paired_ref or {}).get("watermark_bytes"),
+            # THE MEMORY OBJECTIVE's inputs and its three raw ratios
+            # (dsnn-xvi): the other two static numbers of both executables
+            # beside the temps above, so slot 11 can be rebuilt offline.
+            "mem_output_bytes": (mem_parity or {}).get("static_output_bytes"),
+            "mem_args_bytes": (mem_parity or {}).get(
+                "static_argument_bytes"),
+            "ref_output_bytes": (paired_ref or {}).get("output_bytes"),
+            "ref_args_bytes": (paired_ref or {}).get("args_bytes"),
+            "mem_ratios": (mem_objective_rec or {}).get("ratios"),
+            "mem_objective_floored": (mem_objective_rec or {}).get("floored"),
             "candidate_latency_ns": (paired_ref or {}).get(
                 "candidate_latency_ns"),
             "candidate_memory_bytes": (paired_ref or {}).get(
@@ -3151,7 +3162,15 @@ _AXIS_FEAT_GROUP_ID = 3
 #                        (ppo's --sparsity-weight / --sparsity-log /
 #                        ALPHAGRAD_SPARSITY). READ THE HACKABILITY WARNING
 #                        on `_SPARSITY_STATS` before weighting it.
-NUM_REWARDS = 11
+#  11 mem_objective  — THE MEMORY OBJECTIVE (dsnn-xvi, owner ruling
+#                        2026-09-24): -(log(temp/temp*) + log(args/args*)
+#                        + log(out/out*)) from memory_analysis() of the
+#                        timed executable and of the rev-exact reference
+#                        (*), one PopArt channel, never symlogged. Terminal
+#                        only, under --cost-form paired-log; 0.0 otherwise.
+#                        The three raw ratios ride the plan-log record.
+#                        APPENDED, never inserted.
+NUM_REWARDS = 12
 REWARD_NAMES: tuple[str, ...] = (
     "muls_adds_fmas",
     "flops",
@@ -3166,6 +3185,7 @@ REWARD_NAMES: tuple[str, ...] = (
     # RESERVED for the deprecated Ray line; never populated here.
     "bkstep_acc",
     "sparsity",
+    "mem_objective",
 )
 REWARD_INDEX = {name: i for i, name in enumerate(REWARD_NAMES)}
 # BACK-COMPAT ALIAS for slot 7. The slot was ``frob_residual`` until
@@ -4747,17 +4767,34 @@ def window_ratio_record(windows) -> dict:
             "lo": lo, "hi": hi, "n": int(w.size)}
 
 
-def _static_temp_bytes(compiled) -> float | None:
-    """``compiled.memory_analysis().temp_size_in_bytes`` -- the quantity
-    reward slot 5 holds under ``--mem-channel temp`` (ticket .49) -- or
-    None when the executable exposes no analysis."""
+def _static_memory_bytes(compiled) -> tuple[float, float, float] | None:
     try:
         ma = compiled.memory_analysis()
     except Exception:
         return None
     if ma is None:
         return None
-    return float(getattr(ma, "temp_size_in_bytes", 0) or 0.0)
+    return (float(getattr(ma, "temp_size_in_bytes", 0) or 0.0),
+            float(getattr(ma, "output_size_in_bytes", 0) or 0.0),
+            float(getattr(ma, "argument_size_in_bytes", 0) or 0.0))
+
+
+# dsnn-xvi: the ruling's formula on two (temp, output, argument) byte triples.
+# The one-byte floor replaces only an exact 0, which log() cannot take.
+def mem_objective(candidate, reference) -> tuple[float, dict]:
+    c_temp, c_out, c_args = (float(x) for x in candidate)
+    r_temp, r_out, r_args = (float(x) for x in reference)
+    floor = _MEM_LOG_FLOOR_BYTES
+    ratios = {
+        "temp": max(c_temp, floor) / max(r_temp, floor),
+        "args": max(c_args, floor) / max(r_args, floor),
+        "out": max(c_out, floor) / max(r_out, floor),
+    }
+    floored = sum(int(v < floor) for v in
+                  (c_temp, c_out, c_args, r_temp, r_out, r_args))
+    value = -(math.log(ratios["temp"]) + math.log(ratios["args"])
+              + math.log(ratios["out"]))
+    return float(value), {"ratios": ratios, "floored": int(floored)}
 
 
 def _record_paired_ref(rec: dict) -> None:
@@ -9966,6 +10003,7 @@ def _callback_measured(
         _ref_lat_ns = 0.0
         _ref_peak = 0.0
         _ref_temp = None
+        _ref_static = None
         if _paired:
             _ref_lat_ns = (
                 float(_aggregate_samples(_ref_lat_samples,
@@ -9975,7 +10013,8 @@ def _callback_measured(
                 float(_aggregate_samples(_ref_peak_samples,
                                          want_top_quartile=True))
                 if _ref_peak_samples else 0.0)
-            _ref_temp = _static_temp_bytes(_ref_ex)
+            _ref_static = _static_memory_bytes(_ref_ex)
+            _ref_temp = None if _ref_static is None else _ref_static[0]
             _pf("cb.paired_ref")
 
         # ---- LOSS-DROP QUALITY ------------------------------------------
@@ -10214,6 +10253,10 @@ def _callback_measured(
                 # POSITIVE units (ticket .45 logs these as ref/*).
                 "latency_ns": float(_ref_lat_ns),
                 "temp_bytes": _ref_temp,
+                "output_bytes": (None if _ref_static is None
+                                 else _ref_static[1]),
+                "args_bytes": (None if _ref_static is None
+                               else _ref_static[2]),
                 "watermark_bytes": float(_ref_peak),
                 "memory_bytes": float(_ref_mem),
                 "mem_channel": mem_channel(),
@@ -10233,6 +10276,27 @@ def _callback_measured(
                       f" floored={_n_floored}", flush=True)
         else:
             latency_ns, peak_memory = 0.0, 0.0
+    # ---- THE MEMORY OBJECTIVE, reward slot 11 (dsnn-xvi) -------------
+    # Static values, so no windows and no pairing noise: the timed
+    # executable's three memory_analysis() numbers against the rev-exact
+    # reference's, as one log sum. A refused plan never reaches this line.
+    mem_obj = 0.0
+    _mem_obj_rec = None
+    if _paired:
+        if _mp is None or _mp["static_temp_bytes"] is None:
+            raise MemChannelFault(
+                "memory objective: memory_analysis() returned nothing for "
+                "the timed executable, so its static bytes cannot be read "
+                "(peak_source=%s)" % _peak_src)
+        if _ref_static is None:
+            raise MemChannelFault(
+                "memory objective: memory_analysis() returned nothing for "
+                "the rev-exact executable, so its static bytes cannot be "
+                "read")
+        mem_obj, _mem_obj_rec = mem_objective(
+            (_mp["static_temp_bytes"], _mp["static_output_bytes"],
+             _mp["static_argument_bytes"]),
+            _ref_static)
     _pf("cb.quality")
 
     # ------------------------------------------------------------------
@@ -10367,6 +10431,9 @@ def _callback_measured(
             # Slot 10: SPARSITY = clip(1 - stored_approx/stored_exact,
             # -1, 1). 0.0 whenever it was not measured, same convention.
             sparsity,
+            # Slot 11: THE MEMORY OBJECTIVE (see REWARD_NAMES). 0.0 unless
+            # paired: non-terminal steps and --cost-form absolute.
+            mem_obj,
         ]
     )
     rewards = jnp.array(_reward_slots, dtype=jnp.float32)
@@ -10453,7 +10520,8 @@ def _callback_measured(
             face_before=_plan_pf0, face_after=_PER_FACE_STATS,
             counts_from_trace=bool(_plan_traced[0]),
             mem_parity=_mp, paired_ref=_paired_ref_rec,
-            measure_counts=_measure_counts)
+            measure_counts=_measure_counts,
+            mem_objective_rec=_mem_obj_rec)
 
     return _wire(tokens, eqn_ids, rewards)
 

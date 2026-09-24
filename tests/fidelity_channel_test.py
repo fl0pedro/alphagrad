@@ -178,9 +178,10 @@ def test_slot_names_and_the_indices_that_must_not_move():
     # 9 until 2026-08-28; A7 APPENDED slot 10 (`sparsity`) and RESERVED
     # slot 9 for reward_scaling's `bkstep_acc` so the two tables are
     # index-identical. No existing index moved.
-    assert envmod.NUM_REWARDS == 11
+    assert envmod.NUM_REWARDS == 12
     assert envmod.REWARD_NAMES[9] == "bkstep_acc"
     assert envmod.REWARD_NAMES[10] == "sparsity"
+    assert envmod.REWARD_NAMES[11] == rs.REWARD_NAMES[11] == "mem_objective"
     assert rs.REWARD_NAMES[10] == "sparsity"
     assert rs.SPARSITY_IDX == 10
     assert envmod.REWARD_NAMES[7] == "grad_coverage"
