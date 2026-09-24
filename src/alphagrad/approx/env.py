@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import gc
 import itertools
 import math
@@ -6358,8 +6359,11 @@ def _grad_cosine_quality(config, compiled_approx, ref_ex, ref_key, base_args,
         # reference is cached on it, and a seed that does not carry the
         # environment row serves row 0's exact gradient to every other row.
         _seed = _probe_seed(config, "train", None, k)
-        try:
-            out_a = compiled_approx(*a)
+        # A candidate error propagates: the caller scores it as a refusal (Q53).
+        out_a = jax.block_until_ready(compiled_approx(*a))
+        with _reference_errors(
+                f"the reference failed on probe batch {k} of the gradient "
+                f"cosine"):
             if _oracle_ref:
                 r_data = _probe_batch(config, base_args, role="train",
                                       index=k, draw=_ref_draw)
@@ -6385,8 +6389,7 @@ def _grad_cosine_quality(config, compiled_approx, ref_ex, ref_key, base_args,
                 # probe batch (agent/ref16, owner ruling 2026-09-18).
                 out_e = _cosine_reference(ref_ex, ref_key, a, device, _seed)
                 jac_e = out_e[1] if config.has_aux else out_e
-        except Exception:
-            return None
+            jax.block_until_ready(jac_e)
         jac_a = out_a[1] if config.has_aux else out_a
         if _oracle_ref:
             cos, rel = _dense_cosine(jac_e, jac_a)
@@ -8223,6 +8226,21 @@ class ReferenceFault(MeasureToolchainFault):
     pass
 
 
+# A reference-side error stops the run; it is never the plan's refusal (Q53).
+@contextlib.contextmanager
+def _reference_errors(what: str):
+    try:
+        yield
+    except MeasureToolchainFault:
+        raise
+    except Exception as _exc:
+        raise ReferenceFault(
+            f"{what}: {type(_exc).__name__}: "
+            f"{' '.join(str(_exc).split())[:300]}. A failure of the "
+            f"reference stops the run and is never the plan's refusal "
+            f"(owner ruling 2026-09-24 Q53)") from _exc
+
+
 def check_memory_bounds(candidate, reference, where: str) -> None:
     c_out, c_args = float(candidate[1]), float(candidate[2])
     r_out, r_args = float(reference[1]), float(reference[2])
@@ -8969,7 +8987,7 @@ def _callback_measured(
         if not _plan_log_on:
             return
         _record_terminal_plan(
-            order=o_list, rule_specs=partial_specs,
+            order=_rec_order, rule_specs=partial_specs,
             face_specs=_faces_np, face_skips=_skips_np,
             face_joins=_joins_np,
             reward_vec=reward_vec,
@@ -10398,15 +10416,18 @@ def _callback_measured(
         _ref_inner = 0
         _ref_windows = 0
         if _paired:
-            if config.measure_latency:
-                _t_ref = _probe_one(_ref_ex, ref_eval_args_all[0])
-                _ref_inner = resolve_measure_inner(
-                    _t_ref, _window_s, _cfg_inner)
-            else:
-                _t_ref = 0.0
-                _ref_inner = _cfg_inner
-                for _w in range(_warmup):
-                    jax.block_until_ready(_ref_ex(*ref_eval_args_all[0]))
+            with _reference_errors(
+                    f"the reference ({_ref_kind}) failed in its probe or "
+                    f"warm-up"):
+                if config.measure_latency:
+                    _t_ref = _probe_one(_ref_ex, ref_eval_args_all[0])
+                    _ref_inner = resolve_measure_inner(
+                        _t_ref, _window_s, _cfg_inner)
+                else:
+                    _t_ref = 0.0
+                    _ref_inner = _cfg_inner
+                    for _w in range(_warmup):
+                        jax.block_until_ready(_ref_ex(*ref_eval_args_all[0]))
             _ref_windows = n_ref_points * n_ref_reps
             _warmed_ref.add(0)
 
@@ -10458,12 +10479,17 @@ def _callback_measured(
                 _ia += 1
             else:
                 _p = _ib % n_ref_points
-                if _p not in _warmed_ref:
-                    for _w in range(_warmup):
-                        jax.block_until_ready(_ref_ex(*ref_eval_args_all[_p]))
-                    _warmed_ref.add(_p)
-                _l, _pk, _s, _o = _time_one_rep(
-                    _ref_ex, ref_eval_args_all[_p], unique_devices, _ref_inner)
+                with _reference_errors(
+                        f"the reference ({_ref_kind}) failed in its "
+                        f"interleaved windows"):
+                    if _p not in _warmed_ref:
+                        for _w in range(_warmup):
+                            jax.block_until_ready(
+                                _ref_ex(*ref_eval_args_all[_p]))
+                        _warmed_ref.add(_p)
+                    _l, _pk, _s, _o = _time_one_rep(
+                        _ref_ex, ref_eval_args_all[_p], unique_devices,
+                        _ref_inner)
                 del _o, _s
                 _ref_lat_samples.append(_l)
                 _ref_peak_samples.append(_pk)
@@ -10476,34 +10502,26 @@ def _callback_measured(
         # scored on; point 0 only, since latency does not move with the point.
         if _paired and rev_exact_telemetry_enabled() and _rev_telemetry_due(
                 _MEASURE_EPISODE["key"], paired_ref_key):
-            try:
-                _rev_ex = cached_compile(
-                    b"rev-exact:" + paired_ref_key, _do_compile_rev_exact)
-            except Exception as _exc:
-                if _is_graphax_trace_failure(_exc):
-                    return _trace_truncate("rev-exact telemetry compile",
-                                           _exc, compiled_cost)
-                if not _is_oom(_exc):
-                    raise
-                return _oom_truncate("rev-exact telemetry compile", _exc,
-                                     compiled_cost)
             _rv_lat: list[float] = []
             _tl_lat: list[float] = []
-            if config.measure_latency:
-                _rv_inner = resolve_measure_inner(
-                    _probe_one(_rev_ex, ref_eval_args_all[0]), _window_s,
-                    _cfg_inner)
-                for _w in range(_ref_windows):
-                    _l, _pk, _s, _o = _time_one_rep(
-                        _rev_ex, ref_eval_args_all[0], unique_devices,
-                        _rv_inner)
-                    del _o, _s
-                    _rv_lat.append(_l)
-                    _l, _pk, _s, _o = _time_one_rep(
-                        _ref_ex, ref_eval_args_all[0], unique_devices,
-                        _ref_inner)
-                    del _o, _s
-                    _tl_lat.append(_l)
+            with _reference_errors("the rev-exact telemetry failed"):
+                _rev_ex = cached_compile(
+                    b"rev-exact:" + paired_ref_key, _do_compile_rev_exact)
+                if config.measure_latency:
+                    _rv_inner = resolve_measure_inner(
+                        _probe_one(_rev_ex, ref_eval_args_all[0]), _window_s,
+                        _cfg_inner)
+                    for _w in range(_ref_windows):
+                        _l, _pk, _s, _o = _time_one_rep(
+                            _rev_ex, ref_eval_args_all[0], unique_devices,
+                            _rv_inner)
+                        del _o, _s
+                        _rv_lat.append(_l)
+                        _l, _pk, _s, _o = _time_one_rep(
+                            _ref_ex, ref_eval_args_all[0], unique_devices,
+                            _ref_inner)
+                        del _o, _s
+                        _tl_lat.append(_l)
             _rev_tel_raw = (
                 _static_memory_bytes(_rev_ex),
                 float(_aggregate_samples(_rv_lat, want_top_quartile=True))
@@ -10636,8 +10654,8 @@ def _callback_measured(
                     print(
                         "[measure] WARNING quality channel: the GRADIENT "
                         "COSINE HAS NO CHANNEL for this configuration (no "
-                        "data_gen, or the reference failed to build "
-                        "or to execute on the probe batch). The channel reads "
+                        "data_gen, so no probe batch can be drawn). The "
+                        "channel reads "
                         "0.0 for every plan of this run; ask for "
                         "ALPHAGRAD_QUALITY_METRIC=jac_cosine to score at the "
                         "calibration samples instead, or =none to drop the "
