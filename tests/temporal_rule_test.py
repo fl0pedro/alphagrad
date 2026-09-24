@@ -2080,11 +2080,14 @@ rec_v = [v for v in valid if not mask[v - 1]
          and any(iv is jx.invars[8] for iv in jx.eqns[v - 1].invars)]
 assert len(rec_v) == 1, rec_v
 rec_v = rec_v[0]
+# ONE STATE-EDGE FACE PER OUT-EDGE: under the reverse order the later
+# vertices are gone when V @ S is eliminated, so its out-edges reach every
+# sink of the six-output graph, and the Diag goes on each of them.
 s_faces = [e for e in inv if int(e["vertex"]) == rec_v
            and int(e["key"][0]) not in (7, 8)]
-assert len(s_faces) == 1, s_faces
+assert s_faces, "no state-edge face on the recurrent vertex"
 out["recurrent_vertex"] = int(rec_v)
-out["state_edge_face_key"] = [int(x) for x in s_faces[0]["key"]]
+out["state_edge_face_keys"] = [[int(x) for x in e["key"]] for e in s_faces]
 wires = [{"k": int(e["k"]), "f": int(e["f"]), "slot": 0, "row": [0, 0, -1],
           "kind": "X"} for e in inv if int(e["vertex"]) in carry_dot]
 wires += [{"k": int(e["k"]), "f": int(e["f"]), "slot": 0, "row": [0, 0, -1],
@@ -2146,8 +2149,9 @@ def test_the_loss_row_is_the_gradient(plan_carry_results):
 
 def test_the_two_diag_plans_scan_is_eprop(plan_carry_results):
     """Container Diag + Diag on the state operand of the recurrent face
-    (vertex 30, face key [36, 99] on the full graph; located by structure
-    here) scanned over the prefix IS carry_traces at every step."""
+    (located by structure: the V @ S dot_general and its faces whose in-edge
+    is not a weight) scanned over the prefix IS carry_traces at every
+    step."""
     out = plan_carry_results
     assert out["two_diag_plan_vs_carry_traces"] < 1e-11, out
     assert out["plan_draw_vs_carry_traces"] < 1e-11, out
