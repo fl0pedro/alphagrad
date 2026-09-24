@@ -149,6 +149,8 @@ def rsnn_one_call_step(program):
     from graphax.examples.neuromorphic import (project_rsnn_carry,
                                                rsnn_given_container)
 
+    from graphax.sparse.tensor import SparseTensor
+
     def step(*args):
         primal, rows = program(*args)
         states, weights = tuple(args[2:7]), tuple(args[7:10])
@@ -162,7 +164,12 @@ def rsnn_one_call_step(program):
                 raise ValueError(
                     f"the one-call step returns {jnp.shape(a)} {a.dtype} "
                     f"where its argument is {jnp.shape(b)} {b.dtype}")
-        return rows[0], new, nxt
+        # The loss row is dense, one array per weight, the reference's layout.
+        loss_row = tuple(
+            jnp.zeros_like(w) if r is None
+            else r.dense() if isinstance(r, SparseTensor) else r
+            for r, w in zip(rows[0], weights))
+        return loss_row, new, nxt
     return step
 
 

@@ -408,23 +408,6 @@ def measurement_env(container: str, config=None) -> dict | None:
     return v
 
 
-def is_empty_plan_order(config, order) -> bool:
-    # The reverse order over ``order`` is the empty plan of the base program
-    # when ``order`` covers every eliminable vertex of it.
-    entry = _entry(config)
-    if entry is None:
-        return False
-    valid = entry.get("base_valid")
-    if valid is None:
-        base = entry["base"]
-        valid = frozenset(valid_vertices(
-            base["config"].jaxpr, base["args"], base["consts"],
-            tuple(base["config"].argnums)))
-        entry["base_valid"] = valid
-    got = [int(v) for v in order]
-    return len(got) == len(valid) and set(got) == valid
-
-
 def eval_samples_for(container: str, eval_samples, config=None,
                      generator=None):
     """This episode's eval samples, redrawn in ``container``.

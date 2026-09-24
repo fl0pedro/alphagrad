@@ -223,6 +223,7 @@ class CpuApproximationServer:
         face_skips: Any = None,
         episode: int | None = None,
         env_row: int | None = None,
+        timeout_s: float | None = None,
     ):
         """Run the per-step reward pipeline once.
 
@@ -286,6 +287,14 @@ class CpuApproximationServer:
         _slot_was = _env_slot_cell[0]
         if env_row is not None:
             _env_slot_cell[0] = int(env_row)
+        # THE POOL'S KILL TIMEOUT FOR THIS REQUEST (dsnn-4eq): the number a
+        # refused plan is scored at is the number the pool kills at, so it
+        # travels with the request and never lives in a second constant.
+        from alphagrad.approx.env import (
+            _MEASURE_TIMEOUT_S as _timeout_cell,
+            set_measure_timeout_s as _set_timeout)
+        _timeout_was = _timeout_cell[0]
+        _set_timeout(timeout_s)
         order_j = jnp.asarray(order, dtype=jnp.int32)
         specs_j = jnp.asarray(sparsity_specs, dtype=jnp.int32)
         es = (
@@ -298,6 +307,8 @@ class CpuApproximationServer:
         # so we can attribute the leak to *this* process (not the
         # GPU trainer that dispatched the request via Ray).
         self._maybe_init_leak_profile()
+        # The flag belongs to this call (Q52); an unread earlier one is stale.
+        self._last_was_oom = False
         try:
             # env._callback takes face_specs / face_skips between the
             # per-vertex specs and `stop`. With no caller-supplied wires,
@@ -474,7 +485,13 @@ class CpuApproximationServer:
             # so a run of failures actively reclaims memory rather than piling
             # more partially-compiled executables on the saturated GPU.
             self._n_calls += 1
-            self._maybe_clear_compile_caches(oom=_is_oom)
+            # An OOM the callback recorded before it raised is this call's.
+            from alphagrad.approx.env import pop_measure_oom as _pop_oom
+            _n_rec, _ = _pop_oom()
+            if _n_rec:
+                self._last_was_oom = True
+                self._n_oom += _n_rec
+            self._maybe_clear_compile_caches(oom=_is_oom or bool(_n_rec))
             if _delta:
                 return sentinel_tokens, sentinel_reward
             return sentinel_tokens, sentinel_eqn_ids, sentinel_reward
@@ -482,6 +499,7 @@ class CpuApproximationServer:
             # The slot belongs to THIS request, not to the actor. Restoring it
             # is what keeps a raising measurement from stamping the next one.
             _env_slot_cell[0] = _slot_was
+            _timeout_cell[0] = _timeout_was
 
     def precompile(self, order: Any, sparsity_specs: Any, step: int) -> bool:
         """STAGE-2 async: compile-only warm of the shared cluster cache.
@@ -571,12 +589,11 @@ class CpuApproximationServer:
         with a device OOM (RESOURCE_EXHAUSTED / measure-oom), as opposed to
         a benign graphax shape error.
 
-        The pool calls this immediately after it observes a sentinel row for
-        this actor. A True result means the sentinel was caused by the
-        un-freeable per-measure XLA compile leak filling the measure GPU, so
-        the ONLY remedy is to recycle (process teardown) this actor and retry
-        the measure on a fresh one. False means a retry would just re-sentinel
-        (bad action / shape mismatch), so the pool leaves the actor alive.
+        The pool calls this after every row it reads from this actor, and
+        ``evaluate`` resets the flag when it starts. A True result means the
+        un-freeable per-measure XLA compile leak filled the measure GPU during
+        that call, so the ONLY remedy is to recycle (process teardown) this
+        actor; the row is not measured again. False leaves the actor alive.
 
         One-shot: reads and clears the flag so a single OOM triggers exactly
         one recycle. Cheap (no JAX) — safe to call on the RPC hot path.

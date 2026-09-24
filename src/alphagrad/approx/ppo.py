@@ -170,6 +170,7 @@ from alphagrad.approx.env import (
     StepAction,
     VertexEliminationEnv,
     micro_actions_to_rule_specs_jax,
+    set_measure_timeout_s as _set_measure_timeout_s,
     wire_slots as _env_wire_slots,
 )
 from alphagrad.approx.common.token_vocab import incr_token_vocab
@@ -505,6 +506,11 @@ FIDELITY_HEAD = "value_head_fid"
 # head is not constructed, contributes no pytree leaves, and every saved
 # checkpoint keeps loading. INDICES ARE ONLY EVER APPENDED.
 SPARSITY_HEAD = "value_head_spars"
+# --mem-objective-weight != 0 APPENDS a head on reward slot 11
+# (``mem_objective``, dsnn-xvi: the three static memory_analysis() log ratios
+# against rev-exact as one sum). Same discipline: default 0 => no head, no
+# pytree leaf, every checkpoint keeps loading. INDICES ARE ONLY EVER APPENDED.
+MEM_OBJECTIVE_HEAD = "value_head_memobj"
 # Resolved from --quality-metric in `main`; names the quantity reward slot 6
 # actually holds, for every human-readable log line and the wandb
 # ``quality/metric`` key.
@@ -604,6 +610,34 @@ def configure_sparsity(args) -> float:
         _HEAD_REWARD_INDICES_ARR = jnp.asarray(
             HEAD_REWARD_INDICES, dtype=jnp.int32)
     return weight
+
+
+def configure_mem_objective(args) -> float:
+    global HEAD_REWARD_INDICES, NUM_VALUE_HEADS, HEAD_NAMES
+    global VALUE_HEAD_ATTRS, _HEAD_REWARD_INDICES_ARR
+    weight = float(getattr(args, "mem_objective_weight", 0.0) or 0.0)
+    if weight != 0.0 and getattr(args, "cost_form", "paired-log") != "paired-log":
+        raise ValueError(
+            "--mem-objective-weight needs --cost-form paired-log: reward "
+            "slot 11 is measured against the paired rev-exact reference and "
+            "reads 0.0 under the absolute form.")
+    if weight != 0.0 and MEM_OBJECTIVE_HEAD not in VALUE_HEAD_ATTRS:
+        HEAD_REWARD_INDICES = tuple(HEAD_REWARD_INDICES) + (
+            int(REWARD_INDEX["mem_objective"]),)
+        HEAD_NAMES = tuple(HEAD_NAMES) + ("mem_objective",)
+        VALUE_HEAD_ATTRS = tuple(VALUE_HEAD_ATTRS) + (MEM_OBJECTIVE_HEAD,)
+        NUM_VALUE_HEADS = len(HEAD_REWARD_INDICES)
+        _HEAD_REWARD_INDICES_ARR = jnp.asarray(
+            HEAD_REWARD_INDICES, dtype=jnp.int32)
+    return weight
+
+
+# The latency sentinel of a refused plan scored in this process (--ray-measure
+# 0); nothing kills an in-process call (owner rulings 2026-09-24 Q46, Q48).
+def configure_measure_timeout(args) -> float:
+    timeout_s = float(args.ray_measure_timeout)
+    _set_measure_timeout_s(timeout_s)
+    return timeout_s
 
 
 # ---------------------------------------------------------------------------
@@ -1088,6 +1122,10 @@ def configure_symlog(args) -> str:
     # mask-is-bit-identical caveat.
     if float(getattr(args, "sparsity_weight", 0.0) or 0.0) != 0.0:
         _exempt = _exempt + (int(REWARD_INDEX["sparsity"]),)
+    # THE MEMORY OBJECTIVE (slot 11) is a log sum already; symlog on top
+    # would bend it a second time. Same conditional, same flag-off caveat.
+    if float(getattr(args, "mem_objective_weight", 0.0) or 0.0) != 0.0:
+        _exempt = _exempt + (int(REWARD_INDEX["mem_objective"]),)
     # THE QUALITY FLOOR (ticket .9): the hinge channel is bounded like the
     # lagrangian violation slot and needs the same carve-out, for the same
     # reason (symlog would discount the per-unit price of a shortfall).
@@ -2835,6 +2873,9 @@ class Agent(eqx.Module):
     # Value head for reward slot 10 (``sparsity``). ``None`` unless
     # --sparsity-weight != 0; a ``None`` field contributes NO leaves.
     value_head_spars: MLP | None
+    # Value head for reward slot 11 (``mem_objective``). ``None`` unless
+    # --mem-objective-weight != 0; a ``None`` field contributes NO leaves.
+    value_head_memobj: MLP | None
     op_embedding: eqx.nn.Embedding
     # NO identity_pool and NO ctx_proj. A vertex's identity is palimpsa's rows
     # for its own equation, scattered into its own slot by `carry_stream`;
@@ -2878,6 +2919,7 @@ class Agent(eqx.Module):
         face_path_policy=None,
         value_head_fid=None,
         value_head_spars=None,
+        value_head_memobj=None,
     ):
         self.embedding = embedding
         self.pos_enc = pos_enc
@@ -2891,6 +2933,7 @@ class Agent(eqx.Module):
         self.value_head_cos = value_head_cos
         self.value_head_fid = value_head_fid
         self.value_head_spars = value_head_spars
+        self.value_head_memobj = value_head_memobj
         self.op_embedding = op_embedding
         self.pref_proj = pref_proj
         self.num_vertices = num_vertices
@@ -2948,6 +2991,8 @@ class Agent(eqx.Module):
             _vs.append(self.value_head_fid(summary))
         if self.value_head_spars is not None:
             _vs.append(self.value_head_spars(summary))
+        if self.value_head_memobj is not None:
+            _vs.append(self.value_head_memobj(summary))
         value = jnp.concatenate(_vs, axis=-1)
         return vertex_logits, vertex_contexts, value
 
@@ -3473,6 +3518,8 @@ class Agent(eqx.Module):
             _vs.append(self.value_head_fid(summary))
         if self.value_head_spars is not None:
             _vs.append(self.value_head_spars(summary))
+        if self.value_head_memobj is not None:
+            _vs.append(self.value_head_memobj(summary))
         value = jnp.concatenate(_vs, axis=-1)
         return vertex_logits, vertex_contexts, value
 
@@ -5308,6 +5355,17 @@ def make_argparser() -> argparse.ArgumentParser:
              "traced and emits no HLO, so it rides compiles the run pays "
              "for anyway; the residual price is reported as "
              "sparsity/wall_amortised_s. Exports ALPHAGRAD_SPARSITY.")
+    # ---- THE MEMORY OBJECTIVE, reward slot 11 (dsnn-xvi) ----------
+    p.add_argument(
+        "--mem-objective-weight", type=float, default=0.0,
+        dest="mem_objective_weight",
+        help="Weight on the MEMORY OBJECTIVE value head (reward slot 11): "
+             "-(log(temp/temp*) + log(args/args*) + log(out/out*)) from "
+             "memory_analysis() of the timed executable against the "
+             "rev-exact reference (*), static, measured on every terminal "
+             "plan under --cost-form paired-log and normalised once by "
+             "PopArt as one channel. DEFAULT 0 = no head; the channel is "
+             "still measured and logged. Needs --cost-form paired-log.")
     # ---- A6: THE PLAN LOG (every terminal plan, losers included) --
     p.add_argument(
         "--plan-log", type=str, default=None, metavar="PATH",
@@ -5532,8 +5590,11 @@ def make_argparser() -> argparse.ArgumentParser:
              "with --face-actions (the pool's env is per-vertex and would "
              "silently drop the per-face decisions).")
     p.add_argument(
-        "--ray-measure-timeout", type=float, default=600.0,
-        help="Per-call timeout for a --ray-measure actor, seconds.")
+        "--ray-measure-timeout", type=float, default=300.0,
+        help="THE deadline of every measurement call, seconds (owner ruling "
+             "2026-09-24 Q48; no cold budget). A --ray-measure actor's call "
+             "is killed at it, and it is the latency sentinel of every "
+             "refused plan, in the pool and in-process.")
     p.add_argument(
         "--measure-pipeline", type=int, default=0, choices=(0, 1),
         metavar="0|1",
@@ -7079,6 +7140,12 @@ def _build_agent(
     if SPARSITY_HEAD in VALUE_HEAD_ATTRS:
         value_head_spars = MLP(args.embd_dim, 1, value_dims,
                                key=jrand.fold_in(encoder_keys[12], 9))
+    # MEMORY OBJECTIVE value head, key folded in with its own tag for the
+    # same reason as the two above.
+    value_head_memobj = None
+    if MEM_OBJECTIVE_HEAD in VALUE_HEAD_ATTRS:
+        value_head_memobj = MLP(args.embd_dim, 1, value_dims,
+                                key=jrand.fold_in(encoder_keys[12], 10))
     op_embedding = eqx.nn.Embedding(
         OP_TYPE_VOCAB_SIZE,
         args.op_embd_dim,
@@ -7192,6 +7259,7 @@ def _build_agent(
         value_head_cos=value_head_cos,
         value_head_fid=value_head_fid,
         value_head_spars=value_head_spars,
+        value_head_memobj=value_head_memobj,
         op_embedding=op_embedding,
         pref_proj=pref_proj,
         num_vertices=total_v,
@@ -7592,6 +7660,11 @@ def _build_head_weights(args) -> np.ndarray:
     if SPARSITY_HEAD in VALUE_HEAD_ATTRS:
         weights[HEAD_NAMES.index("sparsity")] = np.float32(
             getattr(args, "sparsity_weight", 0.0) or 0.0)
+    # --mem-objective-weight W adds ``+ W*mem_objective``, RAW (a log sum
+    # already, never symlogged). The head exists only when W != 0.
+    if MEM_OBJECTIVE_HEAD in VALUE_HEAD_ATTRS:
+        weights[HEAD_NAMES.index("mem_objective")] = np.float32(
+            getattr(args, "mem_objective_weight", 0.0) or 0.0)
     return weights
 
 
@@ -8030,6 +8103,15 @@ def main(args=None):
                       "ceiling and NOTHING refuses it; read the "
                       "hackability warning]"), flush=True)
 
+    # THE MEMORY OBJECTIVE (reward slot 11, dsnn-xvi) -- after
+    # configure_sparsity so the appended head order stays deterministic.
+    _memobj_weight = configure_mem_objective(args)
+    if _memobj_weight != 0.0:
+        print(f"[cfg] memory objective (three static log ratios vs "
+              f"rev-exact, slot 11): weight={_memobj_weight:g} "
+              f"heads={NUM_VALUE_HEADS} ({', '.join(HEAD_NAMES)})",
+              flush=True)
+
     # THE PALIMPSA READ PAIR, AND THE GUARD ON IT (owner ruling 2026-09-15).
     # The rollout and the loss each have their own read flag, because the
     # fast read costs the rollout about 10 s per episode and saves the loss
@@ -8338,6 +8420,9 @@ def main(args=None):
              else " (absolute measured numbers, negated; the pre-.9 form)"),
           flush=True)
     os.environ["ALPHAGRAD_MEM_CHANNEL"] = str(args.mem_channel)
+    print(f"[alphagrad] measurement deadline (--ray-measure-timeout) = "
+          f"{configure_measure_timeout(args):.0f} s, the latency sentinel "
+          f"of a refused plan", flush=True)
     # ORACLE A (ticket .62), same transport: env.grad_oracle is the one reader.
     # The measure actors read it too and no longer act on it -- the oracle left
     # their path on 2026-09-18 -- but the variable stays published so one
@@ -8824,8 +8909,6 @@ def main(args=None):
         _pool = CpuApproxPool(
             _actors,
             timeout_s=float(args.ray_measure_timeout),
-            initial_timeout_s=float(args.ray_measure_timeout) * 4.0,
-            warm_after=3,
             respawn_factory=_spawn,
             max_tokens=int(env.obs_width),
             # THE WIRE, from the env that declares it. Under delta_obs the
@@ -8890,8 +8973,6 @@ def main(args=None):
             _tok_pool = CpuApproxPool(
                 _tok_actors,
                 timeout_s=float(args.ray_measure_timeout),
-                initial_timeout_s=float(args.ray_measure_timeout) * 4.0,
-                warm_after=3,
                 respawn_factory=_spawn_tok,
                 max_tokens=int(env.obs_width),
                 token_dtype=env.wire_token_dtype,
@@ -14779,7 +14860,7 @@ def main(args=None):
             "ppo/dual_clip_frac": dual_clip_frac,
         }
         # ---- REFUSED TERMINAL MEASUREMENTS, PER EPISODE AND PER KIND -------
-        # The trainer now drops a refused environment from the update
+        # The trainer drops an excluded environment from the update
         # entirely, which is correct AND silent. This is the number that makes
         # it visible: how many of this episode's terminal measurements were
         # refused, and by what. `_POOL_CS` carries the measure actors' share
@@ -14793,14 +14874,23 @@ def main(args=None):
                 _kk = _ks[len("refused_"):]
                 _ref_counts[_kk] = int(_ref_counts.get(_kk, 0)) + int(_v)
         _ref_total = int(_ref_counts.pop("total", 0))
+        # SCORED against EXCLUDED (owner rulings 2026-09-24 Q42, Q48): every
+        # refusal takes the finite sentinel and trains, except a call the
+        # deadline killed; each count names its fate where it is taken.
+        _ref_scored = int(_ref_counts.pop("scored", 0))
+        _ref_excluded = int(_ref_counts.pop("excluded", 0))
         for _k in sorted(_ref_counts):
             log_dict[f"refused/{_k}"] = int(_ref_counts[_k])
         log_dict["refused/total"] = _ref_total
         log_dict["refused/rate"] = (
             float(_ref_total) / float(num_envs) if num_envs else 0.0)
+        log_dict["refused/scored"] = _ref_scored
+        log_dict["refused/excluded"] = _ref_excluded
         if _ref_total:
             print(f"[refused ep{ep}] {_ref_total} of {num_envs} terminal "
-                  f"measurements refused and EXCLUDED from the update: "
+                  f"measurements refused ({_ref_scored} scored at the "
+                  f"sentinel, {_ref_excluded} EXCLUDED from the "
+                  f"update): "
                   + ", ".join(f"{_k}={_ref_counts[_k]}"
                               for _k in sorted(_ref_counts)), flush=True)
         # Per-channel critic loss (sec 12.10 static-objective battery). The
