@@ -318,7 +318,7 @@ def valid_vertices(jaxpr, args, consts, argnums) -> tuple:
     _, _, _, vo_vertices = _build_graph(jaxpr, args, consts, argnums)
     out = []
     for i, eqn in enumerate(jaxpr.eqns, 1):
-        if eqn.outvars[0] not in jaxpr.outvars or i in vo_vertices:
+        if eqn.outvars[0] not in jaxpr.outvars or eqn.outvars[0] in vo_vertices:
             out.append(i)
     return tuple(out)
 

@@ -814,7 +814,9 @@ class VertexEliminationEnv:
             )
             valid = []
             for i, eqn in enumerate(config.jaxpr.eqns, 1):
-                if eqn.outvars[0] not in config.jaxpr.outvars or i in vo_vertices:
+                # ``vo_vertices`` holds VARS, as in env.py.
+                if (eqn.outvars[0] not in config.jaxpr.outvars
+                        or eqn.outvars[0] in vo_vertices):
                     valid.append(i)
             valid_vertices = tuple(valid)
         object.__setattr__(self, "valid_vertices", valid_vertices)

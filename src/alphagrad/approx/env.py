@@ -10649,7 +10649,13 @@ class VertexEliminationEnv:
             )
             valid = []
             for i, eqn in enumerate(config.jaxpr.eqns, 1):
-                if eqn.outvars[0] not in config.jaxpr.outvars or i in vo_vertices:
+                # ``vo_vertices`` holds VARS (an output that is also an
+                # intermediate), the same test graphax's ``_checkify_order``
+                # makes; it used to be asked about the index ``i`` and never
+                # held, so a carried state output was never eliminable and
+                # the loss row would have missed every path through it.
+                if (eqn.outvars[0] not in config.jaxpr.outvars
+                        or eqn.outvars[0] in vo_vertices):
                     valid.append(i)
             valid_vertices = tuple(valid)
         object.__setattr__(self, "valid_vertices", valid_vertices)
