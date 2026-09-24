@@ -28,7 +28,7 @@ STATE=${STATE:-/Scratch/assmuth/thesis_copy}
 LOG=$STATE/copy.log
 # The run names of the matrix and of the smoke (tools/gen_fq_launchers.py:
 # thesis_run_name).  Anything else in the wandb tree is another experiment.
-NAME_RE=${NAME_RE:-^(A|B|C|C_popart|condC)_(nn256|tlm)_s2501[0-9][0-9]$|^smoke_(C_tlm|condC_nn256)$}
+NAME_RE=${NAME_RE:-^(A|B|C|C_popart|condC)_(nn256|tlm|rsnn_(tbptt|bptt|rtrl|window2))_s250[12][0-9][0-9]$|^smoke_(C_tlm|condC_nn256)$}
 T=${T:-120}          # seconds any single home-export operation may take
 
 mkdir -p "$STATE"
