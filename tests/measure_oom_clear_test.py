@@ -142,7 +142,7 @@ def test_an_oom_in_the_callback_is_refused_and_clears_once(
     monkeypatch.setenv("ALPHAGRAD_SKIP_COST_ANALYSIS", "1")
     monkeypatch.setenv("ALPHAGRAD_SKIP_COUNT_OPS", "1")
     monkeypatch.delenv("ALPHAGRAD_PLAN_LOG", raising=False)
-    monkeypatch.setitem(env_mod._MEASURE_TIMEOUT_S, 0, 300.0)
+    monkeypatch.setattr(env_mod, "_MEASURE_TIMEOUT_S", [300.0])
     real = cc.cached_compile
 
     def _oom(key, fn, *a, **kw):

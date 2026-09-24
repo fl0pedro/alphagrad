@@ -493,10 +493,13 @@ def fake_ray(monkeypatch):
 
 
 class _Method:
-    def __init__(self, future, fn, delay):
+    def __init__(self, future, fn, delay, seen=None):
         self._future, self._fn, self._delay = future, fn, delay
+        self._seen = seen
 
     def remote(self, *a, **k):
+        if self._seen is not None:
+            self._seen.append(k.get("timeout_s"))
         return self._future(self._fn, a, k, self._delay())
 
 
@@ -512,7 +515,7 @@ class _Actor:
         self.ready = _Method(future, self._ready, lambda: build)
         self.evaluate = _Method(
             future, self._evaluate,
-            lambda: run + (0.0 if self.built else build))
+            lambda: run + (0.0 if self.built else build), self.timeouts)
 
     def _ready(self):
         self.order.append("ready")
@@ -521,7 +524,6 @@ class _Actor:
 
     def _evaluate(self, order, specs, step, **kw):
         self.order.append("evaluate")
-        self.timeouts.append(kw.get("timeout_s"))
         tokens = np.full((TOK,), 7, np.int32)
         eqn = np.full((TOK,), 3, np.int32)
         reward = np.full((NUM_REWARDS,), -100.0, np.float32)
