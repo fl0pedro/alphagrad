@@ -1938,8 +1938,7 @@ def combined_report(args):
                      {k for k in (prim or summ) if k.startswith("arch:")})
 
 
-# The gradient bar of Oracle B, in units of the rounding step of the narrowest
-# dtype the plan computes in.
+# Oracle B's gradient bar, in rounding steps of the plan's narrowest dtype.
 ORACLE_B_ROUNDING_STEPS = 4
 
 
@@ -1949,8 +1948,6 @@ def _oracle_b_compile(env, fn):
 
 
 def _oracle_b_programs(env, order, plan):
-    """The plan's measured program (dense return) and the same elimination
-    with ``sparse_representation=True``, compiled like the measurement."""
     cfg = env.config
     specs, faces, skips = (np.asarray(x)
                            for x in get_plan_arrays(plan, len(order)))
@@ -1983,8 +1980,7 @@ def _oracle_b_programs(env, order, plan):
 
 
 def _densify(out, like):
-    """``out`` with every SparseTensor densified and every null edge (None)
-    as the zeros of ``like``'s leaf; also the number of SparseTensors."""
+    # A null edge (None) is the zeros of the dense program's leaf.
     leaves = jax.tree_util.tree_leaves(
         out, is_leaf=lambda x: x is None or isinstance(x, SparseTensor))
     like_leaves, like_def = jax.tree_util.tree_flatten(like)
@@ -2007,8 +2003,6 @@ def _rounding_step(dtype) -> float:
 
 
 def _oracle_b_step(plan, n_steps, leaves) -> float:
-    """The rounding step of the narrowest dtype of the plan: a quant row's
-    dtype or a gradient leaf's."""
     step = max(_rounding_step(d.dtype) for d in leaves)
     for arr in get_plan_arrays(plan, n_steps)[:2]:
         rows = np.asarray(arr).reshape(-1, 3)
@@ -2035,8 +2029,7 @@ def _rel_l2_gap(sparse, dense) -> float:
 
 
 def _oracle_b_quality(env, points, program, reference):
-    """Reward slot 6 of ``program``, computed as the measurement computes it
-    under ``quality_metric``, outside the measurement."""
+    # Reward slot 6 as the measurement computes it, outside the measurement.
     cfg = env.config
     metric = envmod.quality_metric(cfg)
     if metric == "none":

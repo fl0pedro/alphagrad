@@ -1,9 +1,5 @@
-# dsnn-cl0, owner ruling 2026-09-24 Q53: only a failure of the plan's own program
-# is a refusal. An error while the candidate is built, traced, compiled or run
-# is scored and never raises. A failure of the reference raises ReferenceFault,
-# the memory check of Q44 raises MemoryBoundFault, and a tokenization error of
-# the terminal step raises in-process and is excluded and counted in the pool.
-# One test per case, in-process and through the pool with the real server.
+# dsnn-cl0, owner ruling 2026-09-24 Q53: the raise boundary, one test per case,
+# in-process and through the pool with the real server.
 from __future__ import annotations
 
 import os
@@ -177,8 +173,7 @@ def _fake_compile(monkeypatch, approx=None, ref=None):
     def fake(key, fn, *a, **kw):
         head = bytes(key).split(b":", 1)[0]
         if head == b"approx":
-            # Built and traced anew on every call: an executable from the
-            # process memo would skip the candidate's build and trace.
+            # Built anew: a memo hit would skip the candidate's build and trace.
             return fn() if approx is None else approx(fn)
         make = (lambda: real(key, fn, *a, **kw))
         if ref is not None and head == b"paired-ref":
@@ -339,8 +334,7 @@ def _reference_compile_fails(monkeypatch):
 
 
 def _reference_run_fails(monkeypatch):
-    # A refused plan (its execution fails) is scored against the reference,
-    # and the reference cannot run.
+    # A refused plan is scored against a reference that cannot run.
     _fake_compile(
         monkeypatch,
         approx=lambda make: _Wrapped(make(), fail=ValueError("candidate")),

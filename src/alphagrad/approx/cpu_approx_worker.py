@@ -307,8 +307,7 @@ class CpuApproximationServer:
         # so we can attribute the leak to *this* process (not the
         # GPU trainer that dispatched the request via Ray).
         self._maybe_init_leak_profile()
-        # The out-of-memory flag belongs to this call (owner ruling 2026-09-24
-        # Q52). A flag from an earlier call that nobody read is stale.
+        # The flag belongs to this call (Q52); an unread earlier one is stale.
         self._last_was_oom = False
         try:
             # env._callback takes face_specs / face_skips between the
@@ -486,8 +485,7 @@ class CpuApproximationServer:
             # so a run of failures actively reclaims memory rather than piling
             # more partially-compiled executables on the saturated GPU.
             self._n_calls += 1
-            # An out-of-memory error that the callback recorded before it
-            # raised belongs to this call too.
+            # An OOM the callback recorded before it raised is this call's.
             from alphagrad.approx.env import pop_measure_oom as _pop_oom
             _n_rec, _ = _pop_oom()
             if _n_rec:

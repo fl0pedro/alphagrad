@@ -9260,9 +9260,7 @@ def _callback_measured(
                 "refusal_error": (f"{type(exc).__name__}: "
                                   + " ".join(str(exc).split())[:400])}
 
-    # A failure while the plan's own program is built (its carry container,
-    # its count pass) is a refused plan, scored once the scorer below exists
-    # (owner ruling 2026-09-24 Q53). (kind, reason, detail).
+    # A failed build of the plan's program is a refusal, scored below (Q53).
     def _build_refusal(where: str, exc: Exception) -> tuple:
         print(f"[refused] {where} failed step={int(stop)} order={o_list}: "
               f"{type(exc).__name__}: {' '.join(str(exc).split())[:200]} "

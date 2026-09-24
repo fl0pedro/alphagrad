@@ -640,8 +640,7 @@ class CpuApproxPool:
                 rule=(None if rule is None else str(rule)),
                 timeout_s=(float(timeout) if timeout > 0 else None),
             )
-            # Ray runs an actor's calls in the order they are sent, so this
-            # reads the out-of-memory flag of the call above.
+            # An actor runs calls in send order: the flag of the call above.
             flag = actor.pop_oom_flag.remote()
             result = ray.get(future) if timeout <= 0 else ray.get(future, timeout=timeout)
             self._check_arity(result)
@@ -695,9 +694,7 @@ class CpuApproxPool:
                 self._emit_eqn_ids,
             )
         except Exception as _exc:
-            # The fault classes of the measurement apparatus (the toolchain,
-            # ReferenceFault, MemoryBoundFault) stop the run here as they do
-            # in evaluate_batch (owner ruling 2026-09-24 Q53).
+            # Apparatus faults stop the run, as in evaluate_batch (Q53).
             if _is_toolchain_fault(_exc):
                 raise
             # Catch-all: anything else (serialization issue, malformed
@@ -724,8 +721,7 @@ class CpuApproxPool:
                 self._eqn_dtype,
                 self._emit_eqn_ids,
             )
-        # THE FLAG OF THIS ROW (owner ruling 2026-09-24 Q52), as in
-        # evaluate_batch.
+        # The flag of this row (Q52), as in evaluate_batch.
         try:
             was_oom = bool(ray.get(flag, timeout=10.0))
         except Exception as _flag_exc:
@@ -991,9 +987,7 @@ class CpuApproxPool:
             futures: dict[int, Any] = {}
             flags: dict[int, Any] = {}
             f_timeouts: dict[int, float] = {}
-            # Map wave-local actor index j -> the slots whose own call ran out
-            # of memory on it in THIS wave. The recycle follows the wave, so
-            # the actor's next slot runs on a fresh process.
+            # Actor index j -> the slots of this wave that ran out of memory.
             oom_by_actor: dict[int, list] = {}
             for j, i in enumerate(wave):
                 actor = held[j]
@@ -1028,8 +1022,7 @@ class CpuApproxPool:
                         rule=(None if rule is None else str(rule)),
                         timeout_s=(float(_to) if _to > 0 else None),
                     )
-                    # Ray runs an actor's calls in the order they are sent, so
-                    # this reads the out-of-memory flag of the call above.
+                    # An actor runs calls in send order: the flag of this call.
                     flags[i] = actor.pop_oom_flag.remote()
                     f_timeouts[i] = _to
                 except Exception as _exc:
@@ -1076,10 +1069,7 @@ class CpuApproxPool:
                         self._measures_since_recycle[id(actor)] = (
                             self._measures_since_recycle.get(id(actor), 0) + 1
                         )
-                    # THE FLAG OF THIS ROW, read after every row (owner ruling
-                    # 2026-09-24 Q52). An out-of-memory error inside the
-                    # callback is a scored row with finite values, so the row
-                    # alone cannot show it.
+                    # Every row (Q52): an in-callback OOM is a scored, finite row.
                     try:
                         _was_oom = bool(ray.get(flags[i], timeout=10.0))
                     except Exception as _flag_exc:
@@ -1098,8 +1088,7 @@ class CpuApproxPool:
                         continue
                     if _was_oom:
                         oom_by_actor.setdefault(j, []).append(i)
-                        # The server's own sentinel row stays excluded; a
-                        # scored row stays scored.
+                        # The server's -1e10 row stays masked, a scored row scored.
                         if self._reward_is_sentinel(reward):
                             sentinel_mask[i] = True
                 except GetTimeoutError:
@@ -1158,9 +1147,7 @@ class CpuApproxPool:
                     held[j] = None
                     _sentinel_slot(i)
 
-            # ---- reactive recycle-on-OOM, after the wave ----
-            # Only process teardown frees the leaked XLA memory. The rows
-            # stay as the actor returned them and are not measured again.
+            # Recycle after the wave: only process teardown frees the leaked XLA memory.
             for j, slots in oom_by_actor.items():
                 old_actor = held[j]
                 if old_actor is None:

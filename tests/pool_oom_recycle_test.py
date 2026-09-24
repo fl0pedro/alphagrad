@@ -1,8 +1,5 @@
 # dsnn-cl0, owner ruling 2026-09-24 Q52 (dsnn-dfw.123, dsnn-nnx): the pool reads
-# the actor's out-of-memory flag after every row and recycles the actor on an
-# out-of-memory error of that row's own call, never on a stale flag. Since
-# dsnn-dkz an out-of-memory error inside env._callback is a scored row with
-# finite values, so the old read, gated on the pool's own -1e10 row, never ran.
+# the out-of-memory flag after every row and recycles on a fresh one only.
 from __future__ import annotations
 
 import os
@@ -73,8 +70,7 @@ class _Remote:
 
 
 class _Actor:
-    # The row kind is order[0]. The flag is set by an OOM call and stays set
-    # until it is popped, as it did on the worker before this change.
+    # order[0] is the row kind; an OOM flag stays set until it is popped.
     def __init__(self, name):
         self.name = name
         self.killed = False
@@ -149,9 +145,7 @@ def test_an_oom_scored_row_recycles_its_actor_and_a_clean_row_after_it_does_not(
 
 
 def test_a_stale_flag_never_recycles_a_later_call(fake_ray, capsys):
-    # One actor and two slots: two waves. The OOM is the first call's; the
-    # second call is a benign sentinel row (a tokenization error) and must
-    # neither recycle an actor nor be masked as an out-of-memory row.
+    # Two waves on one actor: an OOM row, then a benign -1e10 row.
     pool, (actor,), fresh = _pool()
     _tok, _eqn, rewards, mask = _batch(pool, [OOM, SENTINEL])
     assert pool.stats()["oom_recycles"] == 1
@@ -171,8 +165,7 @@ def test_the_flag_is_read_after_every_row(fake_ray):
 
 
 def test_an_oom_hard_sentinel_row_stays_excluded(fake_ray):
-    # The server's own -1e10 row of an OOM that escaped the callback: masked
-    # as before, and the actor recycled once.
+    # The server's -1e10 row of an OOM that escaped the callback.
     pool, (actor,), fresh = _pool()
     actor._flag = False
 
@@ -260,9 +253,7 @@ def _terminal(srv, env, timeout_s):
 
 def test_the_worker_flag_belongs_to_the_call_that_ran_out_of_memory(
         server, monkeypatch):
-    # An OOM in the candidate's compile, then a scorer that cannot score (no
-    # deadline): the callback raises after it recorded the OOM. The flag is
-    # this call's; the clean call after it reads False.
+    # No deadline: the scorer raises after the callback recorded the OOM.
     from alphagrad.approx.common import compile_cache as cc
 
     srv, env = server

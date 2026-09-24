@@ -1,9 +1,5 @@
-# dsnn-cl0, owner ruling 2026-09-24 Q51: since dsnn-dkz every measured program
-# returns the dense form, so Oracle B measured the dense program twice. It now
-# builds the plan's gradient with jacve(..., sparse_representation=True),
-# executes it, densifies it and compares it with the dense program's gradient,
-# outside the measurement and its memory checks: the gradients to float
-# rounding, the two qualities to 1e-3.
+# dsnn-cl0, owner ruling 2026-09-24 Q51: Oracle B compares the densified sparse
+# gradient with the dense program outside the measurement.
 from __future__ import annotations
 
 import os
