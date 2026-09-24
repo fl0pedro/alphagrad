@@ -10,7 +10,6 @@ import json
 import math
 import os
 import sys
-import threading
 import time
 import types
 
@@ -61,7 +60,7 @@ class XlaRuntimeError(RuntimeError):
 
 
 # ------------------------------------------------------------- the toy plans
-def _toy_env(two_leaves=False):
+def _toy_env(two_leaves=False, sparse=True):
     from alphagrad.approx.env import VertexEliminationEnv
 
     rng = np.random.default_rng(0)
@@ -78,6 +77,7 @@ def _toy_env(two_leaves=False):
     closed = jax.make_jaxpr(toy)(*args)
     env = VertexEliminationEnv.from_jaxpr(
         closed, args=args, argnums=argnums, num_envs=0, target_fun=toy,
+        sparse=sparse,
         measure_latency=True, terminal_rewards_only=True,
         latency_inner_reps=1)
     samples = tuple(jnp.asarray(np.stack([np.asarray(a)])) for a in args)
@@ -151,7 +151,8 @@ def paired(monkeypatch):
     env_mod.pop_measure_oom()
 
 
-def _run(monkeypatch, *, approx=None, two_leaves=False, reverse=False):
+def _run(monkeypatch, *, approx=None, two_leaves=False, reverse=False,
+         sparse=True):
     real = _REAL_CACHED_COMPILE
     seen = {}
 
@@ -164,7 +165,7 @@ def _run(monkeypatch, *, approx=None, two_leaves=False, reverse=False):
         return out
 
     monkeypatch.setattr(_cc, "cached_compile", fake)
-    env, samples = _toy_env(two_leaves)
+    env, samples = _toy_env(two_leaves, sparse)
     order = sorted(int(v) for v in np.asarray(env.valid_vertices))
     if reverse:
         order = order[::-1]
@@ -395,14 +396,16 @@ def test_refused_reward_puts_the_sentinel_on_slot_5_and_slot_11(monkeypatch):
 
 
 # ------------------------------------------------------- 4a. O == O* exactly
+@pytest.mark.parametrize("sparse", [True, False])
 @pytest.mark.parametrize("two_leaves", [False, True])
 def test_an_exact_plan_returns_the_reference_output_to_the_byte(
-        paired, monkeypatch, two_leaves):
+        paired, monkeypatch, two_leaves, sparse):
     reward, counts, recs, seen = _run(monkeypatch, two_leaves=two_leaves,
+                                      sparse=sparse,
                                       reverse=True)
     assert counts == {}, counts
     rec = recs[-1]
-    print(f"[check-a] leaves={2 if two_leaves else 1} "
+    print(f"[check-a] leaves={2 if two_leaves else 1} sparse={sparse} "
           f"out {rec['mem_output_bytes']:.0f} B vs reference "
           f"{rec['ref_output_bytes']:.0f} B, args {rec['mem_args_bytes']:.0f}"
           f" B vs {rec['ref_args_bytes']:.0f} B")
