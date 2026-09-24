@@ -426,7 +426,7 @@ def test_every_arm_carries_the_shared_thesis_flags(gen, matrix):
         assert cli["--face-wire-faces"] == want_faces, a["name"]
         assert gen.CAMPAIGN_FACE_WIRE_FACES == FACE_WIRE_FACES
         assert gen.THESIS_TLM_FACE_WIRE_FACES == TLM_FACE_WIRE_FACES
-        assert cli["--ray-measure-timeout"] == "120", a["name"]
+        assert cli["--ray-measure-timeout"] == "300", a["name"]
         assert cli["--rollout-shards"] == "1", a["name"]
         # the gate inputs, resolved from THIS arm's order
         assert (cli["--gate-winners-table"]
@@ -1691,18 +1691,19 @@ def _frozen_rounds(gen):
 
 def test_the_measure_timeout_and_the_actor_cores_of_a_thesis_row(
         gen, matrix, smoke, pairs):
-    """Owner ruling 2026-09-23: every row `thesis_arm` emits measures under
-    --ray-measure-timeout 120 (ppo.py makes the cold timeout four times
-    that) and gives each timing actor 8 cores, on every node class.  The
+    """Owner rulings 2026-09-23 and 2026-09-24 Q48: every row `thesis_arm`
+    emits measures under --ray-measure-timeout 300, one deadline without a
+    cold budget, and gives each timing actor 8 cores, on every node class.  The
     frozen rounds keep 600 and the budget's per-actor width."""
-    assert gen.THESIS_RAY_MEASURE_TIMEOUT == "120"
+    assert gen.THESIS_RAY_MEASURE_TIMEOUT == "300"
+    assert gen.CAMPAIGN_RAY_MEASURE_TIMEOUT == "600"
     assert gen.THESIS_CORES_PER_ACTOR == "8"
     for a in matrix + smoke + pairs:
         cli = _cli(gen, a)
-        assert cli["--ray-measure-timeout"] == "120", a["name"]
+        assert cli["--ray-measure-timeout"] == "300", a["name"]
         assert cli["--cpu-cores-per-actor"] == "8", a["name"]
         text = gen.render(a)
-        assert "--ray-measure-timeout 120" in text, a["name"]
+        assert "--ray-measure-timeout 300" in text, a["name"]
         assert "--cpu-cores-per-actor 8" in text, a["name"]
     for a in _frozen_rounds(gen):
         cli = _cli(gen, a)

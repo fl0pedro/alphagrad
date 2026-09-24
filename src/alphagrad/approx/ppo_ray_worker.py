@@ -4200,8 +4200,6 @@ class PPORayWorker:
         cpu_workers: list,
         *,
         callback_timeout_s: float = 120.0,
-        initial_timeout_s: float = 600.0,
-        warm_after: int = 3,
         recycle_every: int = 50,
         cpu_actor_options: dict | None = None,
         starting_actor_id: int = 0,
@@ -4210,8 +4208,8 @@ class PPORayWorker:
         Ray actor handles. Mirrors `mu0_ray_actors.SPMDActor.init_server`.
 
         After this call, `_fan_out_tokenize` dispatches through the
-        pool — slow / hung actors are killed + respawned per the cold
-        (`initial_timeout_s`) / warm (`callback_timeout_s`) budget,
+        pool — slow / hung actors are killed + respawned at the one
+        deadline (`callback_timeout_s`, owner ruling 2026-09-24 Q48),
         and timed-out env slots get sentinel rewards rather than
         blocking the rollout.
         """
@@ -4240,8 +4238,6 @@ class PPORayWorker:
         self._cpu_pool = CpuApproxPool(
             self.cpu_workers,
             timeout_s=float(callback_timeout_s),
-            initial_timeout_s=float(initial_timeout_s),
-            warm_after=int(warm_after),
             respawn_factory=_factory,
             max_tokens=int(_MAX_TOKENS),
             num_rewards=int(_NUM_REWARDS),

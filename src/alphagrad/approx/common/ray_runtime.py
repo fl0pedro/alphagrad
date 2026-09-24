@@ -102,7 +102,7 @@ def add_common_ray_args(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
         p, "--cpu-callback-timeout",
         type=float,
         default=600.0,
-        help="Per-call (warm-cache) timeout (seconds) for ray.get on the "
+        help="The one per-call deadline (seconds) for ray.get on the "
              "CPU-approx pool. When exceeded, the actor is killed, a "
              "replacement is respawned, and the env step receives a "
              "sentinel reward so the rollout continues. Set to 0 (or "
@@ -110,25 +110,6 @@ def add_common_ray_args(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
              "when investigating zero-reward signals to rule out the "
              "sentinel path. With timeout disabled, only actor crashes "
              "produce sentinels; slow compiles just block until done.",
-    )
-    _maybe_add(
-        p, "--cpu-callback-initial-timeout",
-        type=float,
-        default=1800.0,
-        help="Per-call timeout applied to the FIRST few calls per actor "
-             "before its on-disk cache is warm. After this many calls "
-             "(see --cpu-callback-warm-after), the regular "
-             "--cpu-callback-timeout kicks in. The cold path can take "
-             "10x longer than warm on novel elimination orders, so 1800s "
-             "(30 min) is the conservative default. Set to 0 to disable.",
-    )
-    _maybe_add(
-        p, "--cpu-callback-warm-after",
-        type=int,
-        default=3,
-        help="Number of successful calls per actor before the warm-cache "
-             "timeout (--cpu-callback-timeout) replaces the initial "
-             "timeout (--cpu-callback-initial-timeout).",
     )
     _maybe_add(
         p, "--cpu-worker-recycle-every",

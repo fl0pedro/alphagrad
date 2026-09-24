@@ -3,8 +3,10 @@
 After the candidate's compile and before its first execution the callback
 reads ``memory_analysis()`` (temp + argument + output bytes) and refuses the
 plan above the device's ``bytes_limit`` (three fourths of the card): reason
-``oom-static``, counted as refused, the sentinel reward, both numbers in the
-refusal line and in the plan-log record. The paired reference is not gated.
+``gate``, counted as refused, both numbers in the refusal line and in the
+plan-log record. Since dsnn-4eq (2026-09-24) the refusal is SCORED at the
+timeout, not sentinelled at -1e10 (tests/refusal_sentinel_test.py pins the
+values). The paired reference is not gated.
 """
 import os
 
@@ -86,6 +88,7 @@ def measure(monkeypatch):
     monkeypatch.setenv("ALPHAGRAD_DIRECT_MEASURE", "1")
     monkeypatch.setenv("ALPHAGRAD_PLAN_LOG", "1")
     monkeypatch.setattr(env_mod, "_device_bytes_limit", lambda d: LIMIT)
+    env_mod.set_measure_timeout_s(120.0)
     real = cc.cached_compile
     wrapped = {}
 
@@ -113,7 +116,8 @@ def measure(monkeypatch):
         recs = env_mod.consume_plan_records()["records"]
         return np.asarray(out[-1], dtype=np.float32), counts, recs, wrapped
 
-    return run
+    yield run
+    env_mod.set_measure_timeout_s(None)
 
 
 def _is_sentinel(reward):
@@ -124,18 +128,22 @@ def _is_sentinel(reward):
 def test_a_candidate_above_the_bytes_limit_is_refused(
         measure, capsys):
     reward, counts, recs, wrapped = measure({b"approx:": SWELL})
-    assert counts.get("oom-static", 0) == 1, counts
+    assert counts.get("gate", 0) == 1, counts
     assert counts.get("total", 0) == 1, counts
-    assert _is_sentinel(reward)
+    # scored at the timeout, never the -1e10 sentinel (dsnn-4eq)
+    assert not _is_sentinel(reward)
+    assert np.isfinite(reward).all()
+    assert reward[env_mod.REWARD_INDEX["latency_ns"]] < -10.0
     assert wrapped[b"approx:"].calls == 0
     rec = recs[-1]
-    assert rec["refused"] == "oom-static"
+    assert rec["refused"] == "gate"
     assert rec["sentinelled"] is True
     assert rec["static_peak_bytes"] > SWELL
     assert rec["static_peak_limit_bytes"] == LIMIT
     assert rec["device_bytes_limit"] == LIMIT
+    assert rec["refusal_timeout_s"] == 120.0
     line = [ln for ln in capsys.readouterr().out.splitlines()
-            if "oom-static" in ln]
+            if ln.startswith("[refused] gate ")]
     assert line, "no refusal line"
     assert f"limit_bytes={LIMIT}" in line[0]
     assert "1/4 of" not in line[0]

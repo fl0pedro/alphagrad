@@ -191,8 +191,6 @@ def _run_one_variant(args, variant: str) -> None:
         spmd_actor.init_server.remote(
             cpu_workers,
             callback_timeout_s=args.cpu_callback_timeout,
-            initial_timeout_s=args.cpu_callback_initial_timeout,
-            warm_after=args.cpu_callback_warm_after,
             recycle_every=args.cpu_worker_recycle_every,
             cpu_actor_options=cpu_actor_options,
             starting_actor_id=initial_pool_size,

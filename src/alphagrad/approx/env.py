@@ -1270,8 +1270,12 @@ def _record_zero_work_plan() -> None:
 # with `--plan-log` off.
 #
 # THE KIND is the reason's prefix: `oom`, `untraceable`, `muls-cap`,
-# `no-target-fun`, `raised`. The detail after the colon stays on the plan
-# record's `refused` field, which is not aggregated.
+# `no-target-fun`, `raised`, `gate`, `compile`, `timeout`,
+# `quality-undefined`. The detail after the colon stays on the plan record's
+# `refused` field, which is not aggregated. Since 2026-09-24 (Q42, Q48) every
+# refusal is scored except a call the deadline killed (`timeout`) and an
+# undefined quality, which stay excluded; each count also lands in `scored`
+# or `excluded`.
 #
 # `oracle` IS GONE (owner ruling 2026-09-18). It named the gradient oracle's
 # own float64 compile failing inside the measurement, which was 3.9 percent of
@@ -1288,11 +1292,13 @@ def refusal_kind(reason: str) -> str:
     return r.split(":", 1)[0] or "unknown"
 
 
-def _record_refusal(reason: str) -> None:
+def _record_refusal(reason: str, *, scored: bool) -> None:
     """Count ONE refused terminal measurement. Never raises, never skips."""
     k = refusal_kind(reason)
     _REFUSED_KINDS[k] = int(_REFUSED_KINDS.get(k, 0)) + 1
     _REFUSED_KINDS["total"] = int(_REFUSED_KINDS.get("total", 0)) + 1
+    fate = "scored" if scored else "excluded"
+    _REFUSED_KINDS[fate] = int(_REFUSED_KINDS.get(fate, 0)) + 1
 
 
 def consume_refused_counts() -> dict:
@@ -1300,6 +1306,191 @@ def consume_refused_counts() -> dict:
     out = {k: int(v) for k, v in _REFUSED_KINDS.items()}
     _REFUSED_KINDS.clear()
     return out
+
+
+# ---------------------------------------------------------------------------
+# SCORED REFUSALS (owner rulings 2026-09-24: dsnn-4eq, Q42-Q48). A refused
+# plan takes a finite sentinel on every channel:
+#   latency   log(timeout / t_ref), with THE configured deadline (300 s);
+#   memory    the real static ratios when a compiled program exists, else
+#             the (c') sentinel of `memory_sentinel`;
+#   quality   0.
+# A call the deadline killed is not a refused plan: it is counted and
+# excluded (`timeout`), and `refused_reward` refuses to score it.
+_MEASURE_TIMEOUT_S: list = [None]
+_HOST_LIMIT_NOTED: list = []
+MEM_OBJECTIVE_EPS_FRACTION = 2.0 ** -10
+# The scorer of the terminal measurement in progress; `_callback` hands it a
+# raise from inside that measurement.
+_REFUSAL_SCORER: list = [None]
+_LAST_REFUSAL: list = [None]
+
+
+def consume_last_refusal() -> dict | None:
+    out, _LAST_REFUSAL[0] = _LAST_REFUSAL[0], None
+    return out
+
+
+def set_measure_timeout_s(timeout_s) -> None:
+    _MEASURE_TIMEOUT_S[0] = None if timeout_s is None else float(timeout_s)
+
+
+def measure_timeout_s() -> float:
+    t = _MEASURE_TIMEOUT_S[0]
+    if t is None or not math.isfinite(t) or t <= 0.0:
+        raise RuntimeError(
+            "a refused plan cannot be scored: this measurement enforces no "
+            f"timeout (got {t!r}). The latency sentinel is the configured "
+            "deadline, --ray-measure-timeout (300 s by default), which the "
+            "pool sends with every request and an in-process caller sets "
+            "with set_measure_timeout_s.")
+    return float(t)
+
+
+def allocator_bytes_limit(device) -> tuple[int, str]:
+    limit = _device_bytes_limit(device)
+    if limit:
+        return int(limit), "device"
+    # A device without an allocator limit (the CPU) is bounded by the host.
+    host = int(os.sysconf("SC_PHYS_PAGES")) * int(os.sysconf("SC_PAGE_SIZE"))
+    return host, "host"
+
+
+def mem_objective_eps(reference) -> float:
+    nonzero = [float(x) for x in reference if float(x) > 0.0]
+    if not nonzero:
+        raise ValueError(
+            f"the reference's static bytes {tuple(reference)!r} are all zero, "
+            f"so the memory objective has no perturbation (2^-10 x the "
+            f"smallest nonzero reference value)")
+    return MEM_OBJECTIVE_EPS_FRACTION * min(nonzero)
+
+
+# (c'), owner ruling 2026-09-24 Q44: the lowest slot-11 score a plan that
+# passes the gate (temp + args + output <= L) can reach while args <= A* and
+# output <= O*, as a (temp, output, args) triple for `mem_objective`.
+def memory_sentinel(reference, bytes_limit) -> tuple[tuple, dict]:
+    t_ref, o_ref, a_ref = (float(x) for x in reference)
+    limit = float(bytes_limit)
+    if 2.0 * a_ref + o_ref <= limit:
+        branch = "fill"
+        triple = (limit - a_ref - o_ref, o_ref, a_ref)
+    else:
+        branch = "split"
+        half = (limit - o_ref) / 2.0
+        triple = (half, o_ref, half)
+    if triple[0] < 0.0:
+        raise ValueError(
+            f"the memory sentinel is undefined: the reference's output "
+            f"({o_ref:.0f} B) alone exceeds the device limit ({limit:.0f} B)")
+    return triple, {"branch": branch, "temp_bytes": triple[0],
+                    "output_bytes": triple[1], "args_bytes": triple[2],
+                    "bytes_limit": int(bytes_limit)}
+
+
+def refused_reward(kind: str, *, timeout_s, reference, candidate_static=None,
+                   counts=(0.0, 0.0)) -> tuple[list, dict]:
+    if kind == "timeout":
+        raise ValueError(
+            "a call the deadline killed is excluded from the update and "
+            "never scored (owner ruling 2026-09-24 Q48)")
+    t = None if timeout_s is None else float(timeout_s)
+    if t is None or not math.isfinite(t) or t <= 0.0:
+        raise RuntimeError(
+            f"a {kind} refusal cannot be scored: the measurement enforces "
+            f"no timeout (got {timeout_s!r}); the latency sentinel is the "
+            f"configured deadline and there is no second constant.")
+    ref = dict(reference or {})
+    limit = ref.get("bytes_limit")
+    lat_ns = t * 1e9
+    cand = (None if candidate_static is None
+            else tuple(float(x) for x in candidate_static))
+    sentinel = None
+    if cand is None:
+        if not limit:
+            raise RuntimeError(
+                f"a {kind} refusal without a compiled program cannot be "
+                f"scored: the reference carries no allocator bytes_limit "
+                f"(got {limit!r}).")
+        if ref.get("bytes_limit_source") == "host" and not _HOST_LIMIT_NOTED:
+            _HOST_LIMIT_NOTED.append(1)
+            print(f"[refused] NOTE the measurement device reports no "
+                  f"bytes_limit; the memory sentinel of a refusal without a "
+                  f"program takes the host's physical memory, {int(limit)} "
+                  f"bytes.", flush=True)
+    measure_latency = bool(ref.get("measure_latency", True))
+    mem_obj = 0.0
+    mem_obj_rec = None
+    n_floored = 0
+    if cost_form() == "paired-log":
+        ref_lat = ref.get("latency_ns")
+        ref_mem = ref.get("memory_bytes")
+        ref_static = ref.get("static")
+        if ref_mem is None or ref_static is None or (
+                measure_latency and ref_lat is None):
+            raise RuntimeError(
+                f"a {kind} refusal cannot be scored under --cost-form "
+                f"paired-log: no paired reference has been measured "
+                f"(reference={reference!r}).")
+        if cand is None:
+            cand, sentinel = memory_sentinel(ref_static, limit)
+            mem_bytes = (cand[0] if mem_channel() == "temp"
+                         else float(limit))
+        else:
+            mem_bytes = cand[0]
+        latency, memory, n_floored = paired_log_costs(
+            lat_ns if measure_latency else 0.0, mem_bytes,
+            float(ref_lat) if measure_latency else 0.0, float(ref_mem))
+        mem_obj, mem_obj_rec = mem_objective(cand, ref_static)
+    else:
+        mem_bytes = float(limit) if cand is None else cand[0]
+        latency = lat_ns if measure_latency else 0.0
+        memory = mem_bytes
+    muls, io = (float(x) for x in counts)
+    slots = [0.0] * NUM_REWARDS
+    slots[REWARD_INDEX["muls_adds_fmas"]] = -muls
+    slots[REWARD_INDEX["max_io_sum"]] = -io
+    slots[REWARD_INDEX["latency_ns"]] = -float(latency)
+    slots[REWARD_INDEX["peak_memory"]] = -float(memory)
+    slots[REWARD_INDEX["fidelity"]] = -1.0
+    slots[REWARD_INDEX["sparsity"]] = -1.0
+    slots[REWARD_INDEX["mem_objective"]] = float(mem_obj)
+    info = {
+        "refusal_timeout_s": t,
+        "refusal_latency_ns": float(lat_ns),
+        "refusal_memory_bytes": float(mem_bytes),
+        "refusal_bytes_limit": None if not limit else int(limit),
+        "refusal_program": candidate_static is not None,
+        "refusal_sentinel": sentinel,
+        "delta_latency": float(latency),
+        "delta_memory": float(memory),
+        "mem_floored": int(n_floored),
+        "mem_objective_rec": mem_obj_rec,
+    }
+    return slots, info
+
+
+def record_pool_refusal(reason: str, *, order, rule_specs, face_specs,
+                        face_skips, stop: int, reward_vec, refusal_detail,
+                        scored: bool, paired_ref=None,
+                        mem_objective_rec=None) -> None:
+    _record_refusal(reason, scored=scored)
+    n = int(len(np.asarray(order).reshape(-1)))
+    if int(stop) < n or not plan_log_enabled():
+        return
+    if face_specs is None:
+        face_specs = np.full((n, MAX_FACES, wire_slots(), 3), -1, np.int32)
+        face_skips = np.zeros((n, MAX_FACES), np.int32)
+    _PLAN_LOG_TERMINALS[0] += 1
+    _record_terminal_plan(
+        order=[int(x) for x in np.asarray(order).reshape(-1)[:n].tolist()],
+        rule_specs=np.asarray(rule_specs)[:n],
+        face_specs=np.asarray(face_specs)[:n],
+        face_skips=np.asarray(face_skips)[:n],
+        reward_vec=reward_vec, face_before=None, face_after=_PER_FACE_STATS,
+        counts_from_trace=False, refused=reason,
+        refusal_detail=refusal_detail, paired_ref=paired_ref,
+        mem_objective_rec=mem_objective_rec)
 
 
 # ---------------------------------------------------------------------------
@@ -2427,7 +2618,8 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
                           measure_counts: dict | None = None,
                           measured_from: int | None = None,
                           face_joins=None, refused: str | None = None,
-                          refusal_detail: dict | None = None) -> None:
+                          refusal_detail: dict | None = None,
+                          mem_objective_rec: dict | None = None) -> None:
     """Append ONE terminal plan to this process's plan log. Never raises.
 
     ``refused`` names the resource limit or fault that stopped the
@@ -2498,6 +2690,16 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
             "ref_latency_ns": (paired_ref or {}).get("latency_ns"),
             "ref_temp_bytes": (paired_ref or {}).get("temp_bytes"),
             "ref_watermark_bytes": (paired_ref or {}).get("watermark_bytes"),
+            # THE MEMORY OBJECTIVE's inputs and its three raw ratios
+            # (dsnn-xvi): the other two static numbers of both executables
+            # beside the temps above, so slot 11 can be rebuilt offline.
+            "mem_output_bytes": (mem_parity or {}).get("static_output_bytes"),
+            "mem_args_bytes": (mem_parity or {}).get(
+                "static_argument_bytes"),
+            "ref_output_bytes": (paired_ref or {}).get("output_bytes"),
+            "ref_args_bytes": (paired_ref or {}).get("args_bytes"),
+            "mem_ratios": (mem_objective_rec or {}).get("ratios"),
+            "mem_objective_eps": (mem_objective_rec or {}).get("eps"),
             "candidate_latency_ns": (paired_ref or {}).get(
                 "candidate_latency_ns"),
             "candidate_memory_bytes": (paired_ref or {}).get(
@@ -3151,7 +3353,15 @@ _AXIS_FEAT_GROUP_ID = 3
 #                        (ppo's --sparsity-weight / --sparsity-log /
 #                        ALPHAGRAD_SPARSITY). READ THE HACKABILITY WARNING
 #                        on `_SPARSITY_STATS` before weighting it.
-NUM_REWARDS = 11
+#  11 mem_objective  — THE MEMORY OBJECTIVE (dsnn-xvi, owner ruling
+#                        2026-09-24): -(log(temp/temp*) + log(args/args*)
+#                        + log(out/out*)) from memory_analysis() of the
+#                        timed executable and of the rev-exact reference
+#                        (*), one PopArt channel, never symlogged. Terminal
+#                        only, under --cost-form paired-log; 0.0 otherwise.
+#                        The three raw ratios ride the plan-log record.
+#                        APPENDED, never inserted.
+NUM_REWARDS = 12
 REWARD_NAMES: tuple[str, ...] = (
     "muls_adds_fmas",
     "flops",
@@ -3166,6 +3376,7 @@ REWARD_NAMES: tuple[str, ...] = (
     # RESERVED for the deprecated Ray line; never populated here.
     "bkstep_acc",
     "sparsity",
+    "mem_objective",
 )
 REWARD_INDEX = {name: i for i, name in enumerate(REWARD_NAMES)}
 # BACK-COMPAT ALIAS for slot 7. The slot was ``frob_residual`` until
@@ -4276,22 +4487,26 @@ def _gradient_similarity(jac_exact, jac_approx, site: str):
 
 
 # ---------------------------------------------------------------------------
-# THE PAIRED REFERENCE (ticket dsnn-3qm.9). Under ``--cost-form paired-log``
-# every terminal measurement also measures REV-EXACT -- the reverse order,
-# every face None, the jax.grad-equivalent -- in the same callback,
-# INTERLEAVED with the candidate window by window since 2026-09-14 (it used
-# to run as a second block right after it), through the same executable path
-# and the same instrument (`_time_one_rep`, same eval args, same warmup, same
-# median). Its POINTS x REPS are its own (`EnvConfig.ref_num_data_points`)
-# and so is its INNER, which the window rule derives from its own execution
-# time (`EnvConfig.measure_budget_secs`). The cost
-# channels then carry the LOG-DIFFERENCE ``Delta_c = log cost_c(candidate)
-# - log cost_c(rev-exact)`` (stored negated like every cost slot), so
-# rev-exact scores 0 by construction and a GPU-state drift of 18-20 % between
-# processes cancels instead of masquerading as a win. One record per
-# reference measurement is kept here and drained with the plan records
-# (`consume_plan_records` -> ``"paired_ref"``), so the trainer can log the
-# reference in positive units (ref/latency_ns, ref/temp_bytes; ticket .45).
+# THE PAIRED REFERENCE (ticket dsnn-3qm.9; dsnn-xta). Under ``--cost-form
+# paired-log`` every terminal measurement also measures THE REFERENCE --
+# ``jax.grad`` of the target function with respect to ``config.argnums``, on
+# the base program's inputs, compiled with the measurement's compiler options
+# (owner rulings 2026-09-24 Q39-Q41; until then the graphax rev-exact
+# elimination, which `rev_exact_telemetry_enabled` keeps as telemetry) -- in
+# the same callback, INTERLEAVED with the candidate window by window since
+# 2026-09-14 (it used to run as a second block right after it), through the
+# same executable path and the same instrument (`_time_one_rep`, same eval
+# args, same warmup, same median). Its POINTS x REPS are its own
+# (`EnvConfig.ref_num_data_points`) and so is its INNER, which the window
+# rule derives from its own execution time (`EnvConfig.measure_budget_secs`).
+# The cost channels then carry the LOG-DIFFERENCE ``Delta_c = log
+# cost_c(candidate) - log cost_c(reference)`` (stored negated like every cost
+# slot), so the reference scores 0 by construction and a GPU-state drift of
+# 18-20 % between processes cancels instead of masquerading as a win. One
+# record per reference measurement is kept here and drained with the plan
+# records (`consume_plan_records` -> ``"paired_ref"``), so the trainer can
+# log the reference in positive units (ref/latency_ns, ref/temp_bytes;
+# ticket .45).
 #
 # Until 2026-09-04 this block held the additive quality gate
 # (ALPHAGRAD_QUALITY_GATE_MIN, `_apply_quality_gate`, the per-order floor
@@ -4303,6 +4518,50 @@ def _gradient_similarity(jac_exact, jac_approx, site: str):
 _PAIRED_REF: list = []
 _PAIRED_REF_DROPPED = [0]
 _PAIRED_REF_CAP = 65536
+
+
+def reference_kind(config) -> str:
+    if bool(config.has_aux):
+        return "jax.value_and_grad"
+    outs = list(config.jaxpr.outvars)
+    if len(outs) == 1 and tuple(getattr(outs[0].aval, "shape", ())) == ():
+        return "jax.grad"
+    return "jax.jacrev"
+
+
+def reference_program(config):
+    if config.target_fun is None:
+        raise ValueError(
+            "the paired reference is jax.grad of the target function and "
+            "this configuration has no target_fun")
+    argnums = tuple(int(i) for i in config.argnums)
+    kind = reference_kind(config)
+    if kind == "jax.value_and_grad":
+        # ``((loss, aux), grads)``: the layout jacve's has_aux output has, so
+        # every consumer reads the gradient of the loss at index 1.
+        return jax.value_and_grad(config.target_fun, argnums=argnums,
+                                  has_aux=True)
+    if kind == "jax.grad":
+        return jax.grad(config.target_fun, argnums=argnums)
+    return jax.jacrev(config.target_fun, argnums=argnums)
+
+
+def rev_exact_telemetry_enabled() -> bool:
+    return os.environ.get("ALPHAGRAD_REV_EXACT_TELEMETRY", "0") not in (
+        "0", "", "false", "False", "no")
+
+
+_REV_TELEMETRY: dict = {"episode": None, "keys": set()}
+
+
+def _rev_telemetry_due(episode_key, ref_key) -> bool:
+    if _REV_TELEMETRY["episode"] != episode_key:
+        _REV_TELEMETRY["episode"] = episode_key
+        _REV_TELEMETRY["keys"] = set()
+    if ref_key in _REV_TELEMETRY["keys"]:
+        return False
+    _REV_TELEMETRY["keys"].add(ref_key)
+    return True
 
 # THE FLOOR UNDER log(temp). ``memory_analysis().temp_size_in_bytes`` is an
 # exact integer count of bytes and a plan whose gradient graph dead-code
@@ -4680,12 +4939,12 @@ def _paired_log_delta(candidate: float, reference: float,
 def paired_log_costs(latency_ns: float, peak_memory: float,
                      ref_latency_ns: float, ref_memory: float
                      ) -> tuple[float, float, int]:
-    """The two cost channels as PAIRED LOG-DIFFERENCES against rev-exact.
+    """The two cost channels as PAIRED LOG-DIFFERENCES against the reference.
 
     ``(Delta_lat, Delta_mem, n_floored)``. ``Delta_c = log cost_c(candidate)
-    - log cost_c(rev-exact)``: negative = the candidate is cheaper. The
+    - log cost_c(reference)``: negative = the candidate is cheaper. The
     caller stores both negated, like every cost slot, so a cheaper plan
-    scores above 0 and rev-exact scores exactly 0.
+    scores above 0 and the reference scores exactly 0.
 
     Latency ``0.0`` means NOT MEASURED (``config.measure_latency`` off) and
     passes through as 0.0 -- for the pair, since candidate and reference
@@ -4747,17 +5006,33 @@ def window_ratio_record(windows) -> dict:
             "lo": lo, "hi": hi, "n": int(w.size)}
 
 
-def _static_temp_bytes(compiled) -> float | None:
-    """``compiled.memory_analysis().temp_size_in_bytes`` -- the quantity
-    reward slot 5 holds under ``--mem-channel temp`` (ticket .49) -- or
-    None when the executable exposes no analysis."""
+def _static_memory_bytes(compiled) -> tuple[float, float, float] | None:
     try:
         ma = compiled.memory_analysis()
     except Exception:
         return None
     if ma is None:
         return None
-    return float(getattr(ma, "temp_size_in_bytes", 0) or 0.0)
+    return (float(getattr(ma, "temp_size_in_bytes", 0) or 0.0),
+            float(getattr(ma, "output_size_in_bytes", 0) or 0.0),
+            float(getattr(ma, "argument_size_in_bytes", 0) or 0.0))
+
+
+# dsnn-xvi: the ruling's formula on two (temp, output, argument) byte triples.
+# eps (Q45) keeps each log finite at a zero and moves a nonzero reference term
+# by at most 2^-10.
+def mem_objective(candidate, reference) -> tuple[float, dict]:
+    c_temp, c_out, c_args = (float(x) for x in candidate)
+    r_temp, r_out, r_args = (float(x) for x in reference)
+    eps = mem_objective_eps((r_temp, r_out, r_args))
+    ratios = {
+        "temp": (c_temp + eps) / (r_temp + eps),
+        "args": (c_args + eps) / (r_args + eps),
+        "out": (c_out + eps) / (r_out + eps),
+    }
+    value = -(math.log(ratios["temp"]) + math.log(ratios["args"])
+              + math.log(ratios["out"]))
+    return float(value), {"ratios": ratios, "eps": float(eps)}
 
 
 def _record_paired_ref(rec: dict) -> None:
@@ -4783,7 +5058,7 @@ def consume_paired_refs() -> dict:
 
 def paired_ref_summary(records) -> dict:
     """Per-period reference numbers for the log dict, in POSITIVE units
-    (ticket .45): the mean rev-exact latency in ns and static temp bytes
+    (ticket .45): the mean reference latency in ns and static temp bytes
     (and watermark bytes), how many references were taken, and how many
     memory readings (candidate or reference) the log floor replaced."""
     _lat = [float(r["latency_ns"]) for r in records
@@ -6019,7 +6294,8 @@ def _grad_cosine_quality(config, compiled_approx, ref_ex, ref_key, base_args,
     """THE GRADIENT COSINE: cos(g_approx, g_exact) at the INITIAL weights,
     averaged over ``k_batches`` fixed probe batches of REAL data.
 
-    ``ref_ex`` is the REV-EXACT reference of the paired cost channel, keyed by
+    ``ref_ex`` is the paired reference (`reference_program`: jax.grad of the
+    target on the base program's inputs, dsnn-xta), keyed by
     ``ref_key``; its gradient is the ``g_exact`` of the cosine and it is
     executed once per probe batch, not once per plan (see ``_cosine_reference``
     and the owner's ruling of 2026-09-18).
@@ -6055,7 +6331,7 @@ def _grad_cosine_quality(config, compiled_approx, ref_ex, ref_key, base_args,
         for slot, d in zip(_slots, data):
             a[slot] = jax.device_put(jnp.asarray(d), device)
         # THE REFERENCE, when the DRAW ITSELF is approximated. The in-band
-        # cosine scores the plan against the rev-exact plan ON THE SAME
+        # cosine scores the plan against the reference ON THE SAME
         # ARGUMENTS, so an approximation that lives in an ARGUMENT -- the
         # temporal carry a rule accumulated over a whole recording -- is
         # invisible to it: both sides read the same approximated value and the
@@ -7928,6 +8204,37 @@ class MemChannelFault(MeasureToolchainFault):
     """
 
 
+# `lowered.compile()` raised on THIS plan inside `_compile_measure` (after the
+# degraded retry where one applied); neither a toolchain fault nor a device
+# OOM, which keep their own classes and text. The callback scores it as a
+# `compile` refusal (owner ruling 2026-09-24, dsnn-4eq). `__cause__` is XLA's.
+class MeasureCompileFailure(RuntimeError):
+    pass
+
+
+# Check (b) of Q44: a scored plan's arguments or outputs exceed the
+# reference's, so the (c') memory sentinel no longer bounds it. Stops the run.
+class MemoryBoundFault(MeasureToolchainFault):
+    pass
+
+
+# The reference could not be compiled or measured, so no plan can be scored.
+class ReferenceFault(MeasureToolchainFault):
+    pass
+
+
+def check_memory_bounds(candidate, reference, where: str) -> None:
+    c_out, c_args = float(candidate[1]), float(candidate[2])
+    r_out, r_args = float(reference[1]), float(reference[2])
+    if c_args > r_args or c_out > r_out:
+        raise MemoryBoundFault(
+            f"{where}: the plan's argument bytes {c_args:.0f} (reference "
+            f"{r_args:.0f}) or output bytes {c_out:.0f} (reference "
+            f"{r_out:.0f}) exceed the reference's, so the memory sentinel "
+            f"of a refused plan no longer bounds it (owner ruling 2026-09-24 "
+            f"Q44, check b)")
+
+
 def measure_toolchain_gate_mode() -> str:
     """``abort`` | ``warn`` | ``off`` -- THE one reader of the gate mode.
 
@@ -8119,7 +8426,7 @@ def _compile_measure(lowered):
                 raise MeasureToolchainFault(_toolchain_fault_message(
                     "measure compile, mid-run", _m)) from _e
         if os.environ.get("ALPHAGRAD_MEASURE_COMPILE_FALLBACK", "1") == "0":
-            raise
+            raise MeasureCompileFailure(_m) from _e
         # "Shared memory size limit exceeded" is labelled
         # RESOURCE_EXHAUSTED but is a compiler KERNEL-CONFIG failure
         # (XLA chose a tile above the SM's shared-mem budget -- observed
@@ -8133,26 +8440,29 @@ def _compile_measure(lowered):
         if not _link_fault and not any(_sig in _m for _sig in (
                 "ptxas exited", "Triton kernel", "INTERNAL",
                 "Shared memory size limit", "A cycle is detected")):
-            raise
+            raise MeasureCompileFailure(_m) from _e
         _MEASURE_COMPILE_FALLBACKS["n"] += 1
         print(
             f"[measure] compile FALLBACK #{_MEASURE_COMPILE_FALLBACKS['n']} "
             f"(degraded fusion) after: {_m[:200]}", flush=True)
-        return lowered.compile(compiler_options={
-            "xla_gpu_autotune_level": 0,
-            "xla_gpu_enable_triton_gemm": False,
-            "xla_gpu_enable_dynamic_slice_fusion": False,
-            "xla_gpu_use_runtime_fusion": False,
-            # The observed Blackwell failures are kCustom __triton
-            # fusions with block_level_fusion_config -- produced by the
-            # BLOCK-LEVEL rewriter, which the four knobs above do not
-            # touch (observed: fallback #1 fired and still died on
-            # fusion.205). Both names probed-valid on this build.
-            "xla_gpu_experimental_enable_fusion_block_level_rewriter":
-                False,
-            "xla_gpu_experimental_enable_triton_heroless_priority_fusion":
-                False,
-        })
+        try:
+            return lowered.compile(compiler_options={
+                "xla_gpu_autotune_level": 0,
+                "xla_gpu_enable_triton_gemm": False,
+                "xla_gpu_enable_dynamic_slice_fusion": False,
+                "xla_gpu_use_runtime_fusion": False,
+                # The observed Blackwell failures are kCustom __triton
+                # fusions with block_level_fusion_config -- produced by the
+                # BLOCK-LEVEL rewriter, which the four knobs above do not
+                # touch (observed: fallback #1 fired and still died on
+                # fusion.205). Both names probed-valid on this build.
+                "xla_gpu_experimental_enable_fusion_block_level_rewriter":
+                    False,
+                "xla_gpu_experimental_enable_triton_heroless_priority_fusion":
+                    False,
+            })
+        except Exception as _e2:
+            raise MeasureCompileFailure(str(_e2)) from _e2
 
 
 # ---------------------------------------------------------------------------
@@ -8505,11 +8815,20 @@ def _callback(
     """
     _t0 = int(_PLAN_LOG_TERMINALS[0])
     _r0 = len(_PLAN_RECORDS)
+    _scorer_was = _REFUSAL_SCORER[0]
+    _REFUSAL_SCORER[0] = None
     try:
         return _callback_measured(
             config, args, consts, order, sparsity_specs, face_specs,
             face_skips, stop, *eval_samples, init=init, face_joins=face_joins)
     except BaseException as _exc:
+        # Owner ruling 2026-09-24 Q42: a raise inside the terminal
+        # measurement is a refused plan and is scored; an apparatus fault
+        # and a raise before the measurement began still propagate.
+        _score = _REFUSAL_SCORER[0]
+        if (_score is not None and isinstance(_exc, Exception)
+                and not isinstance(_exc, MeasureToolchainFault)):
+            return _score(_exc)
         # THE RATE IS TELEMETRY, WHATEVER THE PLAN LOG IS DOING. A raised
         # terminal is a refused measurement; the trainer excludes the whole
         # environment from the update, so without this counter the exclusion
@@ -8521,8 +8840,9 @@ def _callback(
         # does not any more (owner ruling 2026-09-18), so there is one source
         # again and `raised:` names it.
         _reason = f"raised:{type(_exc).__name__}"
-        if int(_PLAN_LOG_TERMINALS[0]) > _t0:
-            _record_refusal(_reason)
+        if stop is not None and int(stop) >= int(
+                np.asarray(order).reshape(-1).shape[0]):
+            _record_refusal(_reason, scored=False)
         # Only when THIS call counted a terminal and wrote nothing for it.
         if int(_PLAN_LOG_TERMINALS[0]) > _t0 and len(_PLAN_RECORDS) == _r0:
             try:
@@ -8543,6 +8863,8 @@ def _callback(
             except Exception:
                 pass          # a logging failure must not mask the real one
         raise
+    finally:
+        _REFUSAL_SCORER[0] = _scorer_was
 
 
 def _callback_measured(
@@ -8591,10 +8913,10 @@ def _callback_measured(
     if _plan_log_on:
         _PLAN_LOG_TERMINALS[0] += 1
     # THE COST FORM (ticket .9): under ``paired-log`` the terminal step
-    # measures rev-exact beside the candidate and the two cost slots become
-    # log-differences (see `_PAIRED_REF`). Terminal only, like slots 6/8/10:
-    # a partial order's cost against rev-exact is not a statement about a
-    # plan, so non-terminal steps carry 0.0 in slots 2 and 5 under this form
+    # measures the reference beside the candidate and the two cost slots
+    # become log-differences (see `_PAIRED_REF`). Terminal only, like slots
+    # 6/8/10: a partial order's cost against the reference is not a statement
+    # about a plan, so non-terminal steps carry 0.0 in slots 2 and 5 under this form
     # (training uses terminal rewards strictly; ruling 2026-09-01).
     _paired = bool(is_terminal) and cost_form() == "paired-log"
     _paired_ref_rec = None
@@ -8614,7 +8936,10 @@ def _callback_measured(
     _joins_np = (None if face_joins is None
                  else np.asarray(face_joins)[: len(o_list)])
 
-    def _log_refused(reason: str, reward_vec, detail: dict | None = None):
+    def _log_refused(reason: str, reward_vec, detail: dict | None = None,
+                     *, scored: bool = False, mem_parity=None,
+                     paired_ref=None, measure_counts=None,
+                     mem_objective_rec=None):
         """Record a terminal plan the callback REFUSES to measure.
 
         Every ``return`` between the terminal counter above and the record
@@ -8631,11 +8956,16 @@ def _callback_measured(
         trainer excludes on -- every cost channel at the sentinel -- so the
         two can never disagree about what was refused. ``no-target-fun``
         returns a partial reward vector rather than the sentinel, the
-        trainer keeps that environment, and it is therefore not counted."""
-        if bool(np.all(
+        trainer keeps that environment, and it is therefore not counted.
+        ``scored`` is a refusal that carries a finite sentinel (owner rulings
+        2026-09-24), counted by its reason all the same."""
+        if scored:
+            _record_refusal(reason, scored=True)
+        elif bool(np.all(
                 np.asarray(reward_vec)[list(COMPUTE_REWARD_INDICES)]
                 <= SENTINEL_COST * 0.99)):
-            _record_refusal(reason)
+            _record_refusal(reason, scored=False)
+        _LAST_REFUSAL[0] = {"refused": reason, **(detail or {})}
         if not _plan_log_on:
             return
         _record_terminal_plan(
@@ -8645,7 +8975,9 @@ def _callback_measured(
             reward_vec=reward_vec,
             face_before=_plan_pf0, face_after=_PER_FACE_STATS,
             counts_from_trace=False, refused=reason,
-            refusal_detail=detail)
+            refusal_detail=detail, mem_parity=mem_parity,
+            paired_ref=paired_ref, measure_counts=measure_counts,
+            mem_objective_rec=mem_objective_rec)
     ft_by_vertex = None
     _have_face_actions = bool(
         len(o_list) and (np.any(_skips_np == 1)
@@ -8902,49 +9234,104 @@ def _callback_measured(
     # own eval samples, and every container is divided by that one number.
     _ref_cfg, _ref_args, _ref_consts, _ref_eval = (
         config, args, consts, eval_samples)
+
+    def _is_graphax_trace_failure(exc: BaseException) -> bool:
+        """True when the exception was RAISED INSIDE graphax.
+
+        Deliberately keyed on traceback origin rather than on the message, so
+        an alphagrad-side bug with a similar message still propagates and kills
+        the run. The known instance is
+        ``_normalize_inputs`` refusing to add a tensor to its own transpose
+        ((16,10,784,256) vs (16,10,256,784)) -- the open canonical-output-order
+        gap -- but the whole family belongs here: the plan is well-defined and
+        the library cannot build it, which is apparatus failure, not plan
+        quality.
+        """
+        tb = exc.__traceback__
+        while tb is not None:
+            fn = tb.tb_frame.f_code.co_filename
+            if f"{os.sep}graphax{os.sep}" in fn:
+                return True
+            tb = tb.tb_next
+        return False
+
+    def _refusal_detail(where: str, exc: BaseException) -> dict:
+        return {"refusal_where": where,
+                "refusal_error": (f"{type(exc).__name__}: "
+                                  + " ".join(str(exc).split())[:400])}
+
+    # A failed build of the plan's program is a refusal, scored below (Q53).
+    def _build_refusal(where: str, exc: Exception) -> tuple:
+        print(f"[refused] {where} failed step={int(stop)} order={o_list}: "
+              f"{type(exc).__name__}: {' '.join(str(exc).split())[:200]} "
+              f"(scored at the sentinel)", flush=True)
+        if _is_graphax_trace_failure(exc):
+            _record_untraceable_plan(exc)
+            return ("untraceable", f"untraceable:{where}",
+                    _refusal_detail(where, exc))
+        if _is_oom(exc):
+            _record_truncated_plan()
+            note_measure_oom(where, exc)
+            return ("oom", f"oom:{where}", _refusal_detail(where, exc))
+        return ("raised", f"raised:{type(exc).__name__}",
+                _refusal_detail(where, exc))
+
+    _early_refusal = None
     if is_terminal and _carry.armed(_carry_base_cfg):
-        _carry_container = _carry.container_for_plan(
-            config, o_list, _faces_np, _skips_np, partial_specs)
-        _variant = _carry.measurement_env(_carry_container, _carry_base_cfg)
-        if _variant is not None:
-            (o_list, _m_specs, _m_faces, _m_skips, _m_joins) = \
-                _carry.transport_wires(
-                    o_list, _variant, partial_specs, _faces_np, _skips_np,
-                    _joins_np)
-            config = _variant["config"]
-            args = _variant["args"]
-            consts = _variant["consts"]
-            specs_list = _m_specs.tolist()
-            transforms, _ = _decode_vertex_transforms(
-                config, o_list, specs_list)
-            _m_have = bool(
-                len(o_list) and (np.any(_m_skips == 1)
-                                 or np.any(_m_faces[..., 0] >= 0)
-                                 or np.any(_m_faces[..., 0] == COMPRESS_SENTINEL)
-                                 or np.any(_m_faces[..., 0] == QUANT_SENTINEL)))
-            ft_by_vertex = (
-                _face_transforms_for_order(
-                    config, consts, args, o_list, specs_list,
-                    _m_faces, _m_skips,
-                    wire_sig=_face_wire_keys(_m_faces, _m_skips, len(o_list),
-                                             _m_joins),
-                    face_joins_list=_m_joins)
-                if _m_have else None)
-            # THE VARIANT'S OWN EVAL SAMPLES. They cannot be the base ones --
-            # the shapes of the given values move with the container -- so
-            # they are drawn from a DIGEST of the base draw, which every
-            # process that measures this plan computes the same way and which
-            # moves per episode exactly as the base draw does.
-            if eval_samples:
-                eval_samples = tuple(
-                    _carry.eval_samples_for(_carry_container, eval_samples,
-                                            _carry_base_cfg))
+        try:
+            _carry_container = _carry.container_for_plan(
+                config, o_list, _faces_np, _skips_np, partial_specs)
+            _variant = _carry.measurement_env(_carry_container,
+                                              _carry_base_cfg)
+            if _variant is not None:
+                (o_list, _m_specs, _m_faces, _m_skips, _m_joins) = \
+                    _carry.transport_wires(
+                        o_list, _variant, partial_specs, _faces_np, _skips_np,
+                        _joins_np)
+                config = _variant["config"]
+                args = _variant["args"]
+                consts = _variant["consts"]
+                specs_list = _m_specs.tolist()
+                transforms, _ = _decode_vertex_transforms(
+                    config, o_list, specs_list)
+                _m_have = bool(
+                    len(o_list) and (
+                        np.any(_m_skips == 1)
+                        or np.any(_m_faces[..., 0] >= 0)
+                        or np.any(_m_faces[..., 0] == COMPRESS_SENTINEL)
+                        or np.any(_m_faces[..., 0] == QUANT_SENTINEL)))
+                ft_by_vertex = (
+                    _face_transforms_for_order(
+                        config, consts, args, o_list, specs_list,
+                        _m_faces, _m_skips,
+                        wire_sig=_face_wire_keys(_m_faces, _m_skips,
+                                                 len(o_list), _m_joins),
+                        face_joins_list=_m_joins)
+                    if _m_have else None)
+                # THE VARIANT'S OWN EVAL SAMPLES. They cannot be the base
+                # ones -- the shapes of the given values move with the
+                # container -- so they are drawn from a DIGEST of the base
+                # draw, which every process that measures this plan computes
+                # the same way and which moves per episode exactly as the
+                # base draw does.
+                if eval_samples:
+                    eval_samples = tuple(
+                        _carry.eval_samples_for(_carry_container,
+                                                eval_samples,
+                                                _carry_base_cfg))
+        except MeasureToolchainFault:
+            raise
+        except Exception as _exc:
+            _early_refusal = _build_refusal("carry container", _exc)
+            o_list, config, args, consts, eval_samples = (
+                _rec_order, _carry_base_cfg, _ref_args, _ref_consts,
+                _ref_eval)
     _PLAN_CARRY[0] = _carry_container
     # THE CONTAINER'S AT-REST BYTES ride on the plan record (owner ruling
     # 2026-09-23, no new reward channel): the given blocks of the program the
     # plan is measured on, in the container it implied.
     _PLAN_CARRY_BYTES[0] = None
-    if _carry_container is not None:
+    if _carry_container is not None and _early_refusal is None:
         _c_entry = _carry._entry(_carry_base_cfg)
         _c_var = _carry.measurement_env(_carry_container, _carry_base_cfg)
         _PLAN_CARRY_BYTES[0] = _carry.carry_at_rest_bytes(
@@ -8982,23 +9369,27 @@ def _callback_measured(
     # compare), so the pre-XLA guard against compile-monster plans is gone. The
     # OOM handler still catches device exhaustion, but NOT the v15-style
     # compile hang. Re-enable the count pass if that reappears.
-    if skip_count_ops():
-        muls_adds_fmas = 0.0
-        max_io_sum = 0.0
-    else:
-        _, aux = vertex_elimination_jaxpr(
-            config.jaxpr,
-            o_list,
-            consts,
-            *args,
-            argnums=config.argnums,
-            count_ops=True,
-            sparse_representation=config.sparse,
-            transforms=transforms,
-            face_transforms=ft_by_vertex,
-        )
-        muls_adds_fmas = float(aux["adds"] + aux["muls"] + aux["fmas"])
-        max_io_sum = float(aux["mem"])
+    muls_adds_fmas = 0.0
+    max_io_sum = 0.0
+    if not skip_count_ops() and _early_refusal is None:
+        try:
+            _, aux = vertex_elimination_jaxpr(
+                config.jaxpr,
+                o_list,
+                consts,
+                *args,
+                argnums=config.argnums,
+                count_ops=True,
+                sparse_representation=config.sparse,
+                transforms=transforms,
+                face_transforms=ft_by_vertex,
+            )
+            muls_adds_fmas = float(aux["adds"] + aux["muls"] + aux["fmas"])
+            max_io_sum = float(aux["mem"])
+        except MeasureToolchainFault:
+            raise
+        except Exception as _exc:
+            _early_refusal = _build_refusal("count pass", _exc)
     _pf("cb.count_pass")
 
     # SOFT SENTINEL (v16 post-mortem, ep-39 cliff). The hard ±1e10 sentinel
@@ -9055,15 +9446,18 @@ def _callback_measured(
     # v15 plans measured ~4e12 muls; the default cap only fires on true
     # blowups.
     _muls_cap = float(os.environ.get("ALPHAGRAD_MULS_SENTINEL_CAP", "5e13"))
-    if not skip_count_ops() and muls_adds_fmas > _muls_cap:
+    # (kind, reason, detail) of a refusal found before anything is compiled;
+    # scored once the scorer below exists.
+    if (_early_refusal is None and not skip_count_ops()
+            and muls_adds_fmas > _muls_cap):
         _record_truncated_plan()
         if _dbg_measure or os.environ.get("ALPHAGRAD_DEBUG_DEGEN", "0") == "1":
             print(f"[trunc] MULS-CAP muls={muls_adds_fmas:.3g} > "
                   f"{_muls_cap:.3g} step={int(stop)} order={o_list} "
-                  f"(excluded from gradient)", flush=True)
-        _tr = _truncated_reward()
-        _log_refused("muls-cap", _tr)
-        return _wire(tokens, eqn_ids, _tr)
+                  f"(scored at the sentinel)", flush=True)
+        _early_refusal = ("muls-cap", "muls-cap",
+                          {"refusal_muls": float(muls_adds_fmas),
+                           "refusal_muls_cap": float(_muls_cap)})
 
     # If no `target_fun` is supplied, we can't compile/execute. Skip every
     # execution-derived metric and return a partial reward vector.
@@ -9202,7 +9596,9 @@ def _callback_measured(
             list(o_list),
             argnums=config.argnums,
             has_aux=config.has_aux,
-            sparse_representation=config.sparse,
+            # The reference's layout, one dense array per gradient: the sparse
+            # form adds a scalar_mult output per leaf (Q44 check a).
+            sparse_representation=False,
             # ONE JAXPR FOR BOTH PATHS (dsnn-dfw.24). The order and the face
             # keys are numbered on `config.jaxpr`; a fresh trace inside
             # `.lower()` is a different equation list for the same function
@@ -9300,24 +9696,24 @@ def _callback_measured(
         h_ex.update(repr(callback_device).encode())
     exact_cache_key = h_ex.digest()
 
-    # THE PAIRED REFERENCE (ticket .9): rev-exact = the reverse order over
-    # the SAME vertex set the candidate eliminated, no rule on any vertex,
-    # no action on any face. Built through the same ``jacve`` call shape an
-    # identity candidate gets from `_jacve_fn(approx=True)` -- ``transforms``
-    # is the empty list and ``face_transforms`` None whenever a plan has no
-    # rule and no face action -- so an identity plan and its reference are
-    # the SAME executable and land on the same lowering path (ticket .24's
-    # armed-vs-unarmed question is thereby moot for the pair; its GPU
-    # landing test still stands). Descending vertex ids IS graphax's
-    # ``"rev"`` over these vertices (core._checkify_order). The COMPILE is
-    # cached like every other executable (order, arg shapes, device); the
-    # MEASUREMENT is taken anew in every terminal callback, right after the
-    # candidate's -- that is what makes it paired.
-    # ON THE BASE PROGRAM: the policy's own vertex set (`_rec_order`), the
-    # base jaxpr, its consts and its arguments (see `_ref_cfg` above). With
-    # no carry variant these are the candidate's own, as they always were.
+    # THE PAIRED REFERENCE (ticket .9; dsnn-xta): ``jax.grad`` of the target
+    # function with respect to ``argnums`` (`reference_program`), on the base
+    # program's inputs, through `_compile_measure` like the candidate. Until
+    # 2026-09-24 it was graphax's rev-exact elimination over the candidate's
+    # vertex set; that program is now `_do_compile_rev_exact`, telemetry only
+    # (`rev_exact_telemetry_enabled`), and no longer scores 0. The COMPILE is
+    # cached like every other executable (graph, arg shapes, device); the
+    # MEASUREMENT is taken anew in every terminal callback, interleaved with
+    # the candidate's -- that is what makes it paired.
+    # ON THE BASE PROGRAM: the base target, its arguments and, for the
+    # telemetry, the policy's own vertex set, the base jaxpr and its consts
+    # (see `_ref_cfg` above). With no carry variant these are the
+    # candidate's own, as they always were.
     _rev_order = sorted(_rec_order, reverse=True)
+    _ref_kind = reference_kind(_ref_cfg)
     h_rf = hashlib.blake2b(digest_size=16)
+    h_rf.update(_ref_kind.encode())
+    h_rf.update(np.asarray(tuple(_ref_cfg.argnums), dtype=np.int32).tobytes())
     h_rf.update(np.asarray(_rev_order, dtype=np.int32).tobytes())
     h_rf.update(b"sparse" if bool(_ref_cfg.sparse) else b"dense")
     for a in _ref_args_for_lower:
@@ -9330,19 +9726,21 @@ def _callback_measured(
 
     def _do_compile_paired_ref():
         return _compile_measure(
+            jax.jit(reference_program(_ref_cfg), keep_unused=True)
+            .lower(*_ref_args_for_lower)
+        )
+
+    def _do_compile_rev_exact():
+        return _compile_measure(
             jax.jit(
                 jacve(
                     _ref_cfg.target_fun,
                     list(_rev_order),
                     argnums=_ref_cfg.argnums,
                     has_aux=_ref_cfg.has_aux,
-                    sparse_representation=_ref_cfg.sparse,
+                    sparse_representation=False,
                     transforms=[],
                     face_transforms=None,
-                    # The paired reference walks the graph the POLICY acted
-                    # on. A carry variant is that graph with the
-                    # approximation moved into an argument, and the exact
-                    # rule lives on the base program only (dsnn-biw).
                     jaxpr=_ref_cfg.jaxpr,
                     consts=list(_ref_consts),
                 ),
@@ -9363,52 +9761,244 @@ def _callback_measured(
     # Caught here (compile) and around execution below. `_is_oom` matches on
     # the XLA error text because jaxlib raises a generic XlaRuntimeError for
     # RESOURCE_EXHAUSTED rather than a dedicated class.
-    def _is_graphax_trace_failure(exc: BaseException) -> bool:
-        """True when the exception was RAISED INSIDE graphax.
-
-        Deliberately keyed on traceback origin rather than on the message, so
-        an alphagrad-side bug with a similar message still propagates and kills
-        the run. The known instance is
-        ``_normalize_inputs`` refusing to add a tensor to its own transpose
-        ((16,10,784,256) vs (16,10,256,784)) -- the open canonical-output-order
-        gap -- but the whole family belongs here: the plan is well-defined and
-        the library cannot build it, which is apparatus failure, not plan
-        quality.
-        """
-        tb = exc.__traceback__
-        while tb is not None:
-            fn = tb.tb_frame.f_code.co_filename
-            if f"{os.sep}graphax{os.sep}" in fn:
-                return True
-            tb = tb.tb_next
-        return False
-
-    def _trace_truncate(where: str, exc: BaseException):
+    def _trace_truncate(where: str, exc: BaseException, program):
         _record_untraceable_plan(exc)
-        _tr = _truncated_reward()
-        _log_refused(f"untraceable:{where}", _tr)
-        return _wire(tokens, eqn_ids, _tr)
+        return _score_refusal("untraceable", f"untraceable:{where}",
+                              _refusal_detail(where, exc), program)
 
-    def _oom_truncate(where: str, exc: BaseException):
+    def _oom_truncate(where: str, exc: BaseException, program):
         _record_truncated_plan()
         # The actor clears the caches once per OOM and reports it to the pool.
         note_measure_oom(where, exc)
-        print(f"[trunc] OOM during {where} step={int(stop)} order={o_list} "
-              f"(excluded from gradient): {type(exc).__name__}: "
+        print(f"[refused] OOM during {where} step={int(stop)} order={o_list} "
+              f"(scored at the sentinel): {type(exc).__name__}: "
               f"{str(exc)[:160]}", flush=True)
-        _tr = _truncated_reward()
-        _log_refused(f"oom:{where}", _tr)
-        return _wire(tokens, eqn_ids, _tr)
+        return _score_refusal("oom", f"oom:{where}",
+                              _refusal_detail(where, exc), program)
 
+    def _compile_refusal(where: str, exc: BaseException):
+        _cause = exc.__cause__ if exc.__cause__ is not None else exc
+        print(f"[refused] compile failed during {where} step={int(stop)} "
+              f"order={o_list}: {type(_cause).__name__}: "
+              f"{' '.join(str(exc).split())[:200]} (scored at the "
+              f"sentinel)", flush=True)
+        return ("compile", f"compile:{type(_cause).__name__}",
+                {"refusal_where": where,
+                 "refusal_error": " ".join(str(exc).split())[:400]})
+
+    # The device the measurement lands on; the gate and the sentinel read it.
+    _gate_dev = callback_device
+    if _gate_dev is None:
+        _gate_dev = next(
+            (d for x in jax.tree_util.tree_leaves(args_for_lower)
+             if hasattr(x, "devices") for d in x.devices()),
+            jax.local_devices()[0])
+
+    def _compile_reference():
+        try:
+            return cached_compile(
+                b"paired-ref:" + paired_ref_key, _do_compile_paired_ref)
+        except MeasureToolchainFault:
+            raise
+        except Exception as _exc:
+            raise ReferenceFault(
+                f"the reference ({_ref_kind}) could not be compiled, so no "
+                f"plan can be scored: {type(_exc).__name__}: "
+                f"{' '.join(str(_exc).split())[:300]}") from _exc
+
+    # THE SCORED REFUSAL (owner rulings 2026-09-24 Q42-Q46). The candidate is
+    # never executed; the reference is measured here with the window count a
+    # measured plan's reference gets. `program` is the compiled candidate,
+    # or None when none exists.
+    _st = {"program": None}
+
+    def _score_refusal(kind: str, reason: str, detail: dict, program):
+        _REFUSAL_SCORER[0] = None
+        _timeout = measure_timeout_s()
+        _limit, _limit_src = allocator_bytes_limit(_gate_dev)
+        _ref_for_score = {"bytes_limit": _limit,
+                          "bytes_limit_source": _limit_src,
+                          "measure_latency": bool(config.measure_latency)}
+        _ref_rec = None
+        _counts_r = {"inner": 0, "windows": 0, "secs": 0.0,
+                     "ref_inner": 0, "ref_windows": 0, "ref_secs": 0.0}
+        _r_static = None
+        if _paired:
+            _r_ex = _compile_reference()
+            try:
+                _r_warmup = _resolve_warmup(config)
+                _r_cfg_inner = max(
+                    1, int(getattr(config, "latency_inner_reps", 1)))
+                _r_window_s = float(
+                    getattr(config, "measure_window_secs", 0.05) or 0.0)
+                _r_points = max(
+                    1, int(getattr(config, "ref_num_data_points", 5)))
+                if _ref_eval:
+                    _r_points = min(_r_points, len(_ref_eval[0]))
+                _r_reps = (max(1, int(getattr(config, "ref_reps_per_point",
+                                              32)))
+                           if config.measure_latency else 1)
+                _r_args_all = []
+                for _i in range(_r_points):
+                    _ea = ([_a[_i] for _a in _ref_eval] if _ref_eval
+                           else list(_ref_args))
+                    if callback_device is not None:
+                        _ea = [jax.device_put(_d, callback_device)
+                               for _d in _ea]
+                    _r_args_all.append(_ea)
+                _r_devs = list({
+                    id(_d): _d
+                    for _x in jax.tree_util.tree_leaves(args_for_lower)
+                    if hasattr(_x, "devices") for _d in _x.devices()
+                }.values())
+                if not _r_devs:
+                    _r_devs = jax.local_devices()
+                if config.measure_latency:
+                    _t_ref = 0.0
+                    for _w in range(max(2, _r_warmup)):
+                        _p0 = time.perf_counter()
+                        jax.block_until_ready(_r_ex(*_r_args_all[0]))
+                        _t_ref = time.perf_counter() - _p0
+                    _r_inner = resolve_measure_inner(
+                        _t_ref, _r_window_s, _r_cfg_inner)
+                else:
+                    _r_inner = _r_cfg_inner
+                    for _w in range(_r_warmup):
+                        jax.block_until_ready(_r_ex(*_r_args_all[0]))
+                _r_windows = _r_points * _r_reps
+                _r_warmed = {0}
+                _r_lat_s: list = []
+                _r_pk_s: list = []
+                for _ib in range(_r_windows):
+                    _p = _ib % _r_points
+                    if _p not in _r_warmed:
+                        for _w in range(_r_warmup):
+                            jax.block_until_ready(_r_ex(*_r_args_all[_p]))
+                        _r_warmed.add(_p)
+                    _l, _pk, _s, _o = _time_one_rep(
+                        _r_ex, _r_args_all[_p], _r_devs, _r_inner)
+                    del _o, _s
+                    _r_lat_s.append(_l)
+                    _r_pk_s.append(_pk)
+            except MeasureToolchainFault:
+                raise
+            except Exception as _exc:
+                raise ReferenceFault(
+                    f"the reference ({_ref_kind}) could not be measured, so "
+                    f"the refused plan cannot be scored: "
+                    f"{type(_exc).__name__}: "
+                    f"{' '.join(str(_exc).split())[:300]}") from _exc
+            _r_lat = (float(_aggregate_samples(_r_lat_s,
+                                               want_top_quartile=True))
+                      if _r_lat_s else 0.0)
+            if 0.0 < _r_lat < _LAT_FLOOR_NS:
+                _r_lat = _LAT_FLOOR_NS
+            if not config.measure_latency:
+                _r_lat = 0.0
+            _r_peak = (float(_aggregate_samples(_r_pk_s,
+                                                want_top_quartile=True))
+                       if _r_pk_s else 0.0)
+            _r_static = _static_memory_bytes(_r_ex)
+            if _r_static is None:
+                raise MemChannelFault(
+                    "paired reference: memory_analysis() returned "
+                    "nothing for the reference executable, so a refused "
+                    "plan cannot be scored against it")
+            _r_mem = (float(_r_static[0]) if mem_channel() == "temp"
+                      else float(_r_peak))
+            _ref_for_score.update(latency_ns=_r_lat, memory_bytes=_r_mem,
+                                  static=_r_static)
+            _counts_r.update(
+                ref_inner=int(_r_inner), ref_windows=int(_r_windows),
+                ref_secs=float(sum(_r_lat_s)) * _r_inner / 1e9)
+            _ref_rec = {
+                "latency_ns": float(_r_lat),
+                "temp_bytes": float(_r_static[0]),
+                "output_bytes": float(_r_static[1]),
+                "args_bytes": float(_r_static[2]),
+                "watermark_bytes": float(_r_peak),
+                "memory_bytes": float(_r_mem),
+                "mem_channel": mem_channel(),
+                "candidate_latency_ns": None,
+                "reference": _ref_kind,
+                "rev_exact": None,
+            }
+        _cand_static = None
+        if program is not None:
+            _cand_static = _static_memory_bytes(program)
+            if _cand_static is None:
+                raise MemChannelFault(
+                    f"a {kind} refusal: memory_analysis() returned nothing "
+                    f"for the refused candidate, so its memory ratios cannot "
+                    f"be read")
+            if _r_static is not None:
+                check_memory_bounds(_cand_static, _r_static,
+                                    f"the refused plan ({reason})")
+        _slots, _info = refused_reward(
+            kind, timeout_s=_timeout, reference=_ref_for_score,
+            candidate_static=_cand_static,
+            counts=(muls_adds_fmas, max_io_sum))
+        _mp_r = None
+        if _cand_static is not None:
+            _mp_r = {"static_temp_bytes": float(_cand_static[0]),
+                     "static_output_bytes": float(_cand_static[1]),
+                     "static_argument_bytes": float(_cand_static[2]),
+                     "runtime_peak_bytes": None,
+                     "peak_source": "not_measured"}
+        if _ref_rec is not None:
+            _ref_rec.update(
+                candidate_memory_bytes=float(_info["refusal_memory_bytes"]),
+                delta_latency=float(_info["delta_latency"]),
+                delta_memory=float(_info["delta_memory"]),
+                mem_floored=int(_info["mem_floored"]))
+        _mem_obj_rec_r = _info.pop("mem_objective_rec")
+        for _k in ("delta_latency", "delta_memory", "mem_floored"):
+            _info.pop(_k)
+        _detail = dict(detail or {})
+        _detail.update(_info)
+        _li, _mi, _oi = (REWARD_INDEX["latency_ns"],
+                         REWARD_INDEX["peak_memory"],
+                         REWARD_INDEX["mem_objective"])
+        print(f"[refused] {reason} scored step={int(stop)} order={o_list}: "
+              f"latency sentinel {_timeout:.0f} s -> slot {_li} "
+              f"{_slots[_li]:+.4f}; memory "
+              f"{'real static' if _cand_static is not None else 'sentinel'} "
+              f"{_info['refusal_memory_bytes']:.0f} B -> slot {_mi} "
+              f"{_slots[_mi]:+.4f}, slot {_oi} {_slots[_oi]:+.4f}",
+              flush=True)
+        _log_refused(reason, _slots, detail=_detail, scored=True,
+                     mem_parity=_mp_r, paired_ref=_ref_rec,
+                     measure_counts=_counts_r,
+                     mem_objective_rec=_mem_obj_rec_r)
+        _pf("cb.refused")
+        return _wire(tokens, eqn_ids, jnp.array(_slots, dtype=jnp.float32))
+
+    def _score_raise(exc: BaseException):
+        print(f"[refused] raised during the measurement step={int(stop)} "
+              f"order={o_list}: {type(exc).__name__}: "
+              f"{' '.join(str(exc).split())[:200]} (scored at the "
+              f"sentinel)", flush=True)
+        return _score_refusal(
+            "raised", f"raised:{type(exc).__name__}",
+            _refusal_detail("measurement", exc), _st["program"])
+
+    _REFUSAL_SCORER[0] = _score_raise
+    if _early_refusal is not None:
+        return _score_refusal(*_early_refusal, None)
+    compiled_approx = None
     try:
         compiled_approx = cached_compile(
             b"approx:" + cache_key, _do_compile_approx)
     except Exception as _exc:
         if _is_graphax_trace_failure(_exc):
-            return _trace_truncate("approx compile", _exc)
-        if not _is_oom(_exc):
+            return _trace_truncate("approx compile", _exc, None)
+        if _is_oom(_exc):
+            return _oom_truncate("approx compile", _exc, None)
+        if not isinstance(_exc, MeasureCompileFailure):
             raise
-        return _oom_truncate("approx compile", _exc)
+        return _score_refusal(*_compile_refusal("approx compile", _exc),
+                              None)
+    _st["program"] = compiled_approx
     # SPARSE-BOUNDARY COST MEASUREMENT (ALPHAGRAD_MEASURE_SPARSE=1). The
     # dense executable drains every output to the full nominal Jacobian, so
     # diag/compress plans measure byte-identical latency+peak to exact --
@@ -9464,32 +10054,34 @@ def _callback_measured(
                 b"approx-sparse:" + cache_key, _do_compile_approx_sparse)
         except Exception as _exc:
             if _is_graphax_trace_failure(_exc):
-                return _trace_truncate("approx-sparse compile", _exc)
-            if not _is_oom(_exc):
+                return _trace_truncate("approx-sparse compile", _exc,
+                                       compiled_approx)
+            if _is_oom(_exc):
+                return _oom_truncate("approx-sparse compile", _exc,
+                                     compiled_approx)
+            if not isinstance(_exc, MeasureCompileFailure):
                 raise
-            return _oom_truncate("approx-sparse compile", _exc)
+            return _score_refusal(
+                *_compile_refusal("approx-sparse compile", _exc),
+                compiled_approx)
+        _st["program"] = compiled_cost
     # THE STATIC PEAK GATE (dsnn-dfw.121): the candidate only, never the
     # reference, read after its compile and before its first execution.
-    _gate_dev = callback_device
-    if _gate_dev is None:
-        _gate_dev = next(
-            (d for x in jax.tree_util.tree_leaves(args_for_lower)
-             if hasattr(x, "devices") for d in x.devices()),
-            jax.local_devices()[0])
+    # Since 2026-09-24 (dsnn-4eq) the refusal is SCORED: the timeout on
+    # latency, the candidate's real static ratios on memory.
     _gate = _static_peak_gate(
         [compiled_approx] + ([compiled_cost]
-                             if compiled_cost is not compiled_approx else []),
+                             if compiled_cost is not compiled_approx
+                             else []),
         _gate_dev)
     if _gate is not None:
         _record_truncated_plan()
-        print(f"[trunc] oom-static step={int(stop)} order={o_list} "
+        print(f"[refused] gate step={int(stop)} order={o_list} "
               f"static_peak_bytes={_gate['static_peak_bytes']:.0f} > "
               f"limit_bytes={_gate['static_peak_limit_bytes']:.0f} "
-              f"(bytes_limit {_gate['device_bytes_limit']} on {_gate_dev!r}; "
-              f"refused, excluded from gradient)", flush=True)
-        _tr = _truncated_reward()
-        _log_refused("oom-static", _tr, detail=_gate)
-        return _wire(tokens, eqn_ids, _tr)
+              f"(bytes_limit {_gate['device_bytes_limit']} on "
+              f"{_gate_dev!r}; scored at the timeout)", flush=True)
+        return _score_refusal("gate", "gate", dict(_gate), compiled_cost)
     # ``compiled_exact`` is ONLY needed for the quality metrics
     # (cosine_sim, frob_residual). Those are meaningful only when the
     # elimination order is complete — graphax's ``jacve`` returns a
@@ -9517,27 +10109,19 @@ def _callback_measured(
                 b"exact:" + exact_cache_key, _do_compile_exact)
         except Exception as _exc:
             if _is_graphax_trace_failure(_exc):
-                return _trace_truncate("exact compile", _exc)
+                return _trace_truncate("exact compile", _exc, compiled_cost)
             if not _is_oom(_exc):
                 raise
-            return _oom_truncate("exact compile", _exc)
+            return _oom_truncate("exact compile", _exc, compiled_cost)
     else:
         compiled_exact = None
-    # THE REV-EXACT REFERENCE, compiled here because BOTH consumers are here:
-    # the paired cost channel's timing windows below and, since 2026-09-18,
-    # the gradient cosine. One executable per (vertex set, shapes, device) and
+    # THE REFERENCE, compiled here because BOTH consumers are here: the
+    # paired cost channel's timing windows below and, since 2026-09-18, the
+    # gradient cosine. One executable per (graph, shapes, device) and
     # therefore one compile per process, cached on ``paired_ref_key``.
     _ref_ex = None
     if _paired or (is_terminal and _qmetric == "grad_cosine"):
-        try:
-            _ref_ex = cached_compile(
-                b"paired-ref:" + paired_ref_key, _do_compile_paired_ref)
-        except Exception as _exc:
-            if _is_graphax_trace_failure(_exc):
-                return _trace_truncate("paired-ref compile", _exc)
-            if not _is_oom(_exc):
-                raise
-            return _oom_truncate("paired-ref compile", _exc)
+        _ref_ex = _compile_reference()
     _pf("cb.xla_compile")
     # ORACLE A (ticket .62) IS NOT HERE ANY MORE (owner ruling 2026-09-18).
     #
@@ -9669,6 +10253,7 @@ def _callback_measured(
     # WHICH quantity the peak samples hold (see _record_mem_parity): the
     # measured runtime delta, the substituted static estimate, or nothing.
     _peak_src = "not_measured"
+    _rev_tel_raw = None
 
     # OOM during EXECUTION is truncation too (see _oom_truncate): the
     # measurement allocates the full approximated Jacobian, so a graph that
@@ -9883,6 +10468,49 @@ def _callback_measured(
                 _ref_lat_samples.append(_l)
                 _ref_peak_samples.append(_pk)
                 _ib += 1
+        # THE GRAPHAX REV-EXACT, TELEMETRY ONLY (dsnn-xta): one paired ratio
+        # per episode against the reference, behind
+        # ALPHAGRAD_REV_EXACT_TELEMETRY (off by default). Its windows are
+        # interleaved with fresh reference windows here, after the
+        # candidate's loop, so none of them lands in a window a plan is
+        # scored on; point 0 only, since latency does not move with the point.
+        if _paired and rev_exact_telemetry_enabled() and _rev_telemetry_due(
+                _MEASURE_EPISODE["key"], paired_ref_key):
+            try:
+                _rev_ex = cached_compile(
+                    b"rev-exact:" + paired_ref_key, _do_compile_rev_exact)
+            except Exception as _exc:
+                if _is_graphax_trace_failure(_exc):
+                    return _trace_truncate("rev-exact telemetry compile",
+                                           _exc, compiled_cost)
+                if not _is_oom(_exc):
+                    raise
+                return _oom_truncate("rev-exact telemetry compile", _exc,
+                                     compiled_cost)
+            _rv_lat: list[float] = []
+            _tl_lat: list[float] = []
+            if config.measure_latency:
+                _rv_inner = resolve_measure_inner(
+                    _probe_one(_rev_ex, ref_eval_args_all[0]), _window_s,
+                    _cfg_inner)
+                for _w in range(_ref_windows):
+                    _l, _pk, _s, _o = _time_one_rep(
+                        _rev_ex, ref_eval_args_all[0], unique_devices,
+                        _rv_inner)
+                    del _o, _s
+                    _rv_lat.append(_l)
+                    _l, _pk, _s, _o = _time_one_rep(
+                        _ref_ex, ref_eval_args_all[0], unique_devices,
+                        _ref_inner)
+                    del _o, _s
+                    _tl_lat.append(_l)
+            _rev_tel_raw = (
+                _static_memory_bytes(_rev_ex),
+                float(_aggregate_samples(_rv_lat, want_top_quartile=True))
+                if _rv_lat else 0.0,
+                float(_aggregate_samples(_tl_lat, want_top_quartile=True))
+                if _tl_lat else 0.0,
+                len(_rv_lat))
         # SECONDS OF EXECUTION actually spent inside timed windows, per half.
         # Window w of a half took ``latency_ns[w] * inner`` nanoseconds, which
         # is the quantity the budget is a target for. Warm-ups, probes and the
@@ -9966,6 +10594,7 @@ def _callback_measured(
         _ref_lat_ns = 0.0
         _ref_peak = 0.0
         _ref_temp = None
+        _ref_static = None
         if _paired:
             _ref_lat_ns = (
                 float(_aggregate_samples(_ref_lat_samples,
@@ -9975,7 +10604,8 @@ def _callback_measured(
                 float(_aggregate_samples(_ref_peak_samples,
                                          want_top_quartile=True))
                 if _ref_peak_samples else 0.0)
-            _ref_temp = _static_temp_bytes(_ref_ex)
+            _ref_static = _static_memory_bytes(_ref_ex)
+            _ref_temp = None if _ref_static is None else _ref_static[0]
             _pf("cb.paired_ref")
 
         # ---- LOSS-DROP QUALITY ------------------------------------------
@@ -10006,7 +10636,7 @@ def _callback_measured(
                     print(
                         "[measure] WARNING quality channel: the GRADIENT "
                         "COSINE HAS NO CHANNEL for this configuration (no "
-                        "data_gen, or the rev-exact reference failed to build "
+                        "data_gen, or the reference failed to build "
                         "or to execute on the probe batch). The channel reads "
                         "0.0 for every plan of this run; ask for "
                         "ALPHAGRAD_QUALITY_METRIC=jac_cosine to score at the "
@@ -10075,11 +10705,13 @@ def _callback_measured(
         _pf("cb.quality_walk")
 
     except Exception as _exc:
+        if isinstance(_exc, MeasureToolchainFault):
+            raise
         if _is_graphax_trace_failure(_exc):
-            return _trace_truncate("measurement", _exc)
+            return _trace_truncate("measurement", _exc, compiled_cost)
         if not _is_oom(_exc):
             raise
-        return _oom_truncate('measurement', _exc)
+        return _oom_truncate("measurement", _exc, compiled_cost)
     latency_ns = (
         float(_aggregate_samples(latency_samples, want_top_quartile=True))
         if config.measure_latency
@@ -10176,7 +10808,7 @@ def _callback_measured(
                 if _ref_temp is None:
                     raise MemChannelFault(
                         "paired reference: memory_analysis() returned "
-                        "nothing for the rev-exact executable, so its static "
+                        "nothing for the reference executable, so its static "
                         "temp bytes cannot be read")
                 _ref_mem = float(_ref_temp)
             else:
@@ -10209,11 +10841,38 @@ def _callback_measured(
                 "memory": window_ratio_record(paired_window_log_ratios(
                     _mem_c, _mem_r, _MEM_LOG_FLOOR_BYTES, _mem_fb)),
             }
+            _rev_tel = None
+            if _rev_tel_raw is not None:
+                _rv_static, _rv_med, _tl_med, _rv_n = _rev_tel_raw
+                _rev_tel = {
+                    "latency_ratio": (_rv_med / _tl_med
+                                      if _rv_med > 0.0 and _tl_med > 0.0
+                                      else None),
+                    "temp_ratio": (_rv_static[0] / _ref_static[0]
+                                   if _rv_static is not None
+                                   and _ref_static is not None
+                                   and _ref_static[0] > 0.0 else None),
+                    "latency_ns": float(_rv_med),
+                    "reference_latency_ns": float(_tl_med),
+                    "temp_bytes": (None if _rv_static is None
+                                   else _rv_static[0]),
+                    "windows": int(_rv_n),
+                }
+                print(f"[rev-exact] episode {_MEASURE_EPISODE['label']}: "
+                      f"rev-exact/reference latency ratio "
+                      f"{_rev_tel['latency_ratio']} over {_rv_n} paired "
+                      f"windows, static temp ratio {_rev_tel['temp_ratio']} "
+                      f"(rev-exact {_rv_med/1e3:.1f}us, reference "
+                      f"{_tl_med/1e3:.1f}us)", flush=True)
             _paired_ref_rec = {
                 "ratio_log": _ratio_log,
                 # POSITIVE units (ticket .45 logs these as ref/*).
                 "latency_ns": float(_ref_lat_ns),
                 "temp_bytes": _ref_temp,
+                "output_bytes": (None if _ref_static is None
+                                 else _ref_static[1]),
+                "args_bytes": (None if _ref_static is None
+                               else _ref_static[2]),
                 "watermark_bytes": float(_ref_peak),
                 "memory_bytes": float(_ref_mem),
                 "mem_channel": mem_channel(),
@@ -10222,17 +10881,39 @@ def _callback_measured(
                 "delta_latency": float(latency_ns),
                 "delta_memory": float(peak_memory),
                 "mem_floored": int(_n_floored),
-                "order": list(_rev_order),
+                "reference": _ref_kind,
+                "rev_exact": _rev_tel,
             }
             _record_paired_ref(_paired_ref_rec)
             if os.environ.get("ALPHAGRAD_DEBUG_MEASURE", "0") == "1":
-                print(f"[paired-ref] rev-exact lat={_ref_lat_ns/1e3:.1f}us "
+                print(f"[paired-ref] {_ref_kind} lat={_ref_lat_ns/1e3:.1f}us "
                       f"mem={_ref_mem:.0f}B | candidate "
                       f"lat={_abs_lat/1e3:.1f}us mem={_abs_mem:.0f}B | "
                       f"Delta_lat={latency_ns:+.4f} Delta_mem={peak_memory:+.4f}"
                       f" floored={_n_floored}", flush=True)
         else:
             latency_ns, peak_memory = 0.0, 0.0
+    # ---- THE MEMORY OBJECTIVE, reward slot 11 (dsnn-xvi) -------------
+    # Static values, so no windows and no pairing noise: the timed
+    # executable's three memory_analysis() numbers against the
+    # reference's, as one log sum. A refused plan never reaches this line.
+    mem_obj = 0.0
+    _mem_obj_rec = None
+    if _paired:
+        if _mp is None or _mp["static_temp_bytes"] is None:
+            raise MemChannelFault(
+                "memory objective: memory_analysis() returned nothing for "
+                "the timed executable, so its static bytes cannot be read "
+                "(peak_source=%s)" % _peak_src)
+        if _ref_static is None:
+            raise MemChannelFault(
+                "memory objective: memory_analysis() returned nothing for "
+                "the reference executable, so its static bytes cannot be "
+                "read")
+        _cand_triple = (_mp["static_temp_bytes"], _mp["static_output_bytes"],
+                        _mp["static_argument_bytes"])
+        check_memory_bounds(_cand_triple, _ref_static, "the measured plan")
+        mem_obj, _mem_obj_rec = mem_objective(_cand_triple, _ref_static)
     _pf("cb.quality")
 
     # ------------------------------------------------------------------
@@ -10367,6 +11048,9 @@ def _callback_measured(
             # Slot 10: SPARSITY = clip(1 - stored_approx/stored_exact,
             # -1, 1). 0.0 whenever it was not measured, same convention.
             sparsity,
+            # Slot 11: THE MEMORY OBJECTIVE (see REWARD_NAMES). 0.0 unless
+            # paired: non-terminal steps and --cost-form absolute.
+            mem_obj,
         ]
     )
     rewards = jnp.array(_reward_slots, dtype=jnp.float32)
@@ -10453,7 +11137,8 @@ def _callback_measured(
             face_before=_plan_pf0, face_after=_PER_FACE_STATS,
             counts_from_trace=bool(_plan_traced[0]),
             mem_parity=_mp, paired_ref=_paired_ref_rec,
-            measure_counts=_measure_counts)
+            measure_counts=_measure_counts,
+            mem_objective_rec=_mem_obj_rec)
 
     return _wire(tokens, eqn_ids, rewards)
 

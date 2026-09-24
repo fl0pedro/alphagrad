@@ -52,8 +52,6 @@ class GFNSPMDActor:
         cpu_workers,
         *,
         callback_timeout_s: float = 120.0,
-        initial_timeout_s: float | None = None,
-        warm_after: int = 3,
         recycle_every: int = 50,
         cpu_actor_options: dict | None = None,
         starting_actor_id: int = 1000,
@@ -61,11 +59,8 @@ class GFNSPMDActor:
         """Construct the SPMD-side training state and wire the CPU
         approx pool into the env's ``io_callback``.
 
-        ``initial_timeout_s`` / ``warm_after`` enable a cold-cache
-        budget — first ``warm_after`` calls per actor get a longer
-        timeout before each actor switches to ``callback_timeout_s``.
-        Default ``initial_timeout_s=None`` uses ``callback_timeout_s``
-        for all calls (legacy behaviour).
+        Every call has the one deadline ``callback_timeout_s`` (owner ruling
+        2026-09-24 Q48, no cold budget).
         """
         from alphagrad.approx.gfn_ray_worker import GFNServerWorker
 
@@ -75,8 +70,6 @@ class GFNSPMDActor:
             self.seed,
             cpu_workers=cpu_workers,
             callback_timeout_s=callback_timeout_s,
-            initial_timeout_s=initial_timeout_s,
-            warm_after=warm_after,
             recycle_every=recycle_every,
             cpu_actor_options=cpu_actor_options,
             starting_actor_id=starting_actor_id,

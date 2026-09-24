@@ -192,7 +192,7 @@ def test_terminal_plan_is_recorded_and_replays_to_the_same_reward():
         assert len(recs) == 1, [r["order"] for r in recs]
         rec = recs[0]
         assert rec["schema"] == plog.SCHEMA
-        assert len(rec["rewards"]) == NUM_REWARDS == 11
+        assert len(rec["rewards"]) == NUM_REWARDS == 12
         assert rec["requested"]["skip"] == 1
         assert rec["requested"]["total"] == 0     # a skip is not a rule
         # The recorded slots ARE the emitted reward vector.
@@ -337,6 +337,7 @@ def test_a_plan_refused_by_the_op_count_cap_is_still_recorded(monkeypatch):
     # OFF at import (line 31), so the test has to turn it back on -- which
     # works because `env.skip_count_ops()` reads the variable per call.
     monkeypatch.setenv("ALPHAGRAD_MULS_SENTINEL_CAP", "-1")
+    monkeypatch.setattr(envmod, "_MEASURE_TIMEOUT_S", [300.0])
     monkeypatch.setenv("ALPHAGRAD_SKIP_COUNT_OPS", "0")
     envmod.consume_plan_records()
     env = _make_env()

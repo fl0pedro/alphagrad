@@ -1,6 +1,6 @@
 """Pin that every cost channel populates on a successful env step.
 
-The callback in `env._callback` carries an 11-channel reward vector
+The callback in `env._callback` carries a 12-channel reward vector
 (`env.REWARD_NAMES`):
 
     [0] muls_adds_fmas   — graphax symbolic op count
@@ -14,6 +14,7 @@ The callback in `env._callback` carries an 11-channel reward vector
     [8] fidelity         — only at terminal
     [9] bkstep_acc       — RESERVED for the deprecated Ray line
     [10] sparsity        — stored-byte sparsity
+    [11] mem_objective   — three static log ratios vs rev-exact, paired-log terminal only
 
 The user explicitly asked us to test that ALL SIX cost channels (0..5)
 populate when measure_latency=True — so downstream comparison and wandb

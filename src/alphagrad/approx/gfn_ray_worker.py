@@ -737,8 +737,6 @@ class GFNServerWorker:
         cpu_workers: list | None = None,
         *,
         callback_timeout_s: float = 120.0,
-        initial_timeout_s: float | None = None,
-        warm_after: int = 3,
         recycle_every: int = 50,
         cpu_actor_options: dict | None = None,
         starting_actor_id: int = 1000,
@@ -772,8 +770,6 @@ class GFNServerWorker:
             pool = CpuApproxPool(
                 cpu_workers,
                 timeout_s=callback_timeout_s,
-                initial_timeout_s=initial_timeout_s,
-                warm_after=warm_after,
                 respawn_factory=_respawn_factory,
                 max_tokens=_MAX_TOKENS,
                 num_rewards=_NUM_REWARDS,

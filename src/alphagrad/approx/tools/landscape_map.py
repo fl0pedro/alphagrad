@@ -198,6 +198,11 @@ def make_argparser() -> argparse.ArgumentParser:
                    help="Target duration of one timed window (owner ruling "
                         "2026-09-14); see --latency-inner-reps.")
     p.add_argument("--num-eval-samples", type=int, default=5)
+    p.add_argument("--ray-measure-timeout", type=float, default=300.0,
+                   help="THE measurement deadline, seconds, as in ppo.py "
+                        "(owner rulings 2026-09-24 Q46, Q48): the latency "
+                        "sentinel of a refused plan. Nothing kills a call "
+                        "in this process; a hang stays a hang.")
     # 2, as the launchers pass (--latency-warmup 2). Warmup is a BIAS
     # knob, not a precision knob: one untimed execution leaves first-touch
     # cost in the first timed one.
@@ -485,6 +490,8 @@ from alphagrad.approx.unified_face_head import QUANT_SLOTS    # noqa: E402
 from graphax.sparse.micro_actions import (                    # noqa: E402
     COMPRESS_KINDS, QUANT_DTYPES,
 )
+from graphax import jacve                                     # noqa: E402
+from graphax.sparse.tensor import SparseTensor                # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -512,6 +519,7 @@ def _traced_inlined(target_fn, xs):
 def build_env(args):
     key = jrand.PRNGKey(args.seed)
     key, args_key = jrand.split(key)
+    envmod.set_measure_timeout_s(float(args.ray_measure_timeout))
 
     from alphagrad.approx.common.snn_shd import SHD_TARGETS
     from alphagrad.approx.common.rsnn_shd import (is_rsnn,
@@ -1335,6 +1343,7 @@ def measure(env, eval_samples, order, plan):
     consume_per_face_stats()          # drop whatever the plan-build replay left
     consume_mem_parity()
     specs, face_specs, face_skips = get_plan_arrays(plan, len(order))
+    envmod.consume_last_refusal()
     t0 = time.perf_counter()
     # The callback's arity is 2 under `delta_obs` (tokens, reward) and 3 on
     # the legacy full-stream path (tokens, eqn_ids, reward). The reward is
@@ -1349,6 +1358,9 @@ def measure(env, eval_samples, order, plan):
         *eval_samples,
     )
     wall = time.perf_counter() - t0
+    # A refused plan's row carries its reason and its sentinel values (owner
+    # ruling 2026-09-24 Q46); the reward slots above hold the sentinel.
+    refusal = envmod.consume_last_refusal()
     r = np.asarray(reward, dtype=np.float64)
     st = consume_per_face_stats()
     # Ticket .49 made the drain return {"records", "measured", "dropped"};
@@ -1390,6 +1402,10 @@ def measure(env, eval_samples, order, plan):
         "applied": int(st.get("applied", 0)),
         "skipped": int(st.get("skipped", 0)),
         "applied_detail": json.dumps(detail, sort_keys=True),
+        "refused": "" if refusal is None else str(refusal["refused"]),
+        "refusal": ("" if refusal is None else json.dumps(
+            {k: v for k, v in refusal.items() if k != "refused"},
+            sort_keys=True, default=str)),
     }
 
 
@@ -1441,6 +1457,10 @@ CSV_FIELDS = [
     "measure_secs",
     "measure_budget_secs",
     "measure_window_secs",
+    # A REFUSED PLAN'S ROW (owner ruling 2026-09-24 Q46): its reason and, as
+    # JSON, its sentinel values. Empty on a measured plan.
+    "refused",
+    "refusal",
 ]
 
 
@@ -1918,30 +1938,204 @@ def combined_report(args):
                      {k for k in (prim or summ) if k.startswith("arch:")})
 
 
+# Oracle B's gradient bar, in rounding steps of the plan's narrowest dtype.
+ORACLE_B_ROUNDING_STEPS = 4
+
+
+def _oracle_b_compile(env, fn):
+    return envmod._compile_measure(
+        jax.jit(fn, keep_unused=True).lower(*env.args))
+
+
+def _oracle_b_programs(env, order, plan):
+    cfg = env.config
+    specs, faces, skips = (np.asarray(x)
+                           for x in get_plan_arrays(plan, len(order)))
+    o_list = [int(v) for v in np.asarray(order).reshape(-1)]
+    if envmod._carry.armed(cfg) and envmod._carry.measurement_env(
+            envmod._carry.container_for_plan(cfg, o_list, faces, skips,
+                                             specs), cfg) is not None:
+        raise NotImplementedError(
+            "Oracle B builds the plan on the policy's graph, and this plan "
+            "is measured on the program of its carry container.")
+    specs_list = specs.tolist()
+    transforms, _ = envmod._decode_vertex_transforms(cfg, o_list, specs_list)
+    have_faces = bool(np.any(skips == 1) or np.any(faces[..., 0] >= 0)
+                      or np.any(faces[..., 0] == COMPRESS_SENTINEL)
+                      or np.any(faces[..., 0] == QUANT_SENTINEL))
+    face_transforms = (
+        envmod._face_transforms_for_order(
+            cfg, env.consts, env.args, o_list, specs_list, faces, skips,
+            wire_sig=envmod._face_wire_keys(faces, skips, len(o_list)))
+        if have_faces else None)
+
+    def build(sparse):
+        return _oracle_b_compile(env, jacve(
+            cfg.target_fun, list(o_list), argnums=cfg.argnums,
+            has_aux=cfg.has_aux, sparse_representation=sparse,
+            jaxpr=cfg.jaxpr, consts=list(env.consts),
+            transforms=transforms, face_transforms=face_transforms))
+
+    return build(False), build(True)
+
+
+def _densify(out, like):
+    # A null edge (None) is the zeros of the dense program's leaf.
+    leaves = jax.tree_util.tree_leaves(
+        out, is_leaf=lambda x: x is None or isinstance(x, SparseTensor))
+    like_leaves, like_def = jax.tree_util.tree_flatten(like)
+    if len(leaves) != len(like_leaves):
+        raise AssertionError(
+            f"Oracle B: the sparse program returns {len(leaves)} leaves and "
+            f"the dense program {len(like_leaves)}")
+    dense = [jnp.zeros_like(d) if s is None
+             else (s.dense() if isinstance(s, SparseTensor) else s)
+             for s, d in zip(leaves, like_leaves)]
+    n_sparse = sum(isinstance(s, SparseTensor) for s in leaves)
+    return jax.tree_util.tree_unflatten(like_def, dense), n_sparse
+
+
+def _rounding_step(dtype) -> float:
+    dt = jnp.dtype(dtype)
+    if jnp.issubdtype(dt, jnp.floating):
+        return float(jnp.finfo(dt).eps)
+    return 1.0 / float(jnp.iinfo(dt).max)
+
+
+def _oracle_b_step(plan, n_steps, leaves) -> float:
+    step = max(_rounding_step(d.dtype) for d in leaves)
+    for arr in get_plan_arrays(plan, n_steps)[:2]:
+        rows = np.asarray(arr).reshape(-1, 3)
+        for di in np.unique(rows[rows[:, 0] == QUANT_SENTINEL, 1]):
+            step = max(step, _rounding_step(QUANT_DTYPES[int(di)]))
+    return step
+
+
+def _rel_l2_gap(sparse, dense) -> float:
+    worst = 0.0
+    for s, d in zip(jax.tree_util.tree_leaves(sparse),
+                    jax.tree_util.tree_leaves(dense)):
+        s = np.asarray(s, dtype=np.float64)
+        d = np.asarray(d, dtype=np.float64)
+        if s.shape != d.shape:
+            raise AssertionError(
+                f"Oracle B: a densified sparse leaf has shape {s.shape} and "
+                f"the dense leaf {d.shape}")
+        norm = float(np.linalg.norm(d.ravel()))
+        diff = float(np.linalg.norm((s - d).ravel()))
+        worst = max(worst, diff / norm if norm > 0.0
+                    else (0.0 if diff == 0.0 else math.inf))
+    return worst
+
+
+def _oracle_b_quality(env, points, program, reference):
+    # Reward slot 6 as the measurement computes it, outside the measurement.
+    cfg = env.config
+    metric = envmod.quality_metric(cfg)
+    if metric == "none":
+        return 0.0
+    if metric == "loss_drop":
+        out = envmod._loss_drop_quality(cfg, program, list(env.args), None)
+        return 0.0 if out is None else float(out)
+    if metric == "grad_cosine":
+        out = envmod._grad_cosine_quality(
+            cfg, program, reference, b"oracle-b:reference", list(env.args),
+            None, envmod._grad_cosine_k(cfg))
+        if out is envmod._QUALITY_NO_CHANNEL:
+            return 0.0
+        return None if out is None else float(out[0])
+    cosines = []
+    for ea in points:
+        out_a, out_e = program(*ea), reference(*ea)
+        cos, _ = envmod._quality_metrics(
+            out_e[1] if cfg.has_aux else out_e,
+            out_a[1] if cfg.has_aux else out_a,
+            align=True, site="jac_cosine")
+        cosines.append(float(cos))
+    return float(envmod._aggregate_samples(cosines, want_top_quartile=True))
+
+
 def run_oracle_b(env, eval_samples, order, plans):
-    """Oracle B: verify sparse vs dense (sparse_representation=False) for a
-    small sample of plans per class (ticket dsnn-3qm.63, owner Q21)."""
-    import copy
-    print("[landscape] running Oracle B (sparse vs dense representation check)...", flush=True)
+    """Oracle B (ticket dsnn-3qm.63, owner Q21; rebuilt by owner ruling
+    2026-09-24 Q51): for one plan per class, the plan's gradient from
+    ``jacve(..., sparse_representation=True)``, executed and densified,
+    against the dense program the measurement compiles. Both run outside the
+    measurement and its memory checks. The gradients must agree to float
+    rounding and the two qualities to 1e-3."""
+    print("[landscape] running Oracle B (the sparse program, densified, "
+          "against the dense program)...", flush=True)
     sampled = {}
     for op in ("skip", "quant", "compress", "diag"):
         for pid, pl in plans.items():
             if pl["op"] == op:
                 sampled[op] = (pid, pl)
                 break
-    dense_cfg = env.config._replace(sparse=False)
-    env_dense = copy.copy(env)
-    object.__setattr__(env_dense, "config", dense_cfg)
+    cfg = env.config
+    n_points = max(1, int(getattr(cfg, "num_data_points", 5)))
+    if eval_samples:
+        n_points = min(n_points, len(eval_samples[0]))
+        points = [[a[i] for a in eval_samples] for i in range(n_points)]
+    else:
+        points = [list(env.args)]
+    metric = envmod.quality_metric(cfg)
+    reference = None
+    if metric == "grad_cosine":
+        reference = _oracle_b_compile(env, envmod.reference_program(cfg))
+    elif metric == "jac_cosine":
+        reference = _oracle_b_compile(env, jacve(
+            cfg.target_fun, [int(v) for v in np.asarray(order).reshape(-1)],
+            argnums=cfg.argnums, has_aux=cfg.has_aux,
+            sparse_representation=False, jaxpr=cfg.jaxpr,
+            consts=list(env.consts)))
     oracle_b_results = {}
     for op, (pid, pl) in sampled.items():
-        m_sp = measure(env, eval_samples, order, pl)
-        m_de = measure(env_dense, eval_samples, order, pl)
-        q_sp = m_sp["quality"]
-        q_de = m_de["quality"]
-        diff = abs(q_sp - q_de)
-        print(f"  [oracle-b] {op:8s} ({pid[:32]}): sparse_q={q_sp:.6f} dense_q={q_de:.6f} diff={diff:.2e}", flush=True)
-        assert diff < 1e-3, f"Oracle B failed for {pid}: sparse quality {q_sp} != dense quality {q_de} (diff {diff})"
-        oracle_b_results[pid] = {"op": op, "sparse_quality": q_sp, "dense_quality": q_de, "diff": diff}
+        dense_ex, sparse_ex = _oracle_b_programs(env, order, pl)
+        gap, n_sparse, step = 0.0, 0, 0.0
+        for ea in points:
+            d_out = dense_ex(*ea)
+            s_out, n = _densify(sparse_ex(*ea), d_out)
+            n_sparse = max(n_sparse, n)
+            gap = max(gap, _rel_l2_gap(s_out, d_out))
+            step = max(step, _oracle_b_step(
+                pl, len(order), jax.tree_util.tree_leaves(d_out)))
+        tol = ORACLE_B_ROUNDING_STEPS * step
+        like = d_out
+        q_de = _oracle_b_quality(env, points, dense_ex, reference)
+        q_sp = _oracle_b_quality(
+            env, points, lambda *a: _densify(sparse_ex(*a), like)[0],
+            reference)
+        diff = (abs(q_sp - q_de) if q_sp is not None and q_de is not None
+                else None)
+        print(f"  [oracle-b] {op:8s} ({pid[:32]}): sparse_q={q_sp} "
+              f"dense_q={q_de} diff={diff} grad_rel_l2={gap:.3e} "
+              f"(bar {tol:.3e} = {ORACLE_B_ROUNDING_STEPS} x {step:.3e}) "
+              f"sparse_leaves={n_sparse}", flush=True)
+        if n_sparse == 0:
+            raise AssertionError(
+                f"Oracle B failed for {pid}: the sparse program returned no "
+                f"SparseTensor, so it checked nothing")
+        if gap > tol:
+            raise AssertionError(
+                f"Oracle B failed for {pid}: the densified sparse gradient "
+                f"differs from the dense one by a relative L2 of {gap:.3e}, "
+                f"above float rounding ({tol:.3e})")
+        if (q_sp is None) != (q_de is None):
+            raise AssertionError(
+                f"Oracle B failed for {pid}: the quality is undefined on one "
+                f"side only (sparse {q_sp}, dense {q_de})")
+        if diff is None:
+            print(f"  [oracle-b] {op:8s}: the quality is undefined on both "
+                  f"sides (a zero reference gradient); only the gradient "
+                  f"was compared", flush=True)
+        elif not diff < 1e-3:
+            raise AssertionError(
+                f"Oracle B failed for {pid}: sparse quality {q_sp} != dense "
+                f"quality {q_de} (diff {diff})")
+        oracle_b_results[pid] = {
+            "op": op, "sparse_quality": q_sp, "dense_quality": q_de,
+            "diff": diff, "grad_rel_l2": gap, "grad_bar": tol,
+            "rounding_step": step, "sparse_leaves": n_sparse,
+            "points": len(points)}
     print("[landscape] Oracle B: all checked classes passed!", flush=True)
     return oracle_b_results
 
@@ -2256,7 +2450,8 @@ def main():
                     "timestamp": f"{time.time():.3f}",
                     **{k: m[k] for k in ("latency_ns", "peak_memory", "static_temp",
                                          "quality", "frob_residual", "applied", "skipped",
-                                         "applied_detail", "wall_s")},
+                                         "applied_detail", "wall_s",
+                                         "refused", "refusal")},
                     **stamp,
                 }
                 append_row(csv_path, row)
@@ -2300,7 +2495,8 @@ def main():
                         **{k: m[k] for k in ("latency_ns", "peak_memory", "static_temp",
                                              "quality", "frob_residual",
                                              "applied", "skipped",
-                                             "applied_detail", "wall_s")},
+                                             "applied_detail", "wall_s",
+                                             "refused", "refusal")},
                         **stamp,
                     }
                     append_row(csv_path, row)
@@ -2380,7 +2576,8 @@ def main():
                 "timestamp": f"{time.time():.3f}",
                 **{k: m[k] for k in ("latency_ns", "peak_memory", "static_temp",
                                      "quality", "frob_residual", "applied", "skipped",
-                                     "applied_detail", "wall_s")},
+                                     "applied_detail", "wall_s",
+                                     "refused", "refusal")},
                 **stamp,
             }
             append_row(csv_path, row)
