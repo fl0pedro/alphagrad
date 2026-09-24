@@ -2282,6 +2282,13 @@ _PLAN_CARRY: list = [None]
 _PLAN_CARRY_BYTES: list = [None]
 
 
+def _plan_carry_bytes(container: str, base_cfg) -> int:
+    entry = _carry._entry(base_cfg)
+    var = _carry.measurement_env(container, base_cfg)
+    return _carry.carry_at_rest_bytes(
+        entry["base"] if var is None else var, entry["spec"]["rule"])
+
+
 def _record_plan(rec: dict) -> None:
     if len(_PLAN_RECORDS) >= _plan_log_cap():
         _PLAN_LOG_DROPPED[0] += 1
@@ -8953,6 +8960,10 @@ def _callback_measured(
         if _hit is not None:
             _from_idx, _hit_slots = _hit
             if _plan_log_on:
+                # A dedupe hit is measured, so its record is complete (Q9).
+                if _carry_container is not None:
+                    _PLAN_CARRY_BYTES[0] = _plan_carry_bytes(
+                        _carry_container, config)
                 _record_terminal_plan(
                     order=o_list, rule_specs=partial_specs,
                     face_specs=_faces_np, face_skips=_skips_np,
@@ -9007,10 +9018,8 @@ def _callback_measured(
         # THE CONTAINER'S AT-REST BYTES ride on the plan record (owner ruling
         # 2026-09-23, no new reward channel): the given blocks of the program the
         # plan is measured on, in the container it implied.
-        _c_entry = _carry._entry(_carry_base_cfg)
-        _PLAN_CARRY_BYTES[0] = _carry.carry_at_rest_bytes(
-            _c_entry["base"] if _variant is None else _variant,
-            _c_entry["spec"]["rule"])
+        _PLAN_CARRY_BYTES[0] = _plan_carry_bytes(_carry_container,
+                                                 _carry_base_cfg)
         if _variant is not None:
             (o_list, _m_specs, _m_faces, _m_skips, _m_joins) = \
                 _carry.transport_wires(
