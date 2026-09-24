@@ -6047,24 +6047,22 @@ def _cosine_reference(ref_ex, ref_key, args, device, probe_seed):
     return out
 
 
-def _oracle_reference_grad(target, argnums, has_aux, args, device, probe_seed):
-    # jax.grad of the target on the reference draw, once per probe batch in
-    # the table of _cosine_reference: under an rtrl generator every plan
-    # draws its own carry and scores against the one exact draw (Q29).
-    key = (b"oracle-ref", id(target), tuple(int(i) for i in argnums),
-           str(device), int(probe_seed),
-           tuple((tuple(getattr(x, "shape", ())), str(getattr(x, "dtype", "")))
-                 for x in args))
+def _oracle_reference_grad(target, argnums, has_aux, args_fn, device,
+                           probe_seed, draw):
+    # jax.grad of the target on the reference draw, once per (draw, probe
+    # batch): the draw runs only on a miss (owner ruling 2026-09-24, Q1a).
+    key = (b"oracle-ref", id(target), id(draw),
+           tuple(int(i) for i in argnums), str(device), int(probe_seed))
     hit = _COSINE_REF.get(key)
-    if hit is not None:
+    if hit is not None and hit[0] is target and hit[1] is draw:
         _COSINE_REF_STATS["hits"] += 1
-        return hit[1]
+        return hit[2]
     _COSINE_REF_STATS["misses"] += 1
-    jac_e = jax.grad(target, argnums=argnums, has_aux=has_aux)(*args)
+    jac_e = jax.grad(target, argnums=argnums, has_aux=has_aux)(*args_fn())
     jac_e = jac_e[0] if has_aux else jac_e
     if len(_COSINE_REF) >= _COSINE_REF_MAX:
         _COSINE_REF.clear()
-    _COSINE_REF[key] = (target, jac_e)
+    _COSINE_REF[key] = (target, draw, jac_e)
     return jac_e
 
 
@@ -6151,22 +6149,28 @@ def _grad_cosine_quality(config, compiled_approx, ref_ex, ref_key, base_args,
         try:
             out_a = compiled_approx(*a)
             if _oracle_ref:
-                r_data = _probe_batch(config, base_args, role="train",
-                                      index=k, draw=_ref_draw)
                 if _ref_oracle is None:
-                    ar = list(base_args)
-                    _r_slots = _data_slots(config, r_data)
                     _r_target = _loss_target(config)
                     _r_argnums = config.argnums
                 else:
-                    ar = list(_ref_oracle["args"])
-                    _r_slots = tuple(_ref_oracle["slots"])
                     _r_target = _ref_oracle["target"]
                     _r_argnums = tuple(_ref_oracle["argnums"])
-                for slot, d in zip(_r_slots, r_data):
-                    ar[slot] = jax.device_put(jnp.asarray(d), device)
+
+                def _reference_args(_k=k):
+                    r_data = _probe_batch(config, base_args, role="train",
+                                          index=_k, draw=_ref_draw)
+                    if _ref_oracle is None:
+                        ar = list(base_args)
+                        _r_slots = _data_slots(config, r_data)
+                    else:
+                        ar = list(_ref_oracle["args"])
+                        _r_slots = tuple(_ref_oracle["slots"])
+                    for slot, d in zip(_r_slots, r_data):
+                        ar[slot] = jax.device_put(jnp.asarray(d), device)
+                    return ar
                 jac_e = _oracle_reference_grad(
-                    _r_target, _r_argnums, config.has_aux, ar, device, _seed)
+                    _r_target, _r_argnums, config.has_aux, _reference_args,
+                    device, _seed, _ref_draw)
                 out_e = None
             else:
                 # The CACHED REV-EXACT REFERENCE, not a same-order exact
@@ -9001,8 +9005,9 @@ def _callback_measured(
             # they are drawn from a DIGEST of the base draw, which every
             # process that measures this plan computes the same way and which
             # moves per episode exactly as the base draw does. A generator
-            # that draws PER PLAN (`with_program`) is served below instead.
-            if eval_samples and getattr(config.data_gen, "with_program",
+            # that draws PER PLAN (`with_executable`) is served after the
+            # compile instead.
+            if eval_samples and getattr(config.data_gen, "with_executable",
                                         None) is None:
                 eval_samples = tuple(
                     _carry.eval_samples_for(_carry_container, eval_samples,
@@ -9019,59 +9024,6 @@ def _callback_measured(
             _c_entry["base"] if _c_var is None else _c_var,
             _c_entry["spec"]["rule"])
     _pf("cb.carry_container")
-
-    def _jacve_fn(approx: bool):
-        """THE elimination, built once. `approx=False` is the exact
-        reference: same order, same argnums, same has_aux, same sparse
-        representation, and NOTHING but the two approximation kwargs
-        dropped -- which is what makes any approx/exact ratio taken over
-        this pair a statement about the approximation alone. Both the
-        compiles below and the sparsity tally's abstract fallback walk
-        go through here so a change to one cannot miss the other."""
-        _kw = ({"transforms": transforms,
-                "face_transforms": ft_by_vertex} if approx else {})
-        return jacve(
-            config.target_fun,
-            list(o_list),
-            argnums=config.argnums,
-            has_aux=config.has_aux,
-            sparse_representation=config.sparse,
-            # ONE JAXPR FOR BOTH PATHS (dsnn-dfw.24). The order and the face
-            # keys are numbered on `config.jaxpr`; a fresh trace inside
-            # `.lower()` is a different equation list for the same function
-            # (measured on window2: 90 equations against 72, every
-            # `convert_element_type` moved), and then the plan addresses
-            # vertices that are not there.
-            jaxpr=config.jaxpr,
-            consts=list(consts),
-            **_kw,
-        )
-
-    # ------------------------------------------------------------------
-    # THE PLAN PRODUCES ITS OWN CARRY (owner rulings 2026-09-24, Q28a, Q29).
-    # ------------------------------------------------------------------
-    # On the rtrl graph the given value at step t is the plan's OWN one-step
-    # program scanned over the prefix from the zero carry, the state rows
-    # projected to the container at every step. So the eval samples the cost
-    # channels execute and the probe batches the quality channel scores are
-    # drawn per plan, through the generator's `with_program`; the exact
-    # reference draw the generator publishes (the scan of the empty plan)
-    # stays shared. The program is the measured one, sparse output and all:
-    # the container reads its rows on their stored class. A Skip on the
-    # carried face has no carry and no program to scan; a rule with no
-    # given edge has no `with_program`.
-    from alphagrad.approx.common.rsnn_shd import SKIP_CONTAINER as _SKIP
-    if (is_terminal and _carry_container is not None
-            and _carry_container != _SKIP):
-        _plan_gen = _carry.plan_generator(
-            config.data_gen, _jacve_fn(approx=True))
-        if _plan_gen is not None:
-            config = config._replace(data_gen=_plan_gen)
-            if eval_samples:
-                eval_samples = tuple(_carry.eval_samples_for(
-                    _carry_container, _ref_eval, _carry_base_cfg,
-                    generator=_plan_gen))
-    _pf("cb.plan_carry")
 
     # ------------------------------------------------------------------
     # Compute family — graphax counters (always) → muls_adds_fmas, max_io_sum.
@@ -9307,6 +9259,33 @@ def _callback_measured(
     if callback_device is not None:
         h.update(repr(callback_device).encode())
     cache_key = h.digest()
+
+    def _jacve_fn(approx: bool):
+        """THE elimination, built once. `approx=False` is the exact
+        reference: same order, same argnums, same has_aux, same sparse
+        representation, and NOTHING but the two approximation kwargs
+        dropped -- which is what makes any approx/exact ratio taken over
+        this pair a statement about the approximation alone. Both the
+        compiles below and the sparsity tally's abstract fallback walk
+        go through here so a change to one cannot miss the other."""
+        _kw = ({"transforms": transforms,
+                "face_transforms": ft_by_vertex} if approx else {})
+        return jacve(
+            config.target_fun,
+            list(o_list),
+            argnums=config.argnums,
+            has_aux=config.has_aux,
+            sparse_representation=config.sparse,
+            # ONE JAXPR FOR BOTH PATHS (dsnn-dfw.24). The order and the face
+            # keys are numbered on `config.jaxpr`; a fresh trace inside
+            # `.lower()` is a different equation list for the same function
+            # (measured on window2: 90 equations against 72, every
+            # `convert_element_type` moved), and then the plan addresses
+            # vertices that are not there.
+            jaxpr=config.jaxpr,
+            consts=list(consts),
+            **_kw,
+        )
 
     def _do_compile_approx():
         # THE MEASURED ELIMINATION. graphax invokes every per-vertex/per-face
@@ -9633,6 +9612,26 @@ def _callback_measured(
                 raise
             return _oom_truncate("paired-ref compile", _exc)
     _pf("cb.xla_compile")
+
+    # THE PLAN'S DRAW RUNS THE MEASURED EXECUTABLE (owner ruling 2026-09-24,
+    # Q1a): compiled above, run from the host over the prefix; the reference
+    # runs the paired reference's when that is the empty plan's program.
+    from alphagrad.approx.common.rsnn_shd import (
+        SKIP_CONTAINER as _SKIP_CONTAINER)
+    if (is_terminal and _carry_container is not None
+            and _carry_container != _SKIP_CONTAINER
+            and getattr(config.data_gen, "with_executable", None) is not None):
+        _ref_pair = None
+        if (_ref_ex is not None
+                and _carry.is_empty_plan_order(_carry_base_cfg, _rec_order)):
+            _ref_pair = (_ref_ex, tuple(_ref_args_for_lower))
+        config = config._replace(data_gen=config.data_gen.with_executable(
+            compiled_approx, tuple(args_for_lower), reference=_ref_pair))
+        if eval_samples:
+            eval_samples = tuple(_carry.eval_samples_for(
+                _carry_container, _ref_eval, _carry_base_cfg,
+                generator=config.data_gen))
+    _pf("cb.plan_carry")
     # ORACLE A (ticket .62) IS NOT HERE ANY MORE (owner ruling 2026-09-18).
     #
     # It used to run right at this point: the same-order exact gradient against

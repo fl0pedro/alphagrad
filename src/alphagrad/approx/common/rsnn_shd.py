@@ -21,7 +21,8 @@ numerically outside the graph over the whole, untouched recording.
             Q28a, Q29): the target returns ``(loss, s_t)``, the Jacobian rows
             of ``s_t`` are ``J_t``, the container projects them to its class
             at every step, and the given value at ``t`` is the plan's own
-            program scanned over the prefix (:func:`carry_from_program`).
+            compiled program run over the prefix from the host
+            (:func:`carry_from_executable`, owner ruling 2026-09-24, Q1a).
 
 Both ``bptt`` and ``rtrl`` are EXACT per-step rules. Neither approximates
 anything. What the policy learns is how to treat the FACE where the given
@@ -47,6 +48,7 @@ weights).
 from __future__ import annotations
 
 import math
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -137,6 +139,35 @@ def empty_plan_program(batched: bool = False):
     from graphax import jacve
     return jacve(rsnn_target(batched), "rev", argnums=RSNN_ARGNUMS,
                  sparse_representation=True)
+
+
+def _device_of(args):
+    for a in args:
+        devs = getattr(a, "devices", None)
+        if devs is not None:
+            return next(iter(devs()))
+    return jax.devices()[0]
+
+
+def _spec(a):
+    return jax.ShapeDtypeStruct(tuple(a.shape), a.dtype,
+                                weak_type=bool(getattr(a, "weak_type", False)))
+
+
+_EMPTY_EXE: dict = {}
+
+
+def empty_plan_executable(args, batched: bool = False):
+    # The empty plan's program compiled once per process for these avals.
+    specs = tuple(_spec(a) for a in args)
+    key = (bool(batched), str(jax.devices()[0]),
+           tuple((s.shape, str(s.dtype), s.weak_type) for s in specs))
+    hit = _EMPTY_EXE.get(key)
+    if hit is None:
+        hit = jax.jit(empty_plan_program(batched),
+                      keep_unused=True).lower(*specs).compile()
+        _EMPTY_EXE[key] = hit
+    return hit
 
 #: The four rules, which are the four SNN arms of the thesis matrix (owner
 #: ruling 2026-09-16).
@@ -553,7 +584,7 @@ def carried_jacobians(seq, t, weights, *, check_zeros: bool = True,
     """A FLOAT64 TEST ORACLE (owner ruling 2026-09-24, Q30): the exact
     ``rtrl`` tuple, the ELEVEN blocks stacked per weight into the five
     tensors ``RSNN_CARRY_STACKS`` names. No run reads it; a run's given
-    value is :func:`carry_from_program`.
+    value is :func:`carry_from_executable`.
 
     Block ``(s, w)`` is ``d s_(t-1)^s / d W_w``, taken by reverse-mode
     differentiation of the prefix. That is the same number the RTRL recursion
@@ -621,10 +652,11 @@ def _check_zero_blocks(zero) -> None:
 # on that face, applied at every step of the prefix (or of the suffix, for
 # the future adjoint).
 #
-# SINCE 2026-09-24 (owner rulings Q28a, Q29) the producer of an rtrl carry is
-# the plan's own one-step program scanned over the prefix
-# (`carry_from_program`), with the container's projection at the output of
-# every step. The closed-form recursions below (`carried_jacobians`,
+# SINCE 2026-09-24 (owner rulings Q28a, Q29, Q1a) the producer of an rtrl
+# carry is the plan's own compiled program run over the prefix from the host
+# (`carry_from_executable`), with the container's projection at the output of
+# every step; `carry_from_program` is its scan oracle. The closed-form
+# recursions below (`carried_jacobians`,
 # `carry_traces`, `reduced_columns`, and `carry_under_plan` that names them by
 # container) are FLOAT64 TEST ORACLES only (Q30).
 #
@@ -1012,11 +1044,8 @@ def _select(keep, new, old):
 
 
 def carry_from_program(seq, y, t, weights, program, container="exact"):
-    # THE PRODUCER (owner ruling 2026-09-24, Q29): the plan's own program
-    # scanned over steps 0 .. t-1 from the zero carry, the state rows
-    # projected to the container on their stored class at every step. t may
-    # be traced; a batched recording (B, T, n_in) walks its B prefixes in the
-    # one scan through the batched program.
+    # THE FLOAT64 TEST ORACLE of carry_from_executable (owner ruling Q1a): the
+    # same recursion as one scan over a traced program.
     from graphax.examples.neuromorphic import (
         RSNN_STATE_NAMES, project_rsnn_carry, rsnn_zero_carry)
     c = _container(container)
@@ -1054,12 +1083,78 @@ def carry_from_program(seq, y, t, weights, program, container="exact"):
     return tuple(sg(g) for g in given)
 
 
+@partial(jax.jit, static_argnames=("container",))
+def _advance(rows, st, given, seq, u, t, weights, consts, container):
+    # One step of the host loop: the container's projection of the state rows
+    # and the cell, masked per sample; compiled once per (container, rows).
+    from graphax.examples.neuromorphic import project_rsnn_carry
+    cell = _cell()
+    last = seq.shape[-2] - 1
+    if seq.ndim == 3:
+        cell = jax.vmap(cell, in_axes=(0, 0, 0, 0, 0, 0) + (None,) * 9)
+        x, x_next = seq[:, u], seq[:, jnp.minimum(u + 1, last)]
+    else:
+        x, x_next = seq[u], seq[jnp.minimum(u + 1, last)]
+    new = project_rsnn_carry(rows[1:], container, weights,
+                             [tuple(a.shape) for a in st])
+    for a, b in zip(new, given):
+        if a.dtype != b.dtype or a.shape != b.shape:
+            raise ValueError(
+                f"the projected carry {a.shape} {a.dtype} is not the "
+                f"container's {b.shape} {b.dtype}")
+    nxt = cell(x, *st, *weights, *consts)
+    keep = u < t
+    return (tuple(_select(keep, a, b) for a, b in zip(nxt, st)),
+            tuple(_select(keep, a, b) for a, b in zip(new, given)),
+            x_next, u + 1)
+
+
+def carry_from_executable(seq, y, t, weights, consts, exe, container="exact",
+                          device=None):
+    # THE PRODUCER (owner ruling 2026-09-24, Q1a): the plan's compiled
+    # program run from the host over steps 0 .. t-1 from the zero carry.
+    from graphax.examples.neuromorphic import rsnn_zero_carry
+    c = _container(container)
+    batched = int(jnp.ndim(seq)) == 3
+    lead = (int(seq.shape[0]),) if batched else ()
+    t_host = np.asarray(jax.device_get(t))
+    steps = int(t_host.max()) if t_host.size else 0
+    weights, consts = tuple(weights), tuple(consts)
+    st = tuple(jnp.broadcast_to(a, lead + a.shape) for a in zero_state())
+    given = rsnn_zero_carry(c, weights, lead, dtype=weights[0].dtype)
+    t = jnp.asarray(t_host, jnp.int32)
+    u = jnp.zeros((), jnp.int32)
+    if device is not None:
+        seq, y, weights, consts, st, given, t, u = jax.device_put(
+            (seq, y, weights, consts, st, given, t, u), device)
+    x = seq[:, 0] if batched else seq[0]
+    for _ in range(steps):
+        rows = exe(x, y, *st, *weights, *consts, *given)
+        st, given, x, u = _advance(rows, st, given, seq, u, t, weights,
+                                   consts, container=c.name)
+    return tuple(given)
+
+
+def _empty_plan_carry(seq, y, t, head, container):
+    # The empty plan's carry through its compiled program: the build-time
+    # tuple and the draw of a generator that no plan has named.
+    from graphax.examples.neuromorphic import rsnn_zero_carry
+    c = _container(container)
+    batched = int(jnp.ndim(seq)) == 3
+    lead = (int(seq.shape[0]),) if batched else ()
+    weights = tuple(head[7:10])
+    given = jax.eval_shape(
+        lambda: rsnn_zero_carry(c, weights, lead, dtype=weights[0].dtype))
+    exe = empty_plan_executable(tuple(head) + tuple(given), batched)
+    return carry_from_executable(seq, y, t, weights, head[10:16], exe, c)
+
+
 def carry_under_plan(seq, t, weights, container="exact", *,
                      check_zeros: bool = True):
     """THE FLOAT64 TEST ORACLE of :func:`carry_from_program`, by container
     (owner ruling 2026-09-24, Q30): the eleven blocks the CLOSED-FORM
     recursions produce. No run reads it; the given tuple of a run is the
-    scan of the plan's own program.
+    plan's own compiled program run over the prefix.
 
     ``container`` is the set of classes the plan put on the carried-Jacobian
     face, applied at EVERY step of the prefix:
@@ -1247,12 +1342,13 @@ def rsnn_data_gen(key=None, *, dataset: str | None = None,
     every step position. ``tests/temporal_rule_test.py`` asserts that.
 
     WHAT ONE DRAW COSTS. One prefix pass of ``T`` cell evaluations plus, under
-    ``rtrl``, ``T`` executions of the one-step program inside one scan
-    (:func:`carry_from_program`) or, under ``bptt``, one suffix pass and one
-    reverse sweep. Under ``rtrl`` the draw is PER PLAN (``with_program``):
-    the given value is the scan of the plan's own program, so every measured
-    plan draws its own; the exact reference draw (``reference_draw``, the
-    scan of the empty plan) is shared across plans.
+    ``rtrl``, ``t`` executions of a compiled one-step program from the host
+    (:func:`carry_from_executable`) or, under ``bptt``, one suffix pass and
+    one reverse sweep. Under ``rtrl`` the draw is PER PLAN
+    (``with_executable``): the given value comes from the plan's own
+    measured executable, so every measured plan draws its own; the exact
+    reference draw (``reference_draw``, the empty plan) is shared across
+    plans.
     """
     rule = "tbptt" if temporal_rule is None else str(temporal_rule)
     if rule not in TEMPORAL_RULES:
@@ -1291,21 +1387,14 @@ def rsnn_data_gen(key=None, *, dataset: str | None = None,
             return (seq[t], seq[t + 1], y) + state_prev + weights, state_prev
         return (seq[t], y) + state_prev + weights, state_prev
 
-    def _build(t, container, program=None):
+    def _build(t, container):
         if batch is not None:
             head, given = _batched_step_tuple(seq, y, t, weights, rule,
-                                              container, program)
+                                              container)
             return head + weights + given
         head, state_prev = _head(t)
-        if rule in ("tbptt", "window2"):
+        if rule in ("tbptt", "window2", "rtrl"):
             given = ()
-        elif rule == "rtrl":
-            # THE PLAN'S OWN PROGRAM over the prefix (owner ruling 2026-09-24,
-            # Q29); the empty plan's when no plan has been named yet.
-            given = carry_from_program(
-                seq, y, t, weights,
-                empty_plan_program() if program is None else program,
-                container)
         else:
             given = future_adjoints(seq, y, t, weights, state_prev, container)
         return head + tuple(given)
@@ -1317,32 +1406,74 @@ def rsnn_data_gen(key=None, *, dataset: str | None = None,
                 f"{len(slots)} declared slots {slots}")
         return out
 
+    # Under rtrl this jit is the recording and the head; the carry is the
+    # host loop over a compiled program (owner ruling 2026-09-24, Q1a).
     @jax.jit
     def _draw(keys):
-        return _checked(_build(_t(keys), cont))
+        t = _t(keys)
+        return t, _build(t, cont)
 
-    # A PLAIN PYTHON WRAPPER around the jitted draw: the attributes below are
-    # the generator's contract with the env, and a `PjitFunction` is a C type
+    consts = _consts()
+
+    def _host_draw(keys, exe=None, lower_args=None, container=cont,
+                   device=None):
+        t, head = _draw(keys)
+        head = tuple(head)
+        if exe is None:
+            given = _empty_plan_carry(seq, y, t, head + consts, container)
+        else:
+            given = carry_from_executable(seq, y, t, lower_args[7:10],
+                                          lower_args[10:16], exe, container,
+                                          device)
+        out = head + tuple(given)
+        if device is not None:
+            out = jax.device_put(out, device)
+        return _checked(out)
+
+    # A PLAIN PYTHON WRAPPER around the draw: the attributes below are the
+    # generator's contract with the env, and a `PjitFunction` is a C type
     # that does not take them.
     def fn(keys):
-        return _draw(keys)
+        if rule == "rtrl":
+            return _host_draw(keys)
+        return _checked(_draw(keys)[1])
 
-    def with_program(program):
-        # The same draw with the given tuple from the plan's own program (Q29).
-        @jax.jit
-        def _draw_p(keys):
-            return _checked(_build(_t(keys), cont, program))
+    _refs: dict = {}
+
+    def _reference_through(ref):
+        exe, lower_args = ref
+        hit = _refs.get(id(exe))
+        if hit is not None and hit[0] is exe:
+            return hit[1]
+        dev = _device_of(lower_args)
+
+        def ref_draw(keys):
+            return _host_draw(keys, exe, lower_args, EXACT_CONTAINER, dev)
+        if len(_refs) > 8:
+            _refs.clear()
+        _refs[id(exe)] = (exe, ref_draw)
+        return ref_draw
+
+    def with_executable(exe, lower_args, reference=None):
+        # The draw through the plan's measured executable (Q1a); the
+        # reference through the paired reference's, when it is the empty plan.
+        dev = _device_of(lower_args)
 
         def fn_p(keys):
-            return _draw_p(keys)
+            return _host_draw(keys, exe, lower_args, cont, dev)
         fn_p.__dict__.update(fn.__dict__)
-        fn_p.program = program
+        if reference is not None:
+            fn_p.reference_draw = _reference_through(reference)
         return fn_p
 
     @jax.jit
-    def _draw_exact(keys):
-        """The SAME draw with the EXACT carry. The quality reference."""
+    def _draw_exact_jit(keys):
         return _build(_t(keys), EXACT_CONTAINER)
+
+    def _draw_exact(keys):
+        if rule == "rtrl":
+            return _host_draw(keys, container=EXACT_CONTAINER)
+        return _draw_exact_jit(keys)
 
     def meta(keys):
         """``{t, T, recording, rule, carry}`` of the draw ``keys`` produces.
@@ -1395,14 +1526,15 @@ def rsnn_data_gen(key=None, *, dataset: str | None = None,
     # recording, which is what it has to be. Under `rtrl` EVERY container
     # publishes it, the exact one included: a plan produces its own carry
     # (owner ruling 2026-09-24, Q29), so the in-band reference reads the
-    # plan's carry and only the scan of the empty plan is the truth. Under
+    # plan's carry and only the empty plan's draw is the truth. Under
     # `bptt` it is absent for `exact`, where the in-band reference is exact.
     if cont != EXACT_CONTAINER or rule == "rtrl":
         def reference_draw(keys):
             return _draw_exact(keys)
         fn.reference_draw = reference_draw
     if rule == "rtrl":
-        fn.with_program = with_program
+        fn.with_executable = with_executable
+        fn.host_draw = True
     #: The container this generator draws, so a measurement can ask.
     fn.carry_container = cont
     fn.temporal_rule = rule
@@ -1474,11 +1606,14 @@ def rsnn_args(key=None, *, dataset: str | None = None,
                                     "batch": int(batch)})
         head, given = _batched_step_tuple(seq, y, jnp.asarray(ts), weights,
                                           rule, cont)
+        if rule == "rtrl":
+            given = _empty_plan_carry(seq, y, jnp.asarray(ts),
+                                      head + weights + _consts(), cont)
         want = RSNN_GIVEN_COUNTS[rule]
         if len(given) != want:
             raise ValueError(
                 f"rule {rule} must pass {want} given values, built {len(given)}")
-        return head + weights + _consts() + given
+        return head + weights + _consts() + tuple(given)
 
     sg = jax.lax.stop_gradient
     state_prev = tuple(sg(x) for x in prefix_state(seq, t, weights)(*weights))
@@ -1489,11 +1624,8 @@ def rsnn_args(key=None, *, dataset: str | None = None,
     if rule == "tbptt":
         given = ()
     elif rule == "rtrl":
-        # THE BUILD-TIME TUPLE: the empty plan on this container's own
-        # program. A measured plan replaces it with the scan of its own
-        # program (env._callback_measured, owner ruling 2026-09-24 Q29).
-        given = carry_from_program(seq, y, t, weights, empty_plan_program(),
-                                   cont)
+        # The build-time tuple: the empty plan on this container's program.
+        given = _empty_plan_carry(seq, y, t, head, cont)
     else:
         given = future_adjoints(seq, y, t, weights, state_prev, cont)
     want = RSNN_GIVEN_COUNTS[rule]
@@ -1511,16 +1643,14 @@ def _refuse_batched_window(rule: str, batch) -> None:
             f"batched; only the one-step body ({RSNN_VMAP_TARGET}) is.")
 
 
-def _batched_step_tuple(seqs, ys, ts, weights, rule, container,
-                        program=None):
+def _batched_step_tuple(seqs, ys, ts, weights, rule, container):
     """Slots 0 to 6 and the rule's given values over ``B`` recordings.
 
     One recording per row of ``seqs``, ``ys`` and ``ts``. The frame, the
     label, the carried state and every given value (the five stacked carry
     tensors of ``rtrl``, the five adjoints of ``bptt``) get a leading batch
-    axis. BPTT attaches the future adjoint per sample; RTRL the past
-    Jacobian, which the batched ``program`` (the empty plan's when ``None``)
-    produces for all ``B`` prefixes in one scan. Returns ``(head, given)``.
+    axis. BPTT attaches the future adjoint per sample. Returns
+    ``(head, given)``.
     """
     c = _container(container)
 
@@ -1535,11 +1665,8 @@ def _batched_step_tuple(seqs, ys, ts, weights, rule, container,
         return head, given
 
     head, given = jax.vmap(one)(seqs, ys, ts)
-    if rule == "rtrl":
-        given = carry_from_program(
-            seqs, ys, ts, weights,
-            empty_plan_program(batched=True) if program is None else program,
-            c)
+    # rtrl's past Jacobian is the host loop over the batched program, which
+    # the callers run (carry_from_executable).
     return tuple(head), tuple(given)
 
 

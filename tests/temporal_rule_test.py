@@ -1015,11 +1015,11 @@ def test_the_generator_publishes_an_exact_reference_draw_only_when_it_needs_one(
     exact = ex.data_gen("RSNN_SHD", dataset=None, key=jax.random.PRNGKey(1),
                         temporal_rule="rtrl", carry_container="exact")
     assert getattr(exact, "reference_draw", None) is not None
-    assert getattr(exact, "with_program", None) is not None
+    assert getattr(exact, "with_executable", None) is not None
     bp = ex.data_gen("RSNN_SHD", dataset=None, key=jax.random.PRNGKey(1),
                      temporal_rule="bptt", carry_container="exact")
     assert getattr(bp, "reference_draw", None) is None
-    assert getattr(bp, "with_program", None) is None
+    assert getattr(bp, "with_executable", None) is None
 
 
 def test_the_oracle_reference_makes_the_accumulated_error_visible():
@@ -2117,7 +2117,8 @@ for t in range(1, T):
     worst = max(worst, max(rel(a, b) for a, b in zip(got, want)))
 out["two_diag_plan_vs_carry_traces"] = worst
 # The same plan's generator draw at the pinned step is the same number.
-gen = cfg.data_gen.with_program(program)
+exe = jax.jit(program, keep_unused=True).lower(*vargs).compile()
+gen = cfg.data_gen.with_executable(exe, tuple(vargs))
 keys = jax.random.split(jax.random.PRNGKey(0), 5)
 data = dict(zip(gen.data_slots, gen(keys)))
 t_drawn = int(gen.meta(keys)["t"])
@@ -2208,3 +2209,157 @@ def test_the_state_outputs_stay_eliminable():
     # rtrl = tbptt's body plus the carry block, minus the one pure output
     assert len(valid) == len(valid_t) + n_carry - 1, (
         len(valid), len(valid_t), n_carry)
+
+
+# ---------------------------------------------------------------------------
+# 19. THE DRAW RUNS THE MEASURED EXECUTABLE (owner ruling 2026-09-24, Q1a)
+#
+# The carry of every rtrl draw is the plan's compiled program run from the
+# host over the prefix; carry_from_program, the same recursion as one scan,
+# is its float64 oracle, and through it carried_jacobians (the empty plan)
+# and carry_traces (e-prop).
+# ---------------------------------------------------------------------------
+
+_HOST_LOOP = r'''
+import os, json
+os.environ["JAX_ENABLE_X64"] = "1"
+os.environ.setdefault("ALPHAGRAD_SKIP_COUNT_OPS", "1")
+import numpy as np, jax, jax.numpy as jnp
+from alphagrad.approx.common import rsnn_shd as R
+from alphagrad.approx.common import carry_plan as CP
+import alphagrad.approx.env as envmod
+import alphagrad.approx.tools.landscape_map as lm
+from graphax import jacve
+
+assert jax.config.jax_enable_x64
+H, T = 6, 9
+R.RSNN_HIDDEN = H
+R.SHD_TIME_BINS = T
+argv = ["--example", "RSNN_SHD", "--dataset", "none", "--temporal-rule",
+        "rtrl", "--step-position", "3", "--seed", "5", "--num-eval-samples",
+        "1", "--num-data-points", "1", "--reps-per-point", "1", "--out-dir",
+        "/tmp/host_loop_test"]
+env, _samples, _cj = lm.build_env(lm.make_argparser().parse_args(argv))
+spec = CP._entry(env.config)["spec"]
+k = jax.random.split(spec["key"], 3)
+seq, y, _ = R._draw_recording(k[0], None, -1)
+W = R.rsnn_weights(k[1])
+
+
+def rel(a, b):
+    a, b = np.asarray(a, np.float64), np.asarray(b, np.float64)
+    n = np.linalg.norm(b)
+    return float(np.linalg.norm(a - b) / n) if n else float(np.linalg.norm(a - b))
+
+
+jx = env.config.jaxpr
+valid = sorted(int(v) for v in env.valid_vertices)
+mask = CP.carry_scope_mask(jx)
+order = sorted(valid, reverse=True)
+inv = lm.face_inventory(env, np.asarray(order, dtype=np.int32))
+carry_dot = [v for v in valid if mask[v - 1]
+             and jx.eqns[v - 1].primitive.name == "dot_general"]
+rec_v = [v for v in valid if not mask[v - 1]
+         and jx.eqns[v - 1].primitive.name == "dot_general"
+         and any(iv is jx.invars[8] for iv in jx.eqns[v - 1].invars)]
+assert len(rec_v) == 1, rec_v
+container_w = [{"k": int(e["k"]), "f": int(e["f"]), "slot": 0,
+                "row": [0, 0, -1], "kind": "X"}
+               for e in inv if int(e["vertex"]) in carry_dot]
+state_w = [{"k": int(e["k"]), "f": int(e["f"]), "slot": 0, "row": [0, 0, -1],
+            "kind": "X"} for e in inv if int(e["vertex"]) == rec_v[0]
+           and int(e["key"][0]) not in (7, 8)]
+assert container_w and state_w
+plans = {"empty": [], "container Diag": container_w,
+         "e-prop": container_w + state_w}
+
+
+def measured(wires):
+    # the callback's chain: container, variant, transport, face transforms,
+    # the measured program (its own sparse form) and its executable
+    plan = {"specs": None, "face_specs": None, "face_skips": None,
+            "wires": wires}
+    specs, faces, skips = (np.asarray(a) for a in
+                           lm.get_plan_arrays(plan, len(order)))
+    container = CP.container_for_plan(env.config, order, faces, skips, specs)
+    var = CP.measurement_env(container, env.config)
+    if var is None:
+        o2, m_specs, m_faces, m_skips, m_joins = order, specs, faces, skips, None
+        cfg, vargs, consts = env.config, env.args, env.consts
+    else:
+        o2, m_specs, m_faces, m_skips, m_joins = CP.transport_wires(
+            order, var, specs, faces, skips, None)
+        cfg, vargs, consts = var["config"], var["args"], var["consts"]
+    specs_list = m_specs.tolist()
+    transforms, _ = envmod._decode_vertex_transforms(cfg, o2, specs_list)
+    have = bool(np.any(m_faces[..., 0] >= 0))
+    ft = (envmod._face_transforms_for_order(
+        cfg, consts, vargs, o2, specs_list, m_faces, m_skips,
+        wire_sig=envmod._face_wire_keys(m_faces, m_skips, len(o2), m_joins),
+        face_joins_list=m_joins) if have else None)
+    program = jacve(cfg.target_fun, list(o2), argnums=cfg.argnums,
+                    has_aux=cfg.has_aux, sparse_representation=cfg.sparse,
+                    jaxpr=cfg.jaxpr, consts=list(consts),
+                    transforms=transforms, face_transforms=ft)
+    exe = jax.jit(program, keep_unused=True).lower(*vargs).compile()
+    return container, cfg, tuple(vargs), program, exe
+
+
+out = {}
+for name, wires in plans.items():
+    container, cfg, vargs, program, exe = measured(wires)
+    row = {"container": container, "host_vs_oracle": 0.0,
+           "host_vs_closed_form": None}
+    for t in range(1, T):
+        host = R.carry_from_executable(seq, y, t, vargs[7:10], vargs[10:16],
+                                       exe, container)
+        oracle = R.carry_from_program(seq, y, t, W, program, container)
+        row["host_vs_oracle"] = max(row["host_vs_oracle"], max(
+            rel(a, b) for a, b in zip(host, oracle)))
+        closed = (R.carried_jacobians(seq, t, W) if name == "empty" else
+                  R.carry_traces(seq, t, W) if name == "e-prop" else None)
+        if closed is not None:
+            row["host_vs_closed_form"] = max(
+                row["host_vs_closed_form"] or 0.0,
+                max(rel(a, b) for a, b in zip(host, closed)))
+    gen = cfg.data_gen.with_executable(exe, vargs)
+    keys = jax.random.split(jax.random.PRNGKey(0), 5)
+    data = dict(zip(gen.data_slots, gen(keys)))
+    t_drawn = int(gen.meta(keys)["t"])
+    oracle = R.carry_from_program(seq, y, t_drawn, W, program, container)
+    row["draw_vs_oracle"] = max(rel(data[16 + i], o)
+                                for i, o in enumerate(oracle))
+    row["t_drawn"] = t_drawn
+    out[name] = row
+print("RESULT " + json.dumps(out))
+'''
+
+
+@pytest.fixture(scope="module")
+def host_loop_results():
+    from alphagrad.approx.common import carry_plan as CP
+    CP.reset()
+    try:
+        return _run_float64(_HOST_LOOP)
+    finally:
+        CP.reset()
+
+
+@pytest.mark.parametrize("plan,container", [("empty", "exact"),
+                                            ("container Diag", "diag"),
+                                            ("e-prop", "diag")])
+def test_the_host_loop_over_the_measured_executable_is_the_scan(
+        host_loop_results, plan, container):
+    row = host_loop_results[plan]
+    assert row["container"] == container, row
+    assert row["host_vs_oracle"] < 1e-11, row
+    assert row["draw_vs_oracle"] < 1e-11, row
+
+
+@pytest.mark.parametrize("plan", ["empty", "e-prop"])
+def test_through_the_scan_the_host_loop_is_the_closed_form(
+        host_loop_results, plan):
+    # the empty plan against carried_jacobians, e-prop against carry_traces
+    row = host_loop_results[plan]
+    assert row["host_vs_closed_form"] is not None
+    assert row["host_vs_closed_form"] < 1e-11, row

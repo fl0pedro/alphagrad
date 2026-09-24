@@ -408,13 +408,21 @@ def measurement_env(container: str, config=None) -> dict | None:
     return v
 
 
-def plan_generator(generator, program):
-    # The generator redrawing its given tuple through the plan's own program
-    # (Q29); None for a generator without such a draw (a rule with no carry).
-    with_program = getattr(generator, "with_program", None)
-    if with_program is None:
-        return None
-    return with_program(program)
+def is_empty_plan_order(config, order) -> bool:
+    # The reverse order over ``order`` is the empty plan of the base program
+    # when ``order`` covers every eliminable vertex of it.
+    entry = _entry(config)
+    if entry is None:
+        return False
+    valid = entry.get("base_valid")
+    if valid is None:
+        base = entry["base"]
+        valid = frozenset(valid_vertices(
+            base["config"].jaxpr, base["args"], base["consts"],
+            tuple(base["config"].argnums)))
+        entry["base_valid"] = valid
+    got = [int(v) for v in order]
+    return len(got) == len(valid) and set(got) == valid
 
 
 def eval_samples_for(container: str, eval_samples, config=None,
@@ -426,9 +434,10 @@ def eval_samples_for(container: str, eval_samples, config=None,
     digest) INSIDE the graph's own entry, so two graphs in one process never
     read each other's draw. ``config`` names which graph.
 
-    With ``generator`` -- the plan's own draw from :func:`plan_generator` --
-    the samples are drawn through it on the container's program (the base
-    program for ``exact``) and are NOT cached: they belong to one plan.
+    With ``generator`` -- the plan's own draw through its measured
+    executable -- the samples are drawn through it on the container's program
+    (the base program for ``exact``) and are NOT cached: they belong to one
+    plan.
     """
     if not eval_samples:
         return None
@@ -653,7 +662,7 @@ def carry_at_rest_bytes(variant_or_entry, rule: str) -> int:
     blocks of the measured program, the way they arrive at the step.
 
     Under ``rtrl`` the given tuple is the five stacked tensors
-    ``rsnn_shd.carry_under_plan`` builds, nothing else; under ``bptt`` the
+    ``rsnn_shd.carry_from_executable`` builds, nothing else; under ``bptt`` the
     five adjoints.
     """
     from alphagrad.approx.common.rsnn_shd import RSNN_HEAD_SLOTS
