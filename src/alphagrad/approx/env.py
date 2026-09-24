@@ -9234,49 +9234,106 @@ def _callback_measured(
     # own eval samples, and every container is divided by that one number.
     _ref_cfg, _ref_args, _ref_consts, _ref_eval = (
         config, args, consts, eval_samples)
+
+    def _is_graphax_trace_failure(exc: BaseException) -> bool:
+        """True when the exception was RAISED INSIDE graphax.
+
+        Deliberately keyed on traceback origin rather than on the message, so
+        an alphagrad-side bug with a similar message still propagates and kills
+        the run. The known instance is
+        ``_normalize_inputs`` refusing to add a tensor to its own transpose
+        ((16,10,784,256) vs (16,10,256,784)) -- the open canonical-output-order
+        gap -- but the whole family belongs here: the plan is well-defined and
+        the library cannot build it, which is apparatus failure, not plan
+        quality.
+        """
+        tb = exc.__traceback__
+        while tb is not None:
+            fn = tb.tb_frame.f_code.co_filename
+            if f"{os.sep}graphax{os.sep}" in fn:
+                return True
+            tb = tb.tb_next
+        return False
+
+    def _refusal_detail(where: str, exc: BaseException) -> dict:
+        return {"refusal_where": where,
+                "refusal_error": (f"{type(exc).__name__}: "
+                                  + " ".join(str(exc).split())[:400])}
+
+    # A failure while the plan's own program is built (its carry container,
+    # its count pass) is a refused plan, scored once the scorer below exists
+    # (owner ruling 2026-09-24 Q53). (kind, reason, detail).
+    def _build_refusal(where: str, exc: Exception) -> tuple:
+        print(f"[refused] {where} failed step={int(stop)} order={o_list}: "
+              f"{type(exc).__name__}: {' '.join(str(exc).split())[:200]} "
+              f"(scored at the sentinel)", flush=True)
+        if _is_graphax_trace_failure(exc):
+            _record_untraceable_plan(exc)
+            return ("untraceable", f"untraceable:{where}",
+                    _refusal_detail(where, exc))
+        if _is_oom(exc):
+            _record_truncated_plan()
+            note_measure_oom(where, exc)
+            return ("oom", f"oom:{where}", _refusal_detail(where, exc))
+        return ("raised", f"raised:{type(exc).__name__}",
+                _refusal_detail(where, exc))
+
+    _early_refusal = None
     if is_terminal and _carry.armed(_carry_base_cfg):
-        _carry_container = _carry.container_for_plan(
-            config, o_list, _faces_np, _skips_np, partial_specs)
-        _variant = _carry.measurement_env(_carry_container, _carry_base_cfg)
-        if _variant is not None:
-            (o_list, _m_specs, _m_faces, _m_skips, _m_joins) = \
-                _carry.transport_wires(
-                    o_list, _variant, partial_specs, _faces_np, _skips_np,
-                    _joins_np)
-            config = _variant["config"]
-            args = _variant["args"]
-            consts = _variant["consts"]
-            specs_list = _m_specs.tolist()
-            transforms, _ = _decode_vertex_transforms(
-                config, o_list, specs_list)
-            _m_have = bool(
-                len(o_list) and (np.any(_m_skips == 1)
-                                 or np.any(_m_faces[..., 0] >= 0)
-                                 or np.any(_m_faces[..., 0] == COMPRESS_SENTINEL)
-                                 or np.any(_m_faces[..., 0] == QUANT_SENTINEL)))
-            ft_by_vertex = (
-                _face_transforms_for_order(
-                    config, consts, args, o_list, specs_list,
-                    _m_faces, _m_skips,
-                    wire_sig=_face_wire_keys(_m_faces, _m_skips, len(o_list),
-                                             _m_joins),
-                    face_joins_list=_m_joins)
-                if _m_have else None)
-            # THE VARIANT'S OWN EVAL SAMPLES. They cannot be the base ones --
-            # the shapes of the given values move with the container -- so
-            # they are drawn from a DIGEST of the base draw, which every
-            # process that measures this plan computes the same way and which
-            # moves per episode exactly as the base draw does.
-            if eval_samples:
-                eval_samples = tuple(
-                    _carry.eval_samples_for(_carry_container, eval_samples,
-                                            _carry_base_cfg))
+        try:
+            _carry_container = _carry.container_for_plan(
+                config, o_list, _faces_np, _skips_np, partial_specs)
+            _variant = _carry.measurement_env(_carry_container,
+                                              _carry_base_cfg)
+            if _variant is not None:
+                (o_list, _m_specs, _m_faces, _m_skips, _m_joins) = \
+                    _carry.transport_wires(
+                        o_list, _variant, partial_specs, _faces_np, _skips_np,
+                        _joins_np)
+                config = _variant["config"]
+                args = _variant["args"]
+                consts = _variant["consts"]
+                specs_list = _m_specs.tolist()
+                transforms, _ = _decode_vertex_transforms(
+                    config, o_list, specs_list)
+                _m_have = bool(
+                    len(o_list) and (
+                        np.any(_m_skips == 1)
+                        or np.any(_m_faces[..., 0] >= 0)
+                        or np.any(_m_faces[..., 0] == COMPRESS_SENTINEL)
+                        or np.any(_m_faces[..., 0] == QUANT_SENTINEL)))
+                ft_by_vertex = (
+                    _face_transforms_for_order(
+                        config, consts, args, o_list, specs_list,
+                        _m_faces, _m_skips,
+                        wire_sig=_face_wire_keys(_m_faces, _m_skips,
+                                                 len(o_list), _m_joins),
+                        face_joins_list=_m_joins)
+                    if _m_have else None)
+                # THE VARIANT'S OWN EVAL SAMPLES. They cannot be the base
+                # ones -- the shapes of the given values move with the
+                # container -- so they are drawn from a DIGEST of the base
+                # draw, which every process that measures this plan computes
+                # the same way and which moves per episode exactly as the
+                # base draw does.
+                if eval_samples:
+                    eval_samples = tuple(
+                        _carry.eval_samples_for(_carry_container,
+                                                eval_samples,
+                                                _carry_base_cfg))
+        except MeasureToolchainFault:
+            raise
+        except Exception as _exc:
+            _early_refusal = _build_refusal("carry container", _exc)
+            o_list, config, args, consts, eval_samples = (
+                _rec_order, _carry_base_cfg, _ref_args, _ref_consts,
+                _ref_eval)
     _PLAN_CARRY[0] = _carry_container
     # THE CONTAINER'S AT-REST BYTES ride on the plan record (owner ruling
     # 2026-09-23, no new reward channel): the given blocks of the program the
     # plan is measured on, in the container it implied.
     _PLAN_CARRY_BYTES[0] = None
-    if _carry_container is not None:
+    if _carry_container is not None and _early_refusal is None:
         _c_entry = _carry._entry(_carry_base_cfg)
         _c_var = _carry.measurement_env(_carry_container, _carry_base_cfg)
         _PLAN_CARRY_BYTES[0] = _carry.carry_at_rest_bytes(
@@ -9314,23 +9371,27 @@ def _callback_measured(
     # compare), so the pre-XLA guard against compile-monster plans is gone. The
     # OOM handler still catches device exhaustion, but NOT the v15-style
     # compile hang. Re-enable the count pass if that reappears.
-    if skip_count_ops():
-        muls_adds_fmas = 0.0
-        max_io_sum = 0.0
-    else:
-        _, aux = vertex_elimination_jaxpr(
-            config.jaxpr,
-            o_list,
-            consts,
-            *args,
-            argnums=config.argnums,
-            count_ops=True,
-            sparse_representation=config.sparse,
-            transforms=transforms,
-            face_transforms=ft_by_vertex,
-        )
-        muls_adds_fmas = float(aux["adds"] + aux["muls"] + aux["fmas"])
-        max_io_sum = float(aux["mem"])
+    muls_adds_fmas = 0.0
+    max_io_sum = 0.0
+    if not skip_count_ops() and _early_refusal is None:
+        try:
+            _, aux = vertex_elimination_jaxpr(
+                config.jaxpr,
+                o_list,
+                consts,
+                *args,
+                argnums=config.argnums,
+                count_ops=True,
+                sparse_representation=config.sparse,
+                transforms=transforms,
+                face_transforms=ft_by_vertex,
+            )
+            muls_adds_fmas = float(aux["adds"] + aux["muls"] + aux["fmas"])
+            max_io_sum = float(aux["mem"])
+        except MeasureToolchainFault:
+            raise
+        except Exception as _exc:
+            _early_refusal = _build_refusal("count pass", _exc)
     _pf("cb.count_pass")
 
     # SOFT SENTINEL (v16 post-mortem, ep-39 cliff). The hard ±1e10 sentinel
@@ -9389,8 +9450,8 @@ def _callback_measured(
     _muls_cap = float(os.environ.get("ALPHAGRAD_MULS_SENTINEL_CAP", "5e13"))
     # (kind, reason, detail) of a refusal found before anything is compiled;
     # scored once the scorer below exists.
-    _early_refusal = None
-    if not skip_count_ops() and muls_adds_fmas > _muls_cap:
+    if (_early_refusal is None and not skip_count_ops()
+            and muls_adds_fmas > _muls_cap):
         _record_truncated_plan()
         if _dbg_measure or os.environ.get("ALPHAGRAD_DEBUG_DEGEN", "0") == "1":
             print(f"[trunc] MULS-CAP muls={muls_adds_fmas:.3g} > "
@@ -9702,31 +9763,6 @@ def _callback_measured(
     # Caught here (compile) and around execution below. `_is_oom` matches on
     # the XLA error text because jaxlib raises a generic XlaRuntimeError for
     # RESOURCE_EXHAUSTED rather than a dedicated class.
-    def _is_graphax_trace_failure(exc: BaseException) -> bool:
-        """True when the exception was RAISED INSIDE graphax.
-
-        Deliberately keyed on traceback origin rather than on the message, so
-        an alphagrad-side bug with a similar message still propagates and kills
-        the run. The known instance is
-        ``_normalize_inputs`` refusing to add a tensor to its own transpose
-        ((16,10,784,256) vs (16,10,256,784)) -- the open canonical-output-order
-        gap -- but the whole family belongs here: the plan is well-defined and
-        the library cannot build it, which is apparatus failure, not plan
-        quality.
-        """
-        tb = exc.__traceback__
-        while tb is not None:
-            fn = tb.tb_frame.f_code.co_filename
-            if f"{os.sep}graphax{os.sep}" in fn:
-                return True
-            tb = tb.tb_next
-        return False
-
-    def _refusal_detail(where: str, exc: BaseException) -> dict:
-        return {"refusal_where": where,
-                "refusal_error": (f"{type(exc).__name__}: "
-                                  + " ".join(str(exc).split())[:400])}
-
     def _trace_truncate(where: str, exc: BaseException, program):
         _record_untraceable_plan(exc)
         return _score_refusal("untraceable", f"untraceable:{where}",
