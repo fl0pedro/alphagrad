@@ -118,10 +118,19 @@ def test_window2_is_refused_on_the_batched_target():
 @pytest.mark.parametrize("rule", RULES)
 def test_the_batched_loss_and_gradient_are_the_mean_over_recordings(rule):
     xs = _args(rule)
-    fb = ex.get_fn(BATCHED)
-    fs = ex.get_fn(SINGLE)
+    fb_full = ex.get_fn(BATCHED)
+    fs_full = ex.get_fn(SINGLE)
+    fb = lambda *a: R.loss_of(fb_full(*a))
+    fs = lambda *a: R.loss_of(fs_full(*a))
     rows = _rows(xs, rule)
-    loss_b = fb(*xs)
+    out_b = fb_full(*xs)
+    if rule == "rtrl":
+        # (loss, S, I, U, a, Uo): the B next states behind the mean loss
+        # (owner ruling 2026-09-24, Q27b).
+        assert isinstance(out_b, tuple) and len(out_b) == 6
+        assert [tuple(s.shape) for s in out_b[1:]] == [
+            (B, H), (B, H), (B, H), (B, H), (B, SHD_CLASSES)]
+    loss_b = R.loss_of(out_b)
     assert loss_b.shape == ()
     losses = [fs(*r) for r in rows]
     _close(loss_b, jnp.mean(jnp.stack(losses)))
@@ -135,16 +144,23 @@ def test_the_batched_loss_and_gradient_are_the_mean_over_recordings(rule):
 @pytest.mark.parametrize("container", ["exact", "diag", "reduce", "quant",
                                        "diag+quant"])
 def test_the_past_jacobian_is_built_per_recording(container):
+    """The batched scan of the empty plan's program gives every recording
+    the carry the one-recording scan gives it (owner ruling 2026-09-24,
+    Q29), and the exact container is the exact carry."""
     xs = _args("rtrl", carry_container=container)
     seq, y, W = _recordings()
     ts = R.last_step_position()["t"]
+    prog = R.empty_plan_program()
     for i in range(B):
         assert np.array_equal(np.asarray(xs[0][i]), np.asarray(seq[i][ts[i]]))
-        single = R.carry_under_plan(seq[i], ts[i], W, container)
+        single = R.carry_from_program(seq[i], y[i], ts[i], W, prog, container)
         for k, block in enumerate(single):
             got = xs[16 + k][i]
             assert got.shape == block.shape and got.dtype == block.dtype
             _close(got, block, quant="quant" in container)
+        if container == "exact":
+            for got, block in zip(single, R.carried_jacobians(seq[i], ts[i], W)):
+                _close(got, block)
 
 
 @pytest.mark.parametrize("container", ["exact", "reduce", "quant", "diag"])
@@ -177,7 +193,9 @@ def test_jacve_on_the_batched_step_body_matches_jacrev(rule, seed):
     ref = jax.jacrev(fn, argnums=argnums)(*xs)
     got_leaves = jax.tree_util.tree_leaves(got)
     ref_leaves = jax.tree_util.tree_leaves(ref)
-    assert len(got_leaves) == len(ref_leaves) == len(argnums)
+    # under rtrl the loss row and the five state rows, per weight
+    n_rows = 6 if rule == "rtrl" else 1
+    assert len(got_leaves) == len(ref_leaves) == len(argnums) * n_rows
     for i, (g, r) in enumerate(zip(got_leaves, ref_leaves)):
         scale = float(jnp.max(jnp.abs(r))) or 1.0
         worst = float(jnp.max(jnp.abs(g - r))) / scale

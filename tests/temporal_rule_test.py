@@ -80,6 +80,13 @@ def _args(rule, **kw):
                        temporal_rule=rule, step_position=T_PIN, **kw)
 
 
+def _loss_fn():
+    """The registered target as the scalar loss: under rtrl it returns
+    ``(loss, S, I, U, a, Uo)`` (owner ruling 2026-09-24, Q27b)."""
+    fn = ex.get_fn("RSNN_SHD")
+    return lambda *a: R.loss_of(fn(*a))
+
+
 def _n_bytes(xs, frm):
     return sum(int(np.asarray(x).nbytes) for x in xs[frm:])
 
@@ -96,7 +103,7 @@ def test_each_rule_builds_and_passes_its_own_given_values(rule, n_given):
     assert RSNN_GIVEN_COUNTS[rule] == n_given
     assert rsnn_given_rule(xs[16:]) == rule
     fn = ex.get_fn("RSNN_SHD")
-    assert float(fn(*xs)) == float(fn(*xs))        # builds and evaluates
+    assert float(R.loss_of(fn(*xs))) == float(R.loss_of(fn(*xs)))
 
 
 def test_the_rules_are_told_apart_by_the_given_count_and_rank():
@@ -140,7 +147,7 @@ def test_the_forward_value_does_not_move_between_tbptt_and_rtrl():
     else.
     """
     fn = ex.get_fn("RSNN_SHD")
-    assert float(fn(*_args("tbptt"))) == float(fn(*_args("rtrl")))
+    assert float(fn(*_args("tbptt"))) == float(R.loss_of(fn(*_args("rtrl"))))
 
 
 def test_the_bptt_scalar_is_the_step_loss_plus_the_adjoint_term():
@@ -430,7 +437,8 @@ key = jax.random.split(jax.random.PRNGKey(5), 3)
 seq = jax.random.bernoulli(key[0], 0.2, (T, NIN)).astype(jnp.float64)
 y = jax.nn.one_hot(3, 20).astype(jnp.float64)
 W = R.rsnn_weights(key[1])
-fn = ex.get_fn("RSNN_SHD")
+fn_full = ex.get_fn("RSNN_SHD")
+fn = lambda *a: R.loss_of(fn_full(*a))
 
 
 def rel(a, b):
@@ -880,8 +888,8 @@ def test_the_forward_value_does_not_move_between_containers():
     same to the last bit. A container that moved the loss would be measuring
     a different function, not the same one more cheaply."""
     fn = ex.get_fn("RSNN_SHD")
-    a = fn(*_args("rtrl", carry_container="exact"))
-    b = fn(*_args("rtrl", carry_container="diag"))
+    a = R.loss_of(fn(*_args("rtrl", carry_container="exact")))
+    b = R.loss_of(fn(*_args("rtrl", carry_container="diag")))
     c = fn(*_args("tbptt"))
     assert float(a) == float(b) == float(c)
 
@@ -1003,6 +1011,18 @@ def test_the_generator_publishes_an_exact_reference_draw_only_when_it_needs_one(
         np.testing.assert_array_equal(np.asarray(a[i]), np.asarray(r[i]))
     assert sum(int(np.asarray(x).nbytes) for x in r[10:]) > \
         80 * sum(int(np.asarray(x).nbytes) for x in a[10:])
+    # UNDER rtrl THE EXACT CONTAINER PUBLISHES IT TOO (owner ruling
+    # 2026-09-24, Q29): a plan produces its own carry, so the in-band
+    # reference reads the plan's carry and only the scan of the empty plan
+    # is the truth. bptt's exact container keeps the in-band reference.
+    exact = ex.data_gen("RSNN_SHD", dataset=None, key=jax.random.PRNGKey(1),
+                        temporal_rule="rtrl", carry_container="exact")
+    assert getattr(exact, "reference_draw", None) is not None
+    assert getattr(exact, "with_program", None) is not None
+    bp = ex.data_gen("RSNN_SHD", dataset=None, key=jax.random.PRNGKey(1),
+                     temporal_rule="bptt", carry_container="exact")
+    assert getattr(bp, "reference_draw", None) is None
+    assert getattr(bp, "with_program", None) is None
 
 
 def test_the_oracle_reference_makes_the_accumulated_error_visible():
@@ -1015,7 +1035,7 @@ def test_the_oracle_reference_makes_the_accumulated_error_visible():
     """
     import alphagrad.approx.env as envmod
 
-    fn = ex.get_fn("RSNN_SHD")
+    fn = _loss_fn()
     argnums = tuple(ex.infer_argnums("RSNN_SHD"))
     t = 40
     seq, y, _ = R._draw_recording(jax.random.PRNGKey(1), None, -1)
@@ -1077,7 +1097,7 @@ def test_without_the_reference_draw_the_same_channel_reads_one():
     approximated carry and the channel cannot see what the rule did."""
     import alphagrad.approx.env as envmod
 
-    fn = ex.get_fn("RSNN_SHD")
+    fn = _loss_fn()
     argnums = tuple(ex.infer_argnums("RSNN_SHD"))
     t = 40
     seq, y, _ = R._draw_recording(jax.random.PRNGKey(1), None, -1)
@@ -1119,7 +1139,7 @@ def test_without_the_reference_draw_the_same_channel_reads_one():
 def test_the_oracle_reference_is_not_the_same_number_as_the_in_band_one():
     """Without it the channel reads 1.0 for a rule that accumulated real
     error: both sides read the same approximated carry."""
-    fn = ex.get_fn("RSNN_SHD")
+    fn = _loss_fn()
     argnums = tuple(ex.infer_argnums("RSNN_SHD"))
     seq, y, _ = R._draw_recording(jax.random.PRNGKey(1), None, -1)
     W = R.rsnn_weights(jax.random.PRNGKey(1))
@@ -1213,8 +1233,10 @@ def test_the_forward_value_does_not_move_between_any_two_containers():
     fn = ex.get_fn("RSNN_SHD")
     base = float(fn(*_args("tbptt")))
     for container in CLASS_CONTAINERS:
-        assert float(fn(*_args("rtrl", carry_container=container))) == base, \
-            container
+        out = fn(*_args("rtrl", carry_container=container))
+        # (loss, S, I, U, a, Uo): the first output is the scalar loss.
+        assert isinstance(out, tuple) and len(out) == 6, container
+        assert float(out[0]) == base, container
 
 
 def test_the_reduce_container_is_the_exact_axis_mean():
@@ -1271,7 +1293,7 @@ def test_a_reduce_and_a_quant_plan_score_below_one(container):
     the quality the record shows is below 1.0. Scored against the ORACLE --
     the exact carry on the same step -- because both sides of the in-band
     cosine would read the same approximated argument."""
-    fn = ex.get_fn("RSNN_SHD")
+    fn = _loss_fn()
     argnums = tuple(ex.infer_argnums("RSNN_SHD"))
     seq, y, _ = R._draw_recording(jax.random.PRNGKey(1), None, -1)
     W = R.rsnn_weights(jax.random.PRNGKey(1))
@@ -1870,7 +1892,8 @@ W, V, Wo = R.rsnn_weights(key[1])
 weights = (W, V, Wo)
 c = R._consts()
 a_syn, a_mem, a_out, rho = R.decay_constants()
-fn = ex.get_fn("RSNN_SHD")
+fn_full = ex.get_fn("RSNN_SHD")
+fn = lambda *a: R.loss_of(fn_full(*a))
 
 
 def states(t):
@@ -1976,3 +1999,203 @@ def test_the_diag_plan_is_the_eprop_recursion_in_float64():
     for t in (3, 7):
         assert out[f"diag_vs_hand_eprop_t{t}"] < 1e-12, out
         assert out[f"carry_bytes_t{t}"] > 0
+
+
+# ---------------------------------------------------------------------------
+# 18. THE PLAN PRODUCES ITS OWN CARRY (owner rulings 2026-09-24, Q27b, Q28a,
+#     Q29, Q30)
+#
+# The rtrl target returns (loss, S, I, U, a, Uo). The Jacobian rows of the
+# state ARE the next carry, the container projects them to its class at the
+# output of every step, and the given value at t is the plan's own program
+# scanned over the prefix. The closed-form recursions are the float64 oracles.
+# ---------------------------------------------------------------------------
+
+_PLAN_CARRY = r'''
+import os, json
+os.environ["JAX_ENABLE_X64"] = "1"
+os.environ.setdefault("ALPHAGRAD_SKIP_COUNT_OPS", "1")
+import numpy as np, jax, jax.numpy as jnp
+from alphagrad.approx.common import examples as ex, rsnn_shd as R
+from alphagrad.approx.common import carry_plan as CP
+import alphagrad.approx.env as envmod
+import alphagrad.approx.tools.landscape_map as lm
+from graphax import jacve
+
+assert jax.config.jax_enable_x64
+H, T = 6, 9
+R.RSNN_HIDDEN = H
+R.SHD_TIME_BINS = T
+argv = ["--example", "RSNN_SHD", "--dataset", "none", "--temporal-rule",
+        "rtrl", "--step-position", "3", "--seed", "5", "--num-eval-samples",
+        "1", "--num-data-points", "1", "--reps-per-point", "1", "--out-dir",
+        "/tmp/plan_carry_test"]
+args = lm.make_argparser().parse_args(argv)
+env, _samples, _cj = lm.build_env(args)
+spec = CP._entry(env.config)["spec"]
+k = jax.random.split(spec["key"], 3)
+seq, y, _ = R._draw_recording(k[0], None, -1)
+W = R.rsnn_weights(k[1])
+for a, b in zip(env.args[7:10], W):
+    assert np.array_equal(np.asarray(a), np.asarray(b))
+fn = env.config.target_fun
+
+
+def rel(a, b):
+    a, b = np.asarray(a, np.float64), np.asarray(b, np.float64)
+    n = np.linalg.norm(b)
+    return float(np.linalg.norm(a - b) / n) if n else float(np.linalg.norm(a - b))
+
+
+out = {}
+# (i) THE EMPTY PLAN: its scan is the exact carry, step for step.
+prog = R.empty_plan_program()
+worst = 0.0
+for t in range(1, T):
+    got = R.carry_from_program(seq, y, t, W, prog, "exact")
+    want = R.carried_jacobians(seq, t, W)
+    worst = max(worst, max(rel(a, b) for a, b in zip(got, want)))
+out["empty_plan_vs_carried_jacobians"] = worst
+
+# (ii) THE LOSS ROW of the (loss, state) program is jax.grad of the loss.
+xs = env.args
+rows = jacve(fn, "rev", argnums=(7, 8, 9))(*xs)
+assert len(rows) == 6
+g = jax.grad(lambda *a: fn(*a)[0], argnums=(7, 8, 9))(*xs)
+out["loss_row_vs_grad"] = max(rel(a, b) for a, b in zip(rows[0], g))
+
+# (iii) THE TWO-DIAG PLAN through the wire path: container Diag on the carry
+# dot_generals plus a Diag on slot 0 of the recurrent face's STATE edge, the
+# callback's own chain (container -> variant -> transport -> face transforms
+# -> jacve), scanned over the prefix: e-prop's traces, step for step.
+jx = env.config.jaxpr
+valid = sorted(int(v) for v in env.valid_vertices)
+mask = CP.carry_scope_mask(jx)
+order = sorted(valid, reverse=True)
+inv = lm.face_inventory(env, np.asarray(order, dtype=np.int32))
+carry_dot = [v for v in valid if mask[v - 1]
+             and jx.eqns[v - 1].primitive.name == "dot_general"]
+rec_v = [v for v in valid if not mask[v - 1]
+         and jx.eqns[v - 1].primitive.name == "dot_general"
+         and any(iv is jx.invars[8] for iv in jx.eqns[v - 1].invars)]
+assert len(rec_v) == 1, rec_v
+rec_v = rec_v[0]
+s_faces = [e for e in inv if int(e["vertex"]) == rec_v
+           and int(e["key"][0]) not in (7, 8)]
+assert len(s_faces) == 1, s_faces
+out["recurrent_vertex"] = int(rec_v)
+out["state_edge_face_key"] = [int(x) for x in s_faces[0]["key"]]
+wires = [{"k": int(e["k"]), "f": int(e["f"]), "slot": 0, "row": [0, 0, -1],
+          "kind": "X"} for e in inv if int(e["vertex"]) in carry_dot]
+wires += [{"k": int(e["k"]), "f": int(e["f"]), "slot": 0, "row": [0, 0, -1],
+           "kind": "X"} for e in s_faces]
+plan = {"specs": None, "face_specs": None, "face_skips": None, "wires": wires}
+specs, faces, skips = lm.get_plan_arrays(plan, len(order))
+specs, faces, skips = np.asarray(specs), np.asarray(faces), np.asarray(skips)
+container = CP.container_for_plan(env.config, order, faces, skips, specs)
+assert container == "diag", container
+var = CP.measurement_env("diag", env.config)
+o2, m_specs, m_faces, m_skips, m_joins = CP.transport_wires(
+    order, var, specs, faces, skips, None)
+cfg, vargs, consts = var["config"], var["args"], var["consts"]
+specs_list = m_specs.tolist()
+transforms, _ = envmod._decode_vertex_transforms(cfg, o2, specs_list)
+ft = envmod._face_transforms_for_order(
+    cfg, consts, vargs, o2, specs_list, m_faces, m_skips,
+    wire_sig=envmod._face_wire_keys(m_faces, m_skips, len(o2), m_joins),
+    face_joins_list=m_joins)
+program = jacve(cfg.target_fun, list(o2), argnums=cfg.argnums,
+                has_aux=cfg.has_aux, sparse_representation=False,
+                jaxpr=cfg.jaxpr, consts=list(consts), transforms=transforms,
+                face_transforms=ft)
+worst = 0.0
+for t in range(1, T):
+    got = R.carry_from_program(seq, y, t, W, program, "diag")
+    want = R.carry_traces(seq, t, W)
+    worst = max(worst, max(rel(a, b) for a, b in zip(got, want)))
+out["two_diag_plan_vs_carry_traces"] = worst
+# The same plan's generator draw at the pinned step is the same number.
+gen = cfg.data_gen.with_program(program)
+keys = jax.random.split(jax.random.PRNGKey(0), 5)
+data = dict(zip(gen.data_slots, gen(keys)))
+t_drawn = int(gen.meta(keys)["t"])
+want = R.carry_traces(seq, t_drawn, W)
+out["plan_draw_vs_carry_traces"] = max(
+    rel(data[16 + i], w) for i, w in enumerate(want))
+print("RESULT " + json.dumps(out))
+'''
+
+
+@pytest.fixture(scope="module")
+def plan_carry_results():
+    from alphagrad.approx.common import carry_plan as CP
+    CP.reset()
+    try:
+        return _run_float64(_PLAN_CARRY)
+    finally:
+        CP.reset()
+
+
+def test_the_empty_plans_scan_is_the_exact_carry(plan_carry_results):
+    assert plan_carry_results["empty_plan_vs_carried_jacobians"] < 1e-11
+
+
+def test_the_loss_row_is_the_gradient(plan_carry_results):
+    assert plan_carry_results["loss_row_vs_grad"] < 1e-12
+
+
+def test_the_two_diag_plans_scan_is_eprop(plan_carry_results):
+    """Container Diag + Diag on the state operand of the recurrent face
+    (vertex 30, face key [36, 99] on the full graph; located by structure
+    here) scanned over the prefix IS carry_traces at every step."""
+    out = plan_carry_results
+    assert out["two_diag_plan_vs_carry_traces"] < 1e-11, out
+    assert out["plan_draw_vs_carry_traces"] < 1e-11, out
+
+
+def test_every_container_reads_back_from_the_projection():
+    """The projection lands in the shapes and the dtype the attachment reads
+    as that container (owner ruling 2026-09-24, Q28a)."""
+    from graphax import jacve
+    from graphax.examples.neuromorphic import (
+        RSNN_CARRY_CONTAINERS, project_rsnn_carry, rsnn_carry_container,
+        rsnn_zero_carry)
+    xs = _args("rtrl")
+    fn = ex.get_fn("RSNN_SHD")
+    rows = jacve(fn, "rev", argnums=(7, 8, 9))(*xs)
+    states = tuple(xs[2:7])
+    weights = tuple(xs[7:10])
+    for name in RSNN_CARRY_CONTAINERS:
+        for given in (project_rsnn_carry(rows[1:], name, weights),
+                      rsnn_zero_carry(name, weights)):
+            assert len(given) == len(RSNN_CARRY_STACKS)
+            for (ss, w), J in zip(RSNN_CARRY_STACKS, given):
+                c = rsnn_carry_container((ss[0], w), states[ss[0]].shape,
+                                         weights[w].shape, J.shape, J.dtype,
+                                         n_stacked=len(ss))
+                assert c.name == name, (name, (ss, w), J.shape, J.dtype)
+
+
+def test_the_state_outputs_stay_eliminable():
+    """The state outputs feed the loss, so they are vo vertices and stay
+    eliminable. The one vertex that leaves the eliminable set is the one
+    producing ``a``, which feeds nothing in one step and is a pure output."""
+    from alphagrad.approx.common import carry_plan as CP
+    jx, consts, xs = _jaxpr("rtrl")
+    valid = set(CP.valid_vertices(jx, xs, consts, (7, 8, 9)))
+    producer = {v: i + 1 for i, e in enumerate(jx.eqns) for v in e.outvars}
+    outs = [producer[v] for v in jx.outvars]
+    assert len(outs) == 6
+    loss_v, s_v, i_v, u_v, a_v, uo_v = outs
+    assert loss_v not in valid
+    for v in (s_v, i_v, u_v, uo_v):
+        assert v in valid, v
+    assert a_v not in valid
+    jt, ct, xt = _jaxpr("tbptt")
+    valid_t = set(CP.valid_vertices(jt, xt, ct, (7, 8, 9)))
+    mask = [SNN_CARRY_SCOPE in str(getattr(e.source_info, "name_stack", ""))
+            for e in jx.eqns]
+    n_carry = sum(1 for v in valid if mask[v - 1])
+    # rtrl = tbptt's body plus the carry block, minus the one pure output
+    assert len(valid) == len(valid_t) + n_carry - 1, (
+        len(valid), len(valid_t), n_carry)

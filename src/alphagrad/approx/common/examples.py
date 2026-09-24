@@ -42,6 +42,7 @@ from alphagrad.approx.common.rsnn_shd import (
     rsnn_batch,
     rsnn_data_gen,
     vmapped_step_body,
+    vmapped_step_target,
 )
 
 # ALPHAGRAD_SNN_STEPS and ALPHAGRAD_SNN_TRUNC were the two environment
@@ -683,9 +684,10 @@ def get_fn(fn_str: str):
         return lambda *a: jnp.mean(raw(*a)[0])
 
     # THE BATCHED RECURRENT STEP returns B step losses, one per recording;
-    # the loss is their mean, as the batch of a training run is.
+    # the loss is their mean, as the batch of a training run is. Under rtrl
+    # the B next states follow the loss (owner ruling 2026-09-24, Q27b).
     if batched and base == RSNN_TARGET:
-        return lambda *a: jnp.mean(raw(*a))
+        return vmapped_step_target
 
     # ALREADY THE LOSS. ``LIF_SNN_SHD`` / ``ADALIF_SNN_SEQ`` reduce inside the
     # model and return 0-d. Nothing is added: the model IS the target.
@@ -718,7 +720,10 @@ def scalar_loss_fn(fn, example: str | None = None):
     """
     def _checked(*a):
         out = fn(*a)
-        if getattr(out, "shape", None) != ():
+        head = out[0] if isinstance(out, tuple) and out else out
+        # A tuple whose first element is the scalar loss is the carried-state
+        # form of the recurrent rtrl target (owner ruling 2026-09-24, Q27b).
+        if getattr(head, "shape", None) != ():
             raise ValueError(
                 f"target {example or fn!r} is not a scalar loss: its output "
                 f"is {jax.tree_util.tree_structure(out)} with shapes "

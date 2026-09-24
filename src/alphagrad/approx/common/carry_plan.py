@@ -402,31 +402,52 @@ def measurement_env(container: str, config=None) -> dict | None:
     return v
 
 
-def eval_samples_for(container: str, eval_samples, config=None):
+def plan_generator(generator, program):
+    """``generator`` redrawing its given tuple through ``program``, the
+    plan's own one-step program (owner ruling 2026-09-24, Q29), or ``None``
+    when the generator has no such draw (a rule with no carry)."""
+    with_program = getattr(generator, "with_program", None)
+    if with_program is None:
+        return None
+    return with_program(program)
+
+
+def eval_samples_for(container: str, eval_samples, config=None,
+                     generator=None):
     """This episode's eval samples, redrawn in ``container``.
 
     Keyed by a digest of the base draw (:func:`_eval_key`), so every process
     that measures this plan builds the same ones, and cached per (container,
     digest) INSIDE the graph's own entry, so two graphs in one process never
     read each other's draw. ``config`` names which graph.
+
+    With ``generator`` -- the plan's own draw from :func:`plan_generator` --
+    the samples are drawn through it on the container's program (the base
+    program for ``exact``) and are NOT cached: they belong to one plan.
     """
     if not eval_samples:
         return None
-    var = measurement_env(container, config)
-    if var is None:
+    entry = _entry(config)
+    if entry is None:
         return None
-    cache = _entry(config)["eval_samples"]
+    var = measurement_env(container, config)
+    if var is None and generator is None:
+        return None
     n = int(len(eval_samples[0]))
+    from alphagrad.approx.common.eval_samples import generate_eval_samples
+
+    class _Shim:
+        config = entry["base"]["config"] if var is None else var["config"]
+        args = entry["base"]["args"] if var is None else var["args"]
+
+    if generator is not None:
+        _Shim.config = _Shim.config._replace(data_gen=generator)
+        return generate_eval_samples(_Shim, _eval_key(eval_samples), n)
+    cache = entry["eval_samples"]
     tag = (container, _eval_tag(eval_samples), n)
     hit = cache.get(tag)
     if hit is not None:
         return hit
-    from alphagrad.approx.common.eval_samples import generate_eval_samples
-
-    class _Shim:
-        config = var["config"]
-        args = var["args"]
-
     out = generate_eval_samples(_Shim, _eval_key(eval_samples), n)
     if len(cache) > 64:
         cache.clear()

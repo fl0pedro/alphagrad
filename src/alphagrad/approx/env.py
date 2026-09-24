@@ -1696,7 +1696,8 @@ def consume_sparsity_stats() -> dict:
     return out
 
 
-def _residual_scores(exact_out, approx_out, has_aux: bool):
+def _residual_scores(exact_out, approx_out, has_aux: bool,
+                     carried_outputs: int = 0):
     """``(rel_frob, cos)`` of ``approx_out`` against ``exact_out``, STREAMED.
 
     The same accumulator as `_quality_metrics` (``_gradient_similarity``: the
@@ -1710,6 +1711,9 @@ def _residual_scores(exact_out, approx_out, has_aux: bool):
     """
     e_out = exact_out[1] if has_aux else exact_out
     a_out = approx_out[1] if has_aux else approx_out
+    if int(carried_outputs or 0) > 0:
+        # The loss row only (owner ruling 2026-09-24, Q27b).
+        e_out, a_out = e_out[0], a_out[0]
     leaves_e = _gradient_leaves(e_out)
     if not leaves_e or all(x is None for x in leaves_e):
         return float("nan"), float("nan")
@@ -1725,7 +1729,7 @@ def _residual_scores(exact_out, approx_out, has_aux: bool):
 
 
 def _exact_ref_scores(compile_fn, eval_args, has_aux: bool, approx_out,
-                      want_cos: bool = False):
+                      want_cos: bool = False, carried_outputs: int = 0):
     """ONE exact execution serving the fidelity channel (and the cosine log).
 
     Returns ``(rel_frob, cos)``; ``cos`` is ``None`` unless ``want_cos``.
@@ -1737,7 +1741,8 @@ def _exact_ref_scores(compile_fn, eval_args, has_aux: bool, approx_out,
     out = compile_fn()(*eval_args)
     _FIDELITY_STATS["exact_execs"] += 1
     try:
-        rel_frob, cos = _residual_scores(out, approx_out, has_aux)
+        rel_frob, cos = _residual_scores(out, approx_out, has_aux,
+                                         carried_outputs)
     finally:
         out = None
     return rel_frob, (cos if want_cos else None)
@@ -3485,6 +3490,13 @@ class EnvConfig(NamedTuple):
     # gradient cosine (defined only for a scalar loss) and the legacy Jacobian
     # cosine.
     scalar_target: bool = False
+    # HOW MANY OUTPUTS FOLLOW THE SCALAR LOSS (owner ruling 2026-09-24,
+    # Q27b). The recurrent rtrl target returns ``(loss, S, I, U, a, Uo)``:
+    # the first output is the loss, the rest is the carried state whose
+    # Jacobian rows are the next carry. The quality channel reads the loss
+    # row only (``_loss_rows``); every cost channel measures the whole
+    # program. 0 for every other target. Read off the jaxpr by ``from_jaxpr``.
+    carried_outputs: int = 0
     # DEPRECATED AND UNREAD. ``--measure-grad`` used to decide what was traced.
     # The traced target is now unconditionally the registered target
     # (``common.examples.get_fn`` = model + loss), so this field selects
@@ -4129,6 +4141,37 @@ def _gradient_leaves(tree):
     ``None`` leaf so the two sides pair up positionally."""
     return jax.tree_util.tree_leaves(
         tree, is_leaf=lambda x: x is None or _is_sparse_tensor(x))
+
+
+def _loss_rows(config, out):
+    """THE LOSS ROW of a program's output (owner ruling 2026-09-24, Q27b).
+
+    A target with carried outputs returns one row tuple per output and the
+    quality channel reads the first, the gradient of the loss; the state rows
+    are the next carry and are the cost channels' business. Every other
+    target's output is already its gradient."""
+    if int(getattr(config, "carried_outputs", 0) or 0) > 0:
+        return out[0]
+    return out
+
+
+_LOSS_TARGETS: dict = {}
+
+
+def _loss_target(config):
+    """``config.target_fun`` as the scalar loss, for ``jax.grad``. One
+    wrapper per target, so a cache keyed on its identity holds."""
+    fn = config.target_fun
+    if int(getattr(config, "carried_outputs", 0) or 0) == 0:
+        return fn
+    hit = _LOSS_TARGETS.get(id(fn))
+    if hit is not None and hit[0] is fn:
+        return hit[1]
+    wrapped = lambda *a: fn(*a)[0]
+    if len(_LOSS_TARGETS) > 64:
+        _LOSS_TARGETS.clear()
+    _LOSS_TARGETS[id(fn)] = (fn, wrapped)
+    return wrapped
 
 
 def _is_sparse_tensor(x) -> bool:
@@ -5339,7 +5382,8 @@ def _grad_oracle_exact(config, order, args, device=None):
     exe = (lowered.compile() if _is_cpu_device(device)
            else _compile_measure(lowered))
     out = exe(*args)
-    return _gradient_leaves(out[1] if config.has_aux else out)
+    return _gradient_leaves(_loss_rows(config, out[1] if config.has_aux
+                                       else out))
 
 
 def _grad_oracle_reference(config, args, device, probe_seed):
@@ -5375,7 +5419,7 @@ def _grad_oracle_reference(config, args, device, probe_seed):
         _GRAD_ORACLE_REF_STATS["hits"] += 1
         return hit[2]
     _GRAD_ORACLE_REF_STATS["misses"] += 1
-    ref = jax.grad(config.target_fun, argnums=config.argnums,
+    ref = jax.grad(_loss_target(config), argnums=config.argnums,
                    has_aux=config.has_aux)(*args)
     ref = ref[0] if config.has_aux else ref
     leaves = jax.tree_util.tree_leaves(ref)
@@ -5889,7 +5933,11 @@ def _probe_batch(config, base_args, role: str = "train",
     # and it is the ONE place that does: the cosine's reference is keyed on
     # the same number.
     _seed = _probe_seed(config, role, episode, index)
-    _key = (id(config.data_gen), id(draw), _seed,
+    # KEYED ON THE DRAW, not on the generator: under an rtrl generator every
+    # plan carries its own draw (owner ruling 2026-09-24, Q29) and the exact
+    # reference draw they all publish is one object, so it is drawn once per
+    # probe batch and not once per plan.
+    _key = (id(draw), _seed,
             tuple(getattr(a, "shape", ()) for a in base_args[:2]))
     hit = _PROBE_BATCH.get(_key)
     if hit is not None:
@@ -6002,6 +6050,30 @@ def _cosine_reference(ref_ex, ref_key, args, device, probe_seed):
     return out
 
 
+def _oracle_reference_grad(target, argnums, has_aux, args, device, probe_seed):
+    """``jax.grad`` of ``target`` on the reference draw, once per probe batch.
+
+    The same table and the same seed as :func:`_cosine_reference`: under an
+    rtrl generator every plan draws its own carry (owner ruling 2026-09-24,
+    Q29) and scores against the exact draw at the same step, so the exact
+    gradient of that draw is one number per probe batch, not per plan."""
+    key = (b"oracle-ref", id(target), tuple(int(i) for i in argnums),
+           str(device), int(probe_seed),
+           tuple((tuple(getattr(x, "shape", ())), str(getattr(x, "dtype", "")))
+                 for x in args))
+    hit = _COSINE_REF.get(key)
+    if hit is not None:
+        _COSINE_REF_STATS["hits"] += 1
+        return hit[1]
+    _COSINE_REF_STATS["misses"] += 1
+    jac_e = jax.grad(target, argnums=argnums, has_aux=has_aux)(*args)
+    jac_e = jac_e[0] if has_aux else jac_e
+    if len(_COSINE_REF) >= _COSINE_REF_MAX:
+        _COSINE_REF.clear()
+    _COSINE_REF[key] = (target, jac_e)
+    return jac_e
+
+
 # THE CONFIGURATION HAS NO QUALITY CHANNEL AT ALL: no rev-exact reference and
 # no data generator, so no probe batch exists and no plan of this run can ever
 # be scored. This is NOT the refusable case. `None` means the apparatus DID
@@ -6090,7 +6162,7 @@ def _grad_cosine_quality(config, compiled_approx, ref_ex, ref_key, base_args,
                 if _ref_oracle is None:
                     ar = list(base_args)
                     _r_slots = _data_slots(config, r_data)
-                    _r_target = config.target_fun
+                    _r_target = _loss_target(config)
                     _r_argnums = config.argnums
                 else:
                     ar = list(_ref_oracle["args"])
@@ -6099,19 +6171,19 @@ def _grad_cosine_quality(config, compiled_approx, ref_ex, ref_key, base_args,
                     _r_argnums = tuple(_ref_oracle["argnums"])
                 for slot, d in zip(_r_slots, r_data):
                     ar[slot] = jax.device_put(jnp.asarray(d), device)
-                jac_e = jax.grad(_r_target, argnums=_r_argnums,
-                                 has_aux=config.has_aux)(*ar)
-                jac_e = jac_e[0] if config.has_aux else jac_e
+                jac_e = _oracle_reference_grad(
+                    _r_target, _r_argnums, config.has_aux, ar, device, _seed)
                 out_e = None
             else:
                 # The CACHED REV-EXACT REFERENCE, not a same-order exact
                 # program: one executable for the process, one execution per
                 # probe batch (agent/ref16, owner ruling 2026-09-18).
                 out_e = _cosine_reference(ref_ex, ref_key, a, device, _seed)
-                jac_e = out_e[1] if config.has_aux else out_e
+                jac_e = _loss_rows(config, out_e[1] if config.has_aux
+                                   else out_e)
         except Exception:
             return None
-        jac_a = out_a[1] if config.has_aux else out_a
+        jac_a = _loss_rows(config, out_a[1] if config.has_aux else out_a)
         if _oracle_ref:
             cos, rel = _dense_cosine(jac_e, jac_a)
         else:
@@ -6242,7 +6314,7 @@ def _loss_drop_quality(config, compiled_approx, base_args, device=None,
         for i, wi in zip(wnums, weights):
             a[i] = wi
         out = compiled_approx(*a)
-        out = out[1] if config.has_aux else out
+        out = _loss_rows(config, out[1] if config.has_aux else out)
         leaves = jax.tree_util.tree_leaves(out)
         if len(leaves) <= max(_grad_pos):
             return None
@@ -8934,8 +9006,10 @@ def _callback_measured(
             # the shapes of the given values move with the container -- so
             # they are drawn from a DIGEST of the base draw, which every
             # process that measures this plan computes the same way and which
-            # moves per episode exactly as the base draw does.
-            if eval_samples:
+            # moves per episode exactly as the base draw does. A generator
+            # that draws PER PLAN (`with_program`) is served below instead.
+            if eval_samples and getattr(config.data_gen, "with_program",
+                                        None) is None:
                 eval_samples = tuple(
                     _carry.eval_samples_for(_carry_container, eval_samples,
                                             _carry_base_cfg))
@@ -8951,6 +9025,60 @@ def _callback_measured(
             _c_entry["base"] if _c_var is None else _c_var,
             _c_entry["spec"]["rule"])
     _pf("cb.carry_container")
+
+    def _jacve_fn(approx: bool, sparse=None):
+        """THE elimination, built once. `approx=False` is the exact
+        reference: same order, same argnums, same has_aux, same sparse
+        representation, and NOTHING but the two approximation kwargs
+        dropped -- which is what makes any approx/exact ratio taken over
+        this pair a statement about the approximation alone. Both the
+        compiles below and the sparsity tally's abstract fallback walk
+        go through here so a change to one cannot miss the other.
+        ``sparse`` overrides the return form only (the carry producer
+        wants dense rows); the elimination is the same."""
+        _kw = ({"transforms": transforms,
+                "face_transforms": ft_by_vertex} if approx else {})
+        return jacve(
+            config.target_fun,
+            list(o_list),
+            argnums=config.argnums,
+            has_aux=config.has_aux,
+            sparse_representation=(config.sparse if sparse is None
+                                   else bool(sparse)),
+            # ONE JAXPR FOR BOTH PATHS (dsnn-dfw.24). The order and the face
+            # keys are numbered on `config.jaxpr`; a fresh trace inside
+            # `.lower()` is a different equation list for the same function
+            # (measured on window2: 90 equations against 72, every
+            # `convert_element_type` moved), and then the plan addresses
+            # vertices that are not there.
+            jaxpr=config.jaxpr,
+            consts=list(consts),
+            **_kw,
+        )
+
+    # ------------------------------------------------------------------
+    # THE PLAN PRODUCES ITS OWN CARRY (owner rulings 2026-09-24, Q28a, Q29).
+    # ------------------------------------------------------------------
+    # On the rtrl graph the given value at step t is the plan's OWN one-step
+    # program scanned over the prefix from the zero carry, the state rows
+    # projected to the container at every step. So the eval samples the cost
+    # channels execute and the probe batches the quality channel scores are
+    # drawn per plan, through the generator's `with_program`; the exact
+    # reference draw the generator publishes (the scan of the empty plan)
+    # stays shared. A Skip on the carried face has no carry and no program to
+    # scan; a rule with no given edge has no `with_program`.
+    from alphagrad.approx.common.rsnn_shd import SKIP_CONTAINER as _SKIP
+    if (is_terminal and _carry_container is not None
+            and _carry_container != _SKIP):
+        _plan_gen = _carry.plan_generator(
+            config.data_gen, _jacve_fn(approx=True, sparse=False))
+        if _plan_gen is not None:
+            config = config._replace(data_gen=_plan_gen)
+            if eval_samples:
+                eval_samples = tuple(_carry.eval_samples_for(
+                    _carry_container, _ref_eval, _carry_base_cfg,
+                    generator=_plan_gen))
+    _pf("cb.plan_carry")
 
     # ------------------------------------------------------------------
     # Compute family — graphax counters (always) → muls_adds_fmas, max_io_sum.
@@ -9186,33 +9314,6 @@ def _callback_measured(
     if callback_device is not None:
         h.update(repr(callback_device).encode())
     cache_key = h.digest()
-
-    def _jacve_fn(approx: bool):
-        """THE elimination, built once. `approx=False` is the exact
-        reference: same order, same argnums, same has_aux, same sparse
-        representation, and NOTHING but the two approximation kwargs
-        dropped -- which is what makes any approx/exact ratio taken over
-        this pair a statement about the approximation alone. Both the
-        compiles below and the sparsity tally's abstract fallback walk
-        go through here so a change to one cannot miss the other."""
-        _kw = ({"transforms": transforms,
-                "face_transforms": ft_by_vertex} if approx else {})
-        return jacve(
-            config.target_fun,
-            list(o_list),
-            argnums=config.argnums,
-            has_aux=config.has_aux,
-            sparse_representation=config.sparse,
-            # ONE JAXPR FOR BOTH PATHS (dsnn-dfw.24). The order and the face
-            # keys are numbered on `config.jaxpr`; a fresh trace inside
-            # `.lower()` is a different equation list for the same function
-            # (measured on window2: 90 equations against 72, every
-            # `convert_element_type` moved), and then the plan addresses
-            # vertices that are not there.
-            jaxpr=config.jaxpr,
-            consts=list(consts),
-            **_kw,
-        )
 
     def _do_compile_approx():
         # THE MEASURED ELIMINATION. graphax invokes every per-vertex/per-face
@@ -9949,8 +10050,10 @@ def _callback_measured(
                 # residual is NO LONGER DISCARDED (A2): it is the fidelity
                 # channel, and here it is genuinely free because the exact
                 # reference is already resident for the cosine.
-                _jac_a = out_approx[1] if config.has_aux else out_approx
-                _jac_e = out_exact[1] if config.has_aux else out_exact
+                _jac_a = _loss_rows(config, out_approx[1] if config.has_aux
+                                    else out_approx)
+                _jac_e = _loss_rows(config, out_exact[1] if config.has_aux
+                                    else out_exact)
                 _cos, _rf = _quality_metrics(_jac_e, _jac_a, align=True,
                                              site="jac_cosine")
                 cosines.append(_cos)
@@ -10272,6 +10375,7 @@ def _callback_measured(
                 config.has_aux,
                 approx_out=_fid_approx_out,
                 want_cos=True,
+                carried_outputs=int(getattr(config, "carried_outputs", 0) or 0),
             )
         except Exception as _exc:
             _fid_approx_out = None
@@ -10660,11 +10764,21 @@ class VertexEliminationEnv:
         _outs0 = getattr(jaxpr, "out_avals", None) or [
             getattr(v, "aval", None) for v in jaxpr.jaxpr.outvars
         ]
-        _is_scalar = not [
-            a for a in _outs0
-            if a is not None and getattr(a, "shape", ()) not in ((), (1,))
-        ]
-        if measure_grad or scalar_target:
+
+        def _is_0d(a):
+            return a is None or getattr(a, "shape", ()) in ((), (1,))
+
+        # THE RULE (owner ruling 2026-09-24, Q27b): THE FIRST OUTPUT IS THE
+        # SCALAR LOSS. Every output behind it is carried state, whose
+        # Jacobian rows are the next carry; a caller that arms
+        # ``scalar_target`` states that. Unarmed, a multi-output jaxpr is an
+        # analytic Jacobian benchmark and stays what it was.
+        _first_scalar = bool(_outs0) and _is_0d(_outs0[0])
+        _rest_scalar = all(_is_0d(a) for a in _outs0[1:])
+        _armed = bool(measure_grad or scalar_target)
+        _is_scalar = _first_scalar and (_rest_scalar or _armed)
+        _carried = 0 if (_rest_scalar or not _is_scalar) else len(_outs0) - 1
+        if _armed:
             # THE SCALAR-OUTPUT CONTRACT: the traced function is a SCALAR
             # loss, so differentiating its jaxpr already yields gradients —
             # which is what the spec asks to measure ("instead of returning
@@ -10682,19 +10796,13 @@ class VertexEliminationEnv:
             # ``--measure-grad`` does not arm anything any more.
             # It stays default-False so the callers that legitimately trace a
             # NON-scalar target (elimrl, bare-jaxpr tests) are unaffected.
-            _outs = getattr(jaxpr, "out_avals", None) or [
-                getattr(v, "aval", None) for v in jaxpr.jaxpr.outvars
-            ]
-            _bad = [
-                a for a in _outs
-                if a is not None and getattr(a, "shape", ()) not in ((), (1,))
-            ]
-            if _bad:
+            if not _first_scalar:
                 raise ValueError(
                     "a SCALAR-output target is required (so jacve of it "
                     "yields gradients); got output avals "
-                    f"{[getattr(a, 'shape', a) for a in _outs]}. The "
-                    "registered target must BE model + loss (see "
+                    f"{[getattr(a, 'shape', a) for a in _outs0]}. The "
+                    "registered target must BE model + loss, or the loss "
+                    "followed by the carried state (see "
                     "common.examples.get_fn), or drop scalar_target."
                 )
         if argnums is not None and args is None:
@@ -10725,6 +10833,7 @@ class VertexEliminationEnv:
             delta_obs=bool(delta_obs),
             measure_grad=bool(measure_grad),
             scalar_target=bool(_is_scalar),
+            carried_outputs=int(_carried),
             delta_window=int(delta_window or 0),
             grad_oracle_cadence=int(grad_oracle_cadence) if grad_oracle_cadence is not None else 50,
         )
