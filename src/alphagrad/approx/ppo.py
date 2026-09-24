@@ -238,6 +238,7 @@ from alphagrad.approx.common import auto_stop as _auto
 # grid and the front comparison live in that module; this file pins w and
 # rolls out.
 from alphagrad.approx.common import preference_sweep as _psweep
+from alphagrad.approx.common import repro_bundle as _repro
 
 # Same switch carry_stream reads, so one flag turns the whole fold on or
 # off rather than leaving half the consumers folded and half not.
@@ -14373,6 +14374,14 @@ def main(args=None):
         mode="disabled" if args.wandb == "disabled" else args.wandb,
         **_wandb_resume,
     )
+
+    def _repro_run():
+        return _repro.run_identity(args, _wandb_config, wandb.run)
+
+    def _repro_guard(fn, source, episode):
+        return _repro.guard(fn, source=source, episode=episode, run=_repro_run,
+                            records=_ep_env_mod._PLAN_RECORDS)
+
     # Pareto front over the three objectives the spec plots: compute cost,
     # memory, accuracy. All are stored "higher is better", matching the
     # archive's maximisation convention.
@@ -15488,6 +15497,10 @@ def main(args=None):
                       file=sys.stderr, flush=True)
             log_dict["plan_log/wall_s"] = float(
                 _prof_time.perf_counter() - _plog_t0)
+            for _rb_path in _repro.write_refused(
+                    host_state.get("_gate_records") or (), _repro_run):
+                print(f"[repro] ep{ep}: a refused measurement raised: bundle "
+                      f"{_rb_path}", flush=True)
 
         # ---- GATE G1-G6 TELEMETRY (ticket .45) ------------------------------
         # Computed from copies the trainer already holds: the plan records
@@ -17293,7 +17306,8 @@ def main(args=None):
         if _TWO_GRAPH:
             _swap_graph(_GSTATES.rule_for(int(prev["ctx"]["ep"])))
         (_fm, _ovr, _vm, _pin, _mm, _kl, _e2, _w2) = prev["args"]
-        return _episode_update_jit(
+        return _repro_guard(_episode_update_jit, "update",
+                            int(prev["ctx"]["ep"]))(
             agent, opt_state, prev["roll"], global_step, _fm, _ovr, _vm,
             _pin, _mm, popart_m1, popart_m2, popart_w, probes,
             probe_opt_state, vprobes, vprobe_opt_state, _kl, _e2, _w2)
@@ -18019,7 +18033,8 @@ def main(args=None):
                         _pf = jax.tree_util.tree_map(
                             lambda _x: _x[_lo:_hi], preferences_per_env)
                         _t0, _f0 = _episode_streams(_n, _w)
-                        return rollout_fn(
+                        return _repro_guard(
+                            rollout_fn, "popart warm-up rollout", ep)(
                             _to_device(agent, _dev), _env_s, num_valid,
                             _to_device(reset_envs(_env_s), _dev),
                             _to_device(_ks, _dev),
@@ -18293,7 +18308,7 @@ def main(args=None):
             _tkt = _ep_env_mod.open_measure_ticket() if _MPIPE else None
             try:
                 def _one(_s, _env_s):
-                    return _episode_rollout_jit(
+                    return _repro_guard(_episode_rollout_jit, "rollout", ep)(
                         _to_device(agent, _SHARD_DEVS[_s]),
                         _to_device(reset_envs(_env_s), _SHARD_DEVS[_s]),
                         _env_s,
@@ -18363,7 +18378,7 @@ def main(args=None):
             """
             _ep_begin_attempt()
             _env_w = env_episode.with_delta_window(1 << int(_win_n))
-            _out = train_episode(
+            _out = _repro_guard(train_episode, "rollout and update", ep)(
                 agent,
                 opt_state,
                 reset_envs(_env_w),
