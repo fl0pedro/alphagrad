@@ -33,12 +33,15 @@ from alphagrad.approx.common.snn_shd import (
 from alphagrad.approx.common.rsnn_shd import (
     RSNN_ARGNUMS,
     RSNN_TARGET,
+    RSNN_VMAP_TARGET,
     RSNN_W2_ARGNUMS,
     RSNN_W2_TARGET,
     is_rsnn,
     resolve_temporal_rule,
     rsnn_args,
+    rsnn_batch,
     rsnn_data_gen,
+    vmapped_step_body,
 )
 
 # ALPHAGRAD_SNN_STEPS and ALPHAGRAD_SNN_TRUNC were the two environment
@@ -158,10 +161,9 @@ def data_gen(fn_str: str, dataset: str | None = None, dataset_size: int | None =
         # and reward slot 6 read 0.0 on every SHD plan.
         #
         # THE KEY IS NOT OPTIONAL HERE. The generator has to draw the SAME
-        # recording and the SAME weights `get_args` drew, or the reference
-        # weights it hands back stop matching slots 7 to 9 and the attached
-        # `W - W_ref` stops being zero -- which moves the forward value in
-        # silence. Pass the key `get_args` was given.
+        # recording and the SAME weights `get_args` drew, or the given values
+        # it hands back are the carry of another weight set than the one in
+        # slots 7 to 9 -- in silence. Pass the key `get_args` was given.
         if key is None:
             raise ValueError(
                 f"data_gen({fn_str!r}) needs the same `key` that was passed "
@@ -172,7 +174,8 @@ def data_gen(fn_str: str, dataset: str | None = None, dataset_size: int | None =
         return rsnn_data_gen(key, dataset=dataset, dataset_size=dataset_size,
                              temporal_rule=resolve_temporal_rule(
                                  fn_str, temporal_rule),
-                             carry_container=carry_container)
+                             carry_container=carry_container,
+                             batch=rsnn_batch(fn_str))
     if fn_str in SHD_TARGETS:
         # THE SAME DEFECT, THE SAME FIX, on the two multi-copy SHD targets.
         # They have no temporal rule and no step position; what moves in a
@@ -196,7 +199,7 @@ def data_gen(fn_str: str, dataset: str | None = None, dataset_size: int | None =
 
         return fn
 
-    if fn_str in _TLM_BLOCKS:
+    if base_name(fn_str) in _TLM_BLOCKS:
         # Same data path for every depth: the window/embedding are a property
         # of (S, D, V), not of how many encoder blocks consume them.
         from alphagrad.approx.common.datasets import load_wikitext2
@@ -204,6 +207,17 @@ def data_gen(fn_str: str, dataset: str | None = None, dataset_size: int | None =
         ids = jnp.asarray(load_wikitext2(V))
         E = _tlm_embedding(D, V)
         n_start = int(ids.shape[0]) - (S + 1)
+
+        if fn_str.startswith("Vmapped"):
+            # One window per row, NN_VMAP_BATCH rows: x (B, S, D), y (B, S, V).
+            @jax.jit
+            def fn_b(keys):
+                s = jrand.randint(keys[0], (NN_VMAP_BATCH,), 0, n_start)
+                win = jax.vmap(
+                    lambda a: jax.lax.dynamic_slice(ids, (a,), (S + 1,)))(s)
+                return E[win[:, :S]], jax.nn.one_hot(win[:, 1:], V)
+
+            return fn_b
 
         @jax.jit
         def fn(keys):
@@ -410,7 +424,8 @@ def get_args(fn_str: str, key, dataset: str | None = None,
         resolve_grad_window(fn_str, grad_window)
         return rsnn_args(key, dataset=dataset, dataset_size=dataset_size,
                          temporal_rule=rule, step_position=step_position,
-                         carry_container=carry_container)
+                         carry_container=carry_container,
+                         batch=rsnn_batch(fn_str))
     if fn_str in TEMPORAL_TARGETS:
         n = resolve_grad_window(fn_str, grad_window)
         if fn_str in SHD_TARGETS:
@@ -433,8 +448,8 @@ def get_args(fn_str: str, key, dataset: str | None = None,
                 shapes = [(_w,), (_w,), (_w, _w), (_w,), (_w, _w), (_w,)]
             else:
                 shapes = [(4,), (4,), (8, 4), (8,), (4, 8), (4,)]
-    elif fn_str in _TLM_BLOCKS:
-        n_blk = _TLM_BLOCKS[fn_str]
+    elif base_name(fn_str) in _TLM_BLOCKS:
+        n_blk = _TLM_BLOCKS[base_name(fn_str)]
         S, D, V = _tlm_dims()
         # Slot layout is per-block-strided (7 slots/block, 4 of them used) so
         # block b of the 3-block target draws the SAME key as block b of the
@@ -513,6 +528,15 @@ def get_raw_fn(fn_str: str):
     contracts full Jacobians of the model and sweeps test accuracy through it.
     """
     base = fn_str[len("Vmapped"):] if fn_str.startswith("Vmapped") else fn_str
+    if fn_str == RSNN_VMAP_TARGET:
+        # The step body over B recordings. Its in_axes depend on the given
+        # count, which only the call knows, so the generic vmap below cannot
+        # serve it.
+        return vmapped_step_body
+    if fn_str.startswith("Vmapped") and base == RSNN_W2_TARGET:
+        raise ValueError(
+            f"{fn_str} is not a target: the two-copy window is not batched; "
+            f"the batched recurrent target is {RSNN_VMAP_TARGET}.")
     if base.endswith("NeuralNetwork"):
         fn = _neural_network
     elif base == "Perceptron":
@@ -531,7 +555,7 @@ def get_raw_fn(fn_str: str):
     if fn_str.startswith("Vmapped"):
         num_args = len(inspect.signature(fn).parameters)
         has_y = ("Encoder" in base or base.endswith(("NeuralNetwork", "Perceptron"))
-                 or base in _VISION_MODELS)
+                 or base in _VISION_MODELS or base in _TLM_BLOCKS)
         mapped_axes = (0, 0) if has_y else (0,)
         static_axes = (None,) * (num_args - len(mapped_axes))
         fn = jax.vmap(fn, in_axes=mapped_axes + static_axes)
@@ -657,6 +681,11 @@ def get_fn(fn_str: str):
     # to the last bit (1.0645949840545654).
     if base in ("LIF_SNN", "ADALIF_SNN"):
         return lambda *a: jnp.mean(raw(*a)[0])
+
+    # THE BATCHED RECURRENT STEP returns B step losses, one per recording;
+    # the loss is their mean, as the batch of a training run is.
+    if batched and base == RSNN_TARGET:
+        return lambda *a: jnp.mean(raw(*a))
 
     # ALREADY THE LOSS. ``LIF_SNN_SHD`` / ``ADALIF_SNN_SEQ`` reduce inside the
     # model and return 0-d. Nothing is added: the model IS the target.
@@ -944,7 +973,7 @@ def infer_argnums(fn_str: str) -> tuple[int, ...]:
     # RECURRENT matrix V is one of them. Without V among the differentiated
     # weights the state-to-state Jacobian would be block diagonal and e-prop
     # would be exact rather than an approximation.
-    if fn_str == RSNN_TARGET:
+    if base_name(fn_str) == RSNN_TARGET:
         return RSNN_ARGNUMS
     # THE TWO-COPY WINDOW carries a second input frame ahead of the label, so
     # its three weights sit one slot further along.
@@ -957,9 +986,9 @@ def infer_argnums(fn_str: str) -> tuple[int, ...]:
         # here and were unreachable -- get_fn/get_args build them fine.
         n = len(inspect.signature(getattr(examples, base_name(fn_str))).parameters)
         return tuple(range(2, n))
-    if fn_str in _TLM_BLOCKS:
+    if base_name(fn_str) in _TLM_BLOCKS:
         # (x, y, 7 weights per block, Wout) -> differentiate every weight.
-        return tuple(range(2, 2 + 7 * _TLM_BLOCKS[fn_str] + 1))
+        return tuple(range(2, 2 + 7 * _TLM_BLOCKS[base_name(fn_str)] + 1))
     if fn_str.endswith("NeuralNetwork"):
         return (2, 3, 4, 5)
     if fn_str.endswith("Perceptron"):

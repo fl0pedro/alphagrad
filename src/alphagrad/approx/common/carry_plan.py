@@ -125,7 +125,7 @@ def register(args_like, key, example, temporal_rule, config, args, consts,
     ``args_like`` is the argparse namespace (or the actor's args dict) that
     ``grad_target_setup`` reads; ``key`` is the SAME key ``get_args`` was
     given, because the variant has to draw the same recording and the same
-    weights or its reference weights stop matching the run's own.
+    weights or its given values are the carry of another weight set.
 
     Registering a rule REPLACES that rule's entry and leaves every other
     rule's alone: a run that alternates registers each of its graphs in turn,
@@ -619,14 +619,11 @@ def carry_at_rest_bytes(variant_or_entry, rule: str) -> int:
     """The bytes the carried value occupies in its container: the given
     blocks of the measured program, the way they arrive at the step.
 
-    The given tuple LEADS with the reference weights under ``rtrl``
-    (``rsnn_shd.carry_under_plan``: three weights, then the blocks); those
-    are the run's own weights in every container and are not part of the
-    carry, so they are not counted.
+    Under ``rtrl`` the given tuple is the five stacked tensors
+    ``rsnn_shd.carry_under_plan`` builds, nothing else; under ``bptt`` the
+    five adjoints.
     """
     from alphagrad.approx.common.rsnn_shd import RSNN_HEAD_SLOTS
     args = tuple(variant_or_entry["args"])
     given = args[RSNN_HEAD_SLOTS:]
-    if str(rule) == "rtrl":
-        given = given[3:]
     return int(sum(int(np.asarray(x).nbytes) for x in given))

@@ -62,9 +62,54 @@ RSNN_TARGET = "RSNN_SHD"
 #: The registered name of the TWO-COPY WINDOW target, the fourth SNN arm.
 RSNN_W2_TARGET = "RSNN_SHD_W2"
 
+#: The registered name of the BATCHED one-step target: the step body vmapped
+#: over ``ALPHAGRAD_NN_BATCH`` recordings, the weights shared.
+RSNN_VMAP_TARGET = "VmappedRSNN_SHD"
+
 #: The targets on which ``--temporal-rule`` is defined.
 TEMPORAL_RULE_TARGETS: frozenset[str] = frozenset({RSNN_TARGET,
-                                                   RSNN_W2_TARGET})
+                                                   RSNN_W2_TARGET,
+                                                   RSNN_VMAP_TARGET})
+
+
+def is_batched(example: str | None) -> bool:
+    return bool(example) and str(example) == RSNN_VMAP_TARGET
+
+
+def rsnn_batch(example: str | None) -> int | None:
+    """``B`` for the batched target, ``None`` for the others.
+
+    Read at call time from ``datasets.NN_VMAP_BATCH`` (``ALPHAGRAD_NN_BATCH``),
+    the number every other Vmapped target batches at.
+    """
+    if not is_batched(example):
+        return None
+    from alphagrad.approx.common import datasets
+    b = int(datasets.NN_VMAP_BATCH)
+    if b < 1:
+        raise ValueError(f"ALPHAGRAD_NN_BATCH must be >= 1, got {b}")
+    return b
+
+
+def vmapped_step_body(*args):
+    """``RSNN_SHD`` over ``B`` recordings, the synaptax ``in_axes`` pattern.
+
+    The input frame, the label, the five carried state components and every
+    given value (the five future adjoints of ``bptt``, the five stacked carry
+    tensors of ``rtrl``) are mapped on axis 0; the weights and the six
+    constants are shared. ``RSNN_SHD`` selects the rule per sample by count
+    and rank (``rsnn_given_rule``). Returns the ``B`` step losses;
+    :func:`examples.get_fn` takes their mean.
+    """
+    from graphax.examples.neuromorphic import RSNN_GIVEN_COUNTS, RSNN_SHD
+    n_given = len(args) - RSNN_HEAD_SLOTS
+    if n_given not in set(RSNN_GIVEN_COUNTS.values()):
+        raise ValueError(
+            f"{RSNN_VMAP_TARGET} got {len(args)} arguments, {n_given} past "
+            f"the {RSNN_HEAD_SLOTS} head slots; the legal given counts are "
+            f"{sorted(set(RSNN_GIVEN_COUNTS.values()))}")
+    in_axes = (0, 0) + (0,) * 5 + (None,) * 3 + (None,) * 6 + (0,) * n_given
+    return jax.vmap(RSNN_SHD, in_axes=in_axes)(*args)
 
 #: The four rules, which are the four SNN arms of the thesis matrix (owner
 #: ruling 2026-09-16).
@@ -198,6 +243,12 @@ def resolve_temporal_rule(example: str | None, rule, *,
     r = str(rule)
     if r not in TEMPORAL_RULES:
         raise ValueError(f"{flag} {r!r} is not one of {list(TEMPORAL_RULES)}")
+    if r == "window2" and is_batched(example):
+        raise ValueError(
+            f"{flag} window2 was passed with --example {example}. The window "
+            f"arm is its own two-copy target ({RSNN_W2_TARGET}) and is not "
+            f"batched; only the one-step body is. Run window2 on "
+            f"{RSNN_TARGET}.")
     return r
 
 
@@ -472,7 +523,8 @@ def step_target_loss(seq, y, t, weights, state_prev):
 
 def carried_jacobians(seq, t, weights, *, check_zeros: bool = True,
                       narrow: bool = False):
-    """The RTRL attachment tuple: three reference weights, then ELEVEN blocks.
+    """The RTRL attachment tuple: the ELEVEN blocks, stacked per weight into
+    the five tensors ``RSNN_CARRY_STACKS`` names.
 
     Block ``(s, w)`` is ``d s_(t-1)^s / d W_w``, taken by reverse-mode
     differentiation of the prefix. That is the same number the RTRL recursion
@@ -488,26 +540,47 @@ def carried_jacobians(seq, t, weights, *, check_zeros: bool = True,
     dtype at every step -- the ``Quant`` class applied at every step of the
     prefix.
     """
-    from graphax.examples.neuromorphic import (
-        RSNN_CARRY_BLOCKS, RSNN_STATE_NAMES, RSNN_WEIGHT_NAMES,
-        RSNN_ZERO_BLOCKS)
+    blocks, zero = _carried_jacobian_blocks(seq, t, weights, narrow=narrow)
+    if check_zeros:
+        _check_zero_blocks(zero)
+    sg = jax.lax.stop_gradient
+    return tuple(sg(b) for b in blocks)
+
+
+def _carried_jacobian_blocks(seq, t, weights, *, narrow: bool = False):
+    """The five stacked tensors ``RSNN_CARRY_STACKS`` names, and the max
+    ``|.|`` of each structurally zero block.
+
+    Traced values throughout, so one recording's blocks can be vmapped over
+    a batch and the zero check run once on the host afterwards.
+    """
+    from graphax.examples.neuromorphic import RSNN_CARRY_STACKS, RSNN_ZERO_BLOCKS
 
     run = prefix_state(seq, t, weights, narrow=narrow)
     jac = jax.jacrev(run, argnums=(0, 1, 2))(*weights)
-    if check_zeros:
-        for s_i, w_i in RSNN_ZERO_BLOCKS:
-            nz = float(jnp.max(jnp.abs(jac[s_i][w_i])))
-            if nz != 0.0:
-                raise ValueError(
-                    f"carried block ({RSNN_STATE_NAMES[s_i]}, "
-                    f"{RSNN_WEIGHT_NAMES[w_i]}) is not zero (max |.| = {nz}). "
-                    f"The readout weight feeds nothing back, so that block "
-                    f"cannot carry signal; a non-zero here means the model "
-                    f"changed and RSNN_CARRY_BLOCKS no longer lists every "
-                    f"block.")
-    sg = jax.lax.stop_gradient
-    return (tuple(sg(W) for W in weights)
-            + tuple(sg(jac[s_i][w_i]) for s_i, w_i in RSNN_CARRY_BLOCKS))
+    blocks = tuple(_stack_blocks(ss, [jac[s][w] for s in ss])
+                   for ss, w in RSNN_CARRY_STACKS)
+    zero = tuple(jnp.max(jnp.abs(jac[s_i][w_i])) for s_i, w_i in RSNN_ZERO_BLOCKS)
+    return blocks, zero
+
+
+def _stack_blocks(states, blocks):
+    return jnp.stack(blocks) if len(states) > 1 else blocks[0]
+
+
+def _check_zero_blocks(zero) -> None:
+    from graphax.examples.neuromorphic import (
+        RSNN_STATE_NAMES, RSNN_WEIGHT_NAMES, RSNN_ZERO_BLOCKS)
+    for (s_i, w_i), m in zip(RSNN_ZERO_BLOCKS, zero):
+        nz = float(jnp.max(m))
+        if nz != 0.0:
+            raise ValueError(
+                f"carried block ({RSNN_STATE_NAMES[s_i]}, "
+                f"{RSNN_WEIGHT_NAMES[w_i]}) is not zero (max |.| = {nz}). "
+                f"The readout weight feeds nothing back, so that block "
+                f"cannot carry signal; a non-zero here means the model "
+                f"changed and RSNN_CARRY_BLOCKS no longer lists every "
+                f"block.")
 
 
 # ---------------------------------------------------------------------------
@@ -627,7 +700,8 @@ def _blockdiag_cell(container: str):
 
 def carry_traces(seq, t, weights, *, reduce: bool = False,
                  quant: bool = False):
-    """THE PLAN, RUN OVER THE PREFIX: the eleven blocks in COMPACT form.
+    """THE PLAN, RUN OVER THE PREFIX: the eleven blocks in COMPACT form,
+    stacked per weight into the five tensors ``RSNN_CARRY_STACKS`` names.
 
     Zenke and Neftci (arXiv 2010.11931) approximate real-time recurrent
     learning by replacing the state-to-state Jacobian ``A_t`` with its BLOCK
@@ -667,15 +741,14 @@ def carry_traces(seq, t, weights, *, reduce: bool = False,
 
     so the compact container carries ``f_W``, ``f_V`` and ``g`` and
     :func:`graphax.examples.attach_rsnn_past` restores the constant factor
-    from the REFERENCE weight, which is outside ``argnums`` and therefore adds
-    no edge.
+    from ``stop_gradient(Wo)``, which adds no edge.
 
     ``t`` may be TRACED: the recursion is a masked scan over the whole
     recording, like :func:`prefix_state`.
 
     THE STORE IS THE POINT. 2.12 MB against 225.74 MB dense, a factor of 106.
     """
-    from graphax.examples.neuromorphic import RSNN_CARRY_BLOCKS, RSNN_SURROGATE_SCALE
+    from graphax.examples.neuromorphic import RSNN_CARRY_STACKS, RSNN_SURROGATE_SCALE
 
     cell = _cell()
     a_syn, a_mem, a_out, rho = decay_constants()
@@ -763,7 +836,8 @@ def carry_traces(seq, t, weights, *, reduce: bool = False,
         (4, 2): gw,
     }
     sg = jax.lax.stop_gradient
-    return tuple(sg(blocks[b]) for b in RSNN_CARRY_BLOCKS)
+    return tuple(_stack_blocks(ss, [sg(blocks[(s, w)]) for s in ss])
+                 for ss, w in RSNN_CARRY_STACKS)
 
 
 def reduced_columns(seq, t, weights, *, quant: bool = False):
@@ -789,7 +863,7 @@ def reduced_columns(seq, t, weights, *, quant: bool = False):
     recursion would need, which is why the exact carry is taken by
     :func:`carried_jacobians` instead.
     """
-    from graphax.examples.neuromorphic import RSNN_CARRY_BLOCKS
+    from graphax.examples.neuromorphic import RSNN_CARRY_STACKS
 
     cell = _cell()
     c = _consts()
@@ -847,11 +921,11 @@ def reduced_columns(seq, t, weights, *, quant: bool = False):
     cols = (cW, cV, cWo)
     sg = jax.lax.stop_gradient
     out = []
-    for s, w in RSNN_CARRY_BLOCKS:
+    for ss, w in RSNN_CARRY_STACKS:
         # ``cols[w][s]`` is (column, state); the block wants (state, column,
         # 1) -- the state axes first and the implicit axis stored once.
-        block = jnp.moveaxis(cols[w][s], 0, -1)[..., None]
-        out.append(sg(block))
+        out.append(_stack_blocks(
+            ss, [sg(jnp.moveaxis(cols[w][s], 0, -1)[..., None]) for s in ss]))
     return tuple(out)
 
 
@@ -860,28 +934,29 @@ def eprop_traces(seq, t, weights):
 
     The same recursion and the same numbers, written into the container
     :func:`carried_jacobians` uses, so the two are DROP-IN interchangeable as
-    the ``rtrl`` given values (three reference weights, then eleven blocks)
-    and directly comparable block for block. This is the form the earlier
-    probes and tests compare against; :func:`carry_traces` is what a run
-    actually carries, and it is 106 times smaller.
+    the ``rtrl`` given values (the five stacked tensors) and directly
+    comparable block for block. This is the form the earlier probes and tests
+    compare against; :func:`carry_traces` is what a run actually carries, and
+    it is 106 times smaller.
     """
-    from graphax.examples.neuromorphic import RSNN_CARRY_BLOCKS
+    from graphax.examples.neuromorphic import RSNN_CARRY_STACKS
 
     W, V, Wo = weights
     n_out = SHD_CLASSES
     compact = carry_traces(seq, t, weights)
     out = []
-    for (s, w), m in zip(RSNN_CARRY_BLOCKS, compact):
-        if s == 4 and w != 2:
+    for (ss, w), m in zip(RSNN_CARRY_STACKS, compact):
+        if ss == (4,) and w != 2:
             # (Uo, W) / (Uo, V): restore the constant readout factor.
             out.append(Wo[:, :, None] * m[None])
-        elif s == 4:
+        elif ss == (4,):
             # (Uo, Wo): delta(m, k) * g[j]
             out.append(jnp.eye(n_out)[:, :, None] * m[0][None, None, :])
         else:
-            out.append(jnp.eye(m.shape[0])[:, :, None] * m[:, None, :])
+            # the stacked hidden traces: delta(j', j) * e[k, j, i] per state k
+            out.append(jnp.eye(m.shape[1])[None, :, :, None] * m[:, :, None, :])
     sg = jax.lax.stop_gradient
-    return tuple(sg(x) for x in weights) + tuple(sg(x) for x in out)
+    return tuple(sg(x) for x in out)
 
 
 def carry_under_plan(seq, t, weights, container="exact", *,
@@ -901,22 +976,35 @@ def carry_under_plan(seq, t, weights, container="exact", *,
                        every step, stored narrow.
     combinations       compose, in that order.
 
-    Every container returns three reference weights and eleven blocks, so the
-    varargs COUNT that selects the temporal rule is the same for all of them
-    and only the SHAPES and the DTYPE move.
+    Every container returns the five stacked tensors ``RSNN_CARRY_STACKS``
+    names, so the varargs COUNT that selects the temporal rule is the same for
+    all of them and only the SHAPES and the DTYPE move.
     """
     c = _container(container)
+    blocks, zero = _carry_blocks_under_plan(seq, t, weights, c)
+    if check_zeros and zero is not None:
+        _check_zero_blocks(zero)
+    sg = jax.lax.stop_gradient
+    return tuple(sg(b) for b in blocks)
+
+
+def _carry_blocks_under_plan(seq, t, weights, c):
+    """The eleven blocks of ONE recording in container ``c``, traced.
+
+    Returns ``(blocks, zero)``: ``zero`` is the exact container's structural
+    zero check (see :func:`_carried_jacobian_blocks`), ``None`` for the
+    compact containers, which never form those blocks.
+    """
+    zero = None
     if c.diag:
         blocks = carry_traces(seq, t, weights, reduce=c.reduce, quant=c.quant)
     elif c.reduce:
         blocks = reduced_columns(seq, t, weights, quant=c.quant)
     else:
-        blocks = carried_jacobians(
-            seq, t, weights, check_zeros=check_zeros, narrow=c.quant)[3:]
+        blocks, zero = _carried_jacobian_blocks(seq, t, weights, narrow=c.quant)
     if c.quant:
         blocks = tuple(b.astype(CARRY_QUANT_DTYPE) for b in blocks)
-    sg = jax.lax.stop_gradient
-    return tuple(sg(W) for W in weights) + tuple(blocks)
+    return tuple(blocks), zero
 
 
 def future_adjoints(seq, y, t, weights, state_prev, container="exact"):
@@ -985,22 +1073,22 @@ RSNN_HEAD_SLOTS = 16
 def rsnn_data_slots(rule: str) -> tuple[int, ...]:
     """The slots :func:`rsnn_data_gen` returns, in order.
 
-    THE WEIGHTS ARE AMONG THEM, and that is deliberate. The ``rtrl`` given
-    values LEAD with three REFERENCE WEIGHTS whose whole job is to be bit-for-
-    bit equal to the weights in slots 7 to 9, so that the attached
-    ``W - W_ref`` is exactly zero and no forward value moves. A refresher that
-    replaced the weights and not the reference weights (which is what
-    ``generate_eval_samples`` does to every slot a generator does not cover)
-    would break that equality in silence. So the generator owns the weights
-    too, and hands back the run's initial ones -- which is also the point at
-    which this target is defined (see WEIGHT_SCALE).
+    THE WEIGHTS ARE AMONG THEM, and that is deliberate. The given values are
+    computed FROM the weights: the carried Jacobian under ``rtrl`` and the
+    future adjoints under ``bptt`` are the derivatives of this weight set over
+    the recording. A refresher that replaced the weights and not the given
+    values (which is what ``generate_eval_samples`` does to every slot a
+    generator does not cover) would attach the carry of one weight set to the
+    step of another, in silence. So the generator owns the weights too, and
+    hands back the run's initial ones -- which is also the point at which
+    this target is defined (see WEIGHT_SCALE).
     """
-    from graphax.examples.neuromorphic import RSNN_GIVEN_LENGTHS
+    from graphax.examples.neuromorphic import RSNN_GIVEN_COUNTS
     if str(rule) == "window2":
         # Two input frames, the label, the five carried state components and
         # the three weights. There are no given values in this arm.
         return tuple(range(0, 11))
-    n_given = {v: n for n, v in RSNN_GIVEN_LENGTHS.items()}[str(rule)]
+    n_given = RSNN_GIVEN_COUNTS[str(rule)]
     return (tuple(range(0, 10))
             + tuple(range(RSNN_HEAD_SLOTS, RSNN_HEAD_SLOTS + n_given)))
 
@@ -1037,7 +1125,8 @@ def is_window2(example: str | None) -> bool:
 def rsnn_data_gen(key=None, *, dataset: str | None = None,
                   dataset_size: int | None = -1,
                   temporal_rule: str | None = None,
-                  carry_container: str | None = None):
+                  carry_container: str | None = None,
+                  batch: int | None = None):
     """``keys -> the data-dependent argument slots``, at a SAMPLED ``t``.
 
     OWNER RULING, 2026-09-16: the step position is sampled uniformly over the
@@ -1079,13 +1168,21 @@ def rsnn_data_gen(key=None, *, dataset: str | None = None,
             f"{list(GIVEN_EDGE_RULES)}.")
     key = jax.random.PRNGKey(1) if key is None else key
     k = jax.random.split(key, 3)
-    seq, y, rec = _draw_recording(k[0], dataset, dataset_size)
+    if batch is None:
+        seq, y, rec = _draw_recording(k[0], dataset, dataset_size)
+    else:
+        _refuse_batched_window(rule, batch)
+        seq, y, rec = _draw_recordings(k[0], dataset, dataset_size, batch)
     weights = rsnn_weights(k[1])
-    T = int(seq.shape[0])
+    T = int(seq.shape[-2])
     slots = rsnn_data_slots(rule)
 
     def _t(keys):
-        return sampled_step_position(keys[0], T, rule)
+        if batch is None:
+            return sampled_step_position(keys[0], T, rule)
+        # B step positions, one per recording, each drawn as the single one is.
+        return jax.vmap(lambda kk: sampled_step_position(kk, T, rule))(
+            jax.random.split(keys[0], batch))
 
     def _head(t):
         sg = jax.lax.stop_gradient
@@ -1096,6 +1193,10 @@ def rsnn_data_gen(key=None, *, dataset: str | None = None,
         return (seq[t], y) + state_prev + weights, state_prev
 
     def _build(t, container):
+        if batch is not None:
+            head, given = _batched_step_tuple(seq, y, t, weights, rule,
+                                              container, check_zeros=False)
+            return head + weights + given
         head, state_prev = _head(t)
         if rule in ("tbptt", "window2"):
             given = ()
@@ -1127,9 +1228,16 @@ def rsnn_data_gen(key=None, *, dataset: str | None = None,
         return _build(_t(keys), EXACT_CONTAINER)
 
     def meta(keys):
-        """``{t, T, recording, rule, carry}`` of the draw ``keys`` produces."""
-        return {"t": int(_t(keys)), "T": T, "recording": int(rec),
-                "rule": rule, "carry": cont}
+        """``{t, T, recording, rule, carry}`` of the draw ``keys`` produces.
+
+        On the batched target ``t`` and ``recording`` are lists of ``B``
+        and ``batch`` says so."""
+        if batch is None:
+            return {"t": int(_t(keys)), "T": T, "recording": int(rec),
+                    "rule": rule, "carry": cont}
+        return {"t": [int(v) for v in _t(keys)], "T": T,
+                "recording": [int(r) for r in rec], "rule": rule,
+                "carry": cont, "batch": int(batch)}
 
     # THE CONTRACT WITH env._probe_batch AND generate_eval_samples. Both used
     # to assume a generator fills the first one or two argument slots; this
@@ -1182,7 +1290,8 @@ def rsnn_data_gen(key=None, *, dataset: str | None = None,
 def rsnn_args(key=None, *, dataset: str | None = None,
               dataset_size: int | None = -1, temporal_rule: str | None = None,
               step_position: int | None = None,
-              carry_container: str | None = None):
+              carry_container: str | None = None,
+              batch: int | None = None):
     """The argument tuple of ``graphax.examples.neuromorphic.RSNN_SHD``.
 
     Slots: ``x_t`` 0, ``y`` 1, the five carried state components 2 to 6, the
@@ -1197,7 +1306,7 @@ def rsnn_args(key=None, *, dataset: str | None = None,
     (see :func:`sample_step_position`). The recording is drawn from the same
     key, so two processes given the same seed build the same tuple.
     """
-    from graphax.examples.neuromorphic import RSNN_GIVEN_LENGTHS
+    from graphax.examples.neuromorphic import RSNN_GIVEN_COUNTS
 
     rule = "tbptt" if temporal_rule is None else str(temporal_rule)
     if rule not in TEMPORAL_RULES:
@@ -1212,18 +1321,42 @@ def rsnn_args(key=None, *, dataset: str | None = None,
             f"{list(GIVEN_EDGE_RULES)}.")
     key = jax.random.PRNGKey(1) if key is None else key
     k = jax.random.split(key, 3)
-    seq, y, rec = _draw_recording(k[0], dataset, dataset_size)
+    if batch is not None:
+        _refuse_batched_window(rule, batch)
+        seq, y, rec = _draw_recordings(k[0], dataset, dataset_size, batch)
+    else:
+        seq, y, rec = _draw_recording(k[0], dataset, dataset_size)
     weights = rsnn_weights(k[1])
-    T = int(seq.shape[0])
+    T = int(seq.shape[-2])
     hi = step_position_bound(T, rule)
-    t = (sample_step_position(k[2], T, rule) if step_position is None
-         else int(step_position))
-    if not 0 <= t < hi:
-        raise ValueError(f"step position {t} is outside 0 .. {hi - 1} for "
-                         f"rule {rule}")
+    if batch is None:
+        t = (sample_step_position(k[2], T, rule) if step_position is None
+             else int(step_position))
+        ts = [t]
+    else:
+        # One step position per recording; a pinned position pins every row.
+        ts = ([sample_step_position(kk, T, rule)
+               for kk in jax.random.split(k[2], batch)]
+              if step_position is None else [int(step_position)] * batch)
+    for t in ts:
+        if not 0 <= t < hi:
+            raise ValueError(f"step position {t} is outside 0 .. {hi - 1} for "
+                             f"rule {rule}")
     _LAST_STEP_POSITION.clear()
-    _LAST_STEP_POSITION.update({"t": t, "T": T, "recording": rec,
-                                "rule": rule, "carry": cont})
+    if batch is None:
+        _LAST_STEP_POSITION.update({"t": t, "T": T, "recording": rec,
+                                    "rule": rule, "carry": cont})
+    else:
+        _LAST_STEP_POSITION.update({"t": list(ts), "T": T, "recording": rec,
+                                    "rule": rule, "carry": cont,
+                                    "batch": int(batch)})
+        head, given = _batched_step_tuple(seq, y, jnp.asarray(ts), weights,
+                                          rule, cont, check_zeros=True)
+        want = RSNN_GIVEN_COUNTS[rule]
+        if len(given) != want:
+            raise ValueError(
+                f"rule {rule} must pass {want} given values, built {len(given)}")
+        return head + weights + _consts() + given
 
     sg = jax.lax.stop_gradient
     state_prev = tuple(sg(x) for x in prefix_state(seq, t, weights)(*weights))
@@ -1237,11 +1370,63 @@ def rsnn_args(key=None, *, dataset: str | None = None,
         given = carry_under_plan(seq, t, weights, cont)
     else:
         given = future_adjoints(seq, y, t, weights, state_prev, cont)
-    want = {v: n for n, v in RSNN_GIVEN_LENGTHS.items()}[rule]
+    want = RSNN_GIVEN_COUNTS[rule]
     if len(given) != want:
         raise ValueError(
             f"rule {rule} must pass {want} given values, built {len(given)}")
     return head + tuple(given)
+
+
+def _refuse_batched_window(rule: str, batch) -> None:
+    if rule == "window2":
+        raise ValueError(
+            f"a batch of {batch} was asked of the window2 rule. The window "
+            f"arm is the two-copy target {RSNN_W2_TARGET} and is not "
+            f"batched; only the one-step body ({RSNN_VMAP_TARGET}) is.")
+
+
+def _batched_step_tuple(seqs, ys, ts, weights, rule, container, *,
+                        check_zeros: bool):
+    """Slots 0 to 6 and the rule's given values over ``B`` recordings.
+
+    One recording per row of ``seqs``, ``ys`` and ``ts``. The frame, the
+    label, the carried state and every given value (the five stacked carry
+    tensors of ``rtrl``, the five adjoints of ``bptt``) get a leading batch
+    axis. Each row's carry is built by the same producer the one-recording
+    target uses, run over that row's own prefix or suffix, so every sample
+    arrives in the container the plan implies: BPTT attaches the future
+    adjoint, RTRL the past Jacobian, both per sample. Returns
+    ``(head, given)``.
+    """
+    c = _container(container)
+
+    def one(seq, y, t):
+        sg = jax.lax.stop_gradient
+        state_prev = tuple(
+            sg(x) for x in prefix_state(seq, t, weights)(*weights))
+        head = (seq[t], y) + state_prev
+        given, zero = (), ()
+        if rule == "rtrl":
+            blocks, z = _carry_blocks_under_plan(seq, t, weights, c)
+            given = tuple(sg(b) for b in blocks)
+            zero = () if z is None else tuple(z)
+        elif rule == "bptt":
+            given = future_adjoints(seq, y, t, weights, state_prev, c)
+        return head, given, zero
+
+    head, given, zero = jax.vmap(one)(seqs, ys, ts)
+    if check_zeros and zero:
+        _check_zero_blocks(zero)
+    return tuple(head), tuple(given)
+
+
+def _draw_recordings(key, dataset: str | None, dataset_size: int | None,
+                     batch: int):
+    """``B`` recordings on axis 0: ``(seq [B, T, 700], y [B, 20], indices)``."""
+    out = [_draw_recording(k, dataset, dataset_size)
+           for k in jax.random.split(key, int(batch))]
+    return (jnp.stack([o[0] for o in out]), jnp.stack([o[1] for o in out]),
+            [o[2] for o in out])
 
 
 def _draw_recording(key, dataset: str | None, dataset_size: int | None):
