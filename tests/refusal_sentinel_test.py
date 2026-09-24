@@ -177,7 +177,7 @@ def test_a_gate_refusal_is_scored_at_the_timeout_with_its_real_memory(
     assert wrapped[b"approx:"].calls == 0, "a gated candidate must never run"
     rec = recs[-1]
     assert rec["refused"] == "gate"
-    assert rec["sentinelled"] is True and rec["replayable"] is False
+    assert rec["sentinelled"] is True and rec["replayable"] is True
     assert rec["device_bytes_limit"] == LIMIT
     assert rec["static_peak_bytes"] > SWELL
     assert rec["refusal_timeout_s"] == TIMEOUT

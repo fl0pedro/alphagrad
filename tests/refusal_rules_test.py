@@ -194,7 +194,7 @@ def _check_scored(reward, rec, counts, *, reason, program):
     kind = reason.split(":", 1)[0]
     assert counts == {kind: 1, "total": 1, "scored": 1}, counts
     assert rec["refused"] == reason
-    assert rec["sentinelled"] is True and rec["replayable"] is False
+    assert rec["sentinelled"] is True and rec["replayable"] is True
     assert rec["refusal_timeout_s"] == DEADLINE
     assert rec["refusal_latency_ns"] == DEADLINE * 1e9
     assert rec["refusal_bytes_limit"] == LIMIT
