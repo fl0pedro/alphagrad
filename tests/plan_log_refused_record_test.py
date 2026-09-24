@@ -63,11 +63,11 @@ def _arm(mp, env):
                refuse_on_the_container_program)
 
 
-def _measure(env, order, specs, faces, skips):
+def _measure(env, order, specs, faces, skips, *samples):
     return envmod._callback(
         env.config, env.args, env.consts, jnp.asarray(order),
         jnp.asarray(specs), jnp.asarray(faces), jnp.asarray(skips),
-        int(len(order)))
+        int(len(order)), *samples)
 
 
 @pytest.fixture(scope="module")
@@ -123,6 +123,54 @@ def test_a_refused_plan_record_decodes_and_replays_to_the_same_raise(
         assert again[0].get(k) == rec.get(k), k
     assert rec["faces_truncated"] == 0
     assert rec["replayable"] is True and rec["sentinelled"] is True
+
+
+def test_a_dedupe_hit_record_carries_the_carry_bytes_of_its_container(
+        refused, monkeypatch):
+    env = refused["env"]
+    order, specs, faces, skips = refused["wires"]
+    samples = tuple(env.eval_args_samples)
+    cached = CP.measurement_env(refused["own"], env.config)
+    # A missed hit raises at the container step instead of measuring.
+    _arm(monkeypatch, env)
+    monkeypatch.setenv("ALPHAGRAD_MEASURE_DEDUPE", "1")
+    monkeypatch.setattr(envmod, "_PLAN_CARRY_BYTES", [refused["exact_bytes"]])
+    envmod.consume_plan_records()
+    # This episode measured the same plan before, as its plan 0.
+    envmod._roll_measure_episode(envmod._episode_measure_key(samples))
+    monkeypatch.setitem(
+        envmod._PLAN_DEDUPE,
+        envmod._plan_content_key(order, specs, faces, skips, None),
+        (0, [0.0] * envmod.NUM_REWARDS))
+    _measure(env, order, specs, faces, skips, *samples)
+    records = envmod.consume_plan_records()["records"]
+    assert len(records) == 1 and records[0]["measured_from"] == 0, records
+    assert CP.measurement_env(refused["own"], env.config) is cached
+    assert (records[0].get("carry_container"),
+            records[0].get("carry_bytes")) == (refused["own"],
+                                               refused["own_bytes"])
+
+
+def test_a_record_refused_before_the_container_step_keeps_no_carry_bytes(
+        refused, monkeypatch):
+    env = refused["env"]
+    order, specs, faces, skips = refused["wires"]
+    _arm(monkeypatch, env)
+    monkeypatch.setattr(envmod, "_PLAN_CARRY_BYTES", [refused["exact_bytes"]])
+
+    def overflow_in_the_tokenizer(n):
+        raise ValueError("synthetic refusal in the tokenizer")
+
+    monkeypatch.setattr(envmod, "_record_token_length",
+                        overflow_in_the_tokenizer)
+    envmod.consume_plan_records()
+    with pytest.raises(ValueError, match="synthetic refusal in the tokenizer"):
+        _measure(env, order, specs, faces, skips)
+    records = envmod.consume_plan_records()["records"]
+    assert len(records) == 1, records
+    assert records[0]["refused"] == "raised:ValueError"
+    assert records[0].get("carry_container") == refused["own"]
+    assert "carry_bytes" not in records[0]
 
 
 def test_decode_refuses_only_a_truncated_record():
