@@ -300,8 +300,6 @@ def _run(args) -> int:
     ray.get(actor.init_server.remote(
         cpu_workers,
         callback_timeout_s=float(args.cpu_callback_timeout),
-        initial_timeout_s=float(args.cpu_callback_initial_timeout),
-        warm_after=int(args.cpu_callback_warm_after),
         recycle_every=int(args.cpu_worker_recycle_every),
         cpu_actor_options=cpu_actor_options,
         starting_actor_id=int(args.num_cpu_workers),
@@ -425,8 +423,6 @@ def _run(args) -> int:
         ray.get(sampler.init_server.remote(
             cpu_workers,
             callback_timeout_s=float(args.cpu_callback_timeout),
-            initial_timeout_s=float(args.cpu_callback_initial_timeout),
-            warm_after=int(args.cpu_callback_warm_after),
             recycle_every=int(args.cpu_worker_recycle_every),
             cpu_actor_options=cpu_actor_options,
             starting_actor_id=int(args.num_cpu_workers) + 100,

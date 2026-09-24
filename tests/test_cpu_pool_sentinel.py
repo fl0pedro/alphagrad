@@ -1,7 +1,7 @@
-"""Smoke tests for ``CpuApproxPool`` sentinel + cold-cache budget paths.
+"""Smoke tests for ``CpuApproxPool`` sentinel + deadline paths.
 
 Uses a tiny synchronous fake Ray API so we can exercise the timeout /
-sentinel / cold-vs-warm logic without spinning up a real cluster.
+sentinel / deadline logic without spinning up a real cluster.
 """
 
 from __future__ import annotations
@@ -116,6 +116,8 @@ class _FakeActor:
                 return _Future(self._fn, *a, delay=self._delay)
 
         self.evaluate = _EvalProxy(_ev, self._delay)
+        # Construction is instant here; the pool still waits for it.
+        self.ready = _EvalProxy(lambda: True, 0.0)
 
 
 def test_pool_returns_value_when_under_timeout(_ray_fake):
@@ -168,47 +170,26 @@ def test_pool_returns_sentinel_on_timeout(_ray_fake):
     assert pool.stats()["timeouts"] == 1
 
 
-def test_cold_warm_timeout_budget(_ray_fake):
-    """First ``warm_after`` calls per actor get ``initial_timeout_s``;
-    after that, the regular ``timeout_s`` applies."""
+def test_the_first_call_already_has_the_one_deadline(_ray_fake):
+    # Owner ruling 2026-09-24 Q48: no cold budget, not even on a first call.
     fake_ray, _Future = _ray_fake
-    from alphagrad.approx.cpu_approx_pool import CpuApproxPool
+    from alphagrad.approx.cpu_approx_pool import (
+        CpuApproxPool, _SENTINEL_REWARD_VALUE)
 
-    # Use a delay that fits within initial_timeout_s (0.05s) but NOT
-    # within the warm timeout (0.001s). Each actor should succeed on
-    # the first warm_after calls and start timing out after that.
     actors = [_FakeActor(fake_ray, _Future, delay=0.05)]
     pool = CpuApproxPool(
         actors,
         timeout_s=0.001,
-        initial_timeout_s=0.5,
-        warm_after=2,
         respawn_factory=None,
         max_tokens=8, num_rewards=8,
         cosine_sim_idx=6, frob_residual_idx=7,
     )
-
-    # First call: cold, succeeds.
-    out1 = pool.evaluate(
-        np.zeros(3, np.int32), np.zeros((1, 3), np.int32), 0, None,
-    )
-    assert pool.stats()["timeouts"] == 0
-    assert out1[2][0] == -100.0  # success reward
-
-    # Second call: still cold (warm_after=2), succeeds.
-    out2 = pool.evaluate(
-        np.zeros(3, np.int32), np.zeros((1, 3), np.int32), 0, None,
-    )
-    assert pool.stats()["timeouts"] == 0
-
-    # Third call: warm now — 0.001s timeout < 0.05s delay → sentinel.
-    # The actor is poisoned so the pool is then empty.
-    out3 = pool.evaluate(
+    out = pool.evaluate(
         np.zeros(3, np.int32), np.zeros((1, 3), np.int32), 0, None,
     )
     assert pool.stats()["timeouts"] == 1
-    from alphagrad.approx.cpu_approx_pool import _SENTINEL_REWARD_VALUE
-    assert out3[2][0] == _SENTINEL_REWARD_VALUE
+    assert out[2][0] == _SENTINEL_REWARD_VALUE
+    assert actors[0]._killed
 
 
 def test_evaluate_batch_emits_sentinel_mask(_ray_fake):

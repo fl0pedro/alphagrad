@@ -2361,10 +2361,10 @@ THESIS_PROACTIVE_RECYCLE_EVERY = "100"
 #: it and THESIS_TARGET_ENV_ALLOWED admits it.
 PROACTIVE_RECYCLE_EVERY_VAR = "ALPHAGRAD_PROACTIVE_RECYCLE_EVERY"
 
-#: THE MEASURE TIMEOUT OF A THESIS ROW (owner ruling 2026-09-23).  ppo.py
-#: derives the cold timeout as four times this.  Frozen rounds keep
+#: THE MEASURE DEADLINE OF A THESIS ROW (owner rulings 2026-09-23, 2026-09-24
+#: Q48: one deadline of 300 s, no cold budget).  Frozen rounds keep
 #: CAMPAIGN_RAY_MEASURE_TIMEOUT.
-THESIS_RAY_MEASURE_TIMEOUT = "120"
+THESIS_RAY_MEASURE_TIMEOUT = "300"
 #: THE CORES OF ONE TIMING ACTOR ON A THESIS ROW, on every node class (owner
 #: ruling 2026-09-23).  Frozen rounds keep THESIS_CORE_BUDGET's per_actor.
 THESIS_CORES_PER_ACTOR = "8"

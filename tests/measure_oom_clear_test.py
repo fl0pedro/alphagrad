@@ -99,9 +99,9 @@ def test_without_an_actor_the_env_still_clears(clears):
 
 
 # ---------------------------------------------------------------------------
-# THE REAL CALLBACK PATH: a RESOURCE_EXHAUSTED injected into the compile the
-# measurement makes. The plan must come back REFUSED (counted, never scored)
-# and the actor must clear exactly once.
+# THE REAL CALLBACK PATH: a RESOURCE_EXHAUSTED injected into the candidate's
+# compile. The plan must come back REFUSED (counted, and since 2026-09-24
+# scored at the sentinel) and the actor must clear exactly once.
 # ---------------------------------------------------------------------------
 def _toy_env():
     """A 16-wide scalar loss on the CPU, terminal rewards only."""
@@ -142,9 +142,13 @@ def test_an_oom_in_the_callback_is_refused_and_clears_once(
     monkeypatch.setenv("ALPHAGRAD_SKIP_COST_ANALYSIS", "1")
     monkeypatch.setenv("ALPHAGRAD_SKIP_COUNT_OPS", "1")
     monkeypatch.delenv("ALPHAGRAD_PLAN_LOG", raising=False)
+    monkeypatch.setitem(env_mod._MEASURE_TIMEOUT_S, 0, 300.0)
+    real = cc.cached_compile
 
-    def _oom(*a, **kw):
-        raise _XlaRuntimeError(_OOM_TEXT)
+    def _oom(key, fn, *a, **kw):
+        if bytes(key).startswith(b"approx:"):
+            raise _XlaRuntimeError(_OOM_TEXT)
+        return real(key, fn, *a, **kw)
 
     monkeypatch.setattr(cc, "cached_compile", _oom)
 

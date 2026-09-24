@@ -36,7 +36,12 @@ from alphagrad.approx.env import (                               # noqa: E402
 )
 
 MSLOT = int(REWARD_INDEX["mem_objective"])
-_FLOOR = envmod._MEM_LOG_FLOOR_BYTES
+
+
+# Owner ruling 2026-09-24 Q45: 2^-10 x the smallest nonzero reference value.
+def _eps(ref):
+    return 2.0 ** -10 * min(float(x) for x in ref if float(x) > 0.0)
+
 
 _N = 64
 _rng = np.random.default_rng(0)
@@ -98,7 +103,9 @@ def _triple(ex):
 
 def _formula(cand, ref):
     (t, o, a), (t_r, o_r, a_r) = cand, ref
-    return -(math.log(t / t_r) + math.log(a / a_r) + math.log(o / o_r))
+    e = _eps(ref)
+    return -(math.log((t + e) / (t_r + e)) + math.log((a + e) / (a_r + e))
+             + math.log((o + e) / (o_r + e)))
 
 
 def _spy_executables(monkeypatch):
@@ -146,18 +153,20 @@ def test_slot_11_was_appended_in_both_tables():
 # ------------------------------------------------------ 2. the pure formula
 def test_mem_objective_is_the_negated_log_sum_of_three_ratios():
     same = (512.0, 256.0, 1024.0)
+    e = 2.0 ** -10 * 256.0
     assert envmod.mem_objective(same, same) == (
-        0.0, {"ratios": {"temp": 1.0, "args": 1.0, "out": 1.0},
-              "floored": 0})
+        0.0, {"ratios": {"temp": 1.0, "args": 1.0, "out": 1.0}, "eps": e})
     v, rec = envmod.mem_objective((256.0, 256.0, 512.0), same)
-    assert v == -(math.log(0.5) + math.log(0.5) + math.log(1.0))
-    assert rec == {"ratios": {"temp": 0.5, "args": 0.5, "out": 1.0},
-                   "floored": 0}
-    # an exact 0 takes the one-byte floor on that term only, and is counted
+    half_t, half_a = (256.0 + e) / (512.0 + e), (512.0 + e) / (1024.0 + e)
+    assert v == -(math.log(half_t) + math.log(half_a) + math.log(1.0))
+    assert rec == {"ratios": {"temp": half_t, "args": half_a, "out": 1.0},
+                   "eps": e}
+    assert v == pytest.approx(2.0 * math.log(2.0), abs=2e-3)
+    # an exact 0 is finite through eps, on both sides of that term only
     v, rec = envmod.mem_objective((0.0, 256.0, 1024.0), same)
-    assert v == -(math.log(_FLOOR / 512.0))
-    assert rec == {"ratios": {"temp": _FLOOR / 512.0, "args": 1.0,
-                              "out": 1.0}, "floored": 1}
+    assert v == -(math.log(e / (512.0 + e)))
+    assert rec == {"ratios": {"temp": e / (512.0 + e), "args": 1.0,
+                              "out": 1.0}, "eps": e}
 
 
 # ------------------------------------------ 3. the reference scores exactly 0
@@ -183,7 +192,8 @@ def test_the_reference_scores_exactly_zero(monkeypatch):
     rec = _last_record()
     assert rec["rewards"][MSLOT] == 0.0
     assert rec["mem_ratios"] == {"temp": 1.0, "args": 1.0, "out": 1.0}
-    assert rec["mem_objective_floored"] == 0
+    assert rec["mem_objective_eps"] == _eps(
+        (rec["ref_temp_bytes"], rec["ref_output_bytes"], rec["ref_args_bytes"]))
     assert rec["mem_temp_bytes"] == rec["ref_temp_bytes"] > 0.0
     assert rec["mem_output_bytes"] == rec["ref_output_bytes"] > 0.0
     assert rec["mem_args_bytes"] == rec["ref_args_bytes"] > 0.0
@@ -203,12 +213,13 @@ def test_the_objective_is_the_three_memory_analysis_ratios_bit_for_bit(
     expect = _formula(cand, ref)
     assert expect != 0.0
     rec = _last_record()
-    assert rec["mem_objective_floored"] == 0
+    e = _eps(ref)
+    assert rec["mem_objective_eps"] == e
     assert rec["rewards"][MSLOT] == expect
     assert float(r[MSLOT]) == float(np.float32(expect))
-    assert rec["mem_ratios"] == {"temp": cand[0] / ref[0],
-                                 "args": cand[2] / ref[2],
-                                 "out": cand[1] / ref[1]}
+    assert rec["mem_ratios"] == {"temp": (cand[0] + e) / (ref[0] + e),
+                                 "args": (cand[2] + e) / (ref[2] + e),
+                                 "out": (cand[1] + e) / (ref[1] + e)}
     assert (rec["mem_temp_bytes"], rec["mem_output_bytes"],
             rec["mem_args_bytes"]) == cand
     assert (rec["ref_temp_bytes"], rec["ref_output_bytes"],
@@ -217,7 +228,7 @@ def test_the_objective_is_the_three_memory_analysis_ratios_bit_for_bit(
           f"ratios={rec['mem_ratios']} r_mem={expect:+.6f}")
 
 
-def test_a_zero_temp_plan_takes_the_byte_floor_on_that_term():
+def test_a_zero_temp_plan_is_finite_through_eps_on_that_term():
     env = _make_env()
     r = _run_plan(env, _rev_order(env), skip_everything=True)
     rec = _last_record()
@@ -226,14 +237,13 @@ def test_a_zero_temp_plan_takes_the_byte_floor_on_that_term():
     ref = (rec["ref_temp_bytes"], rec["ref_output_bytes"],
            rec["ref_args_bytes"])
     print(f"[mem-objective] skip-everything: cand={cand} ref={ref} "
-          f"ratios={rec['mem_ratios']} floored={rec['mem_objective_floored']}")
+          f"ratios={rec['mem_ratios']} eps={rec['mem_objective_eps']}")
     # Dead-code elimination leaves the all-skip program with EXACTLY 0 temp
-    # bytes (job 63632); every exact 0 on either side takes the floor and
-    # is counted, a measured value never is.
+    # bytes (job 63632); eps keeps its log finite (owner ruling Q45).
     assert cand[0] == 0.0 and ref[0] > 0.0
-    assert rec["mem_objective_floored"] == sum(
-        int(v < _FLOOR) for v in cand + ref)
-    assert rec["mem_ratios"]["temp"] == _FLOOR / ref[0]
+    e = _eps(ref)
+    assert rec["mem_objective_eps"] == e
+    assert rec["mem_ratios"]["temp"] == e / (ref[0] + e)
     expect = -(math.log(rec["mem_ratios"]["temp"])
                + math.log(rec["mem_ratios"]["args"])
                + math.log(rec["mem_ratios"]["out"]))
@@ -255,7 +265,7 @@ def test_the_absolute_form_reads_zero_and_records_no_ratios(monkeypatch):
     assert float(r[MSLOT]) == 0.0
     rec = _last_record()
     assert rec["mem_ratios"] is None
-    assert rec["mem_objective_floored"] is None
+    assert rec["mem_objective_eps"] is None
     assert rec["ref_args_bytes"] is None and rec["ref_output_bytes"] is None
     # the candidate's own static numbers are recorded under every form
     assert rec["mem_args_bytes"] > 0.0 and rec["mem_output_bytes"] > 0.0
@@ -399,7 +409,7 @@ def test_on_rsnn_shd_a_diag_on_the_carried_face_moves_the_args_term():
     # plan is a candidate like any other: its three ratios are what the two
     # programs' memory_analysis() say, and the diag plan's move is read
     # AGAINST THE EXACT PLAN, both being divided by one reference.
-    assert exact["mem_objective_floored"] == 0
+    assert exact["mem_objective_eps"] > 0.0
     assert exact["rewards"][MSLOT] == -(math.log(exact["mem_ratios"]["temp"])
                                         + math.log(exact["mem_ratios"]["args"])
                                         + math.log(exact["mem_ratios"]["out"]))
@@ -412,7 +422,7 @@ def test_on_rsnn_shd_a_diag_on_the_carried_face_moves_the_args_term():
     # moved by 432 B on 425,552 B (+0.0010 nats), which is the one place the
     # ruling's "moves only the args term" holds to a tenth of a percent
     # rather than exactly.
-    assert diag["mem_objective_floored"] == 0
+    assert diag["mem_objective_eps"] == exact["mem_objective_eps"]
     assert diag["mem_ratios"]["out"] == exact["mem_ratios"]["out"]
     assert abs(math.log(diag["mem_ratios"]["temp"]
                         / exact["mem_ratios"]["temp"])) < 0.002

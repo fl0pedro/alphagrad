@@ -164,13 +164,13 @@ from alphagrad.approx.env import (
     COMPUTE_REWARD_INDICES,
     NUM_AXIS_PAIRS,
     NUM_REWARDS,
-    REFUSAL_SCORED_KINDS,
     REWARD_INDEX,
     REWARD_NAMES,
     SENTINEL_COST,
     StepAction,
     VertexEliminationEnv,
     micro_actions_to_rule_specs_jax,
+    set_measure_timeout_s as _set_measure_timeout_s,
     wire_slots as _env_wire_slots,
 )
 from alphagrad.approx.common.token_vocab import incr_token_vocab
@@ -630,6 +630,14 @@ def configure_mem_objective(args) -> float:
         _HEAD_REWARD_INDICES_ARR = jnp.asarray(
             HEAD_REWARD_INDICES, dtype=jnp.int32)
     return weight
+
+
+# The latency sentinel of a refused plan scored in this process (--ray-measure
+# 0); nothing kills an in-process call (owner rulings 2026-09-24 Q46, Q48).
+def configure_measure_timeout(args) -> float:
+    timeout_s = float(args.ray_measure_timeout)
+    _set_measure_timeout_s(timeout_s)
+    return timeout_s
 
 
 # ---------------------------------------------------------------------------
@@ -5582,8 +5590,11 @@ def make_argparser() -> argparse.ArgumentParser:
              "with --face-actions (the pool's env is per-vertex and would "
              "silently drop the per-face decisions).")
     p.add_argument(
-        "--ray-measure-timeout", type=float, default=600.0,
-        help="Per-call timeout for a --ray-measure actor, seconds.")
+        "--ray-measure-timeout", type=float, default=300.0,
+        help="THE deadline of every measurement call, seconds (owner ruling "
+             "2026-09-24 Q48; no cold budget). A --ray-measure actor's call "
+             "is killed at it, and it is the latency sentinel of every "
+             "refused plan, in the pool and in-process.")
     p.add_argument(
         "--measure-pipeline", type=int, default=0, choices=(0, 1),
         metavar="0|1",
@@ -8409,6 +8420,9 @@ def main(args=None):
              else " (absolute measured numbers, negated; the pre-.9 form)"),
           flush=True)
     os.environ["ALPHAGRAD_MEM_CHANNEL"] = str(args.mem_channel)
+    print(f"[alphagrad] measurement deadline (--ray-measure-timeout) = "
+          f"{configure_measure_timeout(args):.0f} s, the latency sentinel "
+          f"of a refused plan", flush=True)
     # ORACLE A (ticket .62), same transport: env.grad_oracle is the one reader.
     # The measure actors read it too and no longer act on it -- the oracle left
     # their path on 2026-09-18 -- but the variable stays published so one
@@ -8895,8 +8909,6 @@ def main(args=None):
         _pool = CpuApproxPool(
             _actors,
             timeout_s=float(args.ray_measure_timeout),
-            initial_timeout_s=float(args.ray_measure_timeout) * 4.0,
-            warm_after=3,
             respawn_factory=_spawn,
             max_tokens=int(env.obs_width),
             # THE WIRE, from the env that declares it. Under delta_obs the
@@ -8961,8 +8973,6 @@ def main(args=None):
             _tok_pool = CpuApproxPool(
                 _tok_actors,
                 timeout_s=float(args.ray_measure_timeout),
-                initial_timeout_s=float(args.ray_measure_timeout) * 4.0,
-                warm_after=3,
                 respawn_factory=_spawn_tok,
                 max_tokens=int(env.obs_width),
                 token_dtype=env.wire_token_dtype,
@@ -14850,7 +14860,7 @@ def main(args=None):
             "ppo/dual_clip_frac": dual_clip_frac,
         }
         # ---- REFUSED TERMINAL MEASUREMENTS, PER EPISODE AND PER KIND -------
-        # The trainer now drops a refused environment from the update
+        # The trainer drops an excluded environment from the update
         # entirely, which is correct AND silent. This is the number that makes
         # it visible: how many of this episode's terminal measurements were
         # refused, and by what. `_POOL_CS` carries the measure actors' share
@@ -14864,22 +14874,22 @@ def main(args=None):
                 _kk = _ks[len("refused_"):]
                 _ref_counts[_kk] = int(_ref_counts.get(_kk, 0)) + int(_v)
         _ref_total = int(_ref_counts.pop("total", 0))
+        # SCORED against EXCLUDED (owner rulings 2026-09-24 Q42, Q48): every
+        # refusal takes the finite sentinel and trains, except a call the
+        # deadline killed; each count names its fate where it is taken.
+        _ref_scored = int(_ref_counts.pop("scored", 0))
+        _ref_excluded = int(_ref_counts.pop("excluded", 0))
         for _k in sorted(_ref_counts):
             log_dict[f"refused/{_k}"] = int(_ref_counts[_k])
         log_dict["refused/total"] = _ref_total
         log_dict["refused/rate"] = (
             float(_ref_total) / float(num_envs) if num_envs else 0.0)
-        # SCORED against EXCLUDED (owner ruling 2026-09-24, dsnn-4eq): a
-        # gate, timeout or compile refusal takes the finite sentinel and
-        # trains; every other kind is still missing data.
-        _ref_scored = sum(int(_ref_counts.get(_k, 0))
-                          for _k in REFUSAL_SCORED_KINDS)
         log_dict["refused/scored"] = _ref_scored
-        log_dict["refused/excluded"] = _ref_total - _ref_scored
+        log_dict["refused/excluded"] = _ref_excluded
         if _ref_total:
             print(f"[refused ep{ep}] {_ref_total} of {num_envs} terminal "
                   f"measurements refused ({_ref_scored} scored at the "
-                  f"sentinel, {_ref_total - _ref_scored} EXCLUDED from the "
+                  f"sentinel, {_ref_excluded} EXCLUDED from the "
                   f"update): "
                   + ", ".join(f"{_k}={_ref_counts[_k]}"
                               for _k in sorted(_ref_counts)), flush=True)

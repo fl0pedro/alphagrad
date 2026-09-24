@@ -297,11 +297,6 @@ class CpuApproximationActor:
             episode=episode, env_row=env_row, timeout_s=timeout_s,
         )
 
-    def last_reference(self, rule: str | None = None):
-        # The paired reference this actor last measured on `rule`'s graph;
-        # the pool scores a timed-out slot against it (dsnn-4eq).
-        return self._server(rule).last_reference()
-
     def _server(self, rule: str | None):
         """The server that holds ``rule``'s graph."""
         if len(self._impls) == 1:

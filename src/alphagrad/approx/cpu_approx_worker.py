@@ -493,10 +493,6 @@ class CpuApproximationServer:
             _env_slot_cell[0] = _slot_was
             _timeout_cell[0] = _timeout_was
 
-    def last_reference(self) -> dict | None:
-        from alphagrad.approx.env import last_reference as _last
-        return _last()
-
     def precompile(self, order: Any, sparsity_specs: Any, step: int) -> bool:
         """STAGE-2 async: compile-only warm of the shared cluster cache.
 

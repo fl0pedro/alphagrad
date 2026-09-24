@@ -337,6 +337,7 @@ def test_a_plan_refused_by_the_op_count_cap_is_still_recorded(monkeypatch):
     # OFF at import (line 31), so the test has to turn it back on -- which
     # works because `env.skip_count_ops()` reads the variable per call.
     monkeypatch.setenv("ALPHAGRAD_MULS_SENTINEL_CAP", "-1")
+    monkeypatch.setitem(envmod._MEASURE_TIMEOUT_S, 0, 300.0)
     monkeypatch.setenv("ALPHAGRAD_SKIP_COUNT_OPS", "0")
     envmod.consume_plan_records()
     env = _make_env()

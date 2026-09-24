@@ -125,7 +125,8 @@ def test_a_shared_memory_compile_failure_is_refused_as_compile(monkeypatch):
     assert "Shared memory size limit" in rec["refusal_error"]
     reward = np.asarray(out[-1], dtype=np.float32)
     assert np.isfinite(reward).all()
-    assert rec["refusal_latency_ns"] == 10.0 * 120.0 * 1e9
+    assert rec["refusal_latency_ns"] == 120.0 * 1e9
+    assert rec["refusal_program"] is False
 
     assert int(env_mod._TRUNCATED_PLANS[0]) == n_trunc
     assert env_mod.pop_measure_oom() == (0, "")

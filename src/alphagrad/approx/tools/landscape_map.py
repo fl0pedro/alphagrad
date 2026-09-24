@@ -198,6 +198,11 @@ def make_argparser() -> argparse.ArgumentParser:
                    help="Target duration of one timed window (owner ruling "
                         "2026-09-14); see --latency-inner-reps.")
     p.add_argument("--num-eval-samples", type=int, default=5)
+    p.add_argument("--ray-measure-timeout", type=float, default=300.0,
+                   help="THE measurement deadline, seconds, as in ppo.py "
+                        "(owner rulings 2026-09-24 Q46, Q48): the latency "
+                        "sentinel of a refused plan. Nothing kills a call "
+                        "in this process; a hang stays a hang.")
     # 2, as the launchers pass (--latency-warmup 2). Warmup is a BIAS
     # knob, not a precision knob: one untimed execution leaves first-touch
     # cost in the first timed one.
@@ -512,6 +517,7 @@ def _traced_inlined(target_fn, xs):
 def build_env(args):
     key = jrand.PRNGKey(args.seed)
     key, args_key = jrand.split(key)
+    envmod.set_measure_timeout_s(float(args.ray_measure_timeout))
 
     from alphagrad.approx.common.snn_shd import SHD_TARGETS
     from alphagrad.approx.common.rsnn_shd import (is_rsnn,
@@ -1335,6 +1341,7 @@ def measure(env, eval_samples, order, plan):
     consume_per_face_stats()          # drop whatever the plan-build replay left
     consume_mem_parity()
     specs, face_specs, face_skips = get_plan_arrays(plan, len(order))
+    envmod.consume_last_refusal()
     t0 = time.perf_counter()
     # The callback's arity is 2 under `delta_obs` (tokens, reward) and 3 on
     # the legacy full-stream path (tokens, eqn_ids, reward). The reward is
@@ -1349,6 +1356,9 @@ def measure(env, eval_samples, order, plan):
         *eval_samples,
     )
     wall = time.perf_counter() - t0
+    # A refused plan's row carries its reason and its sentinel values (owner
+    # ruling 2026-09-24 Q46); the reward slots above hold the sentinel.
+    refusal = envmod.consume_last_refusal()
     r = np.asarray(reward, dtype=np.float64)
     st = consume_per_face_stats()
     # Ticket .49 made the drain return {"records", "measured", "dropped"};
@@ -1390,6 +1400,10 @@ def measure(env, eval_samples, order, plan):
         "applied": int(st.get("applied", 0)),
         "skipped": int(st.get("skipped", 0)),
         "applied_detail": json.dumps(detail, sort_keys=True),
+        "refused": "" if refusal is None else str(refusal["refused"]),
+        "refusal": ("" if refusal is None else json.dumps(
+            {k: v for k, v in refusal.items() if k != "refused"},
+            sort_keys=True, default=str)),
     }
 
 
@@ -1441,6 +1455,10 @@ CSV_FIELDS = [
     "measure_secs",
     "measure_budget_secs",
     "measure_window_secs",
+    # A REFUSED PLAN'S ROW (owner ruling 2026-09-24 Q46): its reason and, as
+    # JSON, its sentinel values. Empty on a measured plan.
+    "refused",
+    "refusal",
 ]
 
 
@@ -2256,7 +2274,8 @@ def main():
                     "timestamp": f"{time.time():.3f}",
                     **{k: m[k] for k in ("latency_ns", "peak_memory", "static_temp",
                                          "quality", "frob_residual", "applied", "skipped",
-                                         "applied_detail", "wall_s")},
+                                         "applied_detail", "wall_s",
+                                         "refused", "refusal")},
                     **stamp,
                 }
                 append_row(csv_path, row)
@@ -2300,7 +2319,8 @@ def main():
                         **{k: m[k] for k in ("latency_ns", "peak_memory", "static_temp",
                                              "quality", "frob_residual",
                                              "applied", "skipped",
-                                             "applied_detail", "wall_s")},
+                                             "applied_detail", "wall_s",
+                                             "refused", "refusal")},
                         **stamp,
                     }
                     append_row(csv_path, row)
@@ -2380,7 +2400,8 @@ def main():
                 "timestamp": f"{time.time():.3f}",
                 **{k: m[k] for k in ("latency_ns", "peak_memory", "static_temp",
                                      "quality", "frob_residual", "applied", "skipped",
-                                     "applied_detail", "wall_s")},
+                                     "applied_detail", "wall_s",
+                                     "refused", "refusal")},
                 **stamp,
             }
             append_row(csv_path, row)
