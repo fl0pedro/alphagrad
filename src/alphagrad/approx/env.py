@@ -2275,9 +2275,9 @@ def plan_log_attempt() -> int:
 
 
 #: THE CONTAINER THE PLAN JUST MEASURED IMPLIED (owner ruling 2026-09-16).
-#: Written by `_callback_measured` at the container seam and read by
-#: `_record_plan`, which is the one choke point every record passes through.
-#: `None` on every target that carries no temporal edge.
+#: Written by `_callback_measured` from the plan's own wires before anything
+#: can raise, and read by `_record_plan`, which is the one choke point every
+#: record passes through. `None` on every target that carries no temporal edge.
 _PLAN_CARRY: list = [None]
 _PLAN_CARRY_BYTES: list = [None]
 
@@ -2574,7 +2574,6 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
         if refused is not None:
             rec["refused"] = str(refused)
             rec["sentinelled"] = True
-            rec["replayable"] = False
         if refusal_detail:
             rec.update(refusal_detail)
         _record_plan(rec)
@@ -8667,6 +8666,9 @@ def _callback_measured(
         _prof_add(key, now - _pf_last[0])
         _pf_last[0] = now
 
+    # A record names this plan's carry or none, never the previous plan's.
+    _PLAN_CARRY[0] = None
+    _PLAN_CARRY_BYTES[0] = None
     partial_order, partial_specs = _get_partials(order, sparsity_specs, stop)
     is_terminal = int(stop) >= len(order)
     # SPARSITY (reward slot 10). Read ONCE per callback, like `_fid_on`
@@ -8707,6 +8709,11 @@ def _callback_measured(
     # --approx-add choose only; None under every fixed value (EnvState).
     _joins_np = (None if face_joins is None
                  else np.asarray(face_joins)[: len(o_list)])
+    _carry_container = None
+    if is_terminal and _carry.armed(config):
+        _carry_container = _carry.container_for_plan(
+            config, o_list, _faces_np, _skips_np, partial_specs)
+    _PLAN_CARRY[0] = _carry_container
 
     def _log_refused(reason: str, reward_vec, detail: dict | None = None):
         """Record a terminal plan the callback REFUSES to measure.
@@ -8980,7 +8987,6 @@ def _callback_measured(
     # again on the variant's own replay, the way the policy's graph enumerates
     # them.
     _rec_order = o_list
-    _carry_container = None
     # THE GRAPH THE POLICY ACTED ON, held before the variant replaces
     # `config`. A process that serves two graphs of one target holds a
     # carry-plan entry per graph, and this is what picks the right one.
@@ -8997,9 +9003,14 @@ def _callback_measured(
     _ref_cfg, _ref_args, _ref_consts, _ref_eval = (
         config, args, consts, eval_samples)
     if is_terminal and _carry.armed(_carry_base_cfg):
-        _carry_container = _carry.container_for_plan(
-            config, o_list, _faces_np, _skips_np, partial_specs)
         _variant = _carry.measurement_env(_carry_container, _carry_base_cfg)
+        # THE CONTAINER'S AT-REST BYTES ride on the plan record (owner ruling
+        # 2026-09-23, no new reward channel): the given blocks of the program the
+        # plan is measured on, in the container it implied.
+        _c_entry = _carry._entry(_carry_base_cfg)
+        _PLAN_CARRY_BYTES[0] = _carry.carry_at_rest_bytes(
+            _c_entry["base"] if _variant is None else _variant,
+            _c_entry["spec"]["rule"])
         if _variant is not None:
             (o_list, _m_specs, _m_faces, _m_skips, _m_joins) = \
                 _carry.transport_wires(
@@ -9036,17 +9047,6 @@ def _callback_measured(
                 eval_samples = tuple(
                     _carry.eval_samples_for(_carry_container, eval_samples,
                                             _carry_base_cfg))
-    _PLAN_CARRY[0] = _carry_container
-    # THE CONTAINER'S AT-REST BYTES ride on the plan record (owner ruling
-    # 2026-09-23, no new reward channel): the given blocks of the program the
-    # plan is measured on, in the container it implied.
-    _PLAN_CARRY_BYTES[0] = None
-    if _carry_container is not None:
-        _c_entry = _carry._entry(_carry_base_cfg)
-        _c_var = _carry.measurement_env(_carry_container, _carry_base_cfg)
-        _PLAN_CARRY_BYTES[0] = _carry.carry_at_rest_bytes(
-            _c_entry["base"] if _c_var is None else _c_var,
-            _c_entry["spec"]["rule"])
     _pf("cb.carry_container")
 
     # ------------------------------------------------------------------

@@ -330,8 +330,9 @@ def test_gate_mode_and_plan_log_leave_the_reward_bit_identical(monkeypatch):
 
 def test_a_plan_refused_by_the_op_count_cap_is_still_recorded(monkeypatch):
     """The muls cap is the reachable refusal: set it to 0 and every plan
-    trips it. The record must exist, carry the reason, and be marked as not
-    replayable -- its rewards are a sentinel, not a measurement."""
+    trips it. The record must exist, carry the reason, and be marked refused
+    and sentinelled -- its rewards are a sentinel, not a measurement. Its wire
+    is complete, so it stays replayable (dsnn-sf5)."""
     monkeypatch.setenv("ALPHAGRAD_PLAN_LOG", "1")
     # -1, so any counted op count trips it. This file turns the count pass
     # OFF at import (line 31), so the test has to turn it back on -- which
@@ -349,7 +350,7 @@ def test_a_plan_refused_by_the_op_count_cap_is_still_recorded(monkeypatch):
     rec = out["records"][0]
     assert rec["refused"] == "muls-cap"
     assert rec["sentinelled"] is True
-    assert rec["replayable"] is False
+    assert rec["replayable"] is True
     assert len(rec["rewards"]) == NUM_REWARDS
     # the wire is still there, so the refusal can be attributed to a plan
     assert rec["order"] and "faces" in rec
@@ -411,4 +412,4 @@ def test_a_plan_that_raises_is_still_recorded_and_the_error_still_reaches_the_ca
         f"record(s): a crashed plan left no trace")
     rec = out["records"][-1]
     assert rec["refused"].startswith("raised:ValueError")
-    assert rec["sentinelled"] is True and rec["replayable"] is False
+    assert rec["sentinelled"] is True and rec["replayable"] is True

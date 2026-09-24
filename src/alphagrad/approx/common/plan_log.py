@@ -331,10 +331,12 @@ def decode_wires(rec: dict, *, quant_sentinel: int = -3):
             b1 = quant_dtype_id(int(b1), legacy_catalog[0])
         return quant_dtype_id(b1)
 
-    if not rec.get("replayable", True):
+    # Only truncation refuses: old refused records say replayable False.
+    if int(rec.get("faces_truncated") or 0) > 0:
         raise ValueError(
-            f"plan-log record is NOT replayable: {rec.get('faces_truncated')} "
-            f"live faces were dropped by ALPHAGRAD_PLAN_LOG_MAX_FACES. "
+            f"plan-log record is TRUNCATED and NOT replayable: "
+            f"{rec['faces_truncated']} live faces were dropped by "
+            f"ALPHAGRAD_PLAN_LOG_MAX_FACES. "
             f"Re-run with the cap off (0) -- replaying the truncated wire "
             f"would measure a DIFFERENT plan and report it as this one.")
     sh = rec["shape"]
