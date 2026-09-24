@@ -437,10 +437,13 @@ def test_absolute_form_is_the_measured_number(monkeypatch):
     assert -float(r[_MEM]) == term[-1]["static_temp_bytes"] > 0.0
     assert -float(r[_LAT]) >= envmod._LAT_FLOOR_NS
     assert out["paired_ref"] == {"records": [], "dropped": 0}
-    keep = [i for i in range(NUM_REWARDS) if i not in (_MEM, _LAT)]
+    _mobj = REWARD_INDEX["mem_objective"]
+    assert float(r[_mobj]) == 0.0
+    keep = [i for i in range(NUM_REWARDS) if i not in (_MEM, _LAT, _mobj)]
     monkeypatch.setenv("ALPHAGRAD_COST_FORM", "paired-log")
     r2 = _run_plan(env, _rev_order(env))
-    # Nothing but the two cost slots moves between the forms.
+    # Nothing but the three paired slots moves between the forms (slot 11
+    # is a paired quantity by definition: 0.0 under the absolute form).
     assert np.array_equal(r[keep].astype(np.float64),
                           r2[keep].astype(np.float64)), (r, r2)
 

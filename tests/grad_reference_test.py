@@ -181,6 +181,9 @@ def _lm_env(monkeypatch, example, dataset, rule):
     for k, v in _TLM_ENV.items():
         monkeypatch.setenv(k, v)
     monkeypatch.setattr(_ex, "_EQ_NN_HIDDEN", 256)
+    # build_env configures the face width for the process; the toy tests of
+    # this module build their wires at the width they imported.
+    monkeypatch.setattr(envmod, "MAX_FACES", envmod.MAX_FACES)
     argv = ["--example", example, "--dataset", dataset, "--seed", "250197",
             "--num-eval-samples", "1", "--num-data-points", "1",
             "--reps-per-point", "1", "--latency-inner-reps", "1",
@@ -205,30 +208,41 @@ def _rev_exact_and_reference(env):
     return out_rev, out_ref
 
 
-def _leaf_cosines(out_ref, out_rev):
+def _leaves_agree(out_ref, out_rev, tag):
+    """Leaf by leaf, in float64: the same shape and either both exactly
+    zero or a cosine above 1 - 1e-6. Returns the per-leaf (cosine, |ref|,
+    |rev|) rows; the pooled comparator the reward uses must agree too."""
     e = envmod._gradient_leaves(out_ref)
     a = envmod._gradient_leaves(out_rev)
     assert len(e) == len(a) and len(e) > 0
-    cos = []
-    for x, y in zip(e, a):
-        assert envmod._leaf_shape(x) == envmod._leaf_shape(y)
+    rows = []
+    for i, (x, y) in enumerate(zip(e, a)):
+        assert envmod._leaf_shape(x) == envmod._leaf_shape(y), (tag, i)
         y = y.dense() if envmod._is_sparse_tensor(y) else y
         x64 = np.asarray(x, dtype=np.float64).ravel()
         y64 = np.asarray(y, dtype=np.float64).ravel()
-        cos.append(float(np.dot(x64, y64)
-                         / max(np.linalg.norm(x64) * np.linalg.norm(y64),
-                               1e-300)))
-    return cos
+        nx, ny = float(np.linalg.norm(x64)), float(np.linalg.norm(y64))
+        cos = (float(np.dot(x64, y64) / (nx * ny))
+               if nx > 0.0 and ny > 0.0 else None)
+        rows.append((cos, nx, ny))
+    print(f"[grad-reference] {tag}: "
+          + "; ".join(f"leaf {i} cos {c} |ref| {nx:.3e} |rev| {ny:.3e}"
+                      for i, (c, nx, ny) in enumerate(rows)))
+    for i, (cos, nx, ny) in enumerate(rows):
+        if nx == 0.0 and ny == 0.0:
+            continue
+        assert cos is not None, (tag, i, nx, ny)
+        assert cos > 1.0 - 1e-6, (tag, i, cos)
+    c, _rel = envmod._quality_metrics(out_ref, out_rev)
+    assert float(c) > 1.0 - 1e-6, (tag, float(c))
+    return rows
 
 
 def test_on_the_toy_the_reference_gradient_is_the_rev_exact_gradient():
     env = _make_env()
     out_rev, out_ref = _rev_exact_and_reference(env)
-    cos = _leaf_cosines(out_ref, out_rev)
-    assert min(cos) > 1.0 - 1e-6
-    # and the production comparator accepts the pair as it is
-    c, _rel = envmod._quality_metrics(out_ref, out_rev)
-    assert float(c) > 1.0 - 1e-6
+    rows = _leaves_agree(out_ref, out_rev, "toy")
+    assert rows[0][1] > 0.0
 
 
 @pytest.mark.parametrize("example,dataset,rule", [
@@ -242,12 +256,8 @@ def test_the_reference_gradient_is_the_rev_exact_gradient(
     env = _lm_env(monkeypatch, example, dataset, rule)
     assert envmod.reference_kind(env.config) == "jax.grad"
     out_rev, out_ref = _rev_exact_and_reference(env)
-    cos = _leaf_cosines(out_ref, out_rev)
-    print(f"[grad-reference] {example} {rule or ''}: {len(cos)} leaves, "
-          f"min cosine {min(cos):.9f}")
-    assert min(cos) > 1.0 - 1e-6
-    c, _rel = envmod._quality_metrics(out_ref, out_rev)
-    assert float(c) > 1.0 - 1e-6
+    rows = _leaves_agree(out_ref, out_rev, f"{example} {rule or ''}")
+    assert any(nx > 0.0 for _c, nx, _ny in rows)
 
 
 # --------------------------------- 3. the reference scores exactly 0
