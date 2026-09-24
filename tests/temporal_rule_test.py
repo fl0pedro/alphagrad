@@ -43,7 +43,8 @@ import pytest
 from graphax.core import _inline_call_primitives
 from graphax.examples.neuromorphic import (
     RSNN_CARRY_BLOCKS,
-    RSNN_GIVEN_LENGTHS,
+    RSNN_CARRY_STACKS,
+    RSNN_GIVEN_COUNTS,
     RSNN_STATE_NAMES,
     RSNN_SURROGATE_SCALE,
     RSNN_WEIGHT_NAMES,
@@ -51,6 +52,7 @@ from graphax.examples.neuromorphic import (
     SNN_CARRY_SCOPE,
     attach_rsnn_future,
     attach_rsnn_past,
+    rsnn_given_rule,
 )
 
 from alphagrad.approx.common import examples as ex
@@ -77,21 +79,31 @@ def _n_bytes(xs, frm):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("rule,n_given", [("tbptt", 0), ("bptt", 5),
-                                          ("rtrl", 3 + 11)])
+                                          ("rtrl", len(RSNN_CARRY_STACKS))])
 def test_each_rule_builds_and_passes_its_own_given_values(rule, n_given):
     xs = _args(rule)
     assert len(xs) == 16 + n_given
-    assert RSNN_GIVEN_LENGTHS[n_given] == rule
+    assert RSNN_GIVEN_COUNTS[rule] == n_given
+    assert rsnn_given_rule(xs[16:]) == rule
     fn = ex.get_fn("RSNN_SHD")
     assert float(fn(*xs)) == float(fn(*xs))        # builds and evaluates
 
 
-def test_the_rules_are_told_apart_by_the_given_count():
-    assert RSNN_GIVEN_LENGTHS == {0: "tbptt", 5: "bptt", 14: "rtrl"}
+def test_the_rules_are_told_apart_by_the_given_count_and_rank():
+    """Five adjoints and five carried stacks: the count is the same, so the
+    RANK behind it tells the rules apart. An adjoint is a vector, a carried
+    block is rank 2 or more in every container."""
+    assert RSNN_GIVEN_COUNTS == {"tbptt": 0, "bptt": 5, "rtrl": 5}
     xs = list(_args("tbptt"))
     fn = ex.get_fn("RSNN_SHD")
     with pytest.raises(ValueError, match="selected by that count"):
         fn(*(xs + [jnp.zeros((3,))]))
+    bp, rt = _args("bptt")[16:], _args("rtrl")[16:]
+    assert {int(jnp.ndim(g)) for g in bp} == {1}
+    assert min(int(jnp.ndim(g)) for g in rt) >= 2
+    assert rsnn_given_rule(bp) == "bptt" and rsnn_given_rule(rt) == "rtrl"
+    with pytest.raises(ValueError, match="neither"):
+        rsnn_given_rule(bp[:3] + rt[3:])
 
 
 def test_the_weights_are_slots_7_8_9_and_V_is_one_of_them():
@@ -113,8 +125,9 @@ def test_the_carried_state_is_five_components():
 def test_the_forward_value_does_not_move_between_tbptt_and_rtrl():
     """The rtrl attachment is value-neutral, to the last bit.
 
-    ``W - W_ref`` is exactly zero, so the two rules see the same loss and a
-    comparison between them is about credit assignment and nothing else.
+    ``W - stop_gradient(W)`` is exactly zero, so the two rules see the same
+    loss and a comparison between them is about credit assignment and nothing
+    else.
     """
     fn = ex.get_fn("RSNN_SHD")
     assert float(fn(*_args("tbptt"))) == float(fn(*_args("rtrl")))
@@ -158,12 +171,12 @@ def test_carried_block_shapes_and_bytes():
     want = {0: (h,), 1: (h,), 2: (h,), 3: (h,), 4: (n_out,)}
     wshape = {0: (h, n_in), 1: (h, h), 2: (n_out, h)}
     total = 0
-    for (s_i, w_i), J in zip(RSNN_CARRY_BLOCKS, xs[19:]):
-        assert tuple(J.shape) == want[s_i] + wshape[w_i], (s_i, w_i)
+    assert RSNN_CARRY_STACKS == (((0, 1, 2, 3), 0), ((0, 1, 2, 3), 1),
+                                 ((4,), 0), ((4,), 1), ((4,), 2))
+    for (ss, w_i), J in zip(RSNN_CARRY_STACKS, xs[16:]):
+        stack = (len(ss),) if len(ss) > 1 else ()
+        assert tuple(J.shape) == stack + want[ss[0]] + wshape[w_i], (ss, w_i)
         total += int(np.prod(J.shape))
-    # the three reference weights lead the tuple
-    for ref, w in zip(xs[16:19], xs[7:10]):
-        assert np.array_equal(np.asarray(ref), np.asarray(w))
     # 226 MB: four hidden components against W and V, plus the readout row
     want_total = (4 * (h * h * n_in) + 4 * (h * h * h)
                   + n_out * h * n_in + n_out * h * h + n_out * n_out * h)
@@ -191,9 +204,13 @@ def test_a_wrong_given_shape_raises():
     h = R.RSNN_HIDDEN
     st = R.zero_state()
     W = R.rsnn_weights(jax.random.PRNGKey(0))
-    bad = tuple(W) + tuple(jnp.zeros((2, 2, 2)) for _ in RSNN_CARRY_BLOCKS)
+    bad = tuple(jnp.zeros((len(ss), 2, 2)) for ss, _ in RSNN_CARRY_STACKS)
     with pytest.raises(ValueError, match="Nothing else is a container"):
         attach_rsnn_past(st, W, bad)
+    with pytest.raises(ValueError, match="leads with an axis of extent 4"):
+        attach_rsnn_past(st, W, (jnp.zeros((3, h, h)),) + bad[1:])
+    with pytest.raises(ValueError, match="one tensor per stack"):
+        attach_rsnn_past(st, W, bad[:3])
     with pytest.raises(ValueError, match="nor the reduced container"):
         attach_rsnn_future(jnp.array(0.0), st,
                            tuple(jnp.zeros((3,)) for _ in range(5)))
@@ -214,8 +231,10 @@ def _jaxpr(rule):
 
 
 @pytest.mark.parametrize("rule,n_carry", [("tbptt", 0), ("bptt", 15),
-                                          ("rtrl", 25)])
+                                          ("rtrl", 38)])
 def test_the_given_block_is_its_own_scope_and_carries_step_zero(rule, n_carry):
+    # rtrl, exact container: 3 stop_gradient + 3 sub, 5 dot_general, the
+    # 2 x 4 (slice, squeeze, add) of the two stacked rows, 3 readout adds.
     jx, _, _ = _jaxpr(rule)
     carry = [i for i, e in enumerate(jx.eqns)
              if SNN_CARRY_SCOPE in str(getattr(e.source_info, "name_stack", ""))]
@@ -227,30 +246,34 @@ def test_the_given_block_is_its_own_scope_and_carries_step_zero(rule, n_carry):
 def test_the_carried_jacobian_edge_admits_the_eligibility_trace_diag():
     """Every carried-Jacobian edge admits ``Diag(0, 1, gcd)``.
 
-    Pair ``(0, 1)`` ties the STATE index to the weight's ROW index, which is
-    the postsynaptic index of the synapse, and that is exactly the pairing an
-    eligibility trace has. Its factor space is ``(1, gcd)``, so every divisor
-    of the gcd is a legal block granularity and the finest one is the trace.
+    The pair that ties the STATE index to the weight's ROW index -- the
+    postsynaptic index of the synapse -- is exactly the pairing an eligibility
+    trace has. On a readout block that is ``(0, 1)``; on a stacked hidden
+    block the leading axis is the stack, so it is ``(1, 2)``. Its factor
+    space is ``(1, gcd)``, so every divisor of the gcd is a legal block
+    granularity and the finest one is the trace.
     """
     from graphax.core import _build_graph, _force
     jx, consts, xs = _jaxpr("rtrl")
     _, graph, _, _ = _build_graph(jx, xs, consts, (7, 8, 9))
-    seen = 0
+    seen = {3: 0, 4: 0}
     for src, inner in graph.items():
         for dst, e in inner.items():
             t = _force(e)
-            if t is None or t.val is None or np.ndim(t.val) != 3:
+            if t is None or t.val is None or np.ndim(t.val) not in (3, 4):
                 continue
-            if len(t.out_dims) != 1 or len(t.primal_dims) != 2:
+            nd = np.ndim(t.val)
+            if len(t.out_dims) != nd - 2 or len(t.primal_dims) != 2:
                 continue
+            i, j = (0, 1) if nd == 3 else (1, 2)
             m = diag_valid_mask(t, 8)
-            assert m[0, 1] and m[1, 0], "the (state, weight row) pair"
-            base, span = diag_pair_factor_space(t, 0, 1)
+            assert m[i, j] and m[j, i], "the (state, weight row) pair"
+            base, span = diag_pair_factor_space(t, i, j)
             assert base == 1 and span > 1
-            assert span == np.gcd(int(t.out_dims[0].logical_size),
+            assert span == np.gcd(int(t.out_dims[-1].logical_size),
                                   int(t.primal_dims[0].logical_size))
-            seen += 1
-    assert seen == len(RSNN_CARRY_BLOCKS)
+            seen[nd] += 1
+    assert seen == {3: 3, 4: 2}, seen
 
 
 # ---------------------------------------------------------------------------
@@ -445,11 +468,11 @@ Wd = (W[0], jnp.diag(jnp.diag(W[1])), W[2])
 ex_d = R.carried_jacobians(seq, t, Wd)
 tr_d = R.eprop_traces(seq, t, Wd)
 out["eprop_vs_exact_V_diagonal"] = max(
-    rel(a, b) for a, b in zip(tr_d[3:], ex_d[3:]))
+    rel(a, b) for a, b in zip(tr_d, ex_d))
 ex_f = R.carried_jacobians(seq, t, W)
 tr_f = R.eprop_traces(seq, t, W)
 out["eprop_vs_exact_V_full"] = max(
-    rel(a, b) for a, b in zip(tr_f[3:], ex_f[3:]))
+    rel(a, b) for a, b in zip(tr_f, ex_f))
 hf, _ = head(t, W)
 ge = jax.grad(fn, argnums=(7, 8, 9))(*(hf + ex_f))
 gt = jax.grad(fn, argnums=(7, 8, 9))(*(hf + tr_f))
@@ -527,7 +550,7 @@ def _gen(rule, **kw):
 
 
 @pytest.mark.parametrize("rule,n_given", [("tbptt", 0), ("bptt", 5),
-                                          ("rtrl", 14)])
+                                          ("rtrl", 5)])
 def test_the_generator_declares_the_slots_it_fills(rule, n_given):
     gen = _gen(rule)
     assert gen is not None, "the SHD family had no data generator at all"
@@ -553,11 +576,10 @@ def test_the_generator_hands_back_the_runs_own_weights(rule):
     """THE WEIGHTS ARE PART OF THE DRAW ON PURPOSE.
 
     `generate_eval_samples` redraws every differentiated slot a generator does
-    NOT cover. Under `rtrl` the given values lead with three REFERENCE
-    weights whose whole job is to equal slots 7 to 9 bit for bit, so that the
-    attached ``W - W_ref`` is exactly zero and no forward value moves. A
-    generator that left the weights out would have had them redrawn and that
-    equality broken in silence.
+    NOT cover. The given values are computed from the weights over the
+    recording, so a generator that left the weights out would have had them
+    redrawn and the carry of one weight set attached to the step of another,
+    in silence.
     """
     gen = _gen(rule)
     xs = ex.get_args("RSNN_SHD", jax.random.PRNGKey(1), dataset=None,
@@ -567,10 +589,6 @@ def test_the_generator_hands_back_the_runs_own_weights(rule):
     for slot in (7, 8, 9):
         np.testing.assert_array_equal(np.asarray(data[slot]),
                                       np.asarray(xs[slot]))
-    if rule == "rtrl":
-        for slot, w in zip((16, 17, 18), (7, 8, 9)):
-            np.testing.assert_array_equal(np.asarray(data[slot]),
-                                          np.asarray(data[w]))
 
 
 def test_the_generator_needs_the_runs_key():
@@ -810,20 +828,37 @@ def test_the_compact_container_is_the_store_the_approximation_buys():
     graph shrinks an argument."""
     xs_d = _args("rtrl", carry_container="exact")
     xs_e = _args("rtrl", carry_container="diag")
-    assert len(xs_d) == len(xs_e) == 16 + 14, "the rule selector must not move"
-    dense = sum(int(np.asarray(x).nbytes) for x in xs_d[19:])
-    compact = sum(int(np.asarray(x).nbytes) for x in xs_e[19:])
+    assert len(xs_d) == len(xs_e) == 16 + 5, "the rule selector must not move"
+    dense = sum(int(np.asarray(x).nbytes) for x in xs_d[16:])
+    compact = sum(int(np.asarray(x).nbytes) for x in xs_e[16:])
     assert dense == 225_738_752
     assert compact == 2_129_920
     assert dense // compact > 100
 
 
-def test_the_reference_weights_lead_either_container():
+def test_the_attachment_is_a_stop_gradient_and_carries_no_reference_weights():
+    """Owner ruling 2026-09-24 (Q31a): the tuple used to lead with three
+    reference weights (434 kB of arguments per program) so that ``W - W_ref``
+    was zero without a vertex. It is ``W - stop_gradient(W)`` now: one
+    edge-free vertex per weight inside the carry scope and no argument."""
     for cont in ("exact", "diag"):
         xs = _args("rtrl", carry_container=cont)
-        for slot, ref in zip((7, 8, 9), (16, 17, 18)):
-            np.testing.assert_array_equal(np.asarray(xs[slot]),
-                                          np.asarray(xs[ref]))
+        assert len(xs) == 16 + len(RSNN_CARRY_STACKS)
+        wshapes = {tuple(x.shape) for x in xs[7:10]}
+        assert not any(tuple(g.shape) in wshapes for g in xs[16:18])
+        # the readout blocks under diag share the weights' shapes but not
+        # their values
+        for g in xs[16:]:
+            for w in xs[7:10]:
+                assert not (tuple(g.shape) == tuple(w.shape)
+                            and np.array_equal(np.asarray(g), np.asarray(w)))
+    jx, _, _ = _jaxpr("rtrl")
+    sg = [i for i, e in enumerate(jx.eqns)
+          if e.primitive.name == "stop_gradient"]
+    assert len(sg) == 3
+    assert all(SNN_CARRY_SCOPE in str(getattr(jx.eqns[i].source_info,
+                                              "name_stack", ""))
+               for i in sg)
 
 
 def test_the_forward_value_does_not_move_between_containers():
@@ -841,10 +876,11 @@ def test_the_compact_carry_expands_to_the_recursion():
     seq, y, _ = R._draw_recording(jax.random.PRNGKey(1), None, -1)
     W = R.rsnn_weights(jax.random.PRNGKey(1))
     compact = R.carry_traces(seq, 9, W)
-    expanded = R.eprop_traces(seq, 9, W)[3:]
-    assert len(compact) == len(expanded) == len(RSNN_CARRY_BLOCKS)
-    for (s, w), c, e in zip(RSNN_CARRY_BLOCKS, compact, expanded):
-        assert tuple(c.shape) == tuple(W[w].shape), (s, w)
+    expanded = R.eprop_traces(seq, 9, W)
+    assert len(compact) == len(expanded) == len(RSNN_CARRY_STACKS)
+    for (ss, w), c, e in zip(RSNN_CARRY_STACKS, compact, expanded):
+        stack = (len(ss),) if len(ss) > 1 else ()
+        assert tuple(c.shape) == stack + tuple(W[w].shape), (ss, w)
         assert e.ndim == c.ndim + 1
 
 
@@ -854,9 +890,9 @@ def test_the_readout_block_against_the_readout_weight_is_exact():
     form loses nothing at all."""
     seq, y, _ = R._draw_recording(jax.random.PRNGKey(1), None, -1)
     W = R.rsnn_weights(jax.random.PRNGKey(1))
-    exact = R.carried_jacobians(seq, 9, W)[3:]
-    trace = R.eprop_traces(seq, 9, W)[3:]
-    k = RSNN_CARRY_BLOCKS.index((4, 2))
+    exact = R.carried_jacobians(seq, 9, W)
+    trace = R.eprop_traces(seq, 9, W)
+    k = RSNN_CARRY_STACKS.index(((4,), 2))
     a = np.asarray(trace[k], np.float64)
     b = np.asarray(exact[k], np.float64)
     assert np.linalg.norm(a - b) / np.linalg.norm(b) < 1e-6
@@ -1113,7 +1149,7 @@ CLASS_CONTAINERS = ("exact", "diag", "reduce", "quant", "diag+quant",
 
 def _carry_bytes(container):
     xs = _args("rtrl", carry_container=container)
-    return sum(int(np.asarray(x).nbytes) for x in xs[19:])
+    return sum(int(np.asarray(x).nbytes) for x in xs[16:])
 
 
 @pytest.mark.parametrize("container", CLASS_CONTAINERS)
@@ -1122,13 +1158,14 @@ def test_the_carry_arrives_in_the_container_the_class_implies(container):
     block itself, so this is the same question the measured program asks."""
     from graphax.examples.neuromorphic import rsnn_carry_container
     xs = _args("rtrl", carry_container=container)
-    assert len(xs) == 16 + 14, "the rule selector must not move"
+    assert len(xs) == 16 + 5, "the rule selector must not move"
     states = tuple(xs[2:7])
     weights = tuple(xs[7:10])
-    for (s, w), J in zip(RSNN_CARRY_BLOCKS, xs[19:]):
-        c = rsnn_carry_container((s, w), states[s].shape, weights[w].shape,
-                                 J.shape, J.dtype)
-        assert c.name == container, ((s, w), c.name)
+    for (ss, w), J in zip(RSNN_CARRY_STACKS, xs[16:]):
+        c = rsnn_carry_container((ss[0], w), states[ss[0]].shape,
+                                 weights[w].shape, J.shape, J.dtype,
+                                 n_stacked=len(ss))
+        assert c.name == container, ((ss, w), c.name)
 
 
 def test_every_approximated_container_is_smaller_than_the_exact_one():
@@ -1175,11 +1212,12 @@ def test_the_reduce_container_is_the_exact_axis_mean():
     W = R.rsnn_weights(jax.random.PRNGKey(1))
     t = 9
     jac = jax.jacrev(R.prefix_state(seq, t, W), argnums=(0, 1, 2))(*W)
-    red = R.carry_under_plan(seq, t, W, "reduce")[3:]
+    red = R.carry_under_plan(seq, t, W, "reduce")
     worst = 0.0
-    for i, (s, w) in enumerate(RSNN_CARRY_BLOCKS):
-        want = jnp.mean(jac[s][w], axis=-1)[..., None]
-        assert tuple(red[i].shape) == tuple(want.shape), (s, w)
+    for i, (ss, w) in enumerate(RSNN_CARRY_STACKS):
+        want = R._stack_blocks(
+            ss, [jnp.mean(jac[s][w], axis=-1)[..., None] for s in ss])
+        assert tuple(red[i].shape) == tuple(want.shape), (ss, w)
         scale = float(jnp.max(jnp.abs(want))) + 1e-30
         worst = max(worst, float(jnp.max(jnp.abs(red[i] - want))) / scale)
     assert worst < 1e-2, worst
@@ -1189,8 +1227,8 @@ def test_the_quant_container_is_the_same_recursion_held_narrow():
     seq, y, _ = R._draw_recording(jax.random.PRNGKey(1), None, -1)
     W = R.rsnn_weights(jax.random.PRNGKey(1))
     t = 9
-    qnt = R.carry_under_plan(seq, t, W, "quant")[3:]
-    exact = R.carry_under_plan(seq, t, W, "exact")[3:]
+    qnt = R.carry_under_plan(seq, t, W, "quant")
+    exact = R.carry_under_plan(seq, t, W, "exact")
     for a, b in zip(qnt, exact):
         assert a.dtype == jnp.bfloat16
         assert tuple(a.shape) == tuple(b.shape)
@@ -1206,9 +1244,9 @@ def test_the_diag_container_is_the_eprop_recursion():
     seq, y, _ = R._draw_recording(jax.random.PRNGKey(1), None, -1)
     W = R.rsnn_weights(jax.random.PRNGKey(1))
     t = 9
-    got = R.carry_under_plan(seq, t, W, "diag")[3:]
+    got = R.carry_under_plan(seq, t, W, "diag")
     want = R.carry_traces(seq, t, W)
-    assert len(got) == len(want) == len(RSNN_CARRY_BLOCKS)
+    assert len(got) == len(want) == len(RSNN_CARRY_STACKS)
     for a, b in zip(got, want):
         np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
 
@@ -1898,7 +1936,7 @@ for t in (3, 7):
     out[f"diag_vs_hand_eprop_t{t}"] = max(
         rel(a, b) for a, b in zip(plan_g, hand_g))
     out[f"carry_bytes_t{t}"] = int(sum(np.asarray(x).nbytes
-                                       for x in given[3:]))
+                                       for x in given))
 print("RESULT " + json.dumps(out))
 '''
 

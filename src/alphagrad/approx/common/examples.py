@@ -161,10 +161,9 @@ def data_gen(fn_str: str, dataset: str | None = None, dataset_size: int | None =
         # and reward slot 6 read 0.0 on every SHD plan.
         #
         # THE KEY IS NOT OPTIONAL HERE. The generator has to draw the SAME
-        # recording and the SAME weights `get_args` drew, or the reference
-        # weights it hands back stop matching slots 7 to 9 and the attached
-        # `W - W_ref` stops being zero -- which moves the forward value in
-        # silence. Pass the key `get_args` was given.
+        # recording and the SAME weights `get_args` drew, or the given values
+        # it hands back are the carry of another weight set than the one in
+        # slots 7 to 9 -- in silence. Pass the key `get_args` was given.
         if key is None:
             raise ValueError(
                 f"data_gen({fn_str!r}) needs the same `key` that was passed "
