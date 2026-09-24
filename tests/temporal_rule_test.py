@@ -1467,11 +1467,13 @@ def test_the_skip_variant_scores_against_the_arms_own_rule():
     """A truncated program's own exact gradient is the truncated gradient, so
     scoring against it would read 1.0 for a plan that threw the whole prefix
     away. The generator publishes the arm's rule as the reference instead."""
+    import alphagrad.approx.env as envmod
     lm, CP, env = _env_for("rtrl")
     var = CP.measurement_env("skip")
     ref = getattr(var["config"].data_gen, "reference_oracle", None)
     assert ref is not None
-    assert ref["target"] is env.config.target_fun
+    # the loss of the base rtrl target, which returns (loss, *state)
+    assert ref["target"] is envmod._loss_target(env.config)
     assert tuple(ref["argnums"]) == tuple(env.config.argnums)
     assert len(ref["args"]) == len(env.args)
     # the non-skip containers keep the in-band reference draw, which is the
