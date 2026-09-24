@@ -159,7 +159,8 @@ def test_the_two_channel_tables_are_identical():
 def test_nothing_moved_and_sparsity_was_appended():
     assert SSLOT == 10
     assert rs.SPARSITY_IDX == 10
-    assert envmod.NUM_REWARDS == 11
+    assert envmod.NUM_REWARDS == 12
+    assert envmod.REWARD_NAMES[11] == "mem_objective"
     # every pre-existing index is where it was
     assert envmod.REWARD_INDEX["quality"] == 6
     assert envmod.REWARD_INDEX["grad_coverage"] == 7

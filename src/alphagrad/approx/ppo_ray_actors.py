@@ -58,8 +58,6 @@ class PPOActor:
         cpu_workers: list,
         *,
         callback_timeout_s: float = 120.0,
-        initial_timeout_s: float = 600.0,
-        warm_after: int = 3,
         recycle_every: int = 50,
         cpu_actor_options: dict | None = None,
         starting_actor_id: int = 0,
@@ -77,8 +75,6 @@ class PPOActor:
         return self._impl.init_server(
             cpu_workers,
             callback_timeout_s=callback_timeout_s,
-            initial_timeout_s=initial_timeout_s,
-            warm_after=warm_after,
             recycle_every=recycle_every,
             cpu_actor_options=cpu_actor_options,
             starting_actor_id=starting_actor_id,

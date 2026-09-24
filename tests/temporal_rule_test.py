@@ -2348,6 +2348,37 @@ for name, wires in plans.items():
     row["step_state_vs_forward"] = max(
         rel(a, b) for a, b in zip(one[2], cfg.target_fun(*vargs)[1:]))
     out[name] = row
+
+# THE PAIRED REFERENCE (owner ruling 2026-09-24, Q11a): jax.jacrev over the
+# loss and the five state outputs, in the one-call layout, against the exact
+# one-call step on the same arguments, and serving the exact reference draw.
+_c, cfg_e, vargs_e, _p, exe_e = measured([])
+ref_exe = jax.jit(envmod.reference_program(env.config),
+                  keep_unused=True).lower(*vargs_e).compile()
+one_ref, one_step = ref_exe(*vargs_e), exe_e(*vargs_e)
+ref = {"kind": envmod.reference_kind(env.config)}
+for i, part in enumerate(("loss_row", "carry", "state")):
+    ref[part] = max(rel(a, b) for a, b in zip(one_ref[i], one_step[i]))
+ref["host_vs_carried_jacobians"] = 0.0
+for t in range(1, T):
+    host = R.carry_from_executable(seq, y, t, vargs_e[7:10], vargs_e[10:16],
+                                   ref_exe, "exact")
+    ref["host_vs_carried_jacobians"] = max(
+        ref["host_vs_carried_jacobians"],
+        max(rel(a, b) for a, b in zip(host, R.carried_jacobians(seq, t, W))))
+gen = cfg_e.data_gen.with_executable(exe_e, vargs_e,
+                                     reference=(ref_exe, tuple(vargs_e)))
+for s in range(64):
+    keys = jax.random.split(jax.random.PRNGKey(s), 5)
+    if int(gen.meta(keys)["t"]) >= 5:
+        break
+drawn = dict(zip(gen.data_slots, gen.reference_draw(keys)))
+t_ref = int(gen.meta(keys)["t"])
+ref["t_drawn"] = t_ref
+ref["draw_vs_carried_jacobians"] = max(
+    rel(drawn[16 + i], w)
+    for i, w in enumerate(R.carried_jacobians(seq, t_ref, W)))
+out["reference"] = ref
 print("RESULT " + json.dumps(out))
 '''
 
@@ -2380,6 +2411,20 @@ def test_the_one_call_step_returns_the_loss_row_and_the_forward_state(
     row = host_loop_results[plan]
     assert row["step_loss_row_vs_program"] < 1e-12, row
     assert row["step_state_vs_forward"] < 1e-12, row
+
+
+def test_the_rtrl_paired_reference_is_jacrev_and_the_exact_one_call_step(
+        host_loop_results):
+    # owner ruling 2026-09-24, Q11a: the exact gradient, the exact next
+    # carry and the next state, and its layout serves the exact draw
+    ref = host_loop_results["reference"]
+    assert ref["kind"] == "jax.jacrev", ref
+    assert ref["loss_row"] < 1e-12, ref
+    assert ref["carry"] < 1e-12, ref
+    assert ref["state"] < 1e-12, ref
+    assert ref["host_vs_carried_jacobians"] < 1e-11, ref
+    assert ref["t_drawn"] >= 5, ref
+    assert ref["draw_vs_carried_jacobians"] < 1e-11, ref
 
 
 @pytest.mark.parametrize("plan", ["empty", "e-prop"])

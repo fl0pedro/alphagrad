@@ -67,6 +67,7 @@ class _Actor:
         self._flag = False
         self.evaluate = _Remote(self._evaluate)
         self.pop_oom_flag = _Remote(self._pop)
+        self.ready = _Remote(lambda: True)
 
     def _evaluate(self, order, specs, step, **kw):
         self.calls += 1

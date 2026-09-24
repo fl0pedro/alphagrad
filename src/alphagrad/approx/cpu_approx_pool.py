@@ -138,12 +138,14 @@ class CpuApproxPool:
         triples. Order doesn't matter — pool consumes them
         round-robin.
     timeout_s
-        Per-call timeout for ``ray.get``. When exceeded, the future
+        THE deadline of every measurement call (owner ruling 2026-09-24
+        Q48: one deadline, no cold budget). When exceeded, the future
         is cancelled, the actor is killed, a replacement is requested
         from ``respawn_factory`` (in a daemon thread so the
         ``evaluate`` call returns quickly), and the sentinel is
-        returned. Default 60s — REPORT.md baselines run ~0.9 s per
-        callback, so 60 s is ~70× normal.
+        returned: a killed call is excluded from the update and counted.
+        An actor gets no plan before its construction has finished (its
+        ``ready`` call), so construction never runs against a deadline.
     respawn_factory
         Zero-arg callable that returns a fresh actor handle. Called
         from a daemon thread on the SPMD process. The factory is
@@ -170,29 +172,14 @@ class CpuApproxPool:
         frob_residual_idx: int,
         fidelity_idx: int | None = None,
         sparsity_idx: int | None = None,
-        initial_timeout_s: float | None = None,
-        warm_after: int = 3,
         token_dtype=np.int32,
         eqn_dtype=np.int32,
         emit_eqn_ids: bool = True,
     ):
+        for a in actor_handles:
+            self._await_ready(a)
         self._alive: collections.deque = collections.deque(actor_handles)
         self._timeout_s = float(timeout_s)
-        # Phase 4f: cold-cache budget. The first ``warm_after`` calls
-        # per actor use ``initial_timeout_s`` (usually much larger than
-        # the warm timeout); after that each actor switches to the
-        # regular ``timeout_s``. We track the warm-state per actor in
-        # ``_call_counts``; brand-new actors (initial spawn or respawn)
-        # start at zero. ``None`` disables the cold-budget and uses
-        # ``timeout_s`` from the first call.
-        self._initial_timeout_s = (
-            float(initial_timeout_s) if initial_timeout_s is not None
-            else float(timeout_s)
-        )
-        self._warm_after = int(warm_after)
-        self._call_counts: dict[int, int] = {
-            id(a): 0 for a in actor_handles
-        }
         self._respawn_factory = respawn_factory
         self._lock = threading.Lock()
         self._closed = False
@@ -233,9 +220,9 @@ class CpuApproxPool:
         # ---- recycle-on-OOM ----
         # Only PROCESS TEARDOWN frees the XLA-internal executable retention
         # (LRU / clear_caches climb identically to the cap), so an actor whose
-        # measure OOMs is recycled (kill+respawn). The OOM'd slot stays
-        # refused: the retry on the fresh actor is gone (dsnn-dfw.120: 40 of
-        # 47 retries failed again, jobs 67489-67491).
+        # measure OOMs is recycled (kill+respawn). The OOM'd slot is not
+        # measured again: the retry on the fresh actor is gone (dsnn-dfw.120:
+        # 40 of 47 retries failed again, jobs 67489-67491).
         # Optional PROACTIVE recycle: recycle an actor before it reaches the
         # ~500-measure OOM point, so the OOM never happens. A/B alternative to
         # the reactive path; 0 = off (reactive-only, the required deliverable).
@@ -258,12 +245,37 @@ class CpuApproxPool:
         self._submit_exec = None
         self._submit_inflight = None
 
+    @staticmethod
+    def _await_ready(actor: Any) -> Any:
+        # Construction is not a plan, so it runs against no deadline (Q48).
+        import ray
+        ray.get(actor.ready.remote())
+        return actor
+
+    @staticmethod
+    def _is_terminal(order, step) -> bool:
+        return int(step) >= int(np.asarray(order).reshape(-1).shape[0])
+
+    def _record_timeout(self, timeout_s: float, *, order, specs, step,
+                        face_specs, face_skips, reward) -> None:
+        # A terminal call the deadline killed is excluded, counted and
+        # recorded with the reason "timeout" (owner ruling 2026-09-24 Q48).
+        from alphagrad.approx import env as _env
+        _env.record_pool_refusal(
+            "timeout", order=order, rule_specs=specs, face_specs=face_specs,
+            face_skips=face_skips, stop=int(step), reward_vec=reward,
+            refusal_detail={"refusal_timeout_s": float(timeout_s)},
+            scored=False)
+        print(f"[refused] timeout step={int(step)} after "
+              f"{float(timeout_s):.0f}s: excluded from the update",
+              flush=True)
+
     def submit_batch(self, *args, **kwargs):
         """Start :meth:`evaluate_batch` on a worker thread; return its future.
 
         THE MEASUREMENT IS NOT MOVED, ONLY THE WAIT. The thread calls the very
         same ``evaluate_batch`` the blocking path calls -- the same waves, the
-        same per-actor cold/warm timeouts, the same OOM recycle, the
+        same deadline, the same OOM recycle, the
         same sentinel rows -- so a pipelined measurement and a blocking one
         are the same measurement taken by the same actors. What moves is who
         waits: the caller gets a future and can dispatch device work before it
@@ -310,31 +322,9 @@ class CpuApproxPool:
             f = self._submit_inflight
         return f is not None and not f.done()
 
-    def _timeout_for(self, actor: Any) -> float:
-        """Cold vs warm timeout for ``actor``. Returns 0 when the
-        user has disabled timeouts (``--cpu-callback-timeout 0``),
-        which the call site interprets as ``ray.get`` without a
-        timeout — i.e. block until the actor returns or dies.
-
-        Reads the call count under the lock. A brand-new actor (never
-        seen, ``warm_after`` not yet exhausted) gets
-        ``initial_timeout_s``; otherwise the regular ``timeout_s``.
-        """
-        # Explicit disable: any zero or negative timeout means "no
-        # timeout" for that phase. Cold/warm semantics still apply
-        # independently — set both to 0 to disable globally.
-        if self._timeout_s <= 0 and self._initial_timeout_s <= 0:
-            return 0.0
-        with self._lock:
-            n = self._call_counts.get(id(actor), 0)
-            if n < self._warm_after:
-                return self._initial_timeout_s
-            return self._timeout_s
-
-    def _mark_call(self, actor: Any) -> None:
-        """Increment the per-actor successful-call counter."""
-        with self._lock:
-            self._call_counts[id(actor)] = self._call_counts.get(id(actor), 0) + 1
+    def _deadline(self) -> float:
+        # 0 means no deadline (--cpu-callback-timeout 0): ray.get blocks.
+        return max(0.0, self._timeout_s)
 
     # ------------------------------------------------------------------
     # Actor pick / put-back
@@ -409,6 +399,13 @@ class CpuApproxPool:
                 # Driver's periodic ``stats()`` poll will surface
                 # the deficit.
                 return
+            try:
+                self._await_ready(new_handle)
+            except Exception as _exc:
+                print(f"[POOL] respawned actor failed its construction: "
+                      f"{type(_exc).__name__}: {str(_exc)[:200]}",
+                      flush=True)
+                return
             with self._lock:
                 if self._closed:
                     # Pool was closed while we were respawning —
@@ -451,10 +448,9 @@ class CpuApproxPool:
             pass
         # Drop the dead handle's per-actor bookkeeping.
         with self._lock:
-            self._call_counts.pop(id(actor), None)
             self._measures_since_recycle.pop(id(actor), None)
         try:
-            new_handle = self._respawn_factory()
+            new_handle = self._await_ready(self._respawn_factory())
         except Exception as _exc:
             print(
                 f"[POOL] recycle respawn failed: {type(_exc).__name__}: "
@@ -469,7 +465,6 @@ class CpuApproxPool:
                 except Exception:
                     pass
                 return None
-            self._call_counts.setdefault(id(new_handle), 0)
             self._measures_since_recycle[id(new_handle)] = 0
         return new_handle
 
@@ -625,6 +620,11 @@ class CpuApproxPool:
                 samples_arg = (
                     tuple(eval_samples) if eval_samples is not None else None
                 )
+            # THE ONE DEADLINE (owner ruling 2026-09-24 Q48). 0 means no
+            # deadline (``--cpu-callback-timeout 0``): ``ray.get`` blocks, the
+            # debugging escape hatch. THE SAME NUMBER travels with the
+            # request: the actor scores a refused plan at this deadline.
+            timeout = self._deadline()
             future = actor.evaluate.remote(
                 np.asarray(order_np),
                 np.asarray(specs_np),
@@ -638,27 +638,17 @@ class CpuApproxPool:
                 episode=(None if episode is None else int(episode)),
                 env_row=(None if env_row is None else int(env_row)),
                 rule=(None if rule is None else str(rule)),
+                timeout_s=(float(timeout) if timeout > 0 else None),
             )
-            # Per-actor cold/warm timeout. ``timeout_for`` returns 0
-            # when the user requested no-timeout (``--cpu-callback-timeout 0``);
-            # in that case we ``ray.get`` without a timeout so a slow
-            # compile never gets sentinel-poisoned. This is the
-            # debugging escape hatch: useful when the rollout's
-            # reward signal looks suspiciously zero and we want to
-            # rule out the sentinel path. The pool-recycle still
-            # bounds long-term memory growth.
-            timeout = self._timeout_for(actor)
+            # An actor runs calls in send order: the flag of the call above.
+            flag = actor.pop_oom_flag.remote()
             result = ray.get(future) if timeout <= 0 else ray.get(future, timeout=timeout)
             self._check_arity(result)
-            self._mark_call(actor)
-            self._put_back(actor)
             _tk = self._wire(result[0], self._token_dtype, "tokens")
             _rw = np.asarray(result[-1], dtype=np.float32)
-            if not self._emit_eqn_ids:
-                return _tk, _rw
-            return (_tk,
-                    self._wire(result[1], self._eqn_dtype, "eqn_ids"),
-                    _rw)
+            out = ((_tk, _rw) if not self._emit_eqn_ids else
+                   (_tk, self._wire(result[1], self._eqn_dtype, "eqn_ids"),
+                    _rw))
         except GetTimeoutError:
             self._n_timeouts += 1
             print(
@@ -667,7 +657,7 @@ class CpuApproxPool:
                 flush=True,
             )
             self._poison(actor, future=future)
-            return _sentinel_callback_output(
+            _sv = _sentinel_callback_output(
                 self._max_tokens,
                 self._num_rewards,
                 self._cosine_sim_idx,
@@ -678,6 +668,12 @@ class CpuApproxPool:
                 self._eqn_dtype,
                 self._emit_eqn_ids,
             )
+            if self._is_terminal(order_np, step):
+                self._record_timeout(
+                    timeout, order=order_np, specs=specs_np, step=step,
+                    face_specs=face_specs, face_skips=face_skips,
+                    reward=_sv[-1])
+            return _sv
         except RayActorError:
             self._n_actor_errors += 1
             print(
@@ -698,6 +694,9 @@ class CpuApproxPool:
                 self._emit_eqn_ids,
             )
         except Exception as _exc:
+            # Apparatus faults stop the run, as in evaluate_batch (Q53).
+            if _is_toolchain_fault(_exc):
+                raise
             # Catch-all: anything else (serialization issue, malformed
             # return, etc.) is treated like a transient actor failure.
             # We don't ``raise`` because the io_callback caller can't
@@ -722,6 +721,35 @@ class CpuApproxPool:
                 self._eqn_dtype,
                 self._emit_eqn_ids,
             )
+        # The flag of this row (Q52), as in evaluate_batch.
+        try:
+            was_oom = bool(ray.get(flag, timeout=10.0))
+        except Exception as _flag_exc:
+            self._n_actor_errors += 1
+            print(
+                f"[POOL] oom-flag read failed step={int(step)}: "
+                f"{type(_flag_exc).__name__}: {str(_flag_exc)[:120]}; the "
+                f"row stands, the actor is replaced "
+                f"(n_actor_errors={self._n_actor_errors})",
+                flush=True,
+            )
+            self._poison(actor, future=None)
+            return out
+        if was_oom:
+            fresh = self._recycle_actor(actor)
+            self._n_oom_recycles += 1
+            print(
+                f"[POOL] oom-recycle step={int(step)}: "
+                f"{'fresh actor' if fresh is not None else 'respawn failed'}, "
+                f"row not measured again "
+                f"(n_oom_recycles={self._n_oom_recycles})",
+                flush=True,
+            )
+            if fresh is not None:
+                self._put_back(fresh)
+            return out
+        self._put_back(actor)
+        return out
 
     # ------------------------------------------------------------------
     # Batched dispatch — fan out N futures concurrently with a single
@@ -849,10 +877,9 @@ class CpuApproxPool:
         of shapes ``(N, max_tokens)``, ``(N, max_tokens)``,
         ``(N, num_rewards)``, ``(N,) bool``.
 
-        Picks up to ``N`` actors from the pool (each gets its own per-
-        actor cold/warm timeout), fires the futures in parallel, and
-        ``ray.wait``s them with the MAX per-actor timeout as the wall
-        clock. Per-call timeouts are then enforced by ``ray.get(...,
+        Picks up to ``N`` actors from the pool, fires the futures in
+        parallel, and ``ray.wait``s them with the one deadline as the wall
+        clock. The deadline is then enforced by ``ray.get(...,
         timeout=0)`` on already-ready futures and via a final
         ``GetTimeoutError`` sweep on the still-pending ones.
 
@@ -934,10 +961,6 @@ class CpuApproxPool:
                 return tokens_out, rewards_out, sentinel_mask
             return tokens_out, eqn_ids_out, rewards_out, sentinel_mask
 
-        # Map wave-local actor index j -> list of slots that OOM'd on it,
-        # accumulated across waves. Drives the single post-loop recycle.
-        oom_by_actor: dict[int, list] = {}
-
         # Optional PROACTIVE recycle: swap out any held actor that has served
         # >= ALPHAGRAD_PROACTIVE_RECYCLE_EVERY measures since its last recycle,
         # BEFORE it reaches the OOM point. A/B alternative to the reactive path.
@@ -962,7 +985,10 @@ class CpuApproxPool:
         for wave_start in range(0, N, M):
             wave = list(range(wave_start, min(wave_start + M, N)))
             futures: dict[int, Any] = {}
+            flags: dict[int, Any] = {}
             f_timeouts: dict[int, float] = {}
+            # Actor index j -> the slots of this wave that ran out of memory.
+            oom_by_actor: dict[int, list] = {}
             for j, i in enumerate(wave):
                 actor = held[j]
                 if actor is None:
@@ -975,6 +1001,9 @@ class CpuApproxPool:
                     continue
                 self._n_calls += 1
                 try:
+                    # THE SAME NUMBER travels with the request: the actor
+                    # scores a refused plan at the deadline of this slot.
+                    _to = self._deadline()
                     futures[i] = actor.evaluate.remote(
                         np.asarray(order_batch[i]),
                         np.asarray(specs_batch[i]),
@@ -991,8 +1020,11 @@ class CpuApproxPool:
                         env_row=(None if env_rows is None
                                  else int(env_rows[i])),
                         rule=(None if rule is None else str(rule)),
+                        timeout_s=(float(_to) if _to > 0 else None),
                     )
-                    f_timeouts[i] = self._timeout_for(actor)
+                    # An actor runs calls in send order: the flag of this call.
+                    flags[i] = actor.pop_oom_flag.remote()
+                    f_timeouts[i] = _to
                 except Exception as _exc:
                     self._n_other_errors += 1
                     print(
@@ -1005,7 +1037,7 @@ class CpuApproxPool:
                     held[j] = None
                     _sentinel_slot(i)
 
-            # Per-wave wall clock = max per-actor timeout in this wave.
+            # Per-wave wall clock = the deadline of this wave's slots.
             wave_to = max((t for t in f_timeouts.values() if t > 0.0), default=0.0)
             wave_no_timeout = wave_to <= 0.0
             live = list(futures.values())
@@ -1027,7 +1059,6 @@ class CpuApproxPool:
                         _res = ray.get(future, timeout=0)
                     self._check_arity(_res)
                     reward = _res[-1]
-                    self._mark_call(actor)
                     tokens_out[i] = self._wire(_res[0], self._token_dtype,
                                                "tokens")
                     if self._emit_eqn_ids:
@@ -1038,24 +1069,28 @@ class CpuApproxPool:
                         self._measures_since_recycle[id(actor)] = (
                             self._measures_since_recycle.get(id(actor), 0) + 1
                         )
-                    # OOM sentinel? The worker returns the SAME sentinel arrays
-                    # for a device OOM as for a benign graphax shape error, so
-                    # the reward magnitude alone can't tell them apart. Query
-                    # the actor's one-shot pop_oom_flag: True => this sentinel
-                    # was the un-freeable measure-GPU leak filling up; recycle
-                    # this actor. False => benign; leave the actor alive.
-                    if self._reward_is_sentinel(reward):
-                        try:
-                            _was_oom = bool(ray.get(
-                                actor.pop_oom_flag.remote(), timeout=10.0
-                            ))
-                        except Exception:
-                            _was_oom = False
-                        if _was_oom:
-                            # The OOM came back through the success branch, so
-                            # the mask was not set; the slot stays refused.
+                    # Every row (Q52): an in-callback OOM is a scored, finite row.
+                    try:
+                        _was_oom = bool(ray.get(flags[i], timeout=10.0))
+                    except Exception as _flag_exc:
+                        self._n_actor_errors += 1
+                        print(
+                            f"[POOL] oom-flag read failed actor#{j} slot={i} "
+                            f"step={int(step_batch[i])}: "
+                            f"{type(_flag_exc).__name__}: "
+                            f"{str(_flag_exc)[:120]}; the row stands, the "
+                            f"actor is replaced "
+                            f"(n_actor_errors={self._n_actor_errors})",
+                            flush=True,
+                        )
+                        self._poison(actor, future=None)
+                        held[j] = None
+                        continue
+                    if _was_oom:
+                        oom_by_actor.setdefault(j, []).append(i)
+                        # The server's -1e10 row stays masked, a scored row scored.
+                        if self._reward_is_sentinel(reward):
                             sentinel_mask[i] = True
-                            oom_by_actor.setdefault(j, []).append(i)
                 except GetTimeoutError:
                     self._n_timeouts += 1
                     print(
@@ -1066,6 +1101,16 @@ class CpuApproxPool:
                     self._poison(actor, future=future)
                     held[j] = None
                     _sentinel_slot(i)
+                    # A non-terminal slot (a tokenization stall) is no plan.
+                    if self._is_terminal(order_batch[i], step_batch[i]):
+                        self._record_timeout(
+                            f_timeouts.get(i, 0.0), order=order_batch[i],
+                            specs=specs_batch[i], step=step_batch[i],
+                            face_specs=(None if face_specs_batch is None
+                                        else face_specs_batch[i]),
+                            face_skips=(None if face_skips_batch is None
+                                        else face_skips_batch[i]),
+                            reward=rewards_out[i])
                 except RayActorError:
                     self._n_actor_errors += 1
                     print(
@@ -1102,23 +1147,21 @@ class CpuApproxPool:
                     held[j] = None
                     _sentinel_slot(i)
 
-        # ---- reactive recycle-on-OOM pass ----
-        # For each held actor that OOM'd one or more slots: recycle it ONCE
-        # (process teardown frees the leaked XLA memory). Its OOM'd slots keep
-        # the sentinel already written to the output buffers.
-        for j, slots in oom_by_actor.items():
-            old_actor = held[j]
-            if old_actor is None:
-                continue
-            fresh = self._recycle_actor(old_actor)
-            self._n_oom_recycles += 1
-            held[j] = fresh  # replace in-place; may be None on failure
-            print(
-                f"[POOL] oom-recycle actor#{j} slots={slots}: "
-                f"{'fresh actor' if fresh is not None else 'respawn failed'}, "
-                f"slots stay refused (n_oom_recycles={self._n_oom_recycles})",
-                flush=True,
-            )
+            # Recycle after the wave: only process teardown frees the leaked XLA memory.
+            for j, slots in oom_by_actor.items():
+                old_actor = held[j]
+                if old_actor is None:
+                    continue
+                fresh = self._recycle_actor(old_actor)
+                self._n_oom_recycles += 1
+                held[j] = fresh  # replace in-place; may be None on failure
+                print(
+                    f"[POOL] oom-recycle actor#{j} slots={slots}: "
+                    f"{'fresh actor' if fresh is not None else 'respawn failed'}, "
+                    f"rows not measured again "
+                    f"(n_oom_recycles={self._n_oom_recycles})",
+                    flush=True,
+                )
 
         # Return still-alive actors to the pool.
         for a in held:
@@ -1295,7 +1338,7 @@ class CpuApproxPool:
             pass
 
         try:
-            new_handle = self._respawn_factory()
+            new_handle = self._await_ready(self._respawn_factory())
         except Exception:
             # Respawn failed — accept the smaller pool. The driver's
             # next recycle attempt will try again.
@@ -1359,7 +1402,7 @@ class CpuApproxPool:
         new_actors = []
         for _ in range(n_old):
             try:
-                new_actors.append(self._respawn_factory())
+                new_actors.append(self._await_ready(self._respawn_factory()))
             except Exception:
                 # Stop on first failure; we'll run with the partial
                 # pool we managed to build.

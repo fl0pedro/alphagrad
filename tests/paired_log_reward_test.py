@@ -1,17 +1,18 @@
 """THE PAIRED LOG-DIFFERENCE COST CHANNELS (ticket dsnn-3qm.9).
 
 Under ``--cost-form paired-log`` reward slots 2 (latency_ns) and 5
-(peak_memory) carry ``-(log cost(candidate) - log cost(rev-exact))``, with
-rev-exact -- the reverse order, every face None -- measured in the SAME
-callback right after the candidate, through the same executable path and the
-same instrument. Pinned here on the 64-wide toy scalar loss of
-tests/mem_channel_test.py (no TLM, no data generator, CPU, the spec-native
-instrument ALPHAGRAD_DIRECT_MEASURE=1):
+(peak_memory) carry ``-(log cost(candidate) - log cost(reference))``, with
+the reference -- jax.grad of the target (dsnn-xta; the graphax rev-exact
+until 2026-09-24) -- measured in the SAME callback, interleaved with the
+candidate, through the same executable path and the same instrument. Pinned
+here on the 64-wide toy scalar loss of tests/mem_channel_test.py (no TLM, no
+data generator, CPU, the spec-native instrument ALPHAGRAD_DIRECT_MEASURE=1):
 
-1. REV-EXACT SCORES EXACTLY 0 on the memory channel (same executable, same
-   static temp) and within the drift floor on latency (two back-to-back
-   timings of one executable). With the per-rep timer stubbed to a constant
-   both channels are exactly 0.
+1. THE REFERENCE SCORES EXACTLY 0 on the memory channel (the reference
+   program measured as the candidate: same program, same static temp) and
+   within the drift floor on latency (two back-to-back timings of one
+   program). With the per-rep timer stubbed to a constant both channels are
+   exactly 0.
 2. A CHEAPER PLAN scores a NEGATIVE Delta (a positive slot): the
    skip-everything plan, whose temp is exactly 0 and takes the one-byte
    floor; a COSTLIER plan (forward order) scores a positive Delta.
@@ -50,6 +51,7 @@ import numpy as np                                              # noqa: E402
 import pytest                                                   # noqa: E402
 
 import alphagrad.approx.env as envmod                           # noqa: E402
+from alphagrad.approx.common import compile_cache as _cc        # noqa: E402
 from alphagrad.approx.env import (                              # noqa: E402
     FACE_SLOTS,
     MAX_FACES,
@@ -111,6 +113,29 @@ def _run_plan(env, order, skip_everything=False, stop_after=None):
 
 def _rev_order(env):
     return sorted(int(x) for x in np.asarray(env.valid_vertices))[::-1]
+
+
+def _the_reference_as_the_candidate(monkeypatch, env):
+    """Every ``approx:`` compile of the callback becomes the reference
+    program (jax.grad of the target), so the callback scores the reference
+    against itself. The process-local executable memo is keyed on the plan,
+    so it is cleared on both sides of the substitution."""
+    real = _cc.cached_compile
+    _cc._LOCAL_CACHE.clear()
+
+    def _substitute(key, fn):
+        if bytes(key).startswith(b"approx:"):
+            fn = lambda: envmod._compile_measure(                # noqa: E731
+                jax.jit(envmod.reference_program(env.config),
+                        keep_unused=True).lower(*env.args))
+        return real(key, fn)
+    monkeypatch.setattr(_cc, "cached_compile", _substitute)
+
+
+@pytest.fixture(autouse=True)
+def _no_substituted_candidate_outlives_its_test():
+    yield
+    _cc._LOCAL_CACHE.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -177,30 +202,32 @@ def test_cost_form_reader(monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# 1. rev-exact scores 0
+# 1. the reference scores 0
 # --------------------------------------------------------------------------
 
-def test_rev_exact_scores_exactly_zero_on_memory_and_inside_drift_on_latency():
+def test_the_reference_scores_exactly_zero_on_memory_and_inside_drift_on_latency(
+        monkeypatch):
     env = _make_env()
+    _the_reference_as_the_candidate(monkeypatch, env)
     r = _run_plan(env, _rev_order(env))
     recs = envmod.consume_plan_records()["paired_ref"]["records"]
     assert len(recs) == 1
     rec = recs[0]
-    # Same executable on both sides: the static temp is the same number.
+    # Same program on both sides: the static temp is the same number.
     assert rec["temp_bytes"] == rec["candidate_memory_bytes"] > 0.0
     assert float(r[_MEM]) == 0.0
-    # Two back-to-back timings of one executable: a DRIFT FLOOR sample. A
+    # Two back-to-back timings of one program: a DRIFT FLOOR sample. A
     # shared CPU box moves well under 2x between adjacent windows.
     d_lat = -float(r[_LAT])
-    print(f"[paired-log] rev-exact vs itself: Delta_lat={d_lat:+.4f} "
+    print(f"[paired-log] the reference vs itself: Delta_lat={d_lat:+.4f} "
           f"(ratio {math.exp(d_lat):.3f}); temp={rec['temp_bytes']:.0f} B "
           f"lat={rec['latency_ns']/1e3:.1f} us")
     assert abs(d_lat) < math.log(2.0)
     assert rec["latency_ns"] > 0.0 and rec["mem_floored"] == 0
-    assert rec["order"] == _rev_order(env)
+    assert rec["reference"] == "jax.grad"
 
 
-def test_identity_scores_exactly_zero_with_a_deterministic_instrument(
+def test_the_reference_scores_exactly_zero_with_a_deterministic_instrument(
         monkeypatch):
     """With the per-rep timer stubbed to a constant, the pair is exact on
     BOTH channels: the reward form has no offset of its own."""
@@ -212,6 +239,7 @@ def test_identity_scores_exactly_zero_with_a_deterministic_instrument(
 
     monkeypatch.setattr(envmod, "_time_one_rep", _const_rep)
     env = _make_env()
+    _the_reference_as_the_candidate(monkeypatch, env)
     r = _run_plan(env, _rev_order(env))
     assert float(r[_LAT]) == 0.0
     assert float(r[_MEM]) == 0.0
@@ -246,8 +274,9 @@ def test_costlier_plan_scores_positive_delta():
     rev = _rev_order(env)
     r_fwd = _run_plan(env, rev[::-1])                   # forward mode
     rec = envmod.consume_plan_records()["paired_ref"]["records"][-1]
-    # The reference is rev-exact REGARDLESS of the candidate's order.
-    assert rec["order"] == rev
+    # The reference is jax.grad of the target REGARDLESS of the candidate's
+    # order.
+    assert rec["reference"] == "jax.grad"
     assert rec["candidate_memory_bytes"] > rec["temp_bytes"]
     assert float(r_fwd[_MEM]) < 0.0                     # costlier -> below 0
     assert -float(r_fwd[_MEM]) == pytest.approx(
@@ -408,10 +437,13 @@ def test_absolute_form_is_the_measured_number(monkeypatch):
     assert -float(r[_MEM]) == term[-1]["static_temp_bytes"] > 0.0
     assert -float(r[_LAT]) >= envmod._LAT_FLOOR_NS
     assert out["paired_ref"] == {"records": [], "dropped": 0}
-    keep = [i for i in range(NUM_REWARDS) if i not in (_MEM, _LAT)]
+    _mobj = REWARD_INDEX["mem_objective"]
+    assert float(r[_mobj]) == 0.0
+    keep = [i for i in range(NUM_REWARDS) if i not in (_MEM, _LAT, _mobj)]
     monkeypatch.setenv("ALPHAGRAD_COST_FORM", "paired-log")
     r2 = _run_plan(env, _rev_order(env))
-    # Nothing but the two cost slots moves between the forms.
+    # Nothing but the three paired slots moves between the forms (slot 11
+    # is a paired quantity by definition: 0.0 under the absolute form).
     assert np.array_equal(r[keep].astype(np.float64),
                           r2[keep].astype(np.float64)), (r, r2)
 

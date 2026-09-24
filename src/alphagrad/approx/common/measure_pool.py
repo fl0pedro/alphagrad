@@ -88,8 +88,6 @@ def spawn_measure_pool(args_dict: dict, *, n_actors: int, exec_on_gpu: bool,
     return CpuApproxPool(
         actors,
         timeout_s=float(timeout_s),
-        initial_timeout_s=float(timeout_s) * 4.0,
-        warm_after=3,
         respawn_factory=_spawn,
         max_tokens=int(max_tokens),
         num_rewards=int(num_rewards),

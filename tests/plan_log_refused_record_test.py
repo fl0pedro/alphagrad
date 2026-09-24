@@ -12,6 +12,7 @@ from alphagrad.approx.common import plan_log as plog
 T_PIN = 7
 RULE = "rtrl"
 RAISED = "synthetic refusal on the container's program"
+DEADLINE = 300.0
 _BUILT: dict = {}
 
 
@@ -51,6 +52,8 @@ def _quant_on_the_carry(env):
 def _arm(mp, env):
     from graphax.core import FaceTransformIllegal
     mp.setenv("ALPHAGRAD_PLAN_LOG", "1")
+    mp.setenv("ALPHAGRAD_COST_FORM", "absolute")
+    mp.setattr(envmod, "_MEASURE_TIMEOUT_S", [DEADLINE])
     mp.setattr(M, "_PER_FACE_MASKS", [False])
     real = envmod._face_transforms_for_order
 
@@ -72,7 +75,6 @@ def _measure(env, order, specs, faces, skips, *samples):
 
 @pytest.fixture(scope="module")
 def refused(tmp_path_factory):
-    from graphax.core import FaceTransformIllegal
     env = _env(tmp_path_factory.mktemp("planlogrec"))
     order, specs, faces, skips = _quant_on_the_carry(env)
     own = CP.container_for_plan(env.config, order, faces, skips, specs)
@@ -85,8 +87,8 @@ def refused(tmp_path_factory):
         mp.setattr(envmod, "_PLAN_CARRY", ["exact"])
         mp.setattr(envmod, "_PLAN_CARRY_BYTES", [exact_bytes])
         envmod.consume_plan_records()
-        with pytest.raises(FaceTransformIllegal, match=RAISED):
-            _measure(env, order, specs, faces, skips)
+        # The reward chain scores a raise in the carry container step (Q53).
+        _measure(env, order, specs, faces, skips)
         records = envmod.consume_plan_records()["records"]
     assert len(records) == 1, records
     return {"env": env, "record": records[0], "own": own,
@@ -98,15 +100,16 @@ def test_a_refused_plan_record_names_its_own_carry_container_and_bytes(
         refused):
     rec = refused["record"]
     assert rec["refused"] == "raised:FaceTransformIllegal"
+    assert rec["refusal_where"] == "carry container"
+    assert rec["refusal_error"] == f"FaceTransformIllegal: {RAISED}"
     assert refused["own"] == "quant"
     assert refused["own_bytes"] != refused["exact_bytes"]
     assert (rec.get("carry_container"), rec.get("carry_bytes")) == (
         refused["own"], refused["own_bytes"])
 
 
-def test_a_refused_plan_record_decodes_and_replays_to_the_same_raise(
+def test_a_refused_plan_record_decodes_and_replays_to_the_same_refusal(
         refused, monkeypatch):
-    from graphax.core import FaceTransformIllegal
     rec = json.loads(json.dumps(plog.jsonable(refused["record"]),
                                 allow_nan=False))
     order, specs, faces, skips = plog.decode_wires(rec)
@@ -115,11 +118,11 @@ def test_a_refused_plan_record_decodes_and_replays_to_the_same_raise(
     env = refused["env"]
     _arm(monkeypatch, env)
     envmod.consume_plan_records()
-    with pytest.raises(FaceTransformIllegal, match=RAISED):
-        _measure(env, order, specs, faces, skips)
+    _measure(env, order, specs, faces, skips)
     again = envmod.consume_plan_records()["records"]
     assert len(again) == 1, again
-    for k in ("refused", "plan_hash", "carry_container", "carry_bytes"):
+    for k in ("refused", "refusal_where", "refusal_error", "rewards",
+              "plan_hash", "carry_container", "carry_bytes"):
         assert again[0].get(k) == rec.get(k), k
     assert rec["faces_truncated"] == 0
     assert rec["replayable"] is True and rec["sentinelled"] is True
@@ -131,7 +134,7 @@ def test_a_dedupe_hit_record_carries_the_carry_bytes_of_its_container(
     order, specs, faces, skips = refused["wires"]
     samples = tuple(env.eval_args_samples)
     cached = CP.measurement_env(refused["own"], env.config)
-    # A missed hit raises at the container step instead of measuring.
+    # A missed hit is refused at the container step, never measured.
     _arm(monkeypatch, env)
     monkeypatch.setenv("ALPHAGRAD_MEASURE_DEDUPE", "1")
     monkeypatch.setattr(envmod, "_PLAN_CARRY_BYTES", [refused["exact_bytes"]])
