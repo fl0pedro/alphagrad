@@ -41,7 +41,8 @@ import alphagrad.approx.env as envmod                           # noqa: E402
 from alphagrad.approx.common import examples as ex              # noqa: E402
 from alphagrad.approx.common.carry_plan import (                # noqa: E402
     _traced_inlined, valid_vertices)
-from alphagrad.approx.common.rsnn_shd import rsnn_data_gen      # noqa: E402
+from alphagrad.approx.common.rsnn_shd import (                 # noqa: E402
+    loss_of, rsnn_data_gen)
 from graphax import jacve                                       # noqa: E402
 
 EXAMPLE = "RSNN_SHD"
@@ -115,11 +116,14 @@ def test_every_free_order_reproduces_jax_grad_in_float64(rule):
                    else x for x in xs)
         cj = _traced_inlined(fn, xs)
         consts = list(cj.literals)
-        ref = list(jax.grad(fn, argnums=argnums)(*xs))
+        # The rtrl target returns (loss, *state); the reference is the loss.
+        ref = list(jax.grad(lambda *a: loss_of(fn(*a)),
+                            argnums=argnums)(*xs))
         worst_cos, worst_rel = 1.0, 0.0
         for o in _free_orders(valid, N_FREE_ORDERS, 20260919):
-            cos, rel = _cos_rel(list(_eliminate(fn, o, argnums, cj, consts,
-                                                xs)), ref)
+            out = _eliminate(fn, o, argnums, cj, consts, xs)
+            rows = out[0] if len(cj.jaxpr.outvars) > 1 else out
+            cos, rel = _cos_rel(list(rows), ref)
             worst_cos = min(worst_cos, cos)
             worst_rel = max(worst_rel, rel)
     assert worst_cos > 1.0 - 1e-9, (
@@ -151,7 +155,8 @@ def _quality_per_env_row(rows=4):
     cfg = envmod.EnvConfig(
         jaxpr=cj.jaxpr, argnums=tuple(argnums), has_aux=False, sparse=False,
         cmp_type="latency", mem_type="peak_memory", target_fun=fn,
-        data_gen=gen, scalar_target=True)
+        data_gen=gen, scalar_target=True,
+        carried_outputs=len(cj.jaxpr.outvars) - 1)
     dev = jax.devices("cpu")[0]
     rev = sorted((int(v) for v in valid), reverse=True)
     ref_ex = jax.jit(
