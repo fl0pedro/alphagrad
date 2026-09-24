@@ -237,13 +237,30 @@ def test_bottom_up_sampling_never_draws_illegal_ops():
         assert ops[2] not in (W_DIAG, W_QUANT), (k, ops[2])
     assert seen_bit > 0, "the legal bit never fired in 30 draws"
 
-    # with the bit illegal on one operand slot it is never drawn
+    # with no real cast on one operand slot the bit is still drawn, on both
+    # operand slots (owner ruling 2026-09-24 Q8 b)
     q1 = quant.at[1, FACE_QUANT_NARROW].set(0.0)
+    seen_one = 0
     for k in range(30):
         _sk, row, *_ = pol.sample_face(
             feats, tables, jrand.PRNGKey(2000 + k), 0, pair, comp,
             jnp.asarray(1.0), face_context=ctx, face_sizes_f=sizes,
             face_quant_f=q1)
+        ops = [int(x) for x in np.asarray(row["op_type"])]
+        if int(row["quant"]):
+            seen_one += 1
+            assert ops[0] == W_QUANT and ops[1] == W_QUANT, (k, ops)
+        else:
+            assert W_QUANT not in ops, (k, ops)
+    assert seen_one > 0, "the bit never fired with one operand slot casting"
+
+    # with no real cast on either operand slot it is never drawn
+    q0 = q1.at[0, FACE_QUANT_NARROW].set(0.0)
+    for k in range(30):
+        _sk, row, *_ = pol.sample_face(
+            feats, tables, jrand.PRNGKey(2000 + k), 0, pair, comp,
+            jnp.asarray(1.0), face_context=ctx, face_sizes_f=sizes,
+            face_quant_f=q0)
         assert int(row["quant"]) == 0
         assert W_QUANT not in [int(x) for x in np.asarray(row["op_type"])]
 
@@ -499,12 +516,12 @@ def test_tlm_sampled_action_zero_rejection():
 
                 if int(row["quant"]):
                     # the bit lands on BOTH operand slots, and only where
-                    # the narrow float is a legal cast on both
+                    # the narrow float is a legal cast on at least one
                     requested_ops["quant"] += 1
                     for s in QUANT_SLOTS:
                         assert int(row["op_type"][s]) == W_QUANT, (v, f, s)
-                        assert bool(quant[f, s, FACE_QUANT_NARROW] > 0.5), (
-                            v, f, s)
+                    assert any(bool(quant[f, s, FACE_QUANT_NARROW] > 0.5)
+                               for s in QUANT_SLOTS), (v, f)
                     applied_ops["quant"] += 1
                 for s in range(FACE_SLOTS):
                     op = int(row["op_type"][s])
