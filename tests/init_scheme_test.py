@@ -223,15 +223,16 @@ def test_init_logit_statistics_table():
     assert stats[("campaign", 0)]["maxabs"] > stats[("classic", 0)]["maxabs"]
     assert stats[("campaign", 0)]["std"] > stats[("classic", 0)]["std"]
 
-    # The none-bias is exactly +B on each slot's OP_NONE logit and -B on
-    # SKIP, and nothing else -- under BOTH schemes.
+    # The none-bias is exactly +B on each slot's OP_NONE logit, -B on
+    # SKIP and -B on the quant bit, and nothing else -- under BOTH schemes.
     from alphagrad.approx.unified_face_head import (
-        FACE_SLOTS, OP_NONE, O_SKIP, S_OP, slot_base)
+        FACE_SLOTS, OP_NONE, O_QUANT, O_SKIP, S_OP, slot_base)
     for scheme in ("campaign", "classic"):
         d = (stats[(scheme, 6)]["logits"] - stats[(scheme, 0)]["logits"])
         want = np.zeros(d.shape[-1], np.float32)
         for s in range(FACE_SLOTS):
             want[slot_base(s) + S_OP + OP_NONE] = 6.0
         want[O_SKIP] = -6.0
+        want[O_QUANT] = -6.0
         np.testing.assert_allclose(d, np.broadcast_to(want, d.shape),
                                    rtol=0, atol=2e-5)

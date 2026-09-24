@@ -9,10 +9,11 @@ Owner ruling: args only, no env vars for knobs, no fallback period. Pinned:
 2. THE ANALYTIC INIT. Every Linear bias is 0 after ``init_linear_weights``,
    so on a ZERO context the head's 94 logits ARE its output bias, i.e.
    exactly the +B / -B the flag writes. Hence at bias B, per face
-   ``p_skip = sigmoid(-B)`` and, with the three approximation ops legal,
-   per slot ``p_none = e^B / (e^B + 3)``:
-       B = 0 -> 0.5    / 0.25      B = 4 -> 0.018  / 0.948
-       B = 6 -> 0.0025 / 0.993
+   ``p_skip = sigmoid(-B)``, the per-face quant bit ``p_quant = sigmoid(-B)``
+   and, with the two approximation ops legal,
+   per slot ``p_none = e^B / (e^B + 2)``:
+       B = 0 -> 0.5    / 0.333     B = 4 -> 0.018  / 0.965
+       B = 6 -> 0.0025 / 0.995
    ``--scale-face-head`` is weight-only, so it leaves these untouched.
 3. FLAG-OFF BIT-IDENTITY. ``build_and_init_agent`` at ``--face-none-bias 0``
    is leaf-for-leaf the pre-change init at env var unset: ``_build_agent``
@@ -50,7 +51,7 @@ from init_scheme_test import (                                  # noqa: E402
 from alphagrad.approx.common.agent_factory import (             # noqa: E402
     REMOVED_ENV_KNOBS, apply_face_none_bias, refuse_removed_env_knobs)
 from alphagrad.approx.unified_face_head import (                # noqa: E402
-    FACE_SLOTS, NUM_APPROX_OPS, OP_NONE, O_SKIP, S_OP,
+    FACE_SLOTS, NUM_APPROX_OPS, OP_NONE, O_QUANT, O_SKIP, S_OP,
     _cat_logp_ent, slot_base)
 
 _ALPHAGRAD = pathlib.Path(__file__).resolve().parents[1]
@@ -102,16 +103,16 @@ def _init_probs(bias, scale_face_head=0.0, seed=11):
 
 
 @pytest.mark.parametrize("bias,skip_expected,none_expected", [
-    (0.0, 0.5, 0.25),
-    (4.0, 0.018, 0.948),
-    (6.0, 0.0025, 0.993),
+    (0.0, 0.5, 0.333),
+    (4.0, 0.018, 0.965),
+    (6.0, 0.0025, 0.995),
 ])
 @pytest.mark.parametrize("scale_face_head", [0.0, 0.1])
 def test_init_skip_and_none_probabilities_are_analytic(
         bias, skip_expected, none_expected, scale_face_head):
     p_skip, p_none = _init_probs(bias, scale_face_head)
     want_skip = 1.0 / (1.0 + np.exp(bias))                 # sigmoid(-B)
-    want_none = np.exp(bias) / (np.exp(bias) + 3.0)        # e^B / (e^B + 3)
+    want_none = np.exp(bias) / (np.exp(bias) + 2.0)        # e^B / (e^B + 2)
     assert p_skip == pytest.approx(want_skip, rel=1e-5), (bias, p_skip)
     assert p_skip == pytest.approx(skip_expected, abs=1e-4)
     for s, p in enumerate(p_none):
@@ -119,7 +120,7 @@ def test_init_skip_and_none_probabilities_are_analytic(
         assert p == pytest.approx(none_expected, abs=1e-3)
 
 
-def test_bias_moves_exactly_four_logits():
+def test_bias_moves_exactly_five_logits():
     ns0 = _ns()
     raw, init_key = _raw_agent(ns0)
     from alphagrad.approx.ppo import apply_init_scheme
@@ -127,9 +128,10 @@ def test_bias_moves_exactly_four_logits():
     b0 = np.asarray(base.face_path_policy.head.proj.layers[-1].bias)
     b4 = np.asarray(apply_face_none_bias(base, 4.0)
                     .face_path_policy.head.proj.layers[-1].bias)
-    touched = {O_SKIP} | {slot_base(s) + S_OP + OP_NONE
+    touched = {O_SKIP, O_QUANT} | {slot_base(s) + S_OP + OP_NONE
                           for s in range(FACE_SLOTS)}
     assert b4[O_SKIP] - b0[O_SKIP] == pytest.approx(-4.0)
+    assert b4[O_QUANT] - b0[O_QUANT] == pytest.approx(-4.0)
     for s in range(FACE_SLOTS):
         i = slot_base(s) + S_OP + OP_NONE
         assert b4[i] - b0[i] == pytest.approx(4.0)

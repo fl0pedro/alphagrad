@@ -222,7 +222,8 @@ def test_a_face_chunk_carries_the_previous_faces_approximation_echo_not_its_own(
 
     BOTH FACE DECISION CHANNELS ARE CHECKED. ``skip`` is the wire bit graphax
     records itself, legal on every face by construction. ``rule`` is a slot
-    wire row -- a QUANT on the ``lhs`` slot -- which until 2026-09-13 emitted
+    wire row -- a QUANT on both contraction slots, the two-sided form the
+    ruling of 2026-09-23 requires -- which until 2026-09-13 emitted
     NO block at all, because ``env.make_slot_frame_hook`` returned a tensor and
     graphax records a chooser's result only when the chooser returns the
     micro-action itself (module docstring, section 2). The hook is a chooser
@@ -262,7 +263,7 @@ def test_a_face_chunk_carries_the_previous_faces_approximation_echo_not_its_own(
             skips[:upto] = 1
         else:
             for g in range(upto):
-                rows[g, 0] = row
+                rows[g, 0] = rows[g, 1] = row
         return rows, skips
 
     def _all_faces_decide(cand, k):

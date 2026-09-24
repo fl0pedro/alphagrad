@@ -65,6 +65,16 @@ T_PIN = 7
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _this_modules_graphs_only():
+    # carry_plan is process state; the tests below name no config, so the
+    # registry must hold this module's graphs and nobody else's.
+    from alphagrad.approx.common import carry_plan as CP
+    CP.reset()
+    yield
+    CP.reset()
+
+
 def _args(rule, **kw):
     return ex.get_args("RSNN_SHD", jax.random.PRNGKey(1), dataset=None,
                        temporal_rule=rule, step_position=T_PIN, **kw)

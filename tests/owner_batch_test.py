@@ -48,7 +48,8 @@ def test_mult_gate_destroyed_below_every_valid_reward():
 
 
 def test_face_none_bias_identity_init():
-    """factory applies +B to each slot's OP_NONE logit and -B to SKIP; the
+    """factory applies +B to each slot's OP_NONE logit, -B to SKIP and -B
+    to the quant bit; the
     resulting per-face approx probability is small; default (0) changes
     nothing."""
     import test_ppo_az_parity as par
@@ -57,21 +58,23 @@ def test_face_none_bias_identity_init():
     agent0 = par._build({"face_actions": True, "unified_face_head": True,
                          "live_faces": True})
     from alphagrad.approx.unified_face_head import (
-        FACE_SLOTS, OP_NONE, O_SKIP, S_OP, slot_base)
+        FACE_SLOTS, NUM_APPROX_OPS, OP_NONE, O_QUANT, O_SKIP, S_OP,
+        slot_base)
     b = np.asarray(agent.face_path_policy.head.proj.layers[-1].bias)
     b0 = np.asarray(agent0.face_path_policy.head.proj.layers[-1].bias)
     for s in range(FACE_SLOTS):
         idx = slot_base(s) + S_OP + OP_NONE
         assert b[idx] - b0[idx] == pytest.approx(6.0)
     assert b[O_SKIP] - b0[O_SKIP] == pytest.approx(-6.0)
+    assert b[O_QUANT] - b0[O_QUANT] == pytest.approx(-6.0)
     # everything else untouched
-    touched = {O_SKIP} | {slot_base(s) + S_OP + OP_NONE
+    touched = {O_SKIP, O_QUANT} | {slot_base(s) + S_OP + OP_NONE
                           for s in range(FACE_SLOTS)}
     for i in range(len(b)):
         if i not in touched:
             assert b[i] == pytest.approx(b0[i])
-    # softmax over one slot's 4 op logits: NONE dominates at init
+    # softmax over one slot's op logits: NONE dominates at init
     s0 = slot_base(0) + S_OP
-    ops = b[s0:s0 + 4]
+    ops = b[s0:s0 + NUM_APPROX_OPS]
     p = np.exp(ops - ops.max()); p /= p.sum()
     assert p[OP_NONE] > 0.95
