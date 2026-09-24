@@ -26,12 +26,17 @@ import numpy as np                                              # noqa: E402
 import pytest                                                   # noqa: E402
 
 from alphagrad.approx import env as env_mod                     # noqa: E402
+from alphagrad.approx.common import compile_cache as _cc        # noqa: E402
 from alphagrad.approx.env import (                              # noqa: E402
     NUM_REWARDS,
     REWARD_INDEX,
     mem_objective,
     paired_log_costs,
 )
+
+# captured at import: a test that runs two plans patches the same attribute
+# twice, and the second fake must wrap the real cache, not the first fake
+_REAL_CACHED_COMPILE = _cc.cached_compile
 
 LIMIT = 16_000_000_000
 SWELL = 20_000_000_000
@@ -123,9 +128,7 @@ def paired(monkeypatch):
 
 
 def _run(monkeypatch, *, swell=None, fail_approx=False):
-    from alphagrad.approx.common import compile_cache as cc
-
-    real = cc.cached_compile
+    real = _REAL_CACHED_COMPILE
     wrapped = {}
 
     def fake(key, fn, *a, **kw):
@@ -140,7 +143,7 @@ def _run(monkeypatch, *, swell=None, fail_approx=False):
             wrapped[b"approx:"] = out
         return out
 
-    monkeypatch.setattr(cc, "cached_compile", fake)
+    monkeypatch.setattr(_cc, "cached_compile", fake)
     env = _toy_env()
     order = sorted(int(v) for v in np.asarray(env.valid_vertices))
     specs, faces, skips = _plan_arrays(len(order))
