@@ -532,6 +532,13 @@ def transport_order(o_list, variant) -> list:
     while emitted < n_a:
         out.append(alt_carry[emitted])
         emitted += 1
+    # A VERTEX ELIMINABLE ON THE VARIANT ONLY. The eliminable set is a
+    # property of the graph: on the rtrl graph the ``a`` output's add is a
+    # pure output and not eliminable, while on the truncated (skip) variant
+    # the same equation is a dead vertex and is. The policy never chose a
+    # position for it, so it carries no decision and goes last.
+    seen = set(out)
+    out.extend(j for j in sorted(valid) if j not in seen)
     if sorted(out) != sorted(valid):
         raise ValueError(
             f"the transported order has {len(out)} vertices and the measured "

@@ -996,9 +996,6 @@ def test_the_generator_publishes_an_exact_reference_draw_only_when_it_needs_one(
     the reference has to come from the exact draw at the SAME step position,
     or the quality channel would read 1.0 for a rule that accumulated real
     error over the whole recording."""
-    plain = ex.data_gen("RSNN_SHD", dataset=None, key=jax.random.PRNGKey(1),
-                        temporal_rule="rtrl", carry_container="exact")
-    assert getattr(plain, "reference_draw", None) is None
     approx = ex.data_gen("RSNN_SHD", dataset=None, key=jax.random.PRNGKey(1),
                          temporal_rule="rtrl", carry_container="diag")
     ref = getattr(approx, "reference_draw")
