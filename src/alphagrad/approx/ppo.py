@@ -164,6 +164,7 @@ from alphagrad.approx.env import (
     COMPUTE_REWARD_INDICES,
     NUM_AXIS_PAIRS,
     NUM_REWARDS,
+    REFUSAL_SCORED_KINDS,
     REWARD_INDEX,
     REWARD_NAMES,
     SENTINEL_COST,
@@ -14868,9 +14869,18 @@ def main(args=None):
         log_dict["refused/total"] = _ref_total
         log_dict["refused/rate"] = (
             float(_ref_total) / float(num_envs) if num_envs else 0.0)
+        # SCORED against EXCLUDED (owner ruling 2026-09-24, dsnn-4eq): a
+        # gate, timeout or compile refusal takes the finite sentinel and
+        # trains; every other kind is still missing data.
+        _ref_scored = sum(int(_ref_counts.get(_k, 0))
+                          for _k in REFUSAL_SCORED_KINDS)
+        log_dict["refused/scored"] = _ref_scored
+        log_dict["refused/excluded"] = _ref_total - _ref_scored
         if _ref_total:
             print(f"[refused ep{ep}] {_ref_total} of {num_envs} terminal "
-                  f"measurements refused and EXCLUDED from the update: "
+                  f"measurements refused ({_ref_scored} scored at the "
+                  f"sentinel, {_ref_total - _ref_scored} EXCLUDED from the "
+                  f"update): "
                   + ", ".join(f"{_k}={_ref_counts[_k]}"
                               for _k in sorted(_ref_counts)), flush=True)
         # Per-channel critic loss (sec 12.10 static-objective battery). The

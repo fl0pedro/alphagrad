@@ -257,6 +257,71 @@ class CpuApproxPool:
         # apparatus rather than a conservative default.
         self._submit_exec = None
         self._submit_inflight = None
+        # THE PAIRED REFERENCE PER GRAPH (dsnn-4eq): a timed-out slot is
+        # scored against the reference a live actor last measured, and the
+        # freshest answer is kept for the moment no actor can answer.
+        self._reference: dict = {}
+
+    def _reference_for(self, rule, actors) -> dict | None:
+        import ray
+        for a in actors:
+            if a is None:
+                continue
+            try:
+                ref = ray.get(a.last_reference.remote(rule), timeout=10.0)
+            except Exception as _exc:
+                print(f"[POOL] no paired reference from an actor: "
+                      f"{type(_exc).__name__}: {str(_exc)[:120]}", flush=True)
+                continue
+            if ref:
+                with self._lock:
+                    self._reference[rule] = dict(ref)
+                return dict(ref)
+        with self._lock:
+            ref = self._reference.get(rule)
+        return None if ref is None else dict(ref)
+
+    @staticmethod
+    def _is_terminal(order, step) -> bool:
+        return int(step) >= int(np.asarray(order).reshape(-1).shape[0])
+
+    def _timeout_reward(self, timeout_s: float, rule, actors, *, order,
+                        specs, step, face_specs, face_skips) -> np.ndarray:
+        # The scored row of a TERMINAL slot this pool killed at `timeout_s`
+        # (owner ruling 2026-09-24): log(timeout / t_ref) on latency,
+        # bytes_limit against the reference temp on memory, quality 0.
+        from alphagrad.approx import env as _env
+        ref = self._reference_for(rule, actors)
+        if ref is None:
+            raise RuntimeError(
+                f"a terminal measurement timed out after {timeout_s:.0f}s "
+                f"before any actor of this pool had measured a paired "
+                f"reference, so the timeout cannot be scored: no plan of "
+                f"this run has completed yet. Raise --ray-measure-timeout "
+                f"or shrink the target.")
+        slots, info = _env.refused_reward(
+            "timeout", timeout_s=float(timeout_s), reference=ref)
+        if len(slots) != int(self._num_rewards):
+            raise ValueError(
+                f"the scored refusal has {len(slots)} reward slots and this "
+                f"pool serves {self._num_rewards}.")
+        mem_objective_rec = info.pop("mem_objective_rec", None)
+        for k in ("delta_latency", "delta_memory", "mem_floored"):
+            info.pop(k, None)
+        _env.record_pool_refusal(
+            "timeout", order=order, rule_specs=specs, face_specs=face_specs,
+            face_skips=face_skips, stop=int(step), reward_vec=slots,
+            refusal_detail=info, paired_ref=ref,
+            mem_objective_rec=mem_objective_rec)
+        _li = _env.REWARD_INDEX["latency_ns"]
+        _mi = _env.REWARD_INDEX["peak_memory"]
+        print(f"[refused] timeout scored step={int(step)} after "
+              f"{float(timeout_s):.0f}s: slot {_li} {slots[_li]:+.4f}, "
+              f"slot {_mi} {slots[_mi]:+.4f} against the reference "
+              f"(lat {ref.get('latency_ns')} ns, mem "
+              f"{ref.get('memory_bytes')} B, limit {ref.get('bytes_limit')} B)",
+              flush=True)
+        return np.asarray(slots, dtype=np.float32)
 
     def submit_batch(self, *args, **kwargs):
         """Start :meth:`evaluate_batch` on a worker thread; return its future.
@@ -625,6 +690,17 @@ class CpuApproxPool:
                 samples_arg = (
                     tuple(eval_samples) if eval_samples is not None else None
                 )
+            # Per-actor cold/warm timeout. ``timeout_for`` returns 0
+            # when the user requested no-timeout (``--cpu-callback-timeout 0``);
+            # in that case we ``ray.get`` without a timeout so a slow
+            # compile never gets sentinel-poisoned. This is the
+            # debugging escape hatch: useful when the rollout's
+            # reward signal looks suspiciously zero and we want to
+            # rule out the sentinel path. The pool-recycle still
+            # bounds long-term memory growth.
+            # THE SAME NUMBER travels with the request (dsnn-4eq): the actor
+            # scores a refused plan at the timeout this call is killed at.
+            timeout = self._timeout_for(actor)
             future = actor.evaluate.remote(
                 np.asarray(order_np),
                 np.asarray(specs_np),
@@ -638,16 +714,8 @@ class CpuApproxPool:
                 episode=(None if episode is None else int(episode)),
                 env_row=(None if env_row is None else int(env_row)),
                 rule=(None if rule is None else str(rule)),
+                timeout_s=(float(timeout) if timeout > 0 else None),
             )
-            # Per-actor cold/warm timeout. ``timeout_for`` returns 0
-            # when the user requested no-timeout (``--cpu-callback-timeout 0``);
-            # in that case we ``ray.get`` without a timeout so a slow
-            # compile never gets sentinel-poisoned. This is the
-            # debugging escape hatch: useful when the rollout's
-            # reward signal looks suspiciously zero and we want to
-            # rule out the sentinel path. The pool-recycle still
-            # bounds long-term memory growth.
-            timeout = self._timeout_for(actor)
             result = ray.get(future) if timeout <= 0 else ray.get(future, timeout=timeout)
             self._check_arity(result)
             self._mark_call(actor)
@@ -667,7 +735,7 @@ class CpuApproxPool:
                 flush=True,
             )
             self._poison(actor, future=future)
-            return _sentinel_callback_output(
+            _sv = _sentinel_callback_output(
                 self._max_tokens,
                 self._num_rewards,
                 self._cosine_sim_idx,
@@ -678,6 +746,14 @@ class CpuApproxPool:
                 self._eqn_dtype,
                 self._emit_eqn_ids,
             )
+            if self._is_terminal(order_np, step):
+                with self._lock:
+                    _others = list(self._alive)
+                _row = self._timeout_reward(
+                    timeout, rule, _others, order=order_np, specs=specs_np,
+                    step=step, face_specs=face_specs, face_skips=face_skips)
+                _sv = _sv[:-1] + (_row,)
+            return _sv
         except RayActorError:
             self._n_actor_errors += 1
             print(
@@ -975,6 +1051,10 @@ class CpuApproxPool:
                     continue
                 self._n_calls += 1
                 try:
+                    # THE SAME NUMBER travels with the request (dsnn-4eq):
+                    # the actor scores a refused plan at the timeout this
+                    # slot is killed at, cold or warm.
+                    _to = self._timeout_for(actor)
                     futures[i] = actor.evaluate.remote(
                         np.asarray(order_batch[i]),
                         np.asarray(specs_batch[i]),
@@ -991,8 +1071,9 @@ class CpuApproxPool:
                         env_row=(None if env_rows is None
                                  else int(env_rows[i])),
                         rule=(None if rule is None else str(rule)),
+                        timeout_s=(float(_to) if _to > 0 else None),
                     )
-                    f_timeouts[i] = self._timeout_for(actor)
+                    f_timeouts[i] = _to
                 except Exception as _exc:
                     self._n_other_errors += 1
                     print(
@@ -1015,6 +1096,7 @@ class CpuApproxPool:
                 except Exception:
                     pass
 
+            timed_out: list = []
             for j, i in enumerate(wave):
                 if sentinel_mask[i] or i not in futures:
                     continue
@@ -1066,6 +1148,7 @@ class CpuApproxPool:
                     self._poison(actor, future=future)
                     held[j] = None
                     _sentinel_slot(i)
+                    timed_out.append(i)
                 except RayActorError:
                     self._n_actor_errors += 1
                     print(
@@ -1101,6 +1184,27 @@ class CpuApproxPool:
                     self._poison(actor, future=future)
                     held[j] = None
                     _sentinel_slot(i)
+
+            # ---- SCORED TIMEOUTS (dsnn-4eq) ----
+            # After the wave, so the reference comes from an actor that has
+            # just returned; the idle actors of the pool answer otherwise.
+            # A non-terminal slot (a tokenization stall) keeps the sentinel.
+            if timed_out:
+                _live = [a for a in held if a is not None]
+                _seen = {id(a) for a in _live}
+                with self._lock:
+                    _live.extend(a for a in self._alive if id(a) not in _seen)
+                for i in timed_out:
+                    if not self._is_terminal(order_batch[i], step_batch[i]):
+                        continue
+                    rewards_out[i] = self._timeout_reward(
+                        f_timeouts.get(i, 0.0), rule, _live,
+                        order=order_batch[i], specs=specs_batch[i],
+                        step=step_batch[i],
+                        face_specs=(None if face_specs_batch is None
+                                    else face_specs_batch[i]),
+                        face_skips=(None if face_skips_batch is None
+                                    else face_skips_batch[i]))
 
         # ---- reactive recycle-on-OOM pass ----
         # For each held actor that OOM'd one or more slots: recycle it ONCE

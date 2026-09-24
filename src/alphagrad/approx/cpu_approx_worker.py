@@ -223,6 +223,7 @@ class CpuApproximationServer:
         face_skips: Any = None,
         episode: int | None = None,
         env_row: int | None = None,
+        timeout_s: float | None = None,
     ):
         """Run the per-step reward pipeline once.
 
@@ -286,6 +287,14 @@ class CpuApproximationServer:
         _slot_was = _env_slot_cell[0]
         if env_row is not None:
             _env_slot_cell[0] = int(env_row)
+        # THE POOL'S KILL TIMEOUT FOR THIS REQUEST (dsnn-4eq): the number a
+        # refused plan is scored at is the number the pool kills at, so it
+        # travels with the request and never lives in a second constant.
+        from alphagrad.approx.env import (
+            _MEASURE_TIMEOUT_S as _timeout_cell,
+            set_measure_timeout_s as _set_timeout)
+        _timeout_was = _timeout_cell[0]
+        _set_timeout(timeout_s)
         order_j = jnp.asarray(order, dtype=jnp.int32)
         specs_j = jnp.asarray(sparsity_specs, dtype=jnp.int32)
         es = (
@@ -482,6 +491,11 @@ class CpuApproximationServer:
             # The slot belongs to THIS request, not to the actor. Restoring it
             # is what keeps a raising measurement from stamping the next one.
             _env_slot_cell[0] = _slot_was
+            _timeout_cell[0] = _timeout_was
+
+    def last_reference(self) -> dict | None:
+        from alphagrad.approx.env import last_reference as _last
+        return _last()
 
     def precompile(self, order: Any, sparsity_specs: Any, step: int) -> bool:
         """STAGE-2 async: compile-only warm of the shared cluster cache.

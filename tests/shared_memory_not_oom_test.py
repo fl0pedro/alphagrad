@@ -3,8 +3,9 @@
 XLA raises RESOURCE_EXHAUSTED when one fusion asks for more shared memory
 than the SM has (job 67639 on a Blackwell: requested 131072, available
 101376). The degraded-fusion fallback retries it once. When the retry fails
-the same way, the plan is refused as raised, never as oom: no truncation
-count, no measure-OOM record for the actor, no cache clear.
+the same way, the plan is refused as a compile failure (scored at ten times
+the timeout since dsnn-4eq, 2026-09-24), never as oom: no truncation count,
+no measure-OOM record for the actor, no cache clear.
 """
 import os
 
@@ -66,7 +67,7 @@ def _plan_arrays(n):
     return jnp.asarray(specs), jnp.asarray(faces), jnp.asarray(skips)
 
 
-def test_a_shared_memory_compile_failure_is_refused_as_raised(monkeypatch):
+def test_a_shared_memory_compile_failure_is_refused_as_compile(monkeypatch):
     from alphagrad.approx.common import compile_cache as cc
 
     monkeypatch.setenv("ALPHAGRAD_COST_FORM", "paired-log")
@@ -76,11 +77,16 @@ def test_a_shared_memory_compile_failure_is_refused_as_raised(monkeypatch):
     monkeypatch.delenv("ALPHAGRAD_MEASURE_COMPILE_FALLBACK", raising=False)
     monkeypatch.setitem(env_mod._MEASURE_TOOLCHAIN, "checked", True)
     monkeypatch.setattr(cc, "cached_compile", lambda key, fn: fn())
+    env_mod.set_measure_timeout_s(120.0)
     compiles = []
+    real_compile = jax.stages.Lowered.compile
 
     def _compile(self, compiler_options=None):
+        # the candidate's two attempts fail; the paired reference compiles
         compiles.append(compiler_options)
-        raise XlaRuntimeError(_SHMEM_TEXT)
+        if len(compiles) <= 2:
+            raise XlaRuntimeError(_SHMEM_TEXT)
+        return real_compile(self, compiler_options=compiler_options)
 
     monkeypatch.setattr(jax.stages.Lowered, "compile", _compile)
     clears = []
@@ -97,21 +103,29 @@ def test_a_shared_memory_compile_failure_is_refused_as_raised(monkeypatch):
     env_mod.pop_measure_oom()
     n_trunc = int(env_mod._TRUNCATED_PLANS[0])
     n_fallback = int(env_mod._MEASURE_COMPILE_FALLBACKS["n"])
-    with pytest.raises(XlaRuntimeError, match="Shared memory size limit"):
-        env_mod._callback(
+    try:
+        out = env_mod._callback(
             env.config, env.args, env.consts, jnp.asarray(order), specs,
             faces, skips, len(order), *samples)
+    finally:
+        env_mod.set_measure_timeout_s(None)
 
-    assert len(compiles) == 2
+    assert len(compiles) == 3
+    assert compiles[1]["xla_gpu_use_runtime_fusion"] is False
     assert int(env_mod._MEASURE_COMPILE_FALLBACKS["n"]) == n_fallback + 1
 
     counts = env_mod.consume_refused_counts()
-    assert counts.get("raised", 0) == 1, counts
+    assert counts.get("compile", 0) == 1, counts
     assert counts.get("oom", 0) == 0, counts
+    assert counts.get("raised", 0) == 0, counts
     assert counts.get("total", 0) == 1, counts
     rec = env_mod.consume_plan_records()["records"][-1]
-    assert rec["refused"] == "raised:XlaRuntimeError"
+    assert rec["refused"] == "compile:XlaRuntimeError"
     assert rec["sentinelled"] is True
+    assert "Shared memory size limit" in rec["refusal_error"]
+    reward = np.asarray(out[-1], dtype=np.float32)
+    assert np.isfinite(reward).all()
+    assert rec["refusal_latency_ns"] == 10.0 * 120.0 * 1e9
 
     assert int(env_mod._TRUNCATED_PLANS[0]) == n_trunc
     assert env_mod.pop_measure_oom() == (0, "")
