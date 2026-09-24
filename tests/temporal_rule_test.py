@@ -81,8 +81,8 @@ def _args(rule, **kw):
 
 
 def _loss_fn():
-    """The registered target as the scalar loss: under rtrl it returns
-    ``(loss, S, I, U, a, Uo)`` (owner ruling 2026-09-24, Q27b)."""
+    # the registered target as the scalar loss (under rtrl it returns
+    # (loss, S, I, U, a, Uo), owner ruling 2026-09-24 Q27b)
     fn = ex.get_fn("RSNN_SHD")
     return lambda *a: R.loss_of(fn(*a))
 
@@ -2145,18 +2145,18 @@ def test_the_loss_row_is_the_gradient(plan_carry_results):
 
 
 def test_the_two_diag_plans_scan_is_eprop(plan_carry_results):
-    """Container Diag + Diag on the state operand of the recurrent face
-    (located by structure: the V @ S dot_general and its faces whose in-edge
-    is not a weight) scanned over the prefix IS carry_traces at every
-    step."""
+    # container Diag + Diag on the state operand of the recurrent face (the
+    # V @ S dot_general's faces whose in-edge is not a weight), scanned over
+    # the prefix, IS carry_traces at every step
     out = plan_carry_results
     assert out["two_diag_plan_vs_carry_traces"] < 1e-11, out
     assert out["plan_draw_vs_carry_traces"] < 1e-11, out
 
 
 def test_every_container_reads_back_from_the_projection():
-    """The projection lands in the shapes and the dtype the attachment reads
-    as that container (owner ruling 2026-09-24, Q28a)."""
+    # the projection of dense rows and of the same rows on their stored
+    # class lands in the shapes and dtype the attachment reads as that
+    # container, with the same numbers (owner ruling 2026-09-24, Q28a)
     from graphax import jacve
     from graphax.examples.neuromorphic import (
         RSNN_CARRY_CONTAINERS, project_rsnn_carry, rsnn_carry_container,
@@ -2164,23 +2164,29 @@ def test_every_container_reads_back_from_the_projection():
     xs = _args("rtrl")
     fn = ex.get_fn("RSNN_SHD")
     rows = jacve(fn, "rev", argnums=(7, 8, 9))(*xs)
+    rows_s = jacve(fn, "rev", argnums=(7, 8, 9),
+                   sparse_representation=True)(*xs)
     states = tuple(xs[2:7])
     weights = tuple(xs[7:10])
     for name in RSNN_CARRY_CONTAINERS:
-        for given in (project_rsnn_carry(rows[1:], name, weights),
-                      rsnn_zero_carry(name, weights)):
+        dense = project_rsnn_carry(rows[1:], name, weights)
+        stored = project_rsnn_carry(rows_s[1:], name, weights)
+        for given in (dense, stored, rsnn_zero_carry(name, weights)):
             assert len(given) == len(RSNN_CARRY_STACKS)
             for (ss, w), J in zip(RSNN_CARRY_STACKS, given):
                 c = rsnn_carry_container((ss[0], w), states[ss[0]].shape,
                                          weights[w].shape, J.shape, J.dtype,
                                          n_stacked=len(ss))
                 assert c.name == name, (name, (ss, w), J.shape, J.dtype)
+        for a, b in zip(dense, stored):
+            np.testing.assert_allclose(np.asarray(a, np.float32),
+                                       np.asarray(b, np.float32),
+                                       rtol=1e-5, atol=1e-6)
 
 
 def test_the_state_outputs_stay_eliminable():
-    """The state outputs feed the loss, so they are vo vertices and stay
-    eliminable. The one vertex that leaves the eliminable set is the one
-    producing ``a``, which feeds nothing in one step and is a pure output."""
+    # the state outputs feed the loss and stay eliminable; only the vertex
+    # producing ``a``, which feeds nothing in one step, is a pure output
     from alphagrad.approx.common import carry_plan as CP
     jx, consts, xs = _jaxpr("rtrl")
     valid = set(CP.valid_vertices(jx, xs, consts, (7, 8, 9)))

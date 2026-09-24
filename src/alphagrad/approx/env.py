@@ -4144,12 +4144,9 @@ def _gradient_leaves(tree):
 
 
 def _loss_rows(config, out):
-    """THE LOSS ROW of a program's output (owner ruling 2026-09-24, Q27b).
-
-    A target with carried outputs returns one row tuple per output and the
-    quality channel reads the first, the gradient of the loss; the state rows
-    are the next carry and are the cost channels' business. Every other
-    target's output is already its gradient."""
+    # The loss row of a program's output (owner ruling 2026-09-24, Q27b): a
+    # target with carried outputs returns one row tuple per output and the
+    # quality channel reads the first; the state rows are the next carry.
     if int(getattr(config, "carried_outputs", 0) or 0) > 0:
         return out[0]
     return out
@@ -4159,8 +4156,8 @@ _LOSS_TARGETS: dict = {}
 
 
 def _loss_target(config):
-    """``config.target_fun`` as the scalar loss, for ``jax.grad``. One
-    wrapper per target, so a cache keyed on its identity holds."""
+    # The target as the scalar loss for jax.grad, one wrapper per target so
+    # a cache keyed on its identity holds.
     fn = config.target_fun
     if int(getattr(config, "carried_outputs", 0) or 0) == 0:
         return fn
@@ -6051,12 +6048,9 @@ def _cosine_reference(ref_ex, ref_key, args, device, probe_seed):
 
 
 def _oracle_reference_grad(target, argnums, has_aux, args, device, probe_seed):
-    """``jax.grad`` of ``target`` on the reference draw, once per probe batch.
-
-    The same table and the same seed as :func:`_cosine_reference`: under an
-    rtrl generator every plan draws its own carry (owner ruling 2026-09-24,
-    Q29) and scores against the exact draw at the same step, so the exact
-    gradient of that draw is one number per probe batch, not per plan."""
+    # jax.grad of the target on the reference draw, once per probe batch in
+    # the table of _cosine_reference: under an rtrl generator every plan
+    # draws its own carry and scores against the one exact draw (Q29).
     key = (b"oracle-ref", id(target), tuple(int(i) for i in argnums),
            str(device), int(probe_seed),
            tuple((tuple(getattr(x, "shape", ())), str(getattr(x, "dtype", "")))
@@ -9026,16 +9020,14 @@ def _callback_measured(
             _c_entry["spec"]["rule"])
     _pf("cb.carry_container")
 
-    def _jacve_fn(approx: bool, sparse=None):
+    def _jacve_fn(approx: bool):
         """THE elimination, built once. `approx=False` is the exact
         reference: same order, same argnums, same has_aux, same sparse
         representation, and NOTHING but the two approximation kwargs
         dropped -- which is what makes any approx/exact ratio taken over
         this pair a statement about the approximation alone. Both the
         compiles below and the sparsity tally's abstract fallback walk
-        go through here so a change to one cannot miss the other.
-        ``sparse`` overrides the return form only (the carry producer
-        wants dense rows); the elimination is the same."""
+        go through here so a change to one cannot miss the other."""
         _kw = ({"transforms": transforms,
                 "face_transforms": ft_by_vertex} if approx else {})
         return jacve(
@@ -9043,8 +9035,7 @@ def _callback_measured(
             list(o_list),
             argnums=config.argnums,
             has_aux=config.has_aux,
-            sparse_representation=(config.sparse if sparse is None
-                                   else bool(sparse)),
+            sparse_representation=config.sparse,
             # ONE JAXPR FOR BOTH PATHS (dsnn-dfw.24). The order and the face
             # keys are numbered on `config.jaxpr`; a fresh trace inside
             # `.lower()` is a different equation list for the same function
@@ -9065,13 +9056,15 @@ def _callback_measured(
     # channels execute and the probe batches the quality channel scores are
     # drawn per plan, through the generator's `with_program`; the exact
     # reference draw the generator publishes (the scan of the empty plan)
-    # stays shared. A Skip on the carried face has no carry and no program to
-    # scan; a rule with no given edge has no `with_program`.
+    # stays shared. The program is the measured one, sparse output and all:
+    # the container reads its rows on their stored class. A Skip on the
+    # carried face has no carry and no program to scan; a rule with no
+    # given edge has no `with_program`.
     from alphagrad.approx.common.rsnn_shd import SKIP_CONTAINER as _SKIP
     if (is_terminal and _carry_container is not None
             and _carry_container != _SKIP):
         _plan_gen = _carry.plan_generator(
-            config.data_gen, _jacve_fn(approx=True, sparse=False))
+            config.data_gen, _jacve_fn(approx=True))
         if _plan_gen is not None:
             config = config._replace(data_gen=_plan_gen)
             if eval_samples:

@@ -409,9 +409,8 @@ def measurement_env(container: str, config=None) -> dict | None:
 
 
 def plan_generator(generator, program):
-    """``generator`` redrawing its given tuple through ``program``, the
-    plan's own one-step program (owner ruling 2026-09-24, Q29), or ``None``
-    when the generator has no such draw (a rule with no carry)."""
+    # The generator redrawing its given tuple through the plan's own program
+    # (Q29); None for a generator without such a draw (a rule with no carry).
     with_program = getattr(generator, "with_program", None)
     if with_program is None:
         return None

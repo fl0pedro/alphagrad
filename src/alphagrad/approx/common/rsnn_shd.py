@@ -135,7 +135,8 @@ def rsnn_target(batched: bool = False):
 
 def empty_plan_program(batched: bool = False):
     from graphax import jacve
-    return jacve(rsnn_target(batched), "rev", argnums=RSNN_ARGNUMS)
+    return jacve(rsnn_target(batched), "rev", argnums=RSNN_ARGNUMS,
+                 sparse_representation=True)
 
 #: The four rules, which are the four SNN arms of the thesis matrix (owner
 #: ruling 2026-09-16).
@@ -1011,17 +1012,11 @@ def _select(keep, new, old):
 
 
 def carry_from_program(seq, y, t, weights, program, container="exact"):
-    """THE PRODUCER (owner ruling 2026-09-24, Q29): ``J_(t-1)`` in
-    ``container`` is the plan's own program scanned over steps ``0 .. t-1``
-    of the recording from the zero carry, the state rows projected to the
-    container at the output of every step (Q28a).
-
-    ``program`` is the one-step program of the ``(loss, S, I, U, a, Uo)``
-    target on the full argument tuple, returning one row tuple per output;
-    the empty plan is :func:`empty_plan_program`. ``t`` may be traced. A
-    batched recording ``seq (B, T, n_in)`` with ``y (B, n_out)`` and ``t (B,)``
-    walks its ``B`` prefixes in the one scan, through the batched program.
-    """
+    # THE PRODUCER (owner ruling 2026-09-24, Q29): the plan's own program
+    # scanned over steps 0 .. t-1 from the zero carry, the state rows
+    # projected to the container on their stored class at every step. t may
+    # be traced; a batched recording (B, T, n_in) walks its B prefixes in the
+    # one scan through the batched program.
     from graphax.examples.neuromorphic import (
         RSNN_STATE_NAMES, project_rsnn_carry, rsnn_zero_carry)
     c = _container(container)
@@ -1333,8 +1328,7 @@ def rsnn_data_gen(key=None, *, dataset: str | None = None,
         return _draw(keys)
 
     def with_program(program):
-        """The SAME draw with the given tuple produced by ``program``, the
-        plan's own one-step program, scanned over the prefix (Q29)."""
+        # The same draw with the given tuple from the plan's own program (Q29).
         @jax.jit
         def _draw_p(keys):
             return _checked(_build(_t(keys), cont, program))

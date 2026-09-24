@@ -144,9 +144,8 @@ def test_the_batched_loss_and_gradient_are_the_mean_over_recordings(rule):
 @pytest.mark.parametrize("container", ["exact", "diag", "reduce", "quant",
                                        "diag+quant"])
 def test_the_past_jacobian_is_built_per_recording(container):
-    """The batched scan of the empty plan's program gives every recording
-    the carry the one-recording scan gives it (owner ruling 2026-09-24,
-    Q29), and the exact container is the exact carry."""
+    # the batched scan gives every recording the carry the one-recording
+    # scan gives it (Q29); the exact container is the exact carry
     xs = _args("rtrl", carry_container=container)
     seq, y, W = _recordings()
     ts = R.last_step_position()["t"]
