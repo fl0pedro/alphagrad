@@ -307,6 +307,9 @@ class CpuApproximationServer:
         # so we can attribute the leak to *this* process (not the
         # GPU trainer that dispatched the request via Ray).
         self._maybe_init_leak_profile()
+        # The out-of-memory flag belongs to this call (owner ruling 2026-09-24
+        # Q52). A flag from an earlier call that nobody read is stale.
+        self._last_was_oom = False
         try:
             # env._callback takes face_specs / face_skips between the
             # per-vertex specs and `stop`. With no caller-supplied wires,
@@ -483,7 +486,14 @@ class CpuApproximationServer:
             # so a run of failures actively reclaims memory rather than piling
             # more partially-compiled executables on the saturated GPU.
             self._n_calls += 1
-            self._maybe_clear_compile_caches(oom=_is_oom)
+            # An out-of-memory error that the callback recorded before it
+            # raised belongs to this call too.
+            from alphagrad.approx.env import pop_measure_oom as _pop_oom
+            _n_rec, _ = _pop_oom()
+            if _n_rec:
+                self._last_was_oom = True
+                self._n_oom += _n_rec
+            self._maybe_clear_compile_caches(oom=_is_oom or bool(_n_rec))
             if _delta:
                 return sentinel_tokens, sentinel_reward
             return sentinel_tokens, sentinel_eqn_ids, sentinel_reward
@@ -581,12 +591,11 @@ class CpuApproximationServer:
         with a device OOM (RESOURCE_EXHAUSTED / measure-oom), as opposed to
         a benign graphax shape error.
 
-        The pool calls this immediately after it observes a sentinel row for
-        this actor. A True result means the sentinel was caused by the
-        un-freeable per-measure XLA compile leak filling the measure GPU, so
-        the ONLY remedy is to recycle (process teardown) this actor and retry
-        the measure on a fresh one. False means a retry would just re-sentinel
-        (bad action / shape mismatch), so the pool leaves the actor alive.
+        The pool calls this after every row it reads from this actor, and
+        ``evaluate`` resets the flag when it starts. A True result means the
+        un-freeable per-measure XLA compile leak filled the measure GPU during
+        that call, so the ONLY remedy is to recycle (process teardown) this
+        actor; the row is not measured again. False leaves the actor alive.
 
         One-shot: reads and clears the flag so a single OOM triggers exactly
         one recycle. Cheap (no JAX) — safe to call on the RPC hot path.

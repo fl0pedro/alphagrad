@@ -118,6 +118,8 @@ class _FakeActor:
         self.evaluate = _EvalProxy(_ev, self._delay)
         # Construction is instant here; the pool still waits for it.
         self.ready = _EvalProxy(lambda: True, 0.0)
+        # The pool reads the out-of-memory flag after every row (Q52).
+        self.pop_oom_flag = _EvalProxy(lambda: False, 0.0)
 
 
 def test_pool_returns_value_when_under_timeout(_ray_fake):

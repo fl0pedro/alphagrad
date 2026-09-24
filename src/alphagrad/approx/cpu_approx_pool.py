@@ -220,9 +220,9 @@ class CpuApproxPool:
         # ---- recycle-on-OOM ----
         # Only PROCESS TEARDOWN frees the XLA-internal executable retention
         # (LRU / clear_caches climb identically to the cap), so an actor whose
-        # measure OOMs is recycled (kill+respawn). The OOM'd slot stays
-        # refused: the retry on the fresh actor is gone (dsnn-dfw.120: 40 of
-        # 47 retries failed again, jobs 67489-67491).
+        # measure OOMs is recycled (kill+respawn). The OOM'd slot is not
+        # measured again: the retry on the fresh actor is gone (dsnn-dfw.120:
+        # 40 of 47 retries failed again, jobs 67489-67491).
         # Optional PROACTIVE recycle: recycle an actor before it reaches the
         # ~500-measure OOM point, so the OOM never happens. A/B alternative to
         # the reactive path; 0 = off (reactive-only, the required deliverable).
@@ -640,16 +640,16 @@ class CpuApproxPool:
                 rule=(None if rule is None else str(rule)),
                 timeout_s=(float(timeout) if timeout > 0 else None),
             )
+            # Ray runs an actor's calls in the order they are sent, so this
+            # reads the out-of-memory flag of the call above.
+            flag = actor.pop_oom_flag.remote()
             result = ray.get(future) if timeout <= 0 else ray.get(future, timeout=timeout)
             self._check_arity(result)
-            self._put_back(actor)
             _tk = self._wire(result[0], self._token_dtype, "tokens")
             _rw = np.asarray(result[-1], dtype=np.float32)
-            if not self._emit_eqn_ids:
-                return _tk, _rw
-            return (_tk,
-                    self._wire(result[1], self._eqn_dtype, "eqn_ids"),
-                    _rw)
+            out = ((_tk, _rw) if not self._emit_eqn_ids else
+                   (_tk, self._wire(result[1], self._eqn_dtype, "eqn_ids"),
+                    _rw))
         except GetTimeoutError:
             self._n_timeouts += 1
             print(
@@ -695,6 +695,11 @@ class CpuApproxPool:
                 self._emit_eqn_ids,
             )
         except Exception as _exc:
+            # The fault classes of the measurement apparatus (the toolchain,
+            # ReferenceFault, MemoryBoundFault) stop the run here as they do
+            # in evaluate_batch (owner ruling 2026-09-24 Q53).
+            if _is_toolchain_fault(_exc):
+                raise
             # Catch-all: anything else (serialization issue, malformed
             # return, etc.) is treated like a transient actor failure.
             # We don't ``raise`` because the io_callback caller can't
@@ -719,6 +724,36 @@ class CpuApproxPool:
                 self._eqn_dtype,
                 self._emit_eqn_ids,
             )
+        # THE FLAG OF THIS ROW (owner ruling 2026-09-24 Q52), as in
+        # evaluate_batch.
+        try:
+            was_oom = bool(ray.get(flag, timeout=10.0))
+        except Exception as _flag_exc:
+            self._n_actor_errors += 1
+            print(
+                f"[POOL] oom-flag read failed step={int(step)}: "
+                f"{type(_flag_exc).__name__}: {str(_flag_exc)[:120]}; the "
+                f"row stands, the actor is replaced "
+                f"(n_actor_errors={self._n_actor_errors})",
+                flush=True,
+            )
+            self._poison(actor, future=None)
+            return out
+        if was_oom:
+            fresh = self._recycle_actor(actor)
+            self._n_oom_recycles += 1
+            print(
+                f"[POOL] oom-recycle step={int(step)}: "
+                f"{'fresh actor' if fresh is not None else 'respawn failed'}, "
+                f"row not measured again "
+                f"(n_oom_recycles={self._n_oom_recycles})",
+                flush=True,
+            )
+            if fresh is not None:
+                self._put_back(fresh)
+            return out
+        self._put_back(actor)
+        return out
 
     # ------------------------------------------------------------------
     # Batched dispatch — fan out N futures concurrently with a single
@@ -930,10 +965,6 @@ class CpuApproxPool:
                 return tokens_out, rewards_out, sentinel_mask
             return tokens_out, eqn_ids_out, rewards_out, sentinel_mask
 
-        # Map wave-local actor index j -> list of slots that OOM'd on it,
-        # accumulated across waves. Drives the single post-loop recycle.
-        oom_by_actor: dict[int, list] = {}
-
         # Optional PROACTIVE recycle: swap out any held actor that has served
         # >= ALPHAGRAD_PROACTIVE_RECYCLE_EVERY measures since its last recycle,
         # BEFORE it reaches the OOM point. A/B alternative to the reactive path.
@@ -958,7 +989,12 @@ class CpuApproxPool:
         for wave_start in range(0, N, M):
             wave = list(range(wave_start, min(wave_start + M, N)))
             futures: dict[int, Any] = {}
+            flags: dict[int, Any] = {}
             f_timeouts: dict[int, float] = {}
+            # Map wave-local actor index j -> the slots whose own call ran out
+            # of memory on it in THIS wave. The recycle follows the wave, so
+            # the actor's next slot runs on a fresh process.
+            oom_by_actor: dict[int, list] = {}
             for j, i in enumerate(wave):
                 actor = held[j]
                 if actor is None:
@@ -992,6 +1028,9 @@ class CpuApproxPool:
                         rule=(None if rule is None else str(rule)),
                         timeout_s=(float(_to) if _to > 0 else None),
                     )
+                    # Ray runs an actor's calls in the order they are sent, so
+                    # this reads the out-of-memory flag of the call above.
+                    flags[i] = actor.pop_oom_flag.remote()
                     f_timeouts[i] = _to
                 except Exception as _exc:
                     self._n_other_errors += 1
@@ -1037,24 +1076,32 @@ class CpuApproxPool:
                         self._measures_since_recycle[id(actor)] = (
                             self._measures_since_recycle.get(id(actor), 0) + 1
                         )
-                    # OOM sentinel? The worker returns the SAME sentinel arrays
-                    # for a device OOM as for a benign graphax shape error, so
-                    # the reward magnitude alone can't tell them apart. Query
-                    # the actor's one-shot pop_oom_flag: True => this sentinel
-                    # was the un-freeable measure-GPU leak filling up; recycle
-                    # this actor. False => benign; leave the actor alive.
-                    if self._reward_is_sentinel(reward):
-                        try:
-                            _was_oom = bool(ray.get(
-                                actor.pop_oom_flag.remote(), timeout=10.0
-                            ))
-                        except Exception:
-                            _was_oom = False
-                        if _was_oom:
-                            # The OOM came back through the success branch, so
-                            # the mask was not set; the slot stays refused.
+                    # THE FLAG OF THIS ROW, read after every row (owner ruling
+                    # 2026-09-24 Q52). An out-of-memory error inside the
+                    # callback is a scored row with finite values, so the row
+                    # alone cannot show it.
+                    try:
+                        _was_oom = bool(ray.get(flags[i], timeout=10.0))
+                    except Exception as _flag_exc:
+                        self._n_actor_errors += 1
+                        print(
+                            f"[POOL] oom-flag read failed actor#{j} slot={i} "
+                            f"step={int(step_batch[i])}: "
+                            f"{type(_flag_exc).__name__}: "
+                            f"{str(_flag_exc)[:120]}; the row stands, the "
+                            f"actor is replaced "
+                            f"(n_actor_errors={self._n_actor_errors})",
+                            flush=True,
+                        )
+                        self._poison(actor, future=None)
+                        held[j] = None
+                        continue
+                    if _was_oom:
+                        oom_by_actor.setdefault(j, []).append(i)
+                        # The server's own sentinel row stays excluded; a
+                        # scored row stays scored.
+                        if self._reward_is_sentinel(reward):
                             sentinel_mask[i] = True
-                            oom_by_actor.setdefault(j, []).append(i)
                 except GetTimeoutError:
                     self._n_timeouts += 1
                     print(
@@ -1111,23 +1158,23 @@ class CpuApproxPool:
                     held[j] = None
                     _sentinel_slot(i)
 
-        # ---- reactive recycle-on-OOM pass ----
-        # For each held actor that OOM'd one or more slots: recycle it ONCE
-        # (process teardown frees the leaked XLA memory). Its OOM'd slots keep
-        # the sentinel already written to the output buffers.
-        for j, slots in oom_by_actor.items():
-            old_actor = held[j]
-            if old_actor is None:
-                continue
-            fresh = self._recycle_actor(old_actor)
-            self._n_oom_recycles += 1
-            held[j] = fresh  # replace in-place; may be None on failure
-            print(
-                f"[POOL] oom-recycle actor#{j} slots={slots}: "
-                f"{'fresh actor' if fresh is not None else 'respawn failed'}, "
-                f"slots stay refused (n_oom_recycles={self._n_oom_recycles})",
-                flush=True,
-            )
+            # ---- reactive recycle-on-OOM, after the wave ----
+            # Only process teardown frees the leaked XLA memory. The rows
+            # stay as the actor returned them and are not measured again.
+            for j, slots in oom_by_actor.items():
+                old_actor = held[j]
+                if old_actor is None:
+                    continue
+                fresh = self._recycle_actor(old_actor)
+                self._n_oom_recycles += 1
+                held[j] = fresh  # replace in-place; may be None on failure
+                print(
+                    f"[POOL] oom-recycle actor#{j} slots={slots}: "
+                    f"{'fresh actor' if fresh is not None else 'respawn failed'}, "
+                    f"rows not measured again "
+                    f"(n_oom_recycles={self._n_oom_recycles})",
+                    flush=True,
+                )
 
         # Return still-alive actors to the pool.
         for a in held:

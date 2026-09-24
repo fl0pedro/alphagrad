@@ -521,6 +521,7 @@ class _Actor:
         self.timeouts: list = []
         self.order: list = []
         self.ready = _Method(future, self._ready, lambda: build)
+        self.pop_oom_flag = _Method(future, lambda: False, lambda: 0.0)
         self.evaluate = _Method(
             future, self._evaluate,
             lambda: run + (0.0 if self.built else build), self.timeouts)
