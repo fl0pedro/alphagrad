@@ -387,10 +387,14 @@ class CpuApproximationServer:
             # full traceback, the elimination order, and the DECODED per-vertex
             # micro-action sequence (DIAG/COMPRESS/QUANT with dtype names).
             try:
+                import json as _json
                 import traceback as _tb
                 from graphax.sparse.micro_actions import (
                     QUANT_DTYPES as _QD,
                     COMPRESS_KINDS as _CK,
+                )
+                from alphagrad.approx.common.plan_log import (
+                    encode_wires as _encode_wires,
                 )
                 from alphagrad.approx.env import (
                     COMPRESS_SENTINEL as _CS,
@@ -425,6 +429,13 @@ class CpuApproximationServer:
                             + " -> ".join(_rules)
                         )
                 _decoded = "\n".join(_lines) if _lines else "    (no active micro-action rules)"
+                _face_rows = [] if face_specs is None else _encode_wires(
+                    _order_np, _specs_np, face_specs, face_skips,
+                    compress_sentinel=_CS, quant_sentinel=_QS)["faces"]
+                _faces = "\n".join(
+                    f"    v{_r[0]}(vertex_id={_order_np[_r[0]]}) face {_r[1]}: "
+                    + _json.dumps(_r, separators=(",", ":"))
+                    for _r in _face_rows) or "    (no live face wires)"
                 print(
                     f"[SENTINEL-VERBOSE] ==================================================\n"
                     f"[SENTINEL-VERBOSE] step={int(step)} order_len={_olen} "
@@ -434,6 +445,9 @@ class CpuApproximationServer:
                     f"[SENTINEL-VERBOSE] ORDER ({len(_order_np)}): {_order_np}\n"
                     f"[SENTINEL-VERBOSE] MICRO-ACTIONS (per vertex, in elimination order):\n"
                     f"{_decoded}\n"
+                    f"[SENTINEL-VERBOSE] FACE WIRES (live faces, in elimination order, "
+                    f"as plan_log rows [k, face, skip, b0, b1, b2 per slot]):\n"
+                    f"{_faces}\n"
                     f"[SENTINEL-VERBOSE] TRACEBACK:\n{_tb.format_exc()}"
                     f"[SENTINEL-VERBOSE] ==================================================",
                     flush=True,
