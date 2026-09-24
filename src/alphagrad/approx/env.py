@@ -4152,6 +4152,30 @@ def _loss_rows(config, out):
     return out
 
 
+def measured_program(config, order, consts, sparse=None, **jacve_kwargs):
+    # The program a plan is measured on: the elimination, and on a target
+    # with carried outputs the one-call step (owner ruling 2026-09-24, Q1c).
+    carried = int(getattr(config, "carried_outputs", 0) or 0) > 0
+    fn = jacve(
+        config.target_fun,
+        list(order),
+        argnums=config.argnums,
+        has_aux=True if carried else config.has_aux,
+        sparse_representation=config.sparse if sparse is None else sparse,
+        jaxpr=config.jaxpr,
+        consts=list(consts),
+        **jacve_kwargs,
+    )
+    if not carried:
+        return fn
+    if config.has_aux:
+        raise ValueError(
+            "a target with carried outputs returns its state as outputs; "
+            "has_aux on it has no reading")
+    from alphagrad.approx.common.rsnn_shd import rsnn_one_call_step
+    return rsnn_one_call_step(fn)
+
+
 _LOSS_TARGETS: dict = {}
 
 
@@ -9270,22 +9294,13 @@ def _callback_measured(
         go through here so a change to one cannot miss the other."""
         _kw = ({"transforms": transforms,
                 "face_transforms": ft_by_vertex} if approx else {})
-        return jacve(
-            config.target_fun,
-            list(o_list),
-            argnums=config.argnums,
-            has_aux=config.has_aux,
-            sparse_representation=config.sparse,
-            # ONE JAXPR FOR BOTH PATHS (dsnn-dfw.24). The order and the face
-            # keys are numbered on `config.jaxpr`; a fresh trace inside
-            # `.lower()` is a different equation list for the same function
-            # (measured on window2: 90 equations against 72, every
-            # `convert_element_type` moved), and then the plan addresses
-            # vertices that are not there.
-            jaxpr=config.jaxpr,
-            consts=list(consts),
-            **_kw,
-        )
+        # ONE JAXPR FOR BOTH PATHS (dsnn-dfw.24). The order and the face
+        # keys are numbered on `config.jaxpr`; a fresh trace inside
+        # `.lower()` is a different equation list for the same function
+        # (measured on window2: 90 equations against 72, every
+        # `convert_element_type` moved), and then the plan addresses
+        # vertices that are not there. `measured_program` passes it.
+        return measured_program(config, o_list, consts, **_kw)
 
     def _do_compile_approx():
         # THE MEASURED ELIMINATION. graphax invokes every per-vertex/per-face
@@ -9402,23 +9417,15 @@ def _callback_measured(
     paired_ref_key = h_rf.digest()
 
     def _do_compile_paired_ref():
+        # The paired reference walks the graph the POLICY acted on. A carry
+        # variant is that graph with the approximation moved into an
+        # argument, and the exact rule lives on the base program only
+        # (dsnn-biw). On a target with carried outputs it is the one-call
+        # step too, so both halves of the pair do the same work (Q1c).
         return _compile_measure(
             jax.jit(
-                jacve(
-                    _ref_cfg.target_fun,
-                    list(_rev_order),
-                    argnums=_ref_cfg.argnums,
-                    has_aux=_ref_cfg.has_aux,
-                    sparse_representation=_ref_cfg.sparse,
-                    transforms=[],
-                    face_transforms=None,
-                    # The paired reference walks the graph the POLICY acted
-                    # on. A carry variant is that graph with the
-                    # approximation moved into an argument, and the exact
-                    # rule lives on the base program only (dsnn-biw).
-                    jaxpr=_ref_cfg.jaxpr,
-                    consts=list(_ref_consts),
-                ),
+                measured_program(_ref_cfg, _rev_order, _ref_consts,
+                                 transforms=[], face_transforms=None),
                 keep_unused=True,
             ).lower(*_ref_args_for_lower)
         )
@@ -9511,17 +9518,9 @@ def _callback_measured(
             try:
                 return _compile_measure(
                     jax.jit(
-                        jacve(
-                            config.target_fun,
-                            list(o_list),
-                            argnums=config.argnums,
-                            has_aux=config.has_aux,
-                            sparse_representation=True,
-                            transforms=transforms,
-                            face_transforms=ft_by_vertex,
-                            jaxpr=config.jaxpr,
-                            consts=list(consts),
-                        ),
+                        measured_program(config, o_list, consts, sparse=True,
+                                         transforms=transforms,
+                                         face_transforms=ft_by_vertex),
                         keep_unused=True,
                     )
                     .lower(*args_for_lower)

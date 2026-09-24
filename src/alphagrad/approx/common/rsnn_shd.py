@@ -135,10 +135,35 @@ def rsnn_target(batched: bool = False):
     return vmapped_step_target if batched else RSNN_SHD
 
 
-def empty_plan_program(batched: bool = False):
+def empty_plan_program(batched: bool = False, has_aux: bool = False):
     from graphax import jacve
     return jacve(rsnn_target(batched), "rev", argnums=RSNN_ARGNUMS,
-                 sparse_representation=True)
+                 has_aux=has_aux, sparse_representation=True)
+
+
+def rsnn_one_call_step(program):
+    # THE MEASURED RTRL PROGRAM (owner ruling 2026-09-24, Q1c): the plan's
+    # elimination (``program``, jacve with has_aux), the container's
+    # projection and the target's own forward state in one jit; it returns
+    # the loss row, the next carry and the next state.
+    from graphax.examples.neuromorphic import (project_rsnn_carry,
+                                               rsnn_given_container)
+
+    def step(*args):
+        primal, rows = program(*args)
+        states, weights = tuple(args[2:7]), tuple(args[7:10])
+        given = tuple(args[RSNN_HEAD_SLOTS:])
+        c = rsnn_given_container(states, weights, given)
+        new = project_rsnn_carry(rows[1:], c, weights,
+                                 [tuple(jnp.shape(s)) for s in states])
+        nxt = tuple(primal[1:])
+        for a, b in zip(new + nxt, given + states):
+            if a.dtype != b.dtype or jnp.shape(a) != jnp.shape(b):
+                raise ValueError(
+                    f"the one-call step returns {jnp.shape(a)} {a.dtype} "
+                    f"where its argument is {jnp.shape(b)} {b.dtype}")
+        return rows[0], new, nxt
+    return step
 
 
 def _device_of(args):
@@ -158,14 +183,14 @@ _EMPTY_EXE: dict = {}
 
 
 def empty_plan_executable(args, batched: bool = False):
-    # The empty plan's program compiled once per process for these avals.
+    # The empty plan's one-call step compiled once per process for these avals.
     specs = tuple(_spec(a) for a in args)
     key = (bool(batched), str(jax.devices()[0]),
            tuple((s.shape, str(s.dtype), s.weak_type) for s in specs))
     hit = _EMPTY_EXE.get(key)
     if hit is None:
-        hit = jax.jit(empty_plan_program(batched),
-                      keep_unused=True).lower(*specs).compile()
+        step = rsnn_one_call_step(empty_plan_program(batched, has_aux=True))
+        hit = jax.jit(step, keep_unused=True).lower(*specs).compile()
         _EMPTY_EXE[key] = hit
     return hit
 
@@ -1083,36 +1108,42 @@ def carry_from_program(seq, y, t, weights, program, container="exact"):
     return tuple(sg(g) for g in given)
 
 
-@partial(jax.jit, static_argnames=("container",))
-def _advance(rows, st, given, seq, u, t, weights, consts, container):
-    # One step of the host loop: the container's projection of the state rows
-    # and the cell, masked per sample; compiled once per (container, rows).
-    from graphax.examples.neuromorphic import project_rsnn_carry
-    cell = _cell()
-    last = seq.shape[-2] - 1
-    if seq.ndim == 3:
-        cell = jax.vmap(cell, in_axes=(0, 0, 0, 0, 0, 0) + (None,) * 9)
-        x, x_next = seq[:, u], seq[:, jnp.minimum(u + 1, last)]
-    else:
-        x, x_next = seq[u], seq[jnp.minimum(u + 1, last)]
-    new = project_rsnn_carry(rows[1:], container, weights,
-                             [tuple(a.shape) for a in st])
-    for a, b in zip(new, given):
-        if a.dtype != b.dtype or a.shape != b.shape:
-            raise ValueError(
-                f"the projected carry {a.shape} {a.dtype} is not the "
-                f"container's {b.shape} {b.dtype}")
-    nxt = cell(x, *st, *weights, *consts)
+@jax.jit
+def _masked_step(u, t, st_new, st, given_new, given):
+    # A batched recording with one t per sample keeps a sample once u >= t.
     keep = u < t
-    return (tuple(_select(keep, a, b) for a, b in zip(nxt, st)),
-            tuple(_select(keep, a, b) for a, b in zip(new, given)),
-            x_next, u + 1)
+    return (tuple(_select(keep, a, b) for a, b in zip(st_new, st)),
+            tuple(_select(keep, a, b) for a, b in zip(given_new, given)),
+            u + 1)
+
+
+@partial(jax.jit, static_argnames=("batched",))
+def _unstack(seq, batched):
+    return tuple(seq[:, u] if batched else seq[u]
+                 for u in range(seq.shape[-2]))
+
+
+_FRAMES: dict = {}
+
+
+def _frames(seq, batched, device):
+    key = (id(seq), str(device), bool(batched))
+    hit = _FRAMES.get(key)
+    if hit is not None and hit[0] is seq:
+        return hit[1]
+    out = _unstack(seq if device is None else jax.device_put(seq, device),
+                   batched=bool(batched))
+    if len(_FRAMES) > 16:
+        _FRAMES.clear()
+    _FRAMES[key] = (seq, out)
+    return out
 
 
 def carry_from_executable(seq, y, t, weights, consts, exe, container="exact",
                           device=None):
-    # THE PRODUCER (owner ruling 2026-09-24, Q1a): the plan's compiled
-    # program run from the host over steps 0 .. t-1 from the zero carry.
+    # THE PRODUCER (owner rulings 2026-09-24, Q1a and Q1c): the plan's
+    # one-call step run from the host over steps 0 .. t-1 from the zero
+    # carry; each call returns the next carry and the next state.
     from graphax.examples.neuromorphic import rsnn_zero_carry
     c = _container(container)
     batched = int(jnp.ndim(seq)) == 3
@@ -1125,13 +1156,16 @@ def carry_from_executable(seq, y, t, weights, consts, exe, container="exact",
     t = jnp.asarray(t_host, jnp.int32)
     u = jnp.zeros((), jnp.int32)
     if device is not None:
-        seq, y, weights, consts, st, given, t, u = jax.device_put(
-            (seq, y, weights, consts, st, given, t, u), device)
-    x = seq[:, 0] if batched else seq[0]
-    for _ in range(steps):
-        rows = exe(x, y, *st, *weights, *consts, *given)
-        st, given, x, u = _advance(rows, st, given, seq, u, t, weights,
-                                   consts, container=c.name)
+        y, weights, consts, st, given, t, u = jax.device_put(
+            (y, weights, consts, st, given, t, u), device)
+    frames = _frames(seq, batched, device)
+    for k in range(steps):
+        _, given_new, st_new = exe(frames[k], y, *st, *weights, *consts,
+                                   *given)
+        if batched:
+            st, given, u = _masked_step(u, t, st_new, st, given_new, given)
+        else:
+            st, given = st_new, given_new
     return tuple(given)
 
 

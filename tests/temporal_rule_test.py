@@ -2117,7 +2117,9 @@ for t in range(1, T):
     worst = max(worst, max(rel(a, b) for a, b in zip(got, want)))
 out["two_diag_plan_vs_carry_traces"] = worst
 # The same plan's generator draw at the pinned step is the same number.
-exe = jax.jit(program, keep_unused=True).lower(*vargs).compile()
+step = envmod.measured_program(cfg, o2, consts, sparse=False,
+                               transforms=transforms, face_transforms=ft)
+exe = jax.jit(step, keep_unused=True).lower(*vargs).compile()
 gen = cfg.data_gen.with_executable(exe, tuple(vargs))
 keys = jax.random.split(jax.random.PRNGKey(0), 5)
 data = dict(zip(gen.data_slots, gen(keys)))
@@ -2301,8 +2303,15 @@ def measured(wires):
                     has_aux=cfg.has_aux, sparse_representation=cfg.sparse,
                     jaxpr=cfg.jaxpr, consts=list(consts),
                     transforms=transforms, face_transforms=ft)
-    exe = jax.jit(program, keep_unused=True).lower(*vargs).compile()
+    step = envmod.measured_program(cfg, o2, consts, transforms=transforms,
+                                   face_transforms=ft)
+    exe = jax.jit(step, keep_unused=True).lower(*vargs).compile()
     return container, cfg, tuple(vargs), program, exe
+
+
+def dense(x):
+    return np.asarray(x.dense() if hasattr(x, "primal_dims") else x,
+                      np.float64)
 
 
 out = {}
@@ -2330,6 +2339,14 @@ for name, wires in plans.items():
     row["draw_vs_oracle"] = max(rel(data[16 + i], o)
                                 for i, o in enumerate(oracle))
     row["t_drawn"] = t_drawn
+    # the one-call step's outputs are its parts: the program's loss row and
+    # the target's forward state
+    one = exe(*vargs)
+    raw = program(*vargs)
+    row["step_loss_row_vs_program"] = max(
+        rel(dense(a), dense(b)) for a, b in zip(one[0], raw[0]))
+    row["step_state_vs_forward"] = max(
+        rel(a, b) for a, b in zip(one[2], cfg.target_fun(*vargs)[1:]))
     out[name] = row
 print("RESULT " + json.dumps(out))
 '''
@@ -2354,6 +2371,15 @@ def test_the_host_loop_over_the_measured_executable_is_the_scan(
     assert row["container"] == container, row
     assert row["host_vs_oracle"] < 1e-11, row
     assert row["draw_vs_oracle"] < 1e-11, row
+
+
+@pytest.mark.parametrize("plan", ["empty", "container Diag", "e-prop"])
+def test_the_one_call_step_returns_the_loss_row_and_the_forward_state(
+        host_loop_results, plan):
+    # owner ruling 2026-09-24, Q1c
+    row = host_loop_results[plan]
+    assert row["step_loss_row_vs_program"] < 1e-12, row
+    assert row["step_state_vs_forward"] < 1e-12, row
 
 
 @pytest.mark.parametrize("plan", ["empty", "e-prop"])
