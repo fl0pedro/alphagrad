@@ -164,7 +164,7 @@ def register(conftest_path: str) -> bool:
 MEASUREMENT_TESTS: dict[str, str] = {
     # --- B: two adjacent timings of the same executable ---------------------
     "tests/paired_log_reward_test.py::"
-    "test_rev_exact_scores_exactly_zero_on_memory_and_inside_drift_on_latency":
+    "test_the_reference_scores_exactly_zero_on_memory_and_inside_drift_on_latency":
         "B -- asserts abs(Delta_lat) < log(2) on two back-to-back windows of "
         "ONE executable at ~20-37 us (ticket .75)",
     "tests/measure_instrument_test.py::"
