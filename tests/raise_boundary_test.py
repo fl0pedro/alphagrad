@@ -176,9 +176,11 @@ def _fake_compile(monkeypatch, approx=None, ref=None):
 
     def fake(key, fn, *a, **kw):
         head = bytes(key).split(b":", 1)[0]
+        if head == b"approx":
+            # Built and traced anew on every call: an executable from the
+            # process memo would skip the candidate's build and trace.
+            return fn() if approx is None else approx(fn)
         make = (lambda: real(key, fn, *a, **kw))
-        if approx is not None and head == b"approx":
-            return approx(make)
         if ref is not None and head == b"paired-ref":
             return ref(make)
         return make()
