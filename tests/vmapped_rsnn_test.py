@@ -40,11 +40,9 @@ def _args(rule, seed=1, **kw):
 
 def _rows(xs, rule):
     """The ``B`` one-recording tuples the batched tuple holds."""
-    n_ref = 3 if rule == "rtrl" else 0
     head, ws, cs, given = xs[:7], xs[7:10], xs[10:16], xs[16:]
-    refs, blocks = given[:n_ref], given[n_ref:]
-    return [tuple(a[i] for a in head) + tuple(ws) + tuple(cs) + tuple(refs)
-            + tuple(b[i] for b in blocks) for i in range(B)]
+    return [tuple(a[i] for a in head) + tuple(ws) + tuple(cs)
+            + tuple(b[i] for b in given) for i in range(B)]
 
 
 def _recordings(seed=1):
@@ -82,10 +80,7 @@ def test_the_batched_tuple_maps_the_recording_and_shares_the_weights(rule):
     assert xs[7].shape == (H, SHD_CHANNELS)
     assert xs[8].shape == (H, H)
     assert xs[9].shape == (SHD_CLASSES, H)
-    n_ref = 3 if rule == "rtrl" else 0
-    for k in range(n_ref):
-        assert np.array_equal(np.asarray(xs[16 + k]), np.asarray(xs[7 + k]))
-    for slot in range(16 + n_ref, len(xs)):
+    for slot in range(16, len(xs)):
         assert xs[slot].shape == (B,) + ref[slot].shape, slot
         assert xs[slot].dtype == ref[slot].dtype
     assert ex.infer_argnums(BATCHED) == R.RSNN_ARGNUMS
@@ -146,10 +141,8 @@ def test_the_past_jacobian_is_built_per_recording(container):
     for i in range(B):
         assert np.array_equal(np.asarray(xs[0][i]), np.asarray(seq[i][ts[i]]))
         single = R.carry_under_plan(seq[i], ts[i], W, container)
-        for k in range(3):
-            assert np.array_equal(np.asarray(xs[16 + k]), np.asarray(single[k]))
-        for k, block in enumerate(single[3:]):
-            got = xs[19 + k][i]
+        for k, block in enumerate(single):
+            got = xs[16 + k][i]
             assert got.shape == block.shape and got.dtype == block.dtype
             _close(got, block, quant="quant" in container)
 
