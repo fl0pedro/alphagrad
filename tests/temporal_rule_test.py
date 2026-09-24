@@ -853,12 +853,16 @@ def test_the_attachment_is_a_stop_gradient_and_carries_no_reference_weights():
                 assert not (tuple(g.shape) == tuple(w.shape)
                             and np.array_equal(np.asarray(g), np.asarray(w)))
     jx, _, _ = _jaxpr("rtrl")
+    # the step body's log_softmax holds a stop_gradient of its own, so count
+    # inside the carry scope only: one per weight
     sg = [i for i, e in enumerate(jx.eqns)
-          if e.primitive.name == "stop_gradient"]
+          if e.primitive.name == "stop_gradient"
+          and SNN_CARRY_SCOPE in str(getattr(e.source_info, "name_stack",
+                                             "")).split("/")]
     assert len(sg) == 3
-    assert all(SNN_CARRY_SCOPE in str(getattr(jx.eqns[i].source_info,
-                                              "name_stack", ""))
-               for i in sg)
+    assert [tuple(jx.eqns[i].invars[0].aval.shape) for i in sg] == [
+        (R.RSNN_HIDDEN, SHD_CHANNELS), (R.RSNN_HIDDEN, R.RSNN_HIDDEN),
+        (SHD_CLASSES, R.RSNN_HIDDEN)]
 
 
 def test_the_forward_value_does_not_move_between_containers():
