@@ -175,17 +175,71 @@ def test_the_reference_is_not_gated(measure):
 
 
 class _FakeDevice:
-    def __init__(self, stats):
+    def __init__(self, stats, platform=None, id=0, name="dev"):
         self._stats = stats
+        self.platform = platform
+        self.id = id
+        self._name = name
 
     def memory_stats(self):
         return self._stats
 
     def __repr__(self):
-        return f"_FakeDevice({self._stats!r})"
+        return f"_FakeDevice({self._name}, {self._stats!r})"
 
 
-def test_the_limit_is_read_from_the_device_memory_stats():
+MIB = 2 ** 20
+CARD = 97887 * MIB
+
+
+def test_the_limit_is_the_cards_three_fourths_whatever_the_allocator_holds(
+        monkeypatch, capsys):
+    """dsnn-dfw.238: the allocator's bytes_limit is 75 percent of the memory
+    free at the process's JAX init, so a measure actor that started while
+    the card was held read 7.65 GB and kept it. The gate's limit is three
+    fourths of the card from NVML, read once per device."""
+    monkeypatch.setattr(env_mod, "_DEVICE_BYTES_LIMIT", {})
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    calls = []
+
+    def rows():
+        calls.append(1)
+        return [["0", "GPU-aaaa", "97887"], ["1", "GPU-bbbb", "97887"]]
+
+    monkeypatch.setattr(env_mod, "_nvidia_smi_rows", rows)
+    held = _FakeDevice({"bytes_limit": 7651249356, "bytes_in_use": 7},
+                       platform="gpu", id=0, name="held")
+    assert env_mod._device_bytes_limit(held) == int(CARD * 0.75)
+    assert env_mod._device_bytes_limit(held) == int(CARD * 0.75)
+    assert len(calls) == 1
+    assert env_mod.allocator_bytes_limit(held) == (int(CARD * 0.75), "device")
+    out = capsys.readouterr().out
+    assert f"static peak gate limit {int(CARD * 0.75)} B" in out
+    # The logical device maps to its physical card through CUDA_VISIBLE_DEVICES.
+    monkeypatch.setattr(env_mod, "_DEVICE_BYTES_LIMIT", {})
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-bbbb,1")
+    monkeypatch.setattr(env_mod, "_nvidia_smi_rows", lambda: [
+        ["0", "GPU-aaaa", "97887"], ["1", "GPU-bbbb", "48000"]])
+    by_uuid = _FakeDevice({"bytes_limit": 1}, platform="gpu", id=0,
+                          name="by-uuid")
+    assert env_mod._device_bytes_limit(by_uuid) == int(48000 * MIB * 0.75)
+    by_index = _FakeDevice({"bytes_limit": 1}, platform="gpu", id=1,
+                           name="by-index")
+    assert env_mod._device_bytes_limit(by_index) == int(48000 * MIB * 0.75)
+    # A device that is not a card has no gate.
     assert env_mod._device_bytes_limit(
-        _FakeDevice({"bytes_limit": 12345, "bytes_in_use": 7})) == 12345
-    assert env_mod._device_bytes_limit(_FakeDevice(None)) is None
+        _FakeDevice({"bytes_limit": 12345}, platform="cpu", name="cpu")
+    ) is None
+    assert env_mod._device_bytes_limit(_FakeDevice(None, name="bare")) is None
+    # A card NVML does not list, or a logical device outside
+    # CUDA_VISIBLE_DEVICES, raises instead of taking the allocator's number.
+    monkeypatch.setattr(env_mod, "_DEVICE_BYTES_LIMIT", {})
+    monkeypatch.setattr(env_mod, "_nvidia_smi_rows", lambda: [])
+    with pytest.raises(RuntimeError, match="nvidia-smi lists no card"):
+        env_mod._device_bytes_limit(
+            _FakeDevice({"bytes_limit": 1}, platform="gpu", id=0,
+                        name="unlisted"))
+    with pytest.raises(RuntimeError, match="CUDA_VISIBLE_DEVICES"):
+        env_mod._device_bytes_limit(
+            _FakeDevice({"bytes_limit": 1}, platform="gpu", id=2,
+                        name="outside"))
