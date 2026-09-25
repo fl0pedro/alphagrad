@@ -5746,6 +5746,27 @@ _GRAD_ORACLE_ENV = "ALPHAGRAD_GRAD_ORACLE"
 _GRAD_ORACLE_TOL_ENV = "ALPHAGRAD_GRAD_ORACLE_TOL"
 _GRAD_ORACLE_CADENCE_ENV = "ALPHAGRAD_GRAD_ORACLE_CADENCE"
 _GRAD_ORACLE_TIMEOUT_ENV = "ALPHAGRAD_GRAD_ORACLE_TIMEOUT"
+_GRAD_ORACLE_BATCH_ENV = "ALPHAGRAD_GRAD_ORACLE_BATCH"
+# THE RECORDINGS ONE CHECK RUNS ON (--grad-oracle-batch). The float64 CPU
+# elimination of a free-order TLM plan at the row's B=64 asked XLA for 2.6 to
+# 4.2 TB and killed the oracle worker (job 68195, dsnn-dfw.226); the check
+# runs the plan and jax.grad on the first N recordings of the frozen probe
+# batch instead, which is a different check of the same order (owner ruling
+# 2026-09-25). 0 = the whole batch. MEASURED (job 68216, pgi15-cpu2, the 16
+# episode-0 orders of job 68195): XLA's temp of the float64 elimination is
+# linear in the batch, 4.4 to 101.5 GiB per recording across the 16 orders,
+# and the peak RSS of a check is 1.03 to 1.34 times that temp. Two recordings
+# is the smallest batch that still has a batch structure to get wrong; the
+# worst sampled order's program then asks for 203 GiB.
+_GRAD_ORACLE_BATCH_DEFAULT = 2
+_GRAD_ORACLE_HOST_BUDGET_ENV = "ALPHAGRAD_GRAD_ORACLE_HOST_BUDGET_GB"
+# THE HOST MEMORY ONE CHECK MAY ASK FOR (--grad-oracle-host-budget-gb): the
+# compiled program's temp + arguments + output from memory_analysis(), read
+# BEFORE the program runs. A program over it is refused, the check answers
+# ``error`` (missing) and the worker lives; XLA's own refusal comes only for
+# an allocation the node cannot address at all, and a program that fits the
+# address space but not the RAM is what killed the worker of job 68195.
+_GRAD_ORACLE_HOST_BUDGET_GB_DEFAULT = 256.0
 # "Once per process and order" now lives with the worker that schedules the
 # checks (`common.grad_oracle_async.AsyncGradOracle`), because the trainer has
 # to know which orders it is still waiting for and a module-global set does not
@@ -5860,6 +5881,77 @@ def grad_oracle_timeout() -> float:
         return 600.0
 
 
+def grad_oracle_batch_default() -> int:
+    return int(_GRAD_ORACLE_BATCH_DEFAULT)
+
+
+def grad_oracle_batch() -> int:
+    """How many recordings of the probe batch one check runs on: the flag's
+    value as ppo.py publishes it in ``ALPHAGRAD_GRAD_ORACLE_BATCH``, else the
+    default. 0 means the whole batch. Anything else raises."""
+    raw = os.environ.get(_GRAD_ORACLE_BATCH_ENV)
+    if raw is None or not str(raw).strip():
+        return grad_oracle_batch_default()
+    n = int(str(raw).strip())
+    if n < 0:
+        raise ValueError(
+            f"{_GRAD_ORACLE_BATCH_ENV}={raw!r}: the oracle batch is a count "
+            f"of recordings, 0 for the whole batch")
+    return n
+
+
+def grad_oracle_host_budget_gb_default() -> float:
+    return float(_GRAD_ORACLE_HOST_BUDGET_GB_DEFAULT)
+
+
+def grad_oracle_host_budget_gb() -> float:
+    """The host memory one check's program may ask for, in GiB, as ppo.py
+    publishes it in ``ALPHAGRAD_GRAD_ORACLE_HOST_BUDGET_GB``; 0 = no bar.
+    Anything else raises."""
+    raw = os.environ.get(_GRAD_ORACLE_HOST_BUDGET_ENV)
+    if raw is None or not str(raw).strip():
+        return grad_oracle_host_budget_gb_default()
+    gb = float(str(raw).strip())
+    if gb < 0:
+        raise ValueError(
+            f"{_GRAD_ORACLE_HOST_BUDGET_ENV}={raw!r}: the oracle's host "
+            f"budget is GiB, 0 for no bar")
+    return gb
+
+
+class GradientOracleRefused(RuntimeError):
+    """The check was NOT run: its compiled program asks for more host memory
+    than the oracle's budget. The check answers ``error`` (missing data) and
+    the worker lives; nothing about the gradient is claimed."""
+
+
+def _grad_oracle_program_bytes(exe) -> int:
+    ma = exe.memory_analysis()
+    return int(sum(int(getattr(ma, k, 0) or 0) for k in (
+        "temp_size_in_bytes", "argument_size_in_bytes",
+        "output_size_in_bytes")))
+
+
+def _grad_oracle_check_fits(exe, order, budget_gb=None) -> int:
+    """Refuse a compiled check whose program is over the host budget, BEFORE
+    it runs. Returns the program's bytes. Measured on job 68216: the peak RSS
+    of a check is 1.03 to 1.34 times this number, so the static estimate is
+    the number to gate on and the budget is set with that margin."""
+    budget = (grad_oracle_host_budget_gb() if budget_gb is None
+              else float(budget_gb))
+    need = _grad_oracle_program_bytes(exe)
+    if budget > 0 and need > budget * 2 ** 30:
+        raise GradientOracleRefused(
+            f"[grad-oracle] order {tuple(int(v) for v in order)[:6]}...: "
+            f"the float64 elimination needs {need / 2 ** 30:.1f} GiB of "
+            f"host memory (XLA memory_analysis: temp + arguments + output), "
+            f"over the oracle's host budget of {budget:g} GiB "
+            f"({_GRAD_ORACLE_HOST_BUDGET_ENV}); the check is not run and is "
+            f"counted as missing. Lower --grad-oracle-batch, or raise "
+            f"--grad-oracle-host-budget-gb with the job's memory.")
+    return need
+
+
 class GradientOracleFailure(RuntimeError):
     """The exact gradient of an elimination order disagrees with ``jax.grad``
     (oracle A, ticket dsnn-3qm.62).
@@ -5948,6 +6040,10 @@ def _grad_oracle_exact(config, order, args, device=None):
     lowered = jax.jit(fn, keep_unused=True).lower(*args)
     exe = (lowered.compile() if _is_cpu_device(device)
            else _compile_measure(lowered))
+    if _is_cpu_device(device):
+        # The program's host memory is known before it runs; a check over
+        # the budget is refused here, not OOM-killed later (job 68195).
+        _grad_oracle_check_fits(exe, order)
     out = exe(*args)
     rows = out[1] if config.has_aux else out
     # The oracle checks the step, not the full rollout: a carried target's
@@ -6103,18 +6199,27 @@ def grad_oracle_cpu_device():
     return devs[0]
 
 
-def grad_oracle_submission(config, base_args, episode):
+def grad_oracle_submission(config, base_args, episode, batch=None):
     """What the TRAINER freezes for one oracle-due episode.
 
-    Returns ``(probe_seed, args_np)`` or ``None`` when this configuration has
-    nothing the oracle can check (no target, no scalar loss, no data
-    generator -- the same three guards the synchronous check had).
+    Returns ``(probe_seed, args_np, batch)`` or ``None`` when this
+    configuration has nothing the oracle can check (no target, no scalar loss,
+    no data generator -- the same three guards the synchronous check had).
 
     ``args_np`` is HOST memory: the arguments with the episode's probe batch
     already in slots 0 and 1, pulled off the device here, on the trainer's own
     thread, at the moment the episode ends. The worker thread is then
     independent of every device array the trainer goes on to use, and of the
     probe-batch cache.
+
+    ``batch`` asks for the FIRST N recordings of the probe batch (owner ruling
+    2026-09-25, dsnn-dfw.226): every data slot is cut to N along its leading
+    axis, so the plan and jax.grad both see the same N recordings. The third
+    element is the number of recordings the frozen arguments hold, None on
+    the full-rollout path, where the batch is not a leading axis and the
+    request does not apply. A request on data slots that share no leading
+    axis raises: cutting an unbatched array would hand the check a different
+    program.
     """
     if grad_oracle() == "off":
         return None
@@ -6139,16 +6244,33 @@ def grad_oracle_submission(config, base_args, episode):
         for x in given:
             a.append(rng.standard_normal(np.shape(x), dtype=np.float32)
                      .astype(x.dtype))
-        return int(probe_seed), a
+        return int(probe_seed), a, None
     data = _probe_batch(config, base_args, role="train", index=0, episode=ep)
     if data is None:
         return None
     a = list(jax.device_get(list(base_args)))
     # THE DECLARED SLOTS, not the first two: a generator whose draw is a
     # carried state puts arrays further along the tuple.
-    for slot, d in zip(_data_slots(config, data), data):
+    slots = tuple(_data_slots(config, data))
+    for slot, d in zip(slots, data):
         a[slot] = np.asarray(d)
-    return int(probe_seed), a
+    lead = [(int(np.shape(a[s])[0]) if np.ndim(a[s]) > 0 else None)
+            for s in slots]
+    shared = (lead[0] if lead and lead[0] is not None
+              and all(v == lead[0] for v in lead) else None)
+    if batch is None or int(batch) <= 0:
+        return int(probe_seed), a, shared
+    if shared is None:
+        raise ValueError(
+            f"--grad-oracle-batch {int(batch)} asks for the first "
+            f"{int(batch)} recordings, but the data slots {slots} hold "
+            f"leading sizes {lead} and share no batch axis to cut; cutting "
+            f"them would hand the check a different program")
+    if shared > int(batch):
+        for s in slots:
+            a[s] = a[s][:int(batch)]
+        return int(probe_seed), a, int(batch)
+    return int(probe_seed), a, shared
 
 
 def grad_oracle_cpu_check(config, args_np, order, probe_seed):

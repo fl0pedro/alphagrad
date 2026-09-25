@@ -124,8 +124,8 @@ def test_the_late_result_carries_the_episode_it_belongs_to():
         assert got[0]["order"] == _ORDER_A
         assert got[0]["status"] == "pass"
         assert oracle.counts() == {
-            "pass": 1, "fail": 0, "timeout": 0, "pending": 0,
-            "submitted": 1, "late": 0}
+            "pass": 1, "fail": 0, "timeout": 0, "dead": 0, "error": 0,
+            "pending": 0, "submitted": 1, "late": 0}
     finally:
         oracle.close()
 
@@ -192,23 +192,55 @@ def test_a_fail_raises_at_the_boundary(tmp_path):
         oracle.close()
 
 
-def test_a_check_that_raises_is_a_fail_and_not_a_silent_skip(tmp_path):
-    """An oracle that cannot run is a defect of the same apparatus. It is
-    reported as a fail with its exception text, not swallowed."""
-    from alphagrad.approx.env import GradientOracleFailure
+def test_a_check_that_raises_is_an_error_counted_as_missing_and_not_a_wrong_gradient(tmp_path):
+    """An oracle that cannot run has no answer (owner ruling 2026-09-25,
+    dsnn-dfw.227): the check is written as ``error`` with its exception text,
+    printed at the boundary, counted as missing, not memoized, and it does
+    not stop the run. Only a measured rel_l2 above the bar does."""
     from alphagrad.approx.ppo import _grad_oracle_boundary
 
+    calls = []
+
     def check(order, probe_seed, episode):
+        calls.append(order)
         raise ValueError("the elimination did not build")
 
     oracle = AsyncGradOracle(check, timeout_s=60.0)
+    path = str(tmp_path / "p.jsonl")
+    lines = []
     try:
         oracle.submit(1, 5, [_job(_ORDER_A, _HASH_A)])
         assert _wait_for(lambda: oracle._done.qsize() > 0)
-        with pytest.raises(GradientOracleFailure) as exc:
-            _grad_oracle_boundary(oracle, str(tmp_path / "p.jsonl"), 2, 1e-3,
-                                  log=lambda _l: None)
-        assert "the elimination did not build" in str(exc.value)
+        out = _grad_oracle_boundary(oracle, path, 2, 1e-3, log=lines.append)
+        assert [r["status"] for r in out] == ["error"]
+        assert "the elimination did not build" in out[0]["error"]
+        c = oracle.counts()
+        assert (c["error"], c["fail"], c["pass"]) == (1, 0, 0)
+        assert any("1 check(s) error" in l and "missing" in l for l in lines), lines
+        rows = [json.loads(l) for l in open(path) if l.strip()]
+        assert rows[0]["oracle"]["status"] == "error"
+        assert rows[0]["oracle"]["rel_l2"] is None
+        assert "the elimination did not build" in rows[0]["oracle"]["error"]
+        # NOT MEMOIZED: the order is checked again when it comes back.
+        oracle.submit(3, 5, [_job(_ORDER_A, _HASH_B)])
+        assert _wait_for(lambda: oracle._done.qsize() > 0)
+        _grad_oracle_boundary(oracle, path, 4, 1e-3, log=lambda _l: None)
+        assert calls == [_ORDER_A, _ORDER_A]
+    finally:
+        oracle.close()
+
+
+def test_a_fail_without_a_measured_rel_l2_is_an_error_not_a_stop(tmp_path):
+    from alphagrad.approx.ppo import _grad_oracle_boundary
+
+    oracle = AsyncGradOracle(lambda o, s, e: ("fail", None), timeout_s=60.0)
+    try:
+        oracle.submit(1, 5, [_job(_ORDER_A, _HASH_A)])
+        assert _wait_for(lambda: oracle._done.qsize() > 0)
+        out = _grad_oracle_boundary(oracle, str(tmp_path / "p.jsonl"), 2,
+                                    1e-3, log=lambda _l: None)
+        assert [r["status"] for r in out] == ["error"]
+        assert oracle.counts()["fail"] == 0
     finally:
         oracle.close()
 
@@ -451,7 +483,8 @@ def test_the_late_record_names_the_plan_and_the_episode(tmp_path):
         assert row["episode"] == plan["episode"] == 4
         assert row["order"] == [int(v) for v in order]
         assert row["oracle"] == {
-            "status": "pass", "rel_l2": 7e-15, "checked_at_episode": 6,
+            "status": "pass", "rel_l2": 7e-15, "batch": None,
+            "checked_at_episode": 6,
             "tol": 1e-3, "seconds": row["oracle"]["seconds"],
             "device": "cpu", "dtype": "float64", "error": None}
     finally:

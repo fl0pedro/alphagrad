@@ -41,6 +41,8 @@ from typing import Any, Callable, Sequence
 
 import numpy as np
 
+from alphagrad.approx.common.device_guard import ActorStartRefused
+
 
 # Sentinel reward magnitude when the actor times out or errors. Matches
 # the error path inside ``CpuApproximationServer.evaluate`` (see
@@ -188,6 +190,11 @@ class CpuApproxPool:
         # put it on a device a live actor was measuring on (dsnn-dfw.223).
         self._slot_of: dict[int, int] = {
             id(a): i for i, a in enumerate(actor_handles)}
+        self._handles: dict[int, Any] = {id(a): a for a in actor_handles}
+        # A refused start found on a background respawn (a live actor on the
+        # slot, a process of ours on the device) is raised at the next call.
+        self._respawn_error: BaseException | None = None
+        self._n_respawn_refused = 0
         self._factory_takes_slot = bool(
             respawn_factory is not None
             and "slot" in inspect.signature(respawn_factory).parameters)
@@ -366,16 +373,41 @@ class CpuApproxPool:
 
     def _respawn(self, dead: Any) -> Any:
         # The replacement takes the dead actor's slot: its device and its cores.
+        # No actor starts on a slot a live actor still holds (dsnn-dfw.229).
         with self._lock:
             slot = self._slot_of.pop(id(dead), None)
-        if self._factory_takes_slot and slot is not None:
-            new_handle = self._respawn_factory(slot=slot)
-        else:
-            new_handle = self._respawn_factory()
-        if slot is not None:
-            with self._lock:
+            self._handles.pop(id(dead), None)
+            holders = ([self._handles.get(i) for i, s in self._slot_of.items()
+                        if s == slot] if slot is not None else [])
+        if holders:
+            self._n_respawn_refused += 1
+            raise ActorStartRefused(
+                f"slot {slot} is held by the live actor {holders[0]!r}; the "
+                f"replacement for {dead!r} is not started (dsnn-dfw.229)")
+        if self._factory_takes_slot and slot is None:
+            self._n_respawn_refused += 1
+            raise ActorStartRefused(
+                f"the pool holds no slot for {dead!r}, so its replacement has "
+                f"no device to take; nothing is started (dsnn-dfw.229)")
+        try:
+            if self._factory_takes_slot:
+                new_handle = self._respawn_factory(slot=slot)
+            else:
+                new_handle = self._respawn_factory()
+        except ActorStartRefused:
+            self._n_respawn_refused += 1
+            raise
+        with self._lock:
+            if slot is not None:
                 self._slot_of[id(new_handle)] = slot
+            self._handles[id(new_handle)] = new_handle
         return new_handle
+
+    def _raise_refused(self) -> None:
+        with self._lock:
+            exc = self._respawn_error
+        if exc is not None:
+            raise exc
 
     # ------------------------------------------------------------------
     # Cancellation + respawn
@@ -417,6 +449,13 @@ class CpuApproxPool:
         def _respawn_in_background() -> None:
             try:
                 new_handle = self._respawn(actor)
+            except ActorStartRefused as _exc:
+                # The next measurement raises it: the run stops rather than
+                # timing two processes on one device (dsnn-dfw.229).
+                print(f"[POOL] respawn REFUSED: {_exc}", flush=True)
+                with self._lock:
+                    self._respawn_error = _exc
+                return
             except Exception:
                 # Respawn failed — log and accept reduced pool size.
                 # Driver's periodic ``stats()`` poll will surface
@@ -474,6 +513,8 @@ class CpuApproxPool:
             self._measures_since_recycle.pop(id(actor), None)
         try:
             new_handle = self._await_ready(self._respawn(actor))
+        except ActorStartRefused:
+            raise
         except Exception as _exc:
             print(
                 f"[POOL] recycle respawn failed: {type(_exc).__name__}: "
@@ -611,6 +652,7 @@ class CpuApproxPool:
         import ray
         from ray.exceptions import GetTimeoutError, RayActorError
 
+        self._raise_refused()
         self._n_calls += 1
         actor = self._pick()
         if actor is None:
@@ -912,6 +954,7 @@ class CpuApproxPool:
         import ray
         from ray.exceptions import GetTimeoutError, RayActorError
 
+        self._raise_refused()
         N = len(order_batch)
         if not (len(specs_batch) == N and len(step_batch) == N):
             raise ValueError(f"batch length mismatch: orders {N}, specs {len(specs_batch)}, steps {len(step_batch)}")
@@ -1264,6 +1307,7 @@ class CpuApproxPool:
                 "actor_errors": self._n_actor_errors,
                 "other_errors": self._n_other_errors,
                 "respawn_requested": self._n_respawn_requested,
+                "respawn_refused": self._n_respawn_refused,
                 "oom_recycles": self._n_oom_recycles,
                 "proactive_recycles": self._n_proactive_recycles,
             }
@@ -1392,6 +1436,8 @@ class CpuApproxPool:
 
         try:
             new_handle = self._await_ready(self._respawn(actor))
+        except ActorStartRefused:
+            raise
         except Exception:
             # Respawn failed — accept the smaller pool. The driver's
             # next recycle attempt will try again.
@@ -1456,6 +1502,8 @@ class CpuApproxPool:
         for a in old:
             try:
                 new_actors.append(self._await_ready(self._respawn(a)))
+            except ActorStartRefused:
+                raise
             except Exception:
                 # Stop on first failure; we'll run with the partial
                 # pool we managed to build.

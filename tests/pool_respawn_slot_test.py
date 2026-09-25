@@ -157,3 +157,74 @@ def test_a_factory_without_a_slot_keyword_is_called_as_before(fake_ray):
                          num_rewards=NUM_REWARDS, cosine_sim_idx=COS, frob_residual_idx=FROB)
     _batch(pool, [OOM])
     assert first[0].killed and pool.live_actors() == [fresh[0]]
+
+
+# dsnn-dfw.229 (owner ruling 2026-09-25, round 2 Q5 a): before an actor starts on a slot, the
+# pool makes sure no live actor holds it. If one does, the pool raises with the slot and starts
+# nothing; the factory is never called.
+def test_a_respawn_into_a_slot_a_live_actor_holds_raises_and_starts_nothing(fake_ray):
+    from alphagrad.approx.common.device_guard import ActorStartRefused
+
+    pool, first, fresh, calls = _pool(2)
+    # The bookkeeping of the old counter bug: two actors on one slot.
+    pool._slot_of[id(first[1])] = 0
+    with pytest.raises(ActorStartRefused, match="slot 0"):
+        _batch(pool, [OOM, CLEAN])
+    assert calls == [] and fresh == [], "no actor was started"
+    assert pool.stats()["respawn_refused"] == 1
+
+
+def test_a_refusal_on_a_background_respawn_is_raised_at_the_next_measurement(fake_ray):
+    from alphagrad.approx.common.device_guard import ActorStartRefused
+
+    pool, first, fresh, calls = _pool(2, timeout_s=0.01)
+    pool._slot_of[id(first[0])] = 1
+    stuck = _Future(lambda: None)
+    first[1].evaluate = types.SimpleNamespace(remote=lambda *a, **k: stuck)
+    real_get = fake_ray.get
+
+    def _get(fut, timeout=None):
+        if fut is stuck:
+            raise fake_ray.exceptions.GetTimeoutError()
+        return real_get(fut, timeout)
+
+    def _wait(futs, num_returns=1, timeout=None):
+        return [f for f in futs if f is not stuck], [f for f in futs if f is stuck]
+    fake_ray.get, fake_ray.wait = _get, _wait
+    _batch(pool, [CLEAN, CLEAN])
+    assert first[1].killed
+    stop = time.time() + 10.0
+    while pool.stats()["respawn_refused"] < 1 and time.time() < stop:
+        time.sleep(0.01)
+    assert calls == [] and fresh == []
+    with pytest.raises(ActorStartRefused, match="slot 1"):
+        _batch(pool, [CLEAN])
+
+
+def test_a_factory_that_refuses_its_device_stops_the_recycle(fake_ray):
+    from alphagrad.approx.cpu_approx_pool import CpuApproxPool
+    from alphagrad.approx.common.device_guard import DeviceInUse
+
+    first = [_Actor("a0")]
+
+    def factory(slot=None):
+        raise DeviceInUse(f"device 1 for slot {slot} is in use by pid 4242 (1024 MiB)")
+
+    pool = CpuApproxPool(first, timeout_s=300.0, respawn_factory=factory, max_tokens=TOK,
+                         num_rewards=NUM_REWARDS, cosine_sim_idx=COS, frob_residual_idx=FROB)
+    with pytest.raises(DeviceInUse, match="pid 4242"):
+        _batch(pool, [OOM])
+    assert pool.stats()["respawn_refused"] == 1
+
+
+def test_the_trainer_factory_refuses_a_missing_slot_and_checks_the_device():
+    import inspect
+    import alphagrad.approx.ppo as ppo
+
+    src = inspect.getsource(ppo.main)
+    spawn = src[src.index("def _spawn(slot: int | None = None):"):]
+    spawn = spawn[:spawn.index("_actors = [_spawn(i) for i in range(_n_actors)]")]
+    assert "if slot is None:" in spawn and "_ActorStartRefused(" in spawn
+    assert "_wait_device_free(" in spawn
+    assert "slot=_slot, gpu_uuid=_uuid" in spawn
+    assert "% max(_n_actors, 1)" not in spawn, "the counter's wrap-around is gone"

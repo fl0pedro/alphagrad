@@ -58,13 +58,74 @@ import queue
 import threading
 import time
 
-# The three terminal states of one check. ``pass`` and ``fail`` are the
-# oracle's answer; ``timeout`` is the apparatus saying it has no answer, which
-# under the owner's error rule is counted and reported and does not stop the
-# run (an unanswered sanity check is missing data, not a bad plan).
+# The terminal states of one check. ``pass`` and ``fail`` are the oracle's
+# answer, and only a ``fail`` with a MEASURED rel_l2 above the bar stops the
+# run (:func:`disagrees`). The other three are the apparatus saying it has no
+# answer, which under the owner's error rule is counted and reported and does
+# not stop the run (an unanswered sanity check is missing data, not a bad
+# plan): ``timeout`` (in flight too long), ``dead`` (the check died with its
+# actor -- a killed worker, a RayActorError, a lost future; dsnn-dfw.227, job
+# 68195 counted 15 of them as wrong gradients) and ``error`` (the check itself
+# raised, e.g. RESOURCE_EXHAUSTED inside the elimination). None of the three
+# is memoized, so the order is checked again when it comes back.
 STATUS_PASS = "pass"
 STATUS_FAIL = "fail"
 STATUS_TIMEOUT = "timeout"
+STATUS_DEAD = "dead"
+STATUS_ERROR = "error"
+MISSING_STATUSES = (STATUS_TIMEOUT, STATUS_DEAD, STATUS_ERROR)
+
+# Ray's exceptions that mean the actor or the future is gone, not that the
+# check answered; resolved lazily against the installed Ray.
+_DEAD_ERROR_NAMES = (
+    "RayActorError", "ActorDiedError", "ActorUnavailableError",
+    "ObjectLostError", "OwnerDiedError", "ObjectFreedError",
+    "ObjectReconstructionFailedError", "ReferenceCountingAssertionError",
+    "WorkerCrashedError", "LocalRayletDiedError", "NodeDiedError",
+    "OutOfMemoryError", "TaskCancelledError")
+
+
+def _dead_error_types(ray_mod) -> tuple:
+    exc_mod = getattr(ray_mod, "exceptions", None)
+    out = []
+    for name in _DEAD_ERROR_NAMES:
+        cls = getattr(exc_mod, name, None)
+        if isinstance(cls, type) and issubclass(cls, BaseException):
+            out.append(cls)
+    return tuple(out)
+
+
+def _normalize(status, rel):
+    status = str(status)
+    rel = None if rel is None else float(rel)
+    if status == STATUS_FAIL and rel is None:
+        return STATUS_ERROR, None, "fail without a measured rel_l2"
+    return status, rel, None
+
+
+def disagrees(res, tol) -> bool:
+    """The one result that stops the run: a ``fail`` whose MEASURED rel_l2 is
+    above ``tol`` (a NaN counts as above). A dead, errored or timed-out check
+    has no rel_l2 and is missing data, never a wrong gradient."""
+    if res.get("status") != STATUS_FAIL or res.get("rel_l2") is None:
+        return False
+    rel = float(res["rel_l2"])
+    return math.isnan(rel) or rel > float(tol)
+
+
+def _result(job, status, rel, error, seconds, from_memo) -> dict:
+    return {
+        "id": job["id"],
+        "episode": job["episode"],
+        "order": job["order"],
+        "plan_hashes": job["plan_hashes"],
+        "batch": job.get("batch"),
+        "status": status,
+        "rel_l2": rel,
+        "error": error,
+        "seconds": seconds,
+        "from_memo": bool(from_memo),
+    }
 
 # CPUs reserved for the oracle's Ray actor. The check itself is one CPU
 # elimination and one jax.grad, but XLA:CPU's own thread pool wants more than
@@ -74,12 +135,14 @@ ORACLE_ACTOR_NUM_CPUS = 4
 
 
 def _memo_key(job):
-    """``(order, graph)`` -- what makes two checks the same check.
+    """``(order, graph, batch)`` -- what makes two checks the same check.
 
     A job without a graph (every run with one graph, and every test here)
-    keys on the order alone, exactly as before.
+    keys on the order alone, exactly as before. A check on the first N
+    recordings of the batch is a different check from one on the whole batch
+    (owner ruling 2026-09-25), so the batch is part of the key.
     """
-    return (job["order"], job.get("rule"))
+    return (job["order"], job.get("rule"), job.get("batch"))
 
 
 def make_ray_oracle_actor_factory(args_dict: dict,
@@ -117,17 +180,26 @@ def make_ray_oracle_actor_factory(args_dict: dict,
             # ABSOLUTE cpu ids from the node budget when the driver hands
             # them: the trainer narrows its own mask before it starts the
             # raylet, so the mask this process inherits is not the node.
+            import os as _os
             if core_ids:
-                import os as _os
                 _os.sched_setaffinity(0, {int(c) for c in core_ids})
             else:
                 try:
-                    import os as _os
                     _avail = sorted(_os.sched_getaffinity(0))
                     if 0 < num_cpus < len(_avail):
                         _os.sched_setaffinity(0, set(_avail[-num_cpus:]))
                 except (AttributeError, OSError, ValueError):
                     pass
+            try:
+                _mask = sorted(_os.sched_getaffinity(0))
+            except (AttributeError, OSError):
+                _mask = []
+            # The mask is what XLA:CPU sizes its thread pool from at the
+            # first jax import, so the log line is the thread count.
+            print(f"[grad-oracle] actor pid={_os.getpid()} num_cpus={num_cpus} "
+                  f"cpus={len(_mask)}"
+                  + (f" ({_mask[0]}-{_mask[-1]})" if _mask else ""),
+                  flush=True)
             self._args_dict = dict(args_dict)
             # ONE CONFIG PER GRAPH, built lazily on the first check of that
             # graph. A run may alternate between two graphs of one target
@@ -152,8 +224,20 @@ def make_ray_oracle_actor_factory(args_dict: dict,
             return _env.grad_oracle_cpu_check(
                 self._config_once(rule), args_np, order, probe_seed)
 
+    # NO GPU AT ALL. A JAX process holds a context on every GPU it can see,
+    # and this actor inherited the driver's devices (dsnn-dfw.206: 4.96 GB on
+    # the trainer's GPU 0). The check runs on the CPU device; the device guard
+    # of the measure actors (dsnn-dfw.229) must not find this pid on a
+    # measure device either.
+    _runtime_env = {"env_vars": {
+        "CUDA_VISIBLE_DEVICES": "",
+        "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+        "JAX_PLATFORMS": "cpu",
+    }}
+
     def _factory():
-        return _GradOracleActor.remote(args_dict)
+        return _GradOracleActor.options(
+            runtime_env=_runtime_env).remote(args_dict)
 
     return _factory
 
@@ -205,6 +289,8 @@ class AsyncGradOracle:
         self.n_pass = 0
         self.n_fail = 0
         self.n_timeout = 0
+        self.n_dead = 0          # checks that died with their actor
+        self.n_error = 0         # checks that raised inside the worker
         self.n_late = 0          # answers that arrived after their timeout
         self.n_submitted = 0
         # The largest rel_l2 given out. None until the first; a NaN stays.
@@ -215,6 +301,7 @@ class AsyncGradOracle:
         self._actor = None
         self._actor_generation = 0
         self.n_actor_kills = 0
+        self.n_actor_deaths = 0
         if self._actor_factory is not None:
             if self._arg_resolver is None:
                 raise ValueError(
@@ -253,38 +340,31 @@ class AsyncGradOracle:
                 try:
                     status, rel = self._check(
                         job["order"], job["probe_seed"], job["episode"])
-                    status = str(status)
-                    rel = (None if rel is None else float(rel))
-                    error = None
+                    status, rel, error = _normalize(status, rel)
                 except BaseException as exc:            # noqa: BLE001
-                    # THE ORACLE'S OWN FAULT IS STILL A FAULT. It is reported
-                    # as a fail with the exception text; the trainer raises on
-                    # it at the next boundary like any other fail, so an
-                    # apparatus that cannot check anything cannot go unnoticed.
-                    status, rel = STATUS_FAIL, None
+                    # THE ORACLE'S OWN FAULT IS NOT A WRONG GRADIENT. It is
+                    # reported as ``error`` with the exception text, written
+                    # to the plan log and printed at the boundary, counted as
+                    # missing, and not memoized; only a measured rel_l2 above
+                    # the bar stops the run (owner ruling 2026-09-25).
+                    status, rel = STATUS_ERROR, None
                     error = f"{type(exc).__name__}: {exc}"
                 seconds = time.monotonic() - t0
-                self._memo[_memo_key(job)] = (status, rel)
-            self._done.put({
-                "id": job["id"],
-                "episode": job["episode"],
-                "order": job["order"],
-                "plan_hashes": job["plan_hashes"],
-                "status": status,
-                "rel_l2": rel,
-                "error": error,
-                "seconds": seconds,
-                "from_memo": memo is not None,
-            })
+                if status in (STATUS_PASS, STATUS_FAIL):
+                    self._memo[_memo_key(job)] = (status, rel)
+            self._done.put(_result(job, status, rel, error, seconds,
+                                   memo is not None))
 
     # -- the trainer's side -------------------------------------------------
-    def submit(self, episode: int, probe_seed: int, jobs) -> int:
+    def submit(self, episode: int, probe_seed: int, jobs,
+               batch: int | None = None) -> int:
         """Hand the worker the distinct orders of one episode. Returns how
         many jobs were queued. NEVER BLOCKS and never raises on a full queue:
         the queue is unbounded on purpose, because a bound would put the
         trainer's pace back in the oracle's hands. A ``.remote()`` call
         (actor mode) is itself non-blocking, same as a queue put (thread
-        mode)."""
+        mode). ``batch`` is how many recordings of the probe batch the frozen
+        arguments hold, recorded on every result; None when unknown."""
         n = 0
         # One object-store copy of the episode's arguments serves every order.
         shared: dict = {}
@@ -296,6 +376,7 @@ class AsyncGradOracle:
                 "episode": int(episode),
                 "probe_seed": int(probe_seed),
                 "order": order,
+                "batch": (None if batch is None else int(batch)),
                 # THE GRAPH THE PLANS WERE ACTED ON. `None` on a run with one
                 # graph. It is part of the MEMO KEY as well as the request:
                 # two graphs of one target share a vertex numbering, so one
@@ -337,12 +418,21 @@ class AsyncGradOracle:
         rec["memo_result"] = None
 
     def _count(self, res) -> None:
-        if res["status"] == STATUS_PASS:
+        status = res["status"]
+        if status == STATUS_PASS:
             self.n_pass += 1
-        elif res["status"] == STATUS_TIMEOUT:
-            self.n_timeout += 1
-        else:
+        elif status == STATUS_FAIL:
             self.n_fail += 1
+        elif status == STATUS_TIMEOUT:
+            self.n_timeout += 1
+        elif status == STATUS_DEAD:
+            self.n_dead += 1
+        elif status == STATUS_ERROR:
+            self.n_error += 1
+        else:
+            raise ValueError(f"the oracle check answered an unknown status "
+                             f"{status!r}; it must be one of pass, fail, "
+                             f"timeout, dead, error")
         rel = res["rel_l2"]
         if rel is not None and (self.rel_l2_max is None or math.isnan(rel)
                                 or rel > self.rel_l2_max):
@@ -384,17 +474,8 @@ class AsyncGradOracle:
                          if job.get("actor_gen") in dead_gens
                          and job.get("ref") is not None]
         for jid, job in stale:
-            out.append({
-                "id": jid,
-                "episode": job["episode"],
-                "order": job["order"],
-                "plan_hashes": job["plan_hashes"],
-                "status": STATUS_TIMEOUT,
-                "rel_l2": None,
-                "error": None,
-                "seconds": now - job["submitted_at"],
-                "from_memo": False,
-            })
+            out.append(_result(job, STATUS_TIMEOUT, None, None,
+                               now - job["submitted_at"], False))
         for res in out:
             self._pending.pop(res["id"], None)
             self._count(res)
@@ -408,40 +489,50 @@ class AsyncGradOracle:
                     if job.get("ref") is None and job.get("memo_result") is not None]
         for jid, job in memoized:
             status, rel = job["memo_result"]
-            self._done.put({
-                "id": jid, "episode": job["episode"], "order": job["order"],
-                "plan_hashes": job["plan_hashes"], "status": status,
-                "rel_l2": rel, "error": None, "seconds": 0.0,
-                "from_memo": True,
-            })
+            self._done.put(_result(job, status, rel, None, 0.0, True))
         live = [(jid, job) for jid, job in self._pending.items()
                 if job.get("ref") is not None]
         if not live:
             return
         refs = [job["ref"] for _, job in live]
         import ray
+        dead_types = _dead_error_types(ray)
         ready, _ = ray.wait(refs, num_returns=len(refs), timeout=0)
         ready_set = set(ready)  # ray.ObjectRef is hashable and comparable
+        died: set = set()
         for jid, job in live:
             if job["ref"] not in ready_set:
                 continue
             try:
                 status, rel = ray.get(job["ref"])
-                status = str(status)
-                rel = None if rel is None else float(rel)
-                error = None
-            except BaseException as exc:                 # noqa: BLE001
-                # THE ACTOR'S OWN FAULT IS STILL A FAULT, same as the
-                # thread's: reported as a fail with the exception text.
-                status, rel = STATUS_FAIL, None
+                status, rel, error = _normalize(status, rel)
+            except dead_types as exc:
+                # THE CHECK DIED WITH ITS ACTOR (an OOM-killed worker, a
+                # lost future): missing data, not a wrong gradient
+                # (dsnn-dfw.227). Every check queued on that actor comes
+                # back this way, and the actor is replaced below.
+                status, rel = STATUS_DEAD, None
                 error = f"{type(exc).__name__}: {exc}"
-            self._memo[_memo_key(job)] = (status, rel)
-            self._done.put({
-                "id": jid, "episode": job["episode"], "order": job["order"],
-                "plan_hashes": job["plan_hashes"], "status": status,
-                "rel_l2": rel, "error": error,
-                "seconds": now - job["submitted_at"], "from_memo": False,
-            })
+                died.add(job.get("actor_gen"))
+            except BaseException as exc:                 # noqa: BLE001
+                # THE CHECK ITSELF RAISED (a RESOURCE_EXHAUSTED inside the
+                # elimination, a graphax error): the apparatus has no
+                # answer. Reported as ``error`` with the exception text,
+                # counted as missing, not memoized; only a measured rel_l2
+                # above the bar stops the run (owner ruling 2026-09-25).
+                status, rel = STATUS_ERROR, None
+                error = f"{type(exc).__name__}: {exc}"
+            if status in (STATUS_PASS, STATUS_FAIL):
+                self._memo[_memo_key(job)] = (status, rel)
+            self._done.put(_result(job, status, rel, error,
+                                   now - job["submitted_at"], False))
+        if self._actor_generation in died:
+            self.n_actor_deaths += 1
+            self._respawn_actor()
+
+    def _respawn_actor(self) -> None:
+        self._actor_generation += 1
+        self._actor = self._actor_factory()
 
     def _kill_and_respawn(self) -> None:
         """ACTOR MODE ONLY. ``ray.kill`` the hung actor and replace it with a
@@ -453,8 +544,7 @@ class AsyncGradOracle:
         except Exception:
             pass
         self.n_actor_kills += 1
-        self._actor_generation += 1
-        self._actor = self._actor_factory()
+        self._respawn_actor()
 
     def drain(self, timeout_s: float | None = None) -> list:
         """Wait for the pending checks at process exit, up to the timeout, and
@@ -482,14 +572,18 @@ class AsyncGradOracle:
             "pass": int(self.n_pass),
             "fail": int(self.n_fail),
             "timeout": int(self.n_timeout),
+            "dead": int(self.n_dead),
+            "error": int(self.n_error),
             "pending": int(len(self._pending)),
             "submitted": int(self.n_submitted),
             "late": int(self.n_late),
         }
         # ACTOR MODE ONLY, so the exact dict shape thread-mode tests pin is
-        # untouched: how many times a hung check cost the worker its process.
+        # untouched: how many times a hung check cost the worker its process,
+        # and how many times the worker died under a check.
         if self._actor_factory is not None:
             c["actor_kills"] = int(self.n_actor_kills)
+            c["actor_deaths"] = int(self.n_actor_deaths)
         return c
 
     def close(self) -> None:
@@ -524,6 +618,9 @@ def result_record(res, *, plan_hash: str, tol: float) -> dict:
     is the episode boundary at which the answer arrived and this line was
     written. They differ by however long the check took, which is the whole
     point of the asynchronous oracle and is therefore recorded.
+
+    ``batch`` is how many recordings of the probe batch the check ran on
+    (``--grad-oracle-batch``), None when the submission did not say.
     """
     return {
         "kind": "oracle_result",
@@ -534,6 +631,8 @@ def result_record(res, *, plan_hash: str, tol: float) -> dict:
             "status": str(res["status"]),
             "rel_l2": (None if res.get("rel_l2") is None
                        else float(res["rel_l2"])),
+            "batch": (None if res.get("batch") is None
+                      else int(res["batch"])),
             "checked_at_episode": int(res.get("checked_at_episode",
                                               res["episode"])),
             "tol": float(tol),

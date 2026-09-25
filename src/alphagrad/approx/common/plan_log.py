@@ -362,6 +362,23 @@ def decode_wires(rec: dict, *, quant_sentinel: int = -3):
     return order, rule_specs, face_specs, face_skips
 
 
+def stamp_provenance(records, *, device: dict, actor_id: dict,
+                     overwrite: bool = True) -> int:
+    # The process and the device that timed a plan (owner ruling 2026-09-25,
+    # dsnn-dfw.229): device is the CUDA_VISIBLE_DEVICES it saw plus the GPU
+    # uuid when known, actor_id its pid and slot.
+    n = 0
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        if not overwrite and ("device" in rec or "actor_id" in rec):
+            continue
+        rec["device"] = dict(device)
+        rec["actor_id"] = dict(actor_id)
+        n += 1
+    return n
+
+
 def append_records(path: str, records) -> int:
     """Append records to the run's JSONL. Returns how many were written.
 

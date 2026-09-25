@@ -131,11 +131,15 @@ from alphagrad.approx.common.rsnn_shd import (
     temporal_rule_list as _rule_list,
 )
 from alphagrad.approx.common.schedules import cosine_warmup_exp_decay_lr
+from alphagrad.approx.common.grad_oracle_async import (
+    ORACLE_ACTOR_NUM_CPUS as _ORACLE_CPUS_DEFAULT)
 from alphagrad.approx.env import (
     QUANT_SENTINEL,
     quality_metric as _env_quality_metric,
     grad_oracle_tol as _env_grad_oracle_tol,
     grad_oracle_cadence as _env_grad_oracle_cadence,
+    grad_oracle_batch_default as _env_grad_oracle_batch_default,
+    grad_oracle_host_budget_gb_default as _env_grad_oracle_budget_default,
     APPROX_ADD_CHOICES,
     APPROX_ADD_CLI,
     APPROX_ADD_DEFAULT,
@@ -787,6 +791,35 @@ def _grad_oracle_write(path, results, checked_at_episode, tol):
     return int(_append(path, recs))
 
 
+_GRAD_ORACLE_MISSING_WHY = {
+    "timeout": "in flight longer than the timeout",
+    "dead": "died with the oracle worker",
+    "error": "the check itself raised",
+}
+
+
+def _grad_oracle_log_missing(results, episode, log=print) -> int:
+    """One line per missing status at a boundary: how many checks the oracle
+    could not answer and why. Missing data is counted, written and printed;
+    it never stops the run. Returns how many were missing."""
+    from alphagrad.approx.common.grad_oracle_async import MISSING_STATUSES
+    n = 0
+    for status in MISSING_STATUSES:
+        rows = [r for r in results if r["status"] == status]
+        if not rows:
+            continue
+        n += len(rows)
+        shown = []
+        for r in rows[:4]:
+            err = str(r.get("error") or "").strip().splitlines()
+            shown.append(f"{tuple(r['order'])[:6]}..."
+                         + (f" ({err[-1][:160]})" if err else ""))
+        log(f"[grad-oracle] ep{int(episode)}: {len(rows)} check(s) {status} "
+            f"({_GRAD_ORACLE_MISSING_WHY[status]}), counted as missing and "
+            f"not as failures: " + ", ".join(shown))
+    return n
+
+
 def _grad_oracle_boundary(oracle, path, episode, tol, log=print):
     """ONE episode boundary of the asynchronous oracle.
 
@@ -806,12 +839,14 @@ def _grad_oracle_boundary(oracle, path, episode, tol, log=print):
         return []
     results = oracle.take_results()
     _grad_oracle_write(path, results, episode, tol)
-    fails = [r for r in results if r["status"] == "fail"]
-    times = [r for r in results if r["status"] == "timeout"]
-    if times:
-        log(f"[grad-oracle] ep{int(episode)}: {len(times)} check(s) timed out "
-            f"and are counted as missing, not as failures: "
-            + ", ".join(f"{tuple(r['order'])[:6]}..." for r in times[:4]))
+    _grad_oracle_log_missing(results, episode, log)
+    from alphagrad.approx.common.grad_oracle_async import (
+        disagrees as _disagrees)
+    # ONLY A MEASURED rel_l2 ABOVE THE BAR IS A WRONG GRADIENT. A check that
+    # died with its worker, raised inside it or timed out is missing data
+    # (owner ruling 2026-09-25, dsnn-dfw.227: job 68195 raised on 15 checks
+    # that never ran).
+    fails = [r for r in results if _disagrees(r, tol)]
     if not fails:
         return results
     from alphagrad.approx.env import GradientOracleFailure
@@ -836,6 +871,7 @@ def _grad_oracle_exit_summary(oracle, seconds):
     shown = "none" if rel is None else f"{rel:.3e}"
     return (f"[grad-oracle] drained at exit in {float(seconds):.1f}s: "
             f"{c['pass']} pass, {c['fail']} fail, {c['timeout']} timeout, "
+            f"{c['dead']} dead, {c['error']} error, "
             f"{c['pending']} pending of {c['submitted']} submitted "
             f"(max rel_l2 seen {shown})")
 
@@ -5740,6 +5776,39 @@ def make_argparser() -> argparse.ArgumentParser:
              "exit, so a run ends with every check accounted for. Published "
              "as ALPHAGRAD_GRAD_ORACLE_TIMEOUT.")
     p.add_argument(
+        "--grad-oracle-batch", type=int,
+        default=_env_grad_oracle_batch_default(), metavar="N",
+        help="How many recordings of the probe batch one gradient-oracle "
+             "check runs on: the plan and jax.grad both see the FIRST N of "
+             "the episode's frozen batch, and the late record carries N. "
+             "The float64 CPU elimination of a free-order TLM plan at B=64 "
+             "asked XLA for 2.6 to 4.2 TB and killed the oracle worker (job "
+             "68195, dsnn-dfw.226); a smaller batch of the same order is a "
+             "different check of the same elimination (owner ruling "
+             "2026-09-25). 0 = the whole batch. Applies to the Vmapped "
+             "data-generator targets; a full-rollout target checks its whole "
+             "batch. Published as ALPHAGRAD_GRAD_ORACLE_BATCH.")
+    p.add_argument(
+        "--grad-oracle-cores", type=int, default=0, metavar="N",
+        help="Logical CPUs of the gradient oracle's Ray actor: the slice of "
+             "the node's core budget it is pinned to (which is what sizes "
+             "XLA:CPU's thread pool) and its Ray num_cpus. 0 = every core "
+             "the trainer (--reserved-driver-cores) and the timing actors "
+             "(--cpu-cores-per-actor) leave, so no core is left behind "
+             "(owner ruling 2026-09-25 Q11); without a core budget, 0 keeps "
+             f"the historical {int(_ORACLE_CPUS_DEFAULT)} cores.")
+    p.add_argument(
+        "--grad-oracle-host-budget-gb", type=float,
+        default=_env_grad_oracle_budget_default(), metavar="GIB",
+        help="Host memory one gradient-oracle check may ask for, in GiB: the "
+             "compiled program's temp + arguments + output from XLA's "
+             "memory_analysis(), read before the program runs. A check over "
+             "it is refused and counted as missing (error) instead of being "
+             "run and OOM-killed with the worker (job 68195). Measured on "
+             "job 68216: the peak RSS of a check is 1.03 to 1.34 times that "
+             "number, so set it with that margin under the job's memory. "
+             "0 = no bar. Published as ALPHAGRAD_GRAD_ORACLE_HOST_BUDGET_GB.")
+    p.add_argument(
         "--fixed-order", choices=list(_FIXED_ORDER_CHOICES), default="markowitz",
         help="The elimination order the vertex head is pinned to (ticket "
              "dsnn-3qm.64; common/order.py is the one implementation, shared "
@@ -8545,6 +8614,30 @@ def main(args=None):
           f"{float(args.grad_oracle_timeout):g}s (a check still in flight "
           f"after this is counted as a timeout and forgotten; the run does "
           f"NOT stop)", flush=True)
+    if int(args.grad_oracle_batch) < 0 or int(args.grad_oracle_cores) < 0:
+        raise ValueError(
+            f"--grad-oracle-batch {args.grad_oracle_batch} and "
+            f"--grad-oracle-cores {args.grad_oracle_cores} are counts; 0 "
+            f"means the whole batch and every spare core")
+    if float(args.grad_oracle_host_budget_gb) < 0:
+        raise ValueError(
+            f"--grad-oracle-host-budget-gb {args.grad_oracle_host_budget_gb} "
+            f"is GiB; 0 means no bar")
+    os.environ["ALPHAGRAD_GRAD_ORACLE_HOST_BUDGET_GB"] = str(
+        float(args.grad_oracle_host_budget_gb))
+    print(f"[alphagrad] gradient oracle host budget "
+          f"(--grad-oracle-host-budget-gb) = "
+          f"{float(args.grad_oracle_host_budget_gb):g} GiB (a check whose "
+          f"compiled program asks for more is refused before it runs and "
+          f"counted as missing; 0 = no bar)", flush=True)
+    os.environ["ALPHAGRAD_GRAD_ORACLE_BATCH"] = str(int(args.grad_oracle_batch))
+    print(f"[alphagrad] gradient oracle batch (--grad-oracle-batch) = "
+          f"{int(args.grad_oracle_batch)} (0 = the whole batch; the check "
+          f"runs the plan and jax.grad on the first N recordings of the "
+          f"frozen probe batch and its record carries N; a check that dies "
+          f"with its worker, raises inside it or times out is counted as "
+          f"missing, and only a measured rel_l2 above the bar stops the run)",
+          flush=True)
     print(f"[alphagrad] memory channel (reward slot 5, --mem-channel) = "
           f"{args.mem_channel}"
           + (" (XLA static temp bytes of the timed executable; the runtime "
@@ -8974,19 +9067,27 @@ def main(args=None):
         # --reserved-driver-cores 0 nothing below applies and every process
         # keeps the mask it inherits, which is the historical behaviour.
         _layout = None
+        # THE ORACLE'S WIDTH: --grad-oracle-cores, or every core the trainer
+        # and the timing actors leave (owner ruling 2026-09-25 Q11: no core
+        # left behind). Its Ray num_cpus and its thread pool follow it.
+        _oracle_cores = int(getattr(args, "grad_oracle_cores", 0) or 0)
         if int(getattr(args, "reserved_driver_cores", 0) or 0) > 0:
             from alphagrad.approx.common.core_budget import (
                 core_ids as _core_ids, node_core_layout as _node_core_layout,
                 describe as _describe_layout)
-            from alphagrad.approx.common.grad_oracle_async import (
-                ORACLE_ACTOR_NUM_CPUS as _ORACLE_CPUS)
+            _cpa = int(getattr(args, "cpu_cores_per_actor", 0) or 0) or 2
+            if _oracle_cores <= 0:
+                _oracle_cores = (len(NODE_CPUS)
+                                 - int(args.reserved_driver_cores)
+                                 - _n_actors * _cpa)
             _layout = _node_core_layout(
                 len(NODE_CPUS), _n_actors,
                 trainer_cores=int(args.reserved_driver_cores),
-                cores_per_actor=int(getattr(args, "cpu_cores_per_actor", 0)
-                                    or 0) or 2,
-                oracle_cores=int(_ORACLE_CPUS))
+                cores_per_actor=_cpa,
+                oracle_cores=_oracle_cores)
             print(f"[cores] {_describe_layout(_layout)}", flush=True)
+        elif _oracle_cores <= 0:
+            _oracle_cores = int(_ORACLE_CPUS_DEFAULT)
 
         def _actor_core_ids(slot: int):
             if _layout is None:
@@ -8994,15 +9095,40 @@ def main(args=None):
             _b, _w = _layout.timing_actors[int(slot)]
             return _core_ids(NODE_CPUS, _b, _w)
 
+        from alphagrad.approx.common.device_guard import (
+            ActorStartRefused as _ActorStartRefused,
+            gpu_uuids as _gpu_uuids,
+            wait_device_free as _wait_device_free)
+        _first_gpu = int(os.environ.get("ALPHAGRAD_MEASURE_FIRST_GPU", "1"))
+        _gpu_uuid_of = _gpu_uuids() if _gpu else {}
+
         def _spawn(slot: int | None = None):
+            # THE SLOT IS THE POOL'S TO HAND OVER (dsnn-vgp5, dsnn-dfw.229):
+            # a counter once put a replacement on a live actor's device. No
+            # slot, a slot outside the pool, or a device that still has a
+            # process of ours refuses the start; nothing is started.
+            if slot is None:
+                raise _ActorStartRefused(
+                    "no slot was handed to the measure-actor factory; a "
+                    "replacement without the dead actor's slot has no device "
+                    "to take, so nothing is started (dsnn-dfw.229)")
+            _slot = int(slot)
+            if not 0 <= _slot < max(_n_actors, 1):
+                raise _ActorStartRefused(
+                    f"slot {_slot} is outside the {_n_actors} measurement "
+                    f"slots; nothing is started (dsnn-dfw.229)")
+            _uuid = None
+            if _gpu:
+                # The trainer's own pid is not a timed process: its JAX
+                # backend may hold an idle context on a measure device.
+                _dev = _slot + _first_gpu
+                _uuid = _gpu_uuid_of.get(_dev)
+                _wait_device_free(_dev, slot=_slot, uuid=_uuid,
+                                  exclude_pids=(os.getpid(),))
             _next_id[0] += 1
-            _slot = _next_id[0] - 1 if slot is None else int(slot)
-            # Wrap around the available measurement devices so a RESPAWN
-            # lands back on a real device instead of drifting past the last.
-            _slot = _slot % max(_n_actors, 1)
             return CpuApproximationActor.options(**_actor_opts(_slot)).remote(
                 _args_dict, variant=None, actor_id=_next_id[0],
-                core_ids=_actor_core_ids(_slot),
+                core_ids=_actor_core_ids(_slot), slot=_slot, gpu_uuid=_uuid,
             )
 
         _actors = [_spawn(i) for i in range(_n_actors)]
@@ -9032,7 +9158,6 @@ def main(args=None):
             object.__setattr__(_GRAPHS[_k]["env"], "_remote_timeout_s",
                                float(args.ray_measure_timeout))
         env = _GRAPHS[_PRIMARY]["env"]
-        _first_gpu = int(os.environ.get("ALPHAGRAD_MEASURE_FIRST_GPU", "1"))
         print(f"[ray-measure] {_n_actors} actors on gpus "
               f"{[i + _first_gpu for i in range(_n_actors)] if _gpu else 'cpu'}"
               f" (trainer uses gpu 0"
@@ -9131,6 +9256,20 @@ def main(args=None):
     # episode, dropped when that episode's last answer has been taken, so a
     # 1000-episode run holds at most the episodes still in flight.
     _GRAD_ORACLE_ARGS: dict = {}
+    # WHERE THE ORACLE BATCH APPLIES: a Vmapped data-generator target freezes
+    # the first N recordings; a full-rollout target's batch is not a leading
+    # axis of its tuple, so it freezes the whole tuple and says so once.
+    from alphagrad.approx.common.rsnn_shd import (
+        is_full_rollout as _oracle_is_full_rollout)
+    _oracle_full_rollout = bool(_oracle_is_full_rollout(env.config))
+    if (args.grad_oracle != "off" and int(args.grad_oracle_batch) > 0
+            and (_oracle_full_rollout
+                 or not str(args.example).startswith("Vmapped"))):
+        print(f"[grad-oracle] --grad-oracle-batch {int(args.grad_oracle_batch)}"
+              f" does not apply to {args.example}"
+              + (" (a full-rollout target)" if _oracle_full_rollout
+                 else " (not a Vmapped target)")
+              + "; every check runs on the whole frozen tuple", flush=True)
     if args.grad_oracle != "off":
         from alphagrad.approx import env as _oracle_env_mod
         from alphagrad.approx.common.grad_oracle_async import (
@@ -9179,21 +9318,31 @@ def main(args=None):
             # was mutated with the measure pool's own `num_cpu_workers`,
             # which has nothing to do with the oracle.
             _oracle_args_dict = dict(vars(args))
+            # THE ACTOR GETS EVERY CORE OF ITS SLICE: the pin sizes XLA:CPU's
+            # thread pool and the Ray hint follows the same number.
+            _oracle_core_ids = (None if _layout is None else
+                                _core_ids(NODE_CPUS, *_layout.oracle))
+            _oracle_num_cpus = (len(_oracle_core_ids)
+                                if _oracle_core_ids else int(_oracle_cores))
             _GRAD_ORACLE = _AsyncGradOracle(
                 _grad_oracle_run_check,
                 timeout_s=float(args.grad_oracle_timeout),
                 actor_factory=_make_oracle_actor_factory(
-                    _oracle_args_dict,
-                    core_ids=(None if _layout is None else
-                              _core_ids(NODE_CPUS, *_layout.oracle))),
+                    _oracle_args_dict, num_cpus=int(_oracle_num_cpus),
+                    core_ids=_oracle_core_ids),
                 arg_resolver=_grad_oracle_resolve_args)
             print(f"[grad-oracle] asynchronous, one Ray CPU actor "
-                  f"(num_cpus=4, num_gpus=0) built with the measurement "
+                  f"(num_cpus={int(_oracle_num_cpus)}, num_gpus=0"
+                  + (f", pinned to cpus {_oracle_core_ids[0]}-"
+                     f"{_oracle_core_ids[-1]}" if _oracle_core_ids else "")
+                  + f") built with the measurement "
                   f"pool, on {_oracle_env_mod.grad_oracle_cpu_device()}; "
                   f"cadence {int(args.grad_oracle_cadence)}, timeout "
                   f"{float(args.grad_oracle_timeout):g}s, bar "
-                  f"{_GRAD_ORACLE_TOL:.0e}. A check over the timeout kills "
-                  f"and recreates the actor.", flush=True)
+                  f"{_GRAD_ORACLE_TOL:.0e}, batch "
+                  f"{int(args.grad_oracle_batch) or 'whole'}. A check over "
+                  f"the timeout kills and recreates the actor; a check that "
+                  f"dies with the actor is missing, not wrong.", flush=True)
         elif _TWO_GRAPH:
             # THE THREAD MODE IS ONE GRAPH'S. Its check closure reads the
             # trainer's own live env, which the swap rebinds under it, and the
@@ -15580,6 +15729,20 @@ def main(args=None):
                 # same graph and the argument namespace already says which.
                 _plog_rule = (_rule_for_episode(_RULES, int(ep))
                               if _TWO_GRAPH else None)
+                # THE PROCESS AND THE DEVICE THAT TIMED THE PLAN (owner
+                # ruling 2026-09-25, dsnn-dfw.229). A pooled record arrives
+                # stamped by its measure actor; a record the trainer
+                # measured itself carries the trainer here.
+                from alphagrad.approx.common.plan_log import (
+                    stamp_provenance as _plog_stamp)
+                _plog_stamp(
+                    _plog_recs,
+                    device={"cuda_visible_devices":
+                            os.environ.get("CUDA_VISIBLE_DEVICES"),
+                            "gpu_uuid": None},
+                    actor_id={"pid": os.getpid(), "slot": None,
+                              "actor": "trainer"},
+                    overwrite=False)
                 for _plog_j, _plog_r in enumerate(_plog_recs):
                     _plog_r["episode"] = int(ep)
                     if _plog_rule is not None:
@@ -15612,18 +15775,29 @@ def main(args=None):
                         and (int(_ORACLE_CADENCE) <= 1
                              or int(ep) % int(_ORACLE_CADENCE) == 0)):
                     _or_jobs = _grad_oracle_jobs(_plog_recs)
+                    # THE FIRST N RECORDINGS (--grad-oracle-batch) on the
+                    # Vmapped data-generator targets; a full-rollout target
+                    # freezes its whole tuple, and says so once below.
+                    _or_batch = (int(args.grad_oracle_batch)
+                                 if (str(args.example).startswith("Vmapped")
+                                     and not _oracle_full_rollout)
+                                 else None)
                     _or_sub = (_oracle_env_mod.grad_oracle_submission(
-                                   env.config, env.args, int(ep))
+                                   env.config, env.args, int(ep),
+                                   batch=_or_batch)
                                if _or_jobs else None)
                     if _or_sub is not None:
                         _GRAD_ORACLE_ARGS[int(ep)] = _or_sub[1]
                         _n_or = _GRAD_ORACLE.submit(
-                            int(ep), _or_sub[0], _or_jobs)
+                            int(ep), _or_sub[0], _or_jobs, batch=_or_sub[2])
                         print(f"[grad-oracle] ep{ep}: {_n_or} distinct "
                               f"order(s) of {len(_plog_recs)} plan(s) handed "
-                              f"to the oracle thread (probe seed "
-                              f"{_or_sub[0]}); the trainer does not wait",
-                              flush=True)
+                              f"to the oracle worker (probe seed "
+                              f"{_or_sub[0]}, "
+                              + (f"the first {_or_sub[2]} recordings of "
+                                 f"the batch" if _or_sub[2] is not None
+                                 else "the whole tuple")
+                              + "); the trainer does not wait", flush=True)
                 log_dict["plan_log/records_this_ep"] = int(_plog_nw)
                 log_dict["plan_log/records_total"] = int(_plog_n0 + _plog_nw)
                 log_dict["plan_log/dropped_this_ep"] = int(_plog_dropped)
@@ -18916,8 +19090,14 @@ def main(args=None):
                            _EPISODES_DONE[0], _GRAD_ORACLE_TOL)
         print(_grad_oracle_exit_summary(
             _GRAD_ORACLE, _prof_time.perf_counter() - _or_t0), flush=True)
+        _grad_oracle_log_missing(_or_left, _EPISODES_DONE[0],
+                                 log=lambda line: print(line, flush=True))
         _GRAD_ORACLE.close()
-        _or_fails = [r for r in _or_left if r["status"] == "fail"]
+        from alphagrad.approx.common.grad_oracle_async import (
+            disagrees as _or_disagrees)
+        # A measured rel_l2 above the bar, nothing else (dsnn-dfw.227).
+        _or_fails = [r for r in _or_left
+                     if _or_disagrees(r, _GRAD_ORACLE_TOL)]
         if _or_fails:
             from alphagrad.approx.env import GradientOracleFailure
             raise GradientOracleFailure(

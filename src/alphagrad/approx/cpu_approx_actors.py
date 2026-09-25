@@ -115,8 +115,16 @@ class CpuApproximationActor:
         actor_id: int = 0,
         seed: int = 0,
         core_ids: Sequence[int] | None = None,
+        slot: int | None = None,
+        gpu_uuid: str | None = None,
     ):
         self._actor_id = int(actor_id)
+        # What every plan record of this actor is stamped with: the device it
+        # saw and the process that timed the plan (dsnn-dfw.229).
+        self._slot = None if slot is None else int(slot)
+        self._gpu_uuid = None if gpu_uuid is None else str(gpu_uuid)
+        self._device = os.environ.get("CUDA_VISIBLE_DEVICES")
+        self._pid = os.getpid()
 
         # AN EXPLICIT SLICE WINS (owner ruling Q3, 2026-09-18). The node budget
         # is computed once in the driver from the launcher constants, so the
@@ -233,7 +241,9 @@ class CpuApproximationActor:
             import socket as _sock, os as _os2, jax as _jax
             print(
                 f"[measure-actor {self._actor_id}] host={_sock.gethostname()} "
+                f"pid={self._pid} slot={self._slot} "
                 f"CUDA_VISIBLE_DEVICES={_os2.environ.get('CUDA_VISIBLE_DEVICES', '')} "
+                f"gpu_uuid={self._gpu_uuid} "
                 f"jax_devices={_jax.devices()}", flush=True,
             )
         except Exception:
@@ -409,8 +419,16 @@ class CpuApproximationActor:
         from alphagrad.approx.env import (
             check_mem_parity_complete as _mp_check,
             consume_plan_records as _consume)
+        from alphagrad.approx.common.plan_log import (
+            stamp_provenance as _stamp)
         out = _consume()
         out["actor_id"] = self._actor_id
+        _stamp(out.get("records") or (),
+               device={"cuda_visible_devices": getattr(self, "_device", None),
+                       "gpu_uuid": getattr(self, "_gpu_uuid", None)},
+               actor_id={"pid": getattr(self, "_pid", os.getpid()),
+                         "slot": getattr(self, "_slot", None),
+                         "actor": self._actor_id})
         # MEMORY PARITY (ticket .49, folded from .32): every plan THIS
         # actor measured must have left a (temp, watermark) record. Checked
         # HERE, in the process that measured; the fault class rides the
