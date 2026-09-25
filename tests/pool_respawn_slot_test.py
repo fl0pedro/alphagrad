@@ -122,19 +122,18 @@ def test_an_oom_recycle_respawns_into_the_dead_actors_slot(fake_ray):
 
 def test_a_deadline_kill_respawns_into_the_dead_actors_slot(fake_ray):
     pool, first, fresh, calls = _pool(2, timeout_s=0.01)
+    stuck = _Future(lambda: None)
+    first[1].evaluate = types.SimpleNamespace(remote=lambda *a, **k: stuck)
+    real_get, real_wait = fake_ray.get, fake_ray.wait
 
-    def _slow(order, specs, step, **kw):
-        time.sleep(0.05)
-        return first[1]._evaluate(order, specs, step, **kw)
-    first[1].evaluate = _Remote(_slow)
-    fake_ray.get = (lambda fut, timeout=None, _g=fake_ray.get:
-                    (_ for _ in ()).throw(fake_ray.exceptions.GetTimeoutError())
-                    if (timeout is not None and float(timeout) <= 0.0 and isinstance(fut, _Future)
-                        and fut._fn is _slow) else _g(fut, timeout))
-    sys.modules["ray"].get = fake_ray.get
-    fake_ray.wait = lambda futs, num_returns=1, timeout=None: (
-        [f for f in futs if f._fn is not _slow], [f for f in futs if f._fn is _slow])
-    sys.modules["ray"].wait = fake_ray.wait
+    def _get(fut, timeout=None):
+        if fut is stuck:
+            raise fake_ray.exceptions.GetTimeoutError()
+        return real_get(fut, timeout)
+
+    def _wait(futs, num_returns=1, timeout=None):
+        return [f for f in futs if f is not stuck], [f for f in futs if f is stuck]
+    fake_ray.get, fake_ray.wait = _get, _wait
     _batch(pool, [CLEAN, CLEAN])
     assert first[1].killed and pool.stats()["timeouts"] == 1
     stop = time.time() + 10.0
