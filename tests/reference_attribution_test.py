@@ -67,12 +67,19 @@ def _toy_env(draw=_normal_draw, measure_latency=True):
 
 
 # ---------------------------------------------------------- the injection
+def _site(frame):
+    # The quality channels call the candidate through dense_measured_program's wrapper (ALPHAGRAD_MEASURE_SPARSE=1, the default): the site is its caller.
+    while frame.f_code.co_qualname == "dense_measured_program.<locals>.run":
+        frame = frame.f_back
+    return frame.f_code.co_name
+
+
 class _Wrapped:
     def __init__(self, inner, fail):
         self._inner, self._fail = inner, fail
 
     def __call__(self, *a, **kw):
-        exc = self._fail(a, sys._getframe(1).f_code.co_name)
+        exc = self._fail(a, _site(sys._getframe(1)))
         if exc is not None:
             raise exc
         return self._inner(*a, **kw)

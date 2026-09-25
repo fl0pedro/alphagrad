@@ -158,7 +158,7 @@ for example in ("RSNN_SHD", "VmappedRSNN_SHD"):
         out[f"{example}/{rule}/argnums"] = list(env.config.argnums)
         out[f"{example}/{rule}/reference_kind"] = E.reference_kind(env.config)
         # the asynchronous oracle checks the STEP on its own tuple
-        seed, a_np = E.grad_oracle_submission(env.config, env.args, 0)
+        seed, a_np, _batch = E.grad_oracle_submission(env.config, env.args, 0)
         status, rel_l2 = E.grad_oracle_cpu_check(
             env.config, a_np, [int(v) for v in O.reverse_order(
                 env.valid_vertices)], seed)

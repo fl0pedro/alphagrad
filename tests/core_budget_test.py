@@ -71,10 +71,10 @@ def test_launcher_constants_pin_the_budget():
     spec = importlib.util.spec_from_file_location("_gen_fq", p)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    assert mod.THESIS_CORE_BUDGET_CPUS == 64
+    assert mod.THESIS_CORE_BUDGET_CPUS == {4: 64, 8: 128}
     assert mod.THESIS_CORE_BUDGET[8] == {
-        "trainer": 8, "per_actor": 2, "oracle": 4}
+        "trainer": 8, "per_actor": 8, "oracle": 64}
     assert mod.THESIS_CORE_BUDGET[4] == {
-        "trainer": 8, "per_actor": 2, "oracle": 4}
+        "trainer": 8, "per_actor": 8, "oracle": 32}
     for gpus in (4, 8):
         check_disjoint(mod.thesis_core_layout(gpus))
