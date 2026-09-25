@@ -33,6 +33,7 @@ the user-facing knobs.
 from __future__ import annotations
 
 import collections
+import inspect
 import os
 import threading
 import time
@@ -147,7 +148,8 @@ class CpuApproxPool:
         An actor gets no plan before its construction has finished (its
         ``ready`` call), so construction never runs against a deadline.
     respawn_factory
-        Zero-arg callable that returns a fresh actor handle. Called
+        Callable that returns a fresh actor handle; when it takes a
+        ``slot`` keyword it is given the dead actor's slot. Called
         from a daemon thread on the SPMD process. The factory is
         expected to capture ``CPUApproximationActor.options(...)`` +
         the ``args_dict`` / ``variant`` / fresh ``actor_id`` needed
@@ -181,6 +183,14 @@ class CpuApproxPool:
         self._alive: collections.deque = collections.deque(actor_handles)
         self._timeout_s = float(timeout_s)
         self._respawn_factory = respawn_factory
+        # THE SLOT OF EVERY ACTOR: its device and its cores. A replacement
+        # takes the dead actor's slot, never the next one of a counter, which
+        # put it on a device a live actor was measuring on (dsnn-dfw.223).
+        self._slot_of: dict[int, int] = {
+            id(a): i for i, a in enumerate(actor_handles)}
+        self._factory_takes_slot = bool(
+            respawn_factory is not None
+            and "slot" in inspect.signature(respawn_factory).parameters)
         self._lock = threading.Lock()
         self._closed = False
         # Shape constants captured so we don't import jax here.
@@ -354,6 +364,19 @@ class CpuApproxPool:
                 return
             self._alive.append(actor)
 
+    def _respawn(self, dead: Any) -> Any:
+        # The replacement takes the dead actor's slot: its device and its cores.
+        with self._lock:
+            slot = self._slot_of.pop(id(dead), None)
+        if self._factory_takes_slot and slot is not None:
+            new_handle = self._respawn_factory(slot=slot)
+        else:
+            new_handle = self._respawn_factory()
+        if slot is not None:
+            with self._lock:
+                self._slot_of[id(new_handle)] = slot
+        return new_handle
+
     # ------------------------------------------------------------------
     # Cancellation + respawn
     # ------------------------------------------------------------------
@@ -393,7 +416,7 @@ class CpuApproxPool:
 
         def _respawn_in_background() -> None:
             try:
-                new_handle = self._respawn_factory()
+                new_handle = self._respawn(actor)
             except Exception:
                 # Respawn failed — log and accept reduced pool size.
                 # Driver's periodic ``stats()`` poll will surface
@@ -450,7 +473,7 @@ class CpuApproxPool:
         with self._lock:
             self._measures_since_recycle.pop(id(actor), None)
         try:
-            new_handle = self._await_ready(self._respawn_factory())
+            new_handle = self._await_ready(self._respawn(actor))
         except Exception as _exc:
             print(
                 f"[POOL] recycle respawn failed: {type(_exc).__name__}: "
@@ -1368,7 +1391,7 @@ class CpuApproxPool:
             pass
 
         try:
-            new_handle = self._await_ready(self._respawn_factory())
+            new_handle = self._await_ready(self._respawn(actor))
         except Exception:
             # Respawn failed — accept the smaller pool. The driver's
             # next recycle attempt will try again.
@@ -1430,9 +1453,9 @@ class CpuApproxPool:
         # Spawn replacements synchronously — caller (the SPMD worker)
         # is between episodes so a brief block here is fine.
         new_actors = []
-        for _ in range(n_old):
+        for a in old:
             try:
-                new_actors.append(self._await_ready(self._respawn_factory()))
+                new_actors.append(self._await_ready(self._respawn(a)))
             except Exception:
                 # Stop on first failure; we'll run with the partial
                 # pool we managed to build.
