@@ -145,18 +145,22 @@ def test_the_batched_loss_and_gradient_are_the_mean_over_recordings(rule):
                                        "diag+quant"])
 def test_the_past_jacobian_is_built_per_recording(container):
     # the batched scan gives every recording the carry the one-recording
-    # scan gives it (Q29); the exact container is the exact carry
+    # scan gives it (Q29); the exact container is the exact carry. Under the
+    # full rollout (Q24 a) the graph's own tuple holds the container's zero
+    # and the producer is read directly.
     xs = _args("rtrl", carry_container=container)
     seq, y, W = _recordings()
     ts = R.last_step_position()["t"]
     prog = R.empty_plan_program()
+    built = R._empty_plan_carry(seq, y, jnp.asarray(ts), xs[:16], container)
     for i in range(B):
         assert np.array_equal(np.asarray(xs[0][i]), np.asarray(seq[i][ts[i]]))
         single = R.carry_from_program(seq[i], y[i], ts[i], W, prog, container)
         for k, block in enumerate(single):
             got = xs[16 + k][i]
             assert got.shape == block.shape and got.dtype == block.dtype
-            _close(got, block, quant="quant" in container)
+            assert not np.any(np.asarray(got, np.float32))
+            _close(built[k][i], block, quant="quant" in container)
         if container == "exact":
             for got, block in zip(single, R.carried_jacobians(seq[i], ts[i], W)):
                 _close(got, block)
@@ -164,9 +168,13 @@ def test_the_past_jacobian_is_built_per_recording(container):
 
 @pytest.mark.parametrize("container", ["exact", "reduce", "quant", "diag"])
 def test_the_future_adjoint_is_built_per_recording(container):
+    # under the full rollout (Q24 a) the graph's own tuple holds zero
+    # adjoints and the batched producer is read directly
     xs = _args("bptt", carry_container=container)
     seq, y, W = _recordings()
     ts = R.last_step_position()["t"]
+    _head, built = R._batched_step_tuple(seq, y, jnp.asarray(ts), W, "bptt",
+                                         container)
     for i in range(B):
         st = tuple(R.prefix_state(seq[i], ts[i], W)(*W))
         for k, s in enumerate(st):
@@ -175,7 +183,8 @@ def test_the_future_adjoint_is_built_per_recording(container):
         for k, a in enumerate(lam):
             got = xs[16 + k][i]
             assert got.shape == a.shape and got.dtype == a.dtype
-            _close(got, a, quant="quant" in container)
+            assert not np.any(np.asarray(got, np.float32))
+            _close(built[k][i], a, quant="quant" in container)
 
 
 # ---------------------------------------------------------------------------
@@ -215,25 +224,35 @@ def test_the_graph_shape_does_not_move_with_the_step_position(rule):
 
 
 # ---------------------------------------------------------------------------
-# 4. The generator: B recordings, B step positions
+# 4. The generator: B whole recordings (the full rollout, Q24 a)
 # ---------------------------------------------------------------------------
 
+class _Cfg:
+    def __init__(self, gen):
+        self.data_gen = gen
+
+
 @pytest.mark.parametrize("rule", RULES)
-def test_the_generator_draws_b_recordings_and_b_step_positions(rule):
+def test_the_generator_draws_b_whole_recordings(rule):
     gen = ex.data_gen(BATCHED, key=jax.random.PRNGKey(1), temporal_rule=rule)
     xs = _args(rule)
+    base = R.measure_args(_Cfg(gen), xs)
     keys = jax.random.split(jax.random.PRNGKey(3), 5)
     data = gen(keys)
+    assert gen.data_slots == R.ROLLOUT_DATA_SLOTS
     assert len(data) == len(gen.data_slots)
     for slot, d in zip(gen.data_slots, data):
-        assert d.shape == xs[slot].shape, slot
-        assert d.dtype == xs[slot].dtype, slot
+        assert d.shape == base[slot].shape, slot
+        assert d.dtype == base[slot].dtype, slot
+    assert data[0].shape == (B, T, SHD_CHANNELS)
+    assert data[1].shape == (B, SHD_CLASSES)
+    for slot in range(2, 7):
+        assert not np.any(np.asarray(data[slot]))
     m = gen.meta(keys)
-    assert m["batch"] == B and len(m["t"]) == B and len(m["recording"]) == B
-    assert all(1 <= t < T for t in m["t"])
-    drawn = {tuple(gen.meta(jax.random.split(jax.random.PRNGKey(s), 5))["t"])
-             for s in range(6)}
-    assert len(drawn) > 1, "the step positions did not move with the key"
+    assert m["batch"] == B and len(m["recording"]) == B and "t" not in m
+    drawn = {np.asarray(gen(jax.random.split(jax.random.PRNGKey(s), 5))[0])
+             .tobytes() for s in range(6)}
+    assert len(drawn) > 1, "the recordings did not move with the key"
     for slot in gen.data_slots:
         if 7 <= slot <= 9:
             d = data[gen.data_slots.index(slot)]
@@ -241,14 +260,16 @@ def test_the_generator_draws_b_recordings_and_b_step_positions(rule):
 
 
 @pytest.mark.parametrize("container", ["diag", "reduce+quant"])
-def test_the_generator_draws_the_container_per_recording(container):
+def test_the_generator_draws_the_same_recordings_in_every_container(container):
     gen = ex.data_gen(BATCHED, key=jax.random.PRNGKey(1), temporal_rule="rtrl",
                       carry_container=container)
-    xs = _args("rtrl", carry_container=container)
-    data = gen(jax.random.split(jax.random.PRNGKey(3), 5))
-    for slot, d in zip(gen.data_slots, data):
-        assert d.shape == xs[slot].shape and d.dtype == xs[slot].dtype, slot
-    ref = gen.reference_draw(jax.random.split(jax.random.PRNGKey(3), 5))
-    exact = _args("rtrl", carry_container="exact")
-    for slot, d in zip(gen.data_slots, ref):
-        assert d.shape == exact[slot].shape and d.dtype == exact[slot].dtype
+    exact = ex.data_gen(BATCHED, key=jax.random.PRNGKey(1),
+                        temporal_rule="rtrl", carry_container="exact")
+    keys = jax.random.split(jax.random.PRNGKey(3), 5)
+    for a, b in zip(gen(keys), exact(keys)):
+        assert np.array_equal(np.asarray(a), np.asarray(b))
+    assert gen.meta(keys)["carry"] == container
+    # the approximation lives inside the measured program now, so no draw
+    # publishes an exact twin and none runs a plan's executable
+    assert getattr(gen, "reference_draw", None) is None
+    assert getattr(gen, "with_executable", None) is None

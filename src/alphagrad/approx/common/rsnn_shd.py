@@ -1645,11 +1645,12 @@ def rsnn_args(key=None, *, dataset: str | None = None,
         _LAST_STEP_POSITION.update({"t": list(ts), "T": T, "recording": rec,
                                     "rule": rule, "carry": cont,
                                     "batch": int(batch)})
-        head, given = _batched_step_tuple(seq, y, jnp.asarray(ts), weights,
-                                          rule, cont)
-        if rule == "rtrl":
-            given = _empty_plan_carry(seq, y, jnp.asarray(ts),
-                                      head + weights + _consts(), cont)
+        head, _given = _batched_step_tuple(seq, y, jnp.asarray(ts), weights,
+                                           "tbptt", cont)
+        # The full rollout produces the given value from zero inside the
+        # measured program; the graph's own tuple only carries its shape.
+        given = zero_given(rule, cont, weights, (int(batch),),
+                           weights[0].dtype)
         want = RSNN_GIVEN_COUNTS[rule]
         if len(given) != want:
             raise ValueError(
@@ -1662,13 +1663,9 @@ def rsnn_args(key=None, *, dataset: str | None = None,
         return ((seq[t], seq[t + 1], y) + state_prev + weights + _consts())
     head = (seq[t], y) + state_prev + weights + _consts()
 
-    if rule == "tbptt":
-        given = ()
-    elif rule == "rtrl":
-        # The build-time tuple: the empty plan on this container's program.
-        given = _empty_plan_carry(seq, y, t, head, cont)
-    else:
-        given = future_adjoints(seq, y, t, weights, state_prev, cont)
+    # The full rollout produces the given value from zero inside the
+    # measured program; the graph's own tuple only carries its shape.
+    given = zero_given(rule, cont, weights, (), weights[0].dtype)
     want = RSNN_GIVEN_COUNTS[rule]
     if len(given) != want:
         raise ValueError(
@@ -1756,3 +1753,240 @@ def sequence_loss(seq, y, weights):
         return st, _step_loss(st[4], y)
     _, losses = jax.lax.scan(body, zero_state(), seq)
     return jnp.sum(losses)
+
+
+# ---------------------------------------------------------------------------
+# THE FULL ROLLOUT (owner ruling 2026-09-25 Q24 a)
+# ---------------------------------------------------------------------------
+# The measured program runs the plan's step at every step of each recording,
+# as one scan, and the plan produces its own given value at every step from
+# zero at the first one. The search graph stays one step body.
+
+#: The rules the SHD measurement runs over the whole recording.
+FULL_ROLLOUT_RULES: tuple[str, ...] = ("tbptt", "bptt", "rtrl")
+
+#: The carried state's slots, in the step tuple and in the rollout tuple.
+STATE_SLOTS: tuple[int, ...] = (2, 3, 4, 5, 6)
+
+#: The slots the rollout generator fills: the recordings, the labels, the
+#: state the rollout starts from and the weights.
+ROLLOUT_DATA_SLOTS: tuple[int, ...] = tuple(range(10))
+
+
+def is_full_rollout(config) -> bool:
+    return bool(getattr(getattr(config, "data_gen", None), "full_rollout",
+                        False))
+
+
+def rule_of_tuple(xs) -> str:
+    # The rule a step tuple's given values select, read per recording.
+    from graphax.examples.neuromorphic import RSNN_GIVEN_COUNTS
+    xs = tuple(xs)
+    lead = len(jnp.shape(xs[2])) - 1
+    given = xs[RSNN_HEAD_SLOTS:]
+    if not given:
+        return "tbptt"
+    ranks = {len(jnp.shape(g)) - lead for g in given}
+    if len(given) == RSNN_GIVEN_COUNTS["bptt"] and ranks == {1}:
+        return "bptt"
+    if len(given) == RSNN_GIVEN_COUNTS["rtrl"] and min(ranks) >= 2:
+        return "rtrl"
+    raise ValueError(
+        f"{len(given)} given values of per-recording ranks {sorted(ranks)} "
+        f"select no temporal rule")
+
+
+def rsnn_argnums(rule) -> tuple[int, ...]:
+    # Under bptt the rows of the carried state are the plan's own adjoint.
+    if str(rule) == "bptt":
+        return STATE_SLOTS + RSNN_ARGNUMS
+    return RSNN_ARGNUMS
+
+
+def zero_states(lead=(), dtype=jnp.float32) -> tuple:
+    h = RSNN_HIDDEN
+    return tuple(jnp.zeros(tuple(lead) + (n,), dtype)
+                 for n in (h, h, h, h, SHD_CLASSES))
+
+
+def zero_given(rule, container, weights, lead=(), dtype=jnp.float32) -> tuple:
+    from graphax.examples.neuromorphic import rsnn_zero_carry
+    c = _container(container)
+    if str(rule) == "rtrl":
+        return tuple(rsnn_zero_carry(c, tuple(weights), tuple(lead), dtype))
+    if str(rule) == "bptt":
+        return tuple(jnp.zeros(tuple(lead) + ((1,) if c.reduce else (n,)),
+                               c.dtype(dtype))
+                     for n in (RSNN_HIDDEN,) * 4 + (SHD_CLASSES,))
+    return ()
+
+
+def rollout_tuple(seqs, ys, weights, consts) -> tuple:
+    lead = tuple(jnp.shape(seqs)[:-2])
+    return ((seqs, ys) + zero_states(lead, weights[0].dtype) + tuple(weights)
+            + tuple(consts))
+
+
+def measure_args(config, args):
+    base = getattr(getattr(config, "data_gen", None), "measure_base", None)
+    return args if base is None else tuple(base(tuple(args)))
+
+
+def _given_avals(config) -> tuple:
+    return tuple(v.aval for v in config.jaxpr.invars[RSNN_HEAD_SLOTS:])
+
+
+def _rows(out, states, weights):
+    from graphax.sparse.tensor import SparseTensor
+    want = tuple(states) + tuple(weights)
+    leaves = jax.tree_util.tree_leaves(out, is_leaf=lambda x: x is None)
+    if len(leaves) != len(want):
+        raise ValueError(
+            f"the plan's step returned {len(leaves)} gradient rows where the "
+            f"rollout reads {len(want)}")
+    rows = []
+    for r, w in zip(leaves, want):
+        r = (jnp.zeros_like(w) if r is None
+             else r.dense() if isinstance(r, SparseTensor) else r)
+        if tuple(jnp.shape(r)) != tuple(jnp.shape(w)):
+            raise ValueError(
+                f"a gradient row of shape {tuple(jnp.shape(r))} meets an "
+                f"argument of shape {tuple(jnp.shape(w))}")
+        rows.append(r)
+    return tuple(rows[:len(states)]), tuple(rows[len(states):])
+
+
+def _added(acc, rows):
+    return tuple(a + jnp.asarray(r, a.dtype) for a, r in zip(acc, rows))
+
+
+def _project_adjoint(rows, avals) -> tuple:
+    out = []
+    for r, av in zip(rows, avals):
+        shape = tuple(av.shape)
+        if tuple(jnp.shape(r)) != shape:
+            if shape[-1:] != (1,):
+                raise ValueError(
+                    f"an adjoint row of shape {tuple(jnp.shape(r))} meets a "
+                    f"given value of shape {shape}")
+            r = jnp.mean(r, axis=-1, keepdims=True)
+        out.append(jnp.asarray(r).astype(av.dtype))
+    return tuple(out)
+
+
+def full_rollout_program(config, step):
+    avals = _given_avals(config)
+    rule = rule_of_tuple([v.aval for v in config.jaxpr.invars])
+    cell = _cell()
+
+    def run(seqs, ys, S, I, U, a, Uo, W, V, Wo, *c):
+        batched = jnp.ndim(seqs) == 3
+        xs = jnp.swapaxes(seqs, 0, 1) if batched else seqs
+        weights = (W, V, Wo)
+        st0 = (S, I, U, a, Uo)
+        acc0 = tuple(jnp.zeros_like(w) for w in weights)
+        g0 = tuple(jnp.zeros(av.shape, av.dtype) for av in avals)
+        if rule == "rtrl":
+            def body(carry, x):
+                st, g, acc = carry
+                row, g2, st2 = step(x, ys, *st, *weights, *c, *g)
+                _none, row = _rows(row, (), weights)
+                return (tuple(st2), tuple(g2), _added(acc, row)), None
+            (_st, _g, acc), _ = jax.lax.scan(body, (st0, g0, acc0), xs)
+            return acc
+        fwd = (jax.vmap(cell, in_axes=(0,) * 6 + (None,) * 9) if batched
+               else cell)
+        if rule == "tbptt":
+            def body(carry, x):
+                st, acc = carry
+                _none, row = _rows(step(x, ys, *st, *weights, *c), (), weights)
+                return (tuple(fwd(x, *st, *weights, *c)), _added(acc, row)), None
+            (_st, acc), _ = jax.lax.scan(body, (st0, acc0), xs)
+            return acc
+
+        def forward(st, x):
+            return tuple(fwd(x, *st, *weights, *c)), st
+        _last, prev = jax.lax.scan(forward, st0, xs)
+        # The batched target is the mean over the recordings, so its rows of
+        # one recording's state are that recording's adjoint over B.
+        per_row = jnp.shape(seqs)[0] if batched else 1
+
+        def backward(carry, inp):
+            lam, acc = carry
+            x, st = inp
+            srows, wrows = _rows(step(x, ys, *st, *weights, *c, *lam), st,
+                                 weights)
+            srows = tuple(r * per_row for r in srows)
+            return (_project_adjoint(srows, avals), _added(acc, wrows)), None
+        (_lam, acc), _ = jax.lax.scan(backward, (g0, acc0), (xs, prev),
+                                      reverse=True)
+        return acc
+    return run
+
+
+def full_rollout_reference(config):
+    def loss(seqs, ys, S, I, U, a, Uo, W, V, Wo, *c):
+        weights = (W, V, Wo)
+        if jnp.ndim(seqs) == 3:
+            return jnp.mean(jax.vmap(
+                lambda s, y: sequence_loss(s, y, weights))(seqs, ys))
+        return sequence_loss(seqs, ys, weights)
+    return jax.grad(loss, argnums=RSNN_ARGNUMS)
+
+
+def rsnn_rollout_gen(key=None, *, dataset: str | None = None,
+                     dataset_size: int | None = -1,
+                     temporal_rule: str | None = None,
+                     carry_container: str | None = None,
+                     batch: int | None = None):
+    rule = "tbptt" if temporal_rule is None else str(temporal_rule)
+    if rule not in FULL_ROLLOUT_RULES:
+        raise ValueError(
+            f"temporal rule {rule!r} has no full rollout; the rules that do "
+            f"are {list(FULL_ROLLOUT_RULES)}")
+    cont = container_name(carry_container)
+    if rule not in GIVEN_EDGE_RULES and cont != EXACT_CONTAINER:
+        raise ValueError(
+            f"carry container {cont!r} was asked of the {rule} rollout, which "
+            f"attaches no given temporal edge")
+    key = jax.random.PRNGKey(1) if key is None else key
+    k = jax.random.split(key, 3)
+    weights = rsnn_weights(k[1])
+    lead = () if batch is None else (int(batch),)
+
+    def _draw_key(kk):
+        if batch is None:
+            return _draw_recording(kk, dataset, dataset_size)
+        return _draw_recordings(kk, dataset, dataset_size, batch)
+
+    def _draw(keys):
+        return _draw_key(keys[0])
+
+    # The recordings the graph's own tuple was built from.
+    seq0, y0, _rec0 = _draw_key(k[0])
+    T = int(seq0.shape[-2])
+
+    def fn(keys):
+        seq, y, _rec = _draw(keys)
+        return (seq, y) + zero_states(lead, weights[0].dtype) + tuple(weights)
+
+    def meta(keys):
+        _seq, _y, rec = _draw(keys)
+        out = {"T": T, "recording": rec if batch is None
+               else [int(r) for r in rec], "rule": rule, "carry": cont,
+               "rollout": True}
+        if batch is not None:
+            out["batch"] = int(batch)
+        return out
+
+    fn.data_slots = ROLLOUT_DATA_SLOTS
+    fn.measure_base = lambda args: rollout_tuple(seq0, y0, tuple(args[7:10]),
+                                                 tuple(args[10:16]))
+    fn.full_rollout = True
+    fn.host_draw = True
+    fn.resample_per_env_episode = True
+    fn.probe_batches = 5
+    fn.meta = meta
+    fn.carry_container = cont
+    fn.temporal_rule = rule
+    return fn

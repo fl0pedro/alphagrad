@@ -196,13 +196,21 @@ def _lm_env(monkeypatch, example, dataset, rule):
 
 
 def _rev_exact_and_reference(env):
+    from alphagrad.approx.common import rsnn_shd as R
     cfg = env.config
     rev = _rev_order(env)
-    fn_rev = jacve(cfg.target_fun, rev, argnums=cfg.argnums,
-                   has_aux=cfg.has_aux, sparse_representation=cfg.sparse,
-                   jaxpr=cfg.jaxpr, consts=list(env.consts),
-                   transforms=[], face_transforms=None)
-    args = tuple(env.args)
+    if R.is_full_rollout(cfg):
+        # the full rollout (owner ruling 2026-09-25 Q24 a): the rev-exact
+        # plan's rollout over the recording, on the rollout tuple
+        fn_rev = envmod.measured_program(cfg, rev, list(env.consts),
+                                         transforms=[], face_transforms=None)
+        args = R.measure_args(cfg, env.args)
+    else:
+        fn_rev = jacve(cfg.target_fun, rev, argnums=cfg.argnums,
+                       has_aux=cfg.has_aux, sparse_representation=cfg.sparse,
+                       jaxpr=cfg.jaxpr, consts=list(env.consts),
+                       transforms=[], face_transforms=None)
+        args = tuple(env.args)
     out_rev = jax.jit(fn_rev, keep_unused=True)(*args)
     out_ref = jax.jit(envmod.reference_program(cfg), keep_unused=True)(*args)
     return out_rev, out_ref
@@ -254,10 +262,10 @@ def test_on_the_toy_the_reference_gradient_is_the_rev_exact_gradient():
 def test_the_reference_gradient_is_the_rev_exact_gradient(
         monkeypatch, example, dataset, rule):
     env = _lm_env(monkeypatch, example, dataset, rule)
-    # the rtrl target carries its state as outputs, so its reference is
-    # jax.jacrev in the one-call layout (owner ruling 2026-09-24, Q11a)
-    assert envmod.reference_kind(env.config) == (
-        "jax.jacrev" if rule == "rtrl" else "jax.grad")
+    # the recurrent target is measured over the full rollout, so its
+    # reference is jax.grad of the sequence loss under every rule (owner
+    # ruling 2026-09-25 Q24 a, which ends Q11a with the one-step target)
+    assert envmod.reference_kind(env.config) == "jax.grad"
     out_rev, out_ref = _rev_exact_and_reference(env)
     out_rev = envmod._loss_rows(env.config, out_rev)
     out_ref = envmod._loss_rows(env.config, out_ref)

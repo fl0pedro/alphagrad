@@ -137,9 +137,9 @@ def test_every_container_is_divided_by_the_base_programs_reference(
         }
 
     base = got["exact"]
-    # the rtrl target carries its state, so its reference is jax.jacrev in
-    # the one-call layout (owner ruling 2026-09-24, Q11a)
-    assert base["reference"] == "jax.jacrev"
+    # the full rollout's reference is jax.grad of the sequence loss (owner
+    # ruling 2026-09-25 Q24 a, which ends Q11a with the one-step target)
+    assert base["reference"] == "jax.grad"
     for name, g in got.items():
         # ONE executable, one target, one argument tuple: the reference of
         # the base target on the dense carry of the graph the policy acted
@@ -166,7 +166,7 @@ def test_the_candidate_is_still_the_containers_own_program(monkeypatch):
     monkeypatch.setattr(_cc, "cached_compile", _spy)
 
     plans = _plans(lm, env, order)
-    sizes = {}
+    sizes, temps = {}, {}
     for name in ("exact", "diag"):
         cand_ex.clear()
         plan = {"specs": None, "face_specs": None, "face_skips": None,
@@ -175,8 +175,12 @@ def test_the_candidate_is_still_the_containers_own_program(monkeypatch):
         assert len(cand_ex) == 1, (name, list(cand_ex))
         ma = next(iter(cand_ex.values())).memory_analysis()
         sizes[name] = int(ma.argument_size_in_bytes)
+        temps[name] = int(ma.temp_size_in_bytes)
     var = CP.measurement_env("diag", env.config)
     dense = sum(int(np.asarray(a).nbytes) for a in env.args)
     compact = sum(int(np.asarray(a).nbytes) for a in var["args"])
     assert compact < dense / 50, (compact, dense)
-    assert sizes["diag"] < sizes["exact"] / 50, sizes
+    # under the full rollout (Q24 a) both programs read the same recordings
+    # and the container's carry lives in the scan's state, the temporaries
+    assert sizes["diag"] == sizes["exact"], sizes
+    assert temps["diag"] < temps["exact"] / 3, temps

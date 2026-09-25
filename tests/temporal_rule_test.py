@@ -570,23 +570,28 @@ def _gen(rule, **kw):
 @pytest.mark.parametrize("rule,n_given", [("tbptt", 0), ("bptt", 5),
                                           ("rtrl", 5)])
 def test_the_generator_declares_the_slots_it_fills(rule, n_given):
+    # the full rollout (owner ruling 2026-09-25 Q24 a) draws whole
+    # recordings; the plan produces its n_given values inside the program
     gen = _gen(rule)
     assert gen is not None, "the SHD family had no data generator at all"
     slots = gen.data_slots
-    assert slots == tuple(range(0, 10)) + tuple(range(16, 16 + n_given))
+    assert slots == tuple(range(0, 10)) == R.ROLLOUT_DATA_SLOTS
     data = gen(jax.random.split(jax.random.PRNGKey(5), 5))
     assert len(data) == len(slots)
 
 
 @pytest.mark.parametrize("rule", ["tbptt", "bptt", "rtrl"])
 def test_the_draw_has_the_shape_of_the_slots_it_replaces(rule):
+    # the slots are the rollout tuple's: the recording, not one frame
     gen = _gen(rule)
     xs = ex.get_args("RSNN_SHD", jax.random.PRNGKey(1), dataset=None,
                      temporal_rule=rule)
+    base = R.measure_args(_Cfg(gen), xs)
     data = gen(jax.random.split(jax.random.PRNGKey(5), 5))
     for slot, d in zip(gen.data_slots, data):
-        assert jnp.shape(d) == jnp.shape(xs[slot]), f"slot {slot}"
-        assert jnp.asarray(d).dtype == jnp.asarray(xs[slot]).dtype
+        assert jnp.shape(d) == jnp.shape(base[slot]), f"slot {slot}"
+        assert jnp.asarray(d).dtype == jnp.asarray(base[slot]).dtype
+    assert jnp.shape(data[0]) == (R.SHD_TIME_BINS, R.SHD_CHANNELS)
 
 
 @pytest.mark.parametrize("rule", ["tbptt", "bptt", "rtrl"])
@@ -677,12 +682,14 @@ def _face_count(jx, xs):
 
 
 def _probe_t(envmod, cfg, args, episode, slot):
+    # the draw a probe batch holds: under the full rollout (owner ruling
+    # 2026-09-25 Q24 a) a whole recording, named by a digest of its frames
     envmod._PROBE_BATCH.clear()
     os.environ["ALPHAGRAD_WALK_EPISODE"] = str(int(episode))
     envmod._ENV_SLOT[0] = int(slot)
     try:
-        envmod._probe_batch(cfg, list(args), role="train", index=0)
-        return int(envmod.probe_meta()["t"])
+        data = envmod._probe_batch(cfg, list(args), role="train", index=0)
+        return hash(np.asarray(data[0]).tobytes())
     finally:
         envmod._ENV_SLOT[0] = -1
         os.environ.pop("ALPHAGRAD_WALK_EPISODE", None)
@@ -761,7 +768,7 @@ def test_the_plan_record_says_which_step_the_probe_measured():
     envmod._ENV_SLOT[0] = 1
     os.environ["ALPHAGRAD_WALK_EPISODE"] = "1"
     try:
-        envmod._probe_batch(cfg, list(xs), role="train", index=0)
+        data = envmod._probe_batch(cfg, list(xs), role="train", index=0)
         envmod._PLAN_RECORDS.clear()
         envmod._record_plan({"order": [1, 2]})
         rec = envmod._PLAN_RECORDS[-1]
@@ -771,8 +778,13 @@ def test_the_plan_record_says_which_step_the_probe_measured():
         envmod._PROBE_META.clear()
         envmod._ENV_SLOT[0] = -1
         os.environ.pop("ALPHAGRAD_WALK_EPISODE", None)
-    assert rec["step_position"]["t"] == t
+    # the full rollout measures the whole recording, so the record names the
+    # draw and no step position
+    assert hash(np.asarray(data[0]).tobytes()) == t
     assert rec["step_position"]["rule"] == "bptt"
+    assert rec["step_position"]["rollout"] is True
+    assert rec["step_position"]["T"] == R.SHD_TIME_BINS
+    assert "t" not in rec["step_position"]
 
 
 def test_the_declared_slots_must_match_the_arrays():
@@ -979,15 +991,22 @@ def test_the_graph_shape_does_not_move_with_the_step_position_per_container(cont
 
 
 def test_the_generator_draws_the_container_it_was_asked_for():
+    # under the full rollout (Q24 a) the container is the program's, so the
+    # draw is the same recording in every container and only its name moves
+    draws = {}
     for cont in ("exact", "diag"):
         gen = ex.data_gen("RSNN_SHD", dataset=None, key=jax.random.PRNGKey(1),
                           temporal_rule="rtrl", carry_container=cont)
         data = gen(jax.random.split(jax.random.PRNGKey(5), 5))
         xs = ex.get_args("RSNN_SHD", jax.random.PRNGKey(1), dataset=None,
                          temporal_rule="rtrl", carry_container=cont)
+        base = R.measure_args(_Cfg(gen), xs)
         for slot, d in zip(gen.data_slots, data):
-            assert jnp.shape(d) == jnp.shape(xs[slot]), (cont, slot)
+            assert jnp.shape(d) == jnp.shape(base[slot]), (cont, slot)
         assert gen.meta(jax.random.split(jax.random.PRNGKey(5), 5))["carry"] == cont
+        draws[cont] = data
+    for a, b in zip(draws["exact"], draws["diag"]):
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
 
 
 def test_the_generator_publishes_an_exact_reference_draw_only_when_it_needs_one():
@@ -996,26 +1015,23 @@ def test_the_generator_publishes_an_exact_reference_draw_only_when_it_needs_one(
     the reference has to come from the exact draw at the SAME step position,
     or the quality channel would read 1.0 for a rule that accumulated real
     error over the whole recording."""
+    # UNDER THE FULL ROLLOUT (owner ruling 2026-09-25 Q24 a) the approximated
+    # carry is produced inside the measured program from zero, and the
+    # reference is jax.grad of the sequence loss on the same recordings, so
+    # no generator needs an exact twin of its draw any more.
     approx = ex.data_gen("RSNN_SHD", dataset=None, key=jax.random.PRNGKey(1),
                          temporal_rule="rtrl", carry_container="diag")
-    ref = getattr(approx, "reference_draw")
+    assert getattr(approx, "reference_draw", None) is None
     keys = jax.random.split(jax.random.PRNGKey(5), 5)
     a = approx(keys)
-    r = ref(keys)
-    assert len(a) == len(r) == len(approx.data_slots)
-    # the same step position and the same weights, a different carry
-    for i in range(10):
-        np.testing.assert_array_equal(np.asarray(a[i]), np.asarray(r[i]))
-    assert sum(int(np.asarray(x).nbytes) for x in r[10:]) > \
-        80 * sum(int(np.asarray(x).nbytes) for x in a[10:])
-    # UNDER rtrl THE EXACT CONTAINER PUBLISHES IT TOO (owner ruling
-    # 2026-09-24, Q29): a plan produces its own carry, so the in-band
-    # reference reads the plan's carry and only the scan of the empty plan
-    # is the truth. bptt's exact container keeps the in-band reference.
+    assert len(a) == len(approx.data_slots)
     exact = ex.data_gen("RSNN_SHD", dataset=None, key=jax.random.PRNGKey(1),
                         temporal_rule="rtrl", carry_container="exact")
-    assert getattr(exact, "reference_draw", None) is not None
-    assert getattr(exact, "with_executable", None) is not None
+    assert getattr(exact, "reference_draw", None) is None
+    assert getattr(exact, "with_executable", None) is None
+    # the same recording and the same weights in both containers
+    for x, y in zip(a, exact(keys)):
+        np.testing.assert_array_equal(np.asarray(x), np.asarray(y))
     bp = ex.data_gen("RSNN_SHD", dataset=None, key=jax.random.PRNGKey(1),
                      temporal_rule="bptt", carry_container="exact")
     assert getattr(bp, "reference_draw", None) is None
@@ -1470,17 +1486,26 @@ def test_the_skip_variant_scores_against_the_arms_own_rule():
     import alphagrad.approx.env as envmod
     lm, CP, env = _env_for("rtrl")
     var = CP.measurement_env("skip")
-    ref = getattr(var["config"].data_gen, "reference_oracle", None)
-    assert ref is not None
-    # the loss of the base rtrl target, which returns (loss, *state)
-    assert ref["target"] is envmod._loss_target(env.config)
-    assert tuple(ref["argnums"]) == tuple(env.config.argnums)
-    assert len(ref["args"]) == len(env.args)
-    # the non-skip containers keep the in-band reference draw, which is the
-    # exact carry of the SAME rule and the same target
+    # UNDER THE FULL ROLLOUT (owner ruling 2026-09-25 Q24 a) the paired
+    # reference of every container is jax.grad of the sequence loss, the arm's
+    # own exact gradient, so the skip variant needs no oracle of its own and
+    # its reference is the base program's on the same recordings.
+    assert getattr(var["config"].data_gen, "reference_oracle", None) is None
+    assert envmod.reference_kind(var["config"]) == "jax.grad"
+    a = R.measure_args(env.config, env.args)
+    ref_base = jax.jit(envmod.reference_program(env.config))(*a)
+    ref_skip = jax.jit(envmod.reference_program(var["config"]))(*a)
+    for x, y in zip(ref_base, ref_skip):
+        np.testing.assert_array_equal(np.asarray(x), np.asarray(y))
+    # the skip program itself is the truncated rollout, not the reference
+    trunc = jax.jit(envmod.measured_program(
+        var["config"], sorted(var["valid"], reverse=True), var["consts"],
+        transforms=[]))(*a)
+    c, _rel = envmod._quality_metrics(ref_base, trunc)
+    assert float(c) < 1.0 - 1e-6
     diag = CP.measurement_env("diag")
     assert getattr(diag["config"].data_gen, "reference_oracle", None) is None
-    assert getattr(diag["config"].data_gen, "reference_draw", None) is not None
+    assert getattr(diag["config"].data_gen, "reference_draw", None) is None
 
 
 def test_a_step_body_that_stops_matching_raises():
@@ -1620,11 +1645,14 @@ def test_a_variant_draws_its_own_eval_samples_from_the_base_draw():
     a = CP.eval_samples_for("diag", base)
     b = CP.eval_samples_for("diag", base)
     assert a is b, "the same draw must not be rebuilt"
-    var = CP.measurement_env("diag")
-    assert len(a) == len(var["args"])
-    for got, want in zip(a, var["args"]):
-        assert tuple(got.shape[1:]) == tuple(want.shape), got.shape
-    # a DIFFERENT episode's base draw gives a different variant draw
+    # UNDER THE FULL ROLLOUT (owner ruling 2026-09-25 Q24 a) a sample is a
+    # batch of whole recordings, which no container moves: the variant reads
+    # the base draw itself, and a new episode's draw is a new one
+    assert a is base
+    rollout = R.measure_args(env.config, env.args)
+    assert len(a) == len(rollout)
+    for got, want in zip(a, rollout):
+        assert tuple(got.shape[1:]) == tuple(jnp.shape(want)), got.shape
     moved = list(base)
     moved[0] = moved[0] + 1.0
     c = CP.eval_samples_for("diag", tuple(moved))
@@ -2201,17 +2229,19 @@ for t in range(1, T):
     want = R.carry_traces(seq, t, W)
     worst = max(worst, max(rel(a, b) for a, b in zip(got, want)))
 out["two_diag_plan_vs_carry_traces"] = worst
-# The same plan's generator draw at the pinned step is the same number.
-step = envmod.measured_program(cfg, o2, consts, sparse=False,
-                               transforms=transforms, face_transforms=ft)
+# The same plan's one-call step, run over the prefix from the host, is the
+# same number. Under the full rollout (Q24 a) the measured program is the
+# scan of that step and no generator draws through it.
+step = R.rsnn_one_call_step(jacve(
+    cfg.target_fun, list(o2), argnums=cfg.argnums, has_aux=True,
+    sparse_representation=True, jaxpr=cfg.jaxpr, consts=list(consts),
+    transforms=transforms, face_transforms=ft))
 exe = jax.jit(step, keep_unused=True).lower(*vargs).compile()
-gen = cfg.data_gen.with_executable(exe, tuple(vargs))
-keys = jax.random.split(jax.random.PRNGKey(0), 5)
-data = dict(zip(gen.data_slots, gen(keys)))
-t_drawn = int(gen.meta(keys)["t"])
-want = R.carry_traces(seq, t_drawn, W)
-out["plan_draw_vs_carry_traces"] = max(
-    rel(data[16 + i], w) for i, w in enumerate(want))
+t_host = 5
+host = R.carry_from_executable(seq, y, t_host, vargs[7:10], vargs[10:16],
+                               exe, "diag")
+want = R.carry_traces(seq, t_host, W)
+out["plan_draw_vs_carry_traces"] = max(rel(h, w) for h, w in zip(host, want))
 print("RESULT " + json.dumps(out))
 '''
 
@@ -2388,10 +2418,29 @@ def measured(wires):
                     has_aux=cfg.has_aux, sparse_representation=cfg.sparse,
                     jaxpr=cfg.jaxpr, consts=list(consts),
                     transforms=transforms, face_transforms=ft)
-    step = envmod.measured_program(cfg, o2, consts, transforms=transforms,
-                                   face_transforms=ft)
+    # the one-call step of the plan; the measured program is its scan over
+    # the whole recording (the full rollout, owner ruling 2026-09-25 Q24 a)
+    step = R.rsnn_one_call_step(jacve(
+        cfg.target_fun, list(o2), argnums=cfg.argnums, has_aux=True,
+        sparse_representation=True, jaxpr=cfg.jaxpr, consts=list(consts),
+        transforms=transforms, face_transforms=ft))
     exe = jax.jit(step, keep_unused=True).lower(*vargs).compile()
-    return container, cfg, tuple(vargs), program, exe
+    rollout = jax.jit(envmod.measured_program(
+        cfg, o2, consts, transforms=transforms, face_transforms=ft))
+    return container, cfg, tuple(vargs), program, exe, rollout
+
+
+def host_rollout(exe, vargs, container):
+    # the one-call step over every step of the recording from the zero
+    # carry, its loss rows summed
+    from graphax.examples.neuromorphic import rsnn_zero_carry
+    st = tuple(jnp.zeros_like(s) for s in vargs[2:7])
+    g = rsnn_zero_carry(container, tuple(vargs[7:10]), (), vargs[7].dtype)
+    acc = [np.zeros(np.shape(w)) for w in vargs[7:10]]
+    for t in range(T):
+        row, g, st = exe(seq[t], y, *st, *vargs[7:16], *g)
+        acc = [a + dense(r) for a, r in zip(acc, row)]
+    return acc
 
 
 def dense(x):
@@ -2401,7 +2450,7 @@ def dense(x):
 
 out = {}
 for name, wires in plans.items():
-    container, cfg, vargs, program, exe = measured(wires)
+    container, cfg, vargs, program, exe, rollout = measured(wires)
     row = {"container": container, "host_vs_oracle": 0.0,
            "host_vs_closed_form": None}
     for t in range(1, T):
@@ -2416,14 +2465,12 @@ for name, wires in plans.items():
             row["host_vs_closed_form"] = max(
                 row["host_vs_closed_form"] or 0.0,
                 max(rel(a, b) for a, b in zip(host, closed)))
-    gen = cfg.data_gen.with_executable(exe, vargs)
-    keys = jax.random.split(jax.random.PRNGKey(0), 5)
-    data = dict(zip(gen.data_slots, gen(keys)))
-    t_drawn = int(gen.meta(keys)["t"])
-    oracle = R.carry_from_program(seq, y, t_drawn, W, program, container)
-    row["draw_vs_oracle"] = max(rel(data[16 + i], o)
-                                for i, o in enumerate(oracle))
-    row["t_drawn"] = t_drawn
+    # THE MEASURED PROGRAM IS THE HOST LOOP IN ONE SCAN: the plan's full
+    # rollout of the recording against the one-call step called T times
+    roll = rollout(*R.rollout_tuple(seq, y, tuple(vargs[7:10]),
+                                    tuple(vargs[10:16])))
+    row["draw_vs_oracle"] = max(
+        rel(a, b) for a, b in zip(roll, host_rollout(exe, vargs, container)))
     # the one-call step's outputs are its parts: the program's loss row and
     # the target's forward state
     one = exe(*vargs)
@@ -2434,35 +2481,25 @@ for name, wires in plans.items():
         rel(a, b) for a, b in zip(one[2], cfg.target_fun(*vargs)[1:]))
     out[name] = row
 
-# THE PAIRED REFERENCE (owner ruling 2026-09-24, Q11a): jax.jacrev over the
-# loss and the five state outputs, in the one-call layout, against the exact
-# one-call step on the same arguments, and serving the exact reference draw.
-_c, cfg_e, vargs_e, _p, exe_e = measured([])
-ref_exe = jax.jit(envmod.reference_program(env.config),
-                  keep_unused=True).lower(*vargs_e).compile()
-one_ref, one_step = ref_exe(*vargs_e), exe_e(*vargs_e)
+# THE PAIRED REFERENCE (owner ruling 2026-09-25 Q24 a, which ends Q11a with
+# the one-step target): jax.grad of the sequence loss over the recording,
+# BPTT through its scan, the number the empty plan's rollout reproduces.
+_c, cfg_e, vargs_e, _p, exe_e, roll_e = measured([])
+a_e = R.rollout_tuple(seq, y, tuple(vargs_e[7:10]), tuple(vargs_e[10:16]))
+one_ref = jax.jit(envmod.reference_program(env.config))(*a_e)
 ref = {"kind": envmod.reference_kind(env.config)}
-for i, part in enumerate(("loss_row", "carry", "state")):
-    ref[part] = max(rel(a, b) for a, b in zip(one_ref[i], one_step[i]))
+seq_grad = jax.grad(lambda *w: R.sequence_loss(seq, y, w),
+                    argnums=(0, 1, 2))(*vargs_e[7:10])
+ref["ref_vs_sequence_loss"] = max(rel(a, b) for a, b in zip(one_ref, seq_grad))
+ref["ref_vs_empty_rollout"] = max(rel(a, b)
+                                  for a, b in zip(one_ref, roll_e(*a_e)))
 ref["host_vs_carried_jacobians"] = 0.0
 for t in range(1, T):
     host = R.carry_from_executable(seq, y, t, vargs_e[7:10], vargs_e[10:16],
-                                   ref_exe, "exact")
+                                   exe_e, "exact")
     ref["host_vs_carried_jacobians"] = max(
         ref["host_vs_carried_jacobians"],
         max(rel(a, b) for a, b in zip(host, R.carried_jacobians(seq, t, W))))
-gen = cfg_e.data_gen.with_executable(exe_e, vargs_e,
-                                     reference=(ref_exe, tuple(vargs_e)))
-for s in range(64):
-    keys = jax.random.split(jax.random.PRNGKey(s), 5)
-    if int(gen.meta(keys)["t"]) >= 5:
-        break
-drawn = dict(zip(gen.data_slots, gen.reference_draw(keys)))
-t_ref = int(gen.meta(keys)["t"])
-ref["t_drawn"] = t_ref
-ref["draw_vs_carried_jacobians"] = max(
-    rel(drawn[16 + i], w)
-    for i, w in enumerate(R.carried_jacobians(seq, t_ref, W)))
 out["reference"] = ref
 print("RESULT " + json.dumps(out))
 '''
@@ -2498,18 +2535,16 @@ def test_the_one_call_step_returns_the_loss_row_and_the_forward_state(
     assert row["step_state_vs_forward"] < 1e-12, row
 
 
-def test_the_rtrl_paired_reference_is_jacrev_and_the_exact_one_call_step(
+def test_the_rtrl_paired_reference_is_jax_grad_of_the_sequence_loss(
         host_loop_results):
-    # owner ruling 2026-09-24, Q11a: the exact gradient, the exact next
-    # carry and the next state, and its layout serves the exact draw
+    # owner ruling 2026-09-25 Q24 a: the reference is jax.grad of the
+    # sequence loss, the empty plan's rollout reproduces it, and the exact
+    # one-call step over the prefix is the exact carry
     ref = host_loop_results["reference"]
-    assert ref["kind"] == "jax.jacrev", ref
-    assert ref["loss_row"] < 1e-12, ref
-    assert ref["carry"] < 1e-12, ref
-    assert ref["state"] < 1e-12, ref
+    assert ref["kind"] == "jax.grad", ref
+    assert ref["ref_vs_sequence_loss"] < 1e-12, ref
+    assert ref["ref_vs_empty_rollout"] < 1e-11, ref
     assert ref["host_vs_carried_jacobians"] < 1e-11, ref
-    assert ref["t_drawn"] >= 5, ref
-    assert ref["draw_vs_carried_jacobians"] < 1e-11, ref
 
 
 @pytest.mark.parametrize("plan", ["empty", "e-prop"])
