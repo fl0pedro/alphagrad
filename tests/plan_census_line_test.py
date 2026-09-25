@@ -59,3 +59,34 @@ def test_host_log_prints_the_helper_line_with_the_cost_form():
     assert all(ast.unparse(c.args[3]) == "_paired_costs" for c in calls)
     assert not any(isinstance(n, ast.Constant) and n.value == "lat_us "
                    for n in ast.walk(fn))
+
+
+def _with_excluded_row():
+    # Rows 0 to 2 are live. Row 3 is excluded: the sentinel in every cost slot.
+    rows = _rows([-0.05, -0.1, -0.2], quality=[0.9, 0.95, 1.0], approx=[1, 2, 3])
+    excluded = {"quality": 0.0, "latency_ns": ppo.SENTINEL_COST,
+                "approx_count": 30.0, "req_diag": 30.0, "req_compress": 0.0,
+                "req_quant": 0.0, "approx_applied_est": 30.0, "skip_count": 9.0}
+    rows = {k: np.append(v, excluded[k]) for k, v in rows.items()}
+    return rows, np.array([True, True, True, False])
+
+
+def test_an_excluded_row_does_not_enter_the_summary():
+    rows, live = _with_excluded_row()
+    for paired_log in (True, False):
+        line = ppo._plan_census_line(4, rows, live, paired_log)
+        assert "live=3" in line, line
+        assert not re.search(r"1e\+0?7|1e\+10|30", line), line
+        assert "q med=+0.95 [+0.9,+1]" in line, line
+        assert "req med=2 [1,3]" in line and "req d/c/q=6/0/0" in line, line
+        assert "skips=0" in line, line
+    line = ppo._plan_census_line(4, rows, live, True)
+    assert "lat_logratio med=+0.1 [+0.05,+0.2]" in line, line
+    line = ppo._plan_census_line(4, rows, live, False)
+    assert "lat_us med=0.0001 [5e-05,0.0002]" in line, line
+
+
+def test_a_batch_with_no_live_row_prints_no_numbers():
+    rows, _ = _with_excluded_row()
+    line = ppo._plan_census_line(2, rows, np.zeros(4, bool), True)
+    assert line == "[plan ep=2] n=4 live=0 | no live row", line

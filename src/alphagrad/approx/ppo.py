@@ -7928,9 +7928,13 @@ def _validate_checkpoint_keep_at(checkpoint_every: int, keep_at) -> frozenset:
 def _plan_census_line(ep, rows, live, paired_log):
     # The [plan ep=N] line; under paired-log latency_ns is -log(cand/ref).
     live = np.asarray(live, bool)
+    idx = np.flatnonzero(live)
+    if not idx.size:
+        return f"[plan ep={ep}] n={live.size} live=0 | no live row"
 
     def col(k):
-        return np.asarray(rows.get(k, []), np.float64)
+        a = np.asarray(rows.get(k, []), np.float64)
+        return a[idx] if a.size else a
 
     def fmt(a, sign=""):
         return (f"med={np.median(a):{sign}.4g} "
@@ -7953,7 +7957,7 @@ def _plan_census_line(ep, rows, live, paired_log):
         # per-kind applied fraction -- an estimate, marked as one.
         parts.append("req " + fmt(ac))
         parts.append("req d/c/q=" + "/".join(
-            str(int(np.sum(rows.get(f"req_{k}", 0))))
+            str(int(col(f"req_{k}").sum()))
             for k in ("diag", "compress", "quant")))
     if ae.size:
         parts.append("applied~ " + fmt(ae))
@@ -7967,15 +7971,13 @@ def _plan_census_line(ep, rows, live, paired_log):
         if paired_log:
             fast = lat < 0.0
         else:
-            base = (float(np.median(lat[live])) if live.any()
-                    else float(np.median(lat)))
-            fast = lat <= 0.9 * base
-        hit = np.flatnonzero((ac <= 20) & (q >= 0.8) & fast & live)
+            fast = lat <= 0.9 * float(np.median(lat))
+        hit = np.flatnonzero((ac <= 20) & (q >= 0.8) & fast)
         if hit.size:
             b = int(hit[np.argmin(lat[hit])])
             shown = (f"lat_logratio={lat[b]:+.4g}" if paired_log
                      else f"lat={lat[b]:.4g}us")
-            parts.append(f"WIN env={b} {shown} "
+            parts.append(f"WIN env={int(idx[b])} {shown} "
                          f"q={q[b]:+.3f} ops={int(ac[b])}")
         else:
             parts.append("WIN none")
