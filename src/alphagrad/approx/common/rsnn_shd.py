@@ -1907,12 +1907,16 @@ def full_rollout_program(config, step):
         def forward(st, x):
             return tuple(fwd(x, *st, *weights, *c)), st
         _last, prev = jax.lax.scan(forward, st0, xs)
+        # The batched target is the mean over the recordings, so its rows of
+        # one recording's state are that recording's adjoint over B.
+        per_row = jnp.shape(seqs)[0] if batched else 1
 
         def backward(carry, inp):
             lam, acc = carry
             x, st = inp
             srows, wrows = _rows(step(x, ys, *st, *weights, *c, *lam), st,
                                  weights)
+            srows = tuple(r * per_row for r in srows)
             return (_project_adjoint(srows, avals), _added(acc, wrows)), None
         (_lam, acc), _ = jax.lax.scan(backward, (g0, acc0), (xs, prev),
                                       reverse=True)
