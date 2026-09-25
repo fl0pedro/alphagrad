@@ -3034,18 +3034,82 @@ def _memory_analysis_bytes(compiled) -> float | None:
 # whose compiled memory_analysis() (temp + argument + output bytes) exceeds
 # this fraction of its device's memory is refused before its first execution.
 # The trace's stored-byte tally is not a peak: 116 GB stored ran with 17 GB of temporaries.
-# 1.0 of bytes_limit is three fourths of the card: XLA preallocates 75 percent (job 67639: 76.5 of 102.6 GB).
+# The limit is three fourths of the card (job 67639: 76.5 of 102.6 GB), read off NVML.
+# Until dsnn-dfw.238 it was the allocator's bytes_limit, which is 75 percent of the memory
+# FREE at the process's JAX init (probe job 68228: 76.5 GB for a process alone on a
+# 97887 MiB card under both preallocation settings, 7.65 GB in a measure actor that
+# started while the card was held), and it was read once, so an actor kept refusing
+# plans above 7.65 GB that the card holds.
 STATIC_PEAK_FRACTION = 1.0
+STATIC_PEAK_CARD_FRACTION = 0.75
 _DEVICE_BYTES_LIMIT: dict = {}
 _STATIC_GATE_OFF_NOTED: list = []
+
+
+def _nvidia_smi_rows() -> list:
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,uuid,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as _exc:
+        raise RuntimeError(
+            f"nvidia-smi could not be run for the static peak gate: "
+            f"{type(_exc).__name__}: {_exc}") from _exc
+    if out.returncode != 0:
+        raise RuntimeError(
+            f"nvidia-smi exited {out.returncode} for the static peak gate: "
+            f"{' '.join(out.stderr.split())[:200]}")
+    return [[c.strip() for c in line.split(",")]
+            for line in out.stdout.splitlines() if line.strip()]
+
+
+def _card_total_bytes(device) -> int | None:
+    # The card's memory from NVML, never from the allocator. A device that
+    # is not a GPU has no card and no gate.
+    if getattr(device, "platform", None) != "gpu":
+        return None
+    rows = _nvidia_smi_rows()
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    logical = int(getattr(device, "id", 0))
+    if visible is not None and visible.strip() != "":
+        ids = [v.strip() for v in visible.split(",")]
+        if logical >= len(ids):
+            raise RuntimeError(
+                f"static peak gate: device {device!r} is logical device "
+                f"{logical} but CUDA_VISIBLE_DEVICES={visible!r} names "
+                f"{len(ids)} devices")
+        want = ids[logical]
+        row = next((r for r in rows if len(r) >= 3 and (
+            r[0] == want or r[1] == want or r[1].startswith(want))), None)
+    else:
+        row = next((r for r in rows if len(r) >= 3 and r[0] == str(logical)),
+                   None)
+    if row is None:
+        raise RuntimeError(
+            f"static peak gate: nvidia-smi lists no card for device "
+            f"{device!r} (logical {logical}, CUDA_VISIBLE_DEVICES="
+            f"{visible!r}); rows {rows}")
+    try:
+        mib = int(row[2])
+    except ValueError as _exc:
+        raise RuntimeError(
+            f"static peak gate: nvidia-smi reports no memory.total for "
+            f"device {device!r}: {row}") from _exc
+    return mib * 2 ** 20
 
 
 def _device_bytes_limit(device) -> int | None:
     key = repr(device)
     if key not in _DEVICE_BYTES_LIMIT:
-        stats = device.memory_stats()
-        lim = (stats or {}).get("bytes_limit")
-        _DEVICE_BYTES_LIMIT[key] = int(lim) if lim else None
+        total = _card_total_bytes(device)
+        limit = (None if total is None
+                 else int(total * STATIC_PEAK_CARD_FRACTION))
+        _DEVICE_BYTES_LIMIT[key] = limit
+        if limit is not None:
+            print(f"[measure] static peak gate limit {limit} B: three "
+                  f"fourths of the {total} B card of {device!r}", flush=True)
     return _DEVICE_BYTES_LIMIT[key]
 
 
