@@ -124,7 +124,7 @@ def test_a_deadline_kill_respawns_into_the_dead_actors_slot(fake_ray):
     pool, first, fresh, calls = _pool(2, timeout_s=0.01)
     stuck = _Future(lambda: None)
     first[1].evaluate = types.SimpleNamespace(remote=lambda *a, **k: stuck)
-    real_get, real_wait = fake_ray.get, fake_ray.wait
+    real_get = fake_ray.get
 
     def _get(fut, timeout=None):
         if fut is stuck:
