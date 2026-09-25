@@ -1845,31 +1845,11 @@ def _popart_derive(m1, m2, w, sigma_min, sigma_max):
     return jnp.where(warm, mu, 0.0), jnp.where(warm, sigma, 1.0)
 
 
-def _popart_live_moments(flat, live):
-    # Mean and mean square of the live rows of (B, K), and their count.
-    keep = jnp.reshape(live, (-1, 1)) > 0.5
-    n = jnp.sum(keep.astype(flat.dtype))
-    x = jnp.where(keep, flat, 0.0)
-    d = jnp.maximum(n, 1.0)
-    return jnp.sum(x, axis=0) / d, jnp.sum(jnp.square(x), axis=0) / d, n
-
-
-def _popart_seed_stats(returns, live, sigma_min):
-    # The cold seed's (mu, sigma) over the live samples, and their count.
-    m1, m2, n = _popart_live_moments(
-        returns.reshape(-1, returns.shape[-1]), live)
-    sigma = jnp.clip(jnp.sqrt(jnp.maximum(m2 - jnp.square(m1), 1e-12)),
-                     sigma_min, 1e12)
-    return m1, sigma, n
-
-
-def _popart_update(m1, m2, w, returns, beta, sigma_min, sigma_max, winsor_k,
-                   live=None):
+def _popart_update(m1, m2, w, returns, beta, sigma_min, sigma_max, winsor_k):
     """One debiased-EMA PopArt step on the RAW accumulators, jax-native so it
     runs inside the jit.
 
-    ``returns`` is ``(E, T, K)`` raw per-channel value targets. ``live``
-    ``(E, T)``, when given, keeps only the environments the update uses. Mirrors
+    ``returns`` is ``(E, T, K)`` raw per-channel value targets. Mirrors
     ``common.popart.PopArtStats`` (numpy/host-side, hence unusable inside
     ``train_episode``): winsorize each channel to ``mu +/- winsor_k*sigma``
     so one extreme cost outlier can't spike a channel's sigma and crush the
@@ -1888,20 +1868,12 @@ def _popart_update(m1, m2, w, returns, beta, sigma_min, sigma_max, winsor_k,
     warm = w > 1e-8
     lo, hi = mu - winsor_k * sigma, mu + winsor_k * sigma
     flat = jnp.where(warm, jnp.clip(flat, lo, hi), flat)
-    if live is None:
-        batch_m1 = jnp.mean(flat, axis=0)
-        batch_m2 = jnp.mean(jnp.square(flat), axis=0)
-    else:
-        batch_m1, batch_m2, n_live = _popart_live_moments(flat, live)
+    batch_m1 = jnp.mean(flat, axis=0)
+    batch_m2 = jnp.mean(jnp.square(flat), axis=0)
     new_m1 = m1 * (1.0 - beta) + batch_m1 * beta
     new_m2 = m2 * (1.0 - beta) + batch_m2 * beta
     new_w = w + beta * (1.0 - w)
-    if live is None:
-        return new_m1, new_m2, new_w
-    # A batch with no live sample measured nothing, so the statistics stay.
-    moved = n_live > 0
-    return (jnp.where(moved, new_m1, m1), jnp.where(moved, new_m2, m2),
-            jnp.where(moved, new_w, w))
+    return new_m1, new_m2, new_w
 
 
 def _popart_seed_returns(rewards, done, discount):
@@ -13352,8 +13324,6 @@ def main(args=None):
         use_popart = args.advantage_norm == "popart"
         popart_mu, popart_sigma = _popart_derive(
             popart_m1, popart_m2, popart_w, args.popart_sigma_min, 1e12)
-        # The live environments. The PopArt statistics read only these.
-        _env_refused, _live_step = refused_env_mask(traj.reward)
         # --popart-init-episodes 0 (owner ruling 2026-09-14, the new
         # default): no warm-up rollouts. The FIRST REAL EPISODE instead
         # seeds the DECODE above from its own returns, computed straight off
@@ -13372,10 +13342,13 @@ def main(args=None):
         if use_popart and int(getattr(args, "popart_init_episodes", 0)) == 0:
             _cold = jnp.all(popart_w <= 1e-8)
             _seed_ret = _popart_seed_returns(head_rewards, traj.done, traj.discount)
-            _seed_mu, _seed_sigma, _seed_n = _popart_seed_stats(
-                _seed_ret, _live_step, args.popart_sigma_min)
-            # No live environment: the decode stays the identity.
-            _cold = _cold & (_seed_n > 0)
+            _flat_seed = _seed_ret.reshape(-1, _seed_ret.shape[-1])
+            _seed_mu = jnp.mean(_flat_seed, axis=0)
+            _seed_var = (jnp.mean(jnp.square(_flat_seed), axis=0)
+                         - jnp.square(_seed_mu))
+            _seed_sigma = jnp.clip(
+                jnp.sqrt(jnp.maximum(_seed_var, 1e-12)),
+                args.popart_sigma_min, 1e12)
             popart_mu = jnp.where(_cold, _seed_mu, popart_mu)
             popart_sigma = jnp.where(_cold, _seed_sigma, popart_sigma)
         # TRUE OPTIMIZED RETURN (owner 2026-08-09): preference-weighted
@@ -13493,6 +13466,7 @@ def main(args=None):
         # as the worst result"). In a terminal-reward-only MDP a missing
         # terminal reward leaves the WHOLE episode without a measured return,
         # so no transition of that environment may train anything.
+        _env_refused, _live_step = refused_env_mask(traj.reward)
         _live = _live_step[..., None]                                      # (E,T,1)
         advantages = advantages * _live
 
@@ -13500,7 +13474,6 @@ def main(args=None):
             new_m1, new_m2, new_w = _popart_update(
                 popart_m1, popart_m2, popart_w, estim_returns,
                 args.popart_beta, args.popart_sigma_min, 1e12, 5.0,
-                live=_live_step,
             )
             if args.reward_mode == "lagrangian" and args.popart_basin_freeze:
                 # Section-3 ratchet guard: a majority-in-the-basin batch
