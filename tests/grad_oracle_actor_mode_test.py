@@ -18,20 +18,29 @@ class _Ref:
         self.ready = ready
 
 
+class _Stored:
+    def __init__(self, value):
+        self.value = value
+
+
 class _Actor:
-    def __init__(self, calls, hang):
+    def __init__(self, box, hang):
         self.hang = hang
-        self.calls = calls
+        self.box = box
         self.check = types.SimpleNamespace(remote=self._remote)
 
     def _remote(self, args_np, order, probe_seed, rule=None):
-        self.calls.append((args_np, tuple(order), int(probe_seed), rule))
+        self.box["sent"].append(args_np)
+        # Ray gives the method the value of a top-level object ref.
+        if isinstance(args_np, _Stored):
+            args_np = args_np.value
+        self.box["calls"].append((args_np, tuple(order), int(probe_seed), rule))
         return _Ref(("pass", 1e-15), ready=not self.hang)
 
 
 @pytest.fixture
 def fake_ray(monkeypatch):
-    box = {"calls": [], "killed": [], "actors": []}
+    box = {"calls": [], "killed": [], "actors": [], "puts": [], "sent": []}
 
     def wait(refs, num_returns=1, timeout=None):
         return ([r for r in refs if r.ready], [r for r in refs if not r.ready])
@@ -39,15 +48,19 @@ def fake_ray(monkeypatch):
     def kill(actor, no_restart=False):
         box["killed"].append((actor, bool(no_restart)))
 
+    def put(value):
+        box["puts"].append(_Stored(value))
+        return box["puts"][-1]
+
     monkeypatch.setitem(sys.modules, "ray", types.SimpleNamespace(
-        wait=wait, get=lambda ref: ref.value, kill=kill))
+        wait=wait, get=lambda ref: ref.value, kill=kill, put=put))
     return box
 
 
 def _factory(box, hang_first=False):
     def make():
         box["actors"].append(
-            _Actor(box["calls"], hang=hang_first and not box["actors"]))
+            _Actor(box, hang=hang_first and not box["actors"]))
         return box["actors"][-1]
     return make
 
@@ -94,6 +107,23 @@ def test_the_check_runs_in_the_actor_and_no_trainer_thread_starts(fake_ray):
     assert fake_ray["calls"] == [({"frozen_for_episode": 3}, (5, 4, 3), 7, None)]
     started = [t.name for t in set(threading.enumerate()) - before]
     assert "grad-oracle" not in started, started
+
+
+# dsnn-dfw.202: every order sent its own copy of the episode's arguments, 14.4 GB each at B=64.
+def test_the_orders_of_one_episode_share_one_copy_of_its_arguments(fake_ray):
+    oracle = G.AsyncGradOracle(
+        _in_process_check, timeout_s=60.0, actor_factory=_factory(fake_ray),
+        arg_resolver=lambda ep: {"frozen_for_episode": ep})
+    jobs = [{"order": [i, 9, 8], "plan_hashes": [f"h{i}"]} for i in range(3)]
+    assert oracle.submit(4, 7, jobs) == 3
+    assert len(fake_ray["puts"]) == 1, fake_ray["puts"]
+    assert all(s is fake_ray["puts"][0] for s in fake_ray["sent"]), fake_ray["sent"]
+    assert [c[0] for c in fake_ray["calls"]] == [{"frozen_for_episode": 4}] * 3
+    assert oracle.submit(5, 7, [{"order": [1, 2], "plan_hashes": ["h5"]}]) == 1
+    assert [p.value for p in fake_ray["puts"]] == [
+        {"frozen_for_episode": 4}, {"frozen_for_episode": 5}]
+    assert [r["status"] for r in oracle.take_results()] == ["pass"] * 4
+    oracle.close()
 
 
 # The pre-fix thread could only disown a hung check; a process can be killed and replaced.

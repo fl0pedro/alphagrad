@@ -283,6 +283,8 @@ class AsyncGradOracle:
         (actor mode) is itself non-blocking, same as a queue put (thread
         mode)."""
         n = 0
+        # One object-store copy of the episode's arguments serves every order.
+        shared: dict = {}
         for job in jobs:
             order = tuple(int(v) for v in job["order"])
             self._next_id += 1
@@ -303,7 +305,7 @@ class AsyncGradOracle:
             }
             self._pending[rec["id"]] = rec
             if self._actor_factory is not None:
-                self._submit_to_actor(rec)
+                self._submit_to_actor(rec, shared)
             else:
                 self._jobs.put(rec)
             n += 1
@@ -312,7 +314,7 @@ class AsyncGradOracle:
             self._start()
         return n
 
-    def _submit_to_actor(self, rec: dict) -> None:
+    def _submit_to_actor(self, rec: dict, shared: dict) -> None:
         """ACTOR MODE ONLY. A memoized order resolves at once, off the memo,
         with no remote call; a new order is dispatched to the actor and its
         object ref is kept until :meth:`take_results` finds it ready or
@@ -324,9 +326,11 @@ class AsyncGradOracle:
             rec["ref"] = None
             rec["memo_result"] = (status, rel)
             return
-        args_np = self._arg_resolver(rec["episode"])
+        if "args" not in shared:
+            import ray
+            shared["args"] = ray.put(self._arg_resolver(rec["episode"]))
         rec["ref"] = self._actor.check.remote(
-            args_np, rec["order"], rec["probe_seed"], rec.get("rule"))
+            shared["args"], rec["order"], rec["probe_seed"], rec.get("rule"))
         rec["memo_result"] = None
 
     def _count(self, res) -> None:
