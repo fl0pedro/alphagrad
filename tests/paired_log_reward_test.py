@@ -288,9 +288,11 @@ def test_costlier_plan_scores_positive_delta():
 # 3./4. one reference per terminal callback; non-terminal steps carry 0
 # --------------------------------------------------------------------------
 
-def test_reference_is_measured_once_per_terminal_callback(monkeypatch):
-    """ONE full reference measurement per terminal callback, re-taken for a
-    plan that was already measured, and none at a non-terminal step.
+def test_reference_is_measured_once_per_process(monkeypatch):
+    """ONE full reference measurement per process and program, at the first
+    terminal callback. A later terminal callback, the same plan again
+    included, pairs against it, and a non-terminal step takes none (owner
+    ruling 2026-09-25, Q17 b; before it, every terminal callback re-took it).
 
     COUNTED ON THE WINDOWS SINCE 2026-09-14. The reference used to be a
     single call to `_campaign_measure_cost` placed after the candidate's
@@ -374,9 +376,9 @@ def test_reference_is_measured_once_per_terminal_callback(monkeypatch):
     _run_plan(env, fwd)
     assert _ref_windows() == per_cb                     # one episode, one ref
     _run_plan(env, fwd)                                 # same plan again...
-    assert _ref_windows() == 2 * per_cb                 # ...measured anew
+    assert _ref_windows() == per_cb                     # ...paired, not timed
     _run_plan(env, fwd, skip_everything=True)
-    assert _ref_windows() == 3 * per_cb
+    assert _ref_windows() == per_cb
     out = envmod.consume_plan_records()
     assert len(out["paired_ref"]["records"]) == 3
     assert out["paired_ref"]["dropped"] == 0

@@ -91,3 +91,12 @@ def _report_run_phase_configuration_leaks(request):
         yield
         return
     yield from _G.run_phase_leak(request)
+
+
+# Each test is a new measuring process for the reference (Q17 b, 2026-09-25).
+@pytest.fixture(autouse=True)
+def _reference_timed_once_per_test():
+    _env = sys.modules.get("alphagrad.approx.env")
+    if _env is not None:
+        _env._REF_ONCE.clear()
+    yield
