@@ -518,12 +518,14 @@ def test_the_targets_are_the_ones_the_owner_named(gen, matrix):
             assert "export ALPHAGRAD_NN_HIDDEN=256\n" in text, a["name"]
             assert "export ALPHAGRAD_NN_BATCH=4096\n" in text, a["name"]
         elif a["thesis_target"] == "tlm":
-            assert cli["--example"] == "TransformerLM", a["name"]
+            assert cli["--example"] == "VmappedTransformerLM", a["name"]
             assert cli["--dataset"] == "wikitext2", a["name"]
-            assert a["env"] == MATRIX_ENV, a["name"]
+            assert a["env"] == {"ALPHAGRAD_NN_BATCH": "64",
+                                **MATRIX_ENV}, a["name"]
             assert cli["--face-wire-faces"] == TLM_FACE_WIRE_FACES, a["name"]
             text = gen.render(a)
             assert "ALPHAGRAD_NN_HIDDEN" not in text, a["name"]
+            assert "export ALPHAGRAD_NN_BATCH=64\n" in text, a["name"]
         else:
             assert a["thesis_target"] in RSNN_TARGETS, a["name"]
             assert cli["--example"] == RSNN_EXAMPLE, a["name"]
@@ -1175,7 +1177,8 @@ def test_the_smoke_is_the_three_runs_the_owner_asked_for(gen, smoke):
 
     first, resume, cond = smoke
     assert _cli(gen, first)["--episodes"] == "20"
-    assert _cli(gen, first)["--example"] == "TransformerLM"
+    assert _cli(gen, first)["--example"] == "VmappedTransformerLM"
+    assert first["env"]["ALPHAGRAD_NN_BATCH"] == "64"
     assert _cli(gen, first)["--reward-mode"] == "lagrangian"
     assert _cli(gen, first)["--grad-oracle-cadence"] == "10"
     assert "--preference-conditioned" not in _cli(gen, first)

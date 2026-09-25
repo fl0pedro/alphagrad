@@ -2623,7 +2623,7 @@ NN_BATCH_VAR = "ALPHAGRAD_NN_BATCH"
 THESIS_TARGET_CLI = {
     "nn256": {"--example": "VmappedNeuralNetwork",
               "--dataset": "mnist"},
-    "tlm": {"--example": "TransformerLM",
+    "tlm": {"--example": "VmappedTransformerLM",
             "--dataset": "wikitext2"},
     # THE RECURRENT TARGET.  --example and --dataset are the same in all four
     # rows; --temporal-rule is the only difference between them, and it is
@@ -2638,7 +2638,8 @@ THESIS_TARGET_ENV = {
     # Decision D1 (dsnn-dfw.152): 43 percent of the card under Markowitz.
     "nn256": {"ALPHAGRAD_NN_HIDDEN": "256", NN_BATCH_VAR: "4096"},
     # the ALPHAGRAD_TLM_* triple is in CAMPAIGN_ENV
-    "tlm": {},
+    # Owner ruling Q21 (2026-09-25): 62 percent of the card under Markowitz.
+    "tlm": {NN_BATCH_VAR: "64"},
     # The recurrent target's shape is NOT an environment variable: the hidden
     # width, the time constants and the init scale are module constants of
     # common/rsnn_shd.py (RSNN_HIDDEN = 128, the seven measured constants and
