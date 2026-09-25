@@ -814,6 +814,7 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *,
     # the GPU preallocator (it usually lands on CPU jax devices anyway),
     # and the env's `_callback` can transiently allocate GPU buffers via
     # `exec_on_gpu` mode.
+    # Preallocation stays off by the owner's ruling of 2026-09-25 (dsnn-dfw.238); the static peak gate reads the card, not this allocator.
     os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
     key = jrand.PRNGKey(int(getattr(args, "seed", seed)))

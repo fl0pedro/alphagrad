@@ -506,6 +506,7 @@ class PPORayWorker:
             self._checkpoint_every = int(_env_every)
         if self.args.no_jit:
             jax.config.update("jax_disable_jit", True)
+        # Preallocation stays off by the owner's ruling of 2026-09-25 (dsnn-dfw.238); the static peak gate reads the card, not this allocator.
         os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
         _setup_jax_compile_cache()
 
