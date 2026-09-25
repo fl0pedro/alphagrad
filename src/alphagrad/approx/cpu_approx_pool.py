@@ -760,7 +760,7 @@ class CpuApproxPool:
             )
         except Exception as _exc:
             # Apparatus faults stop the run, as in evaluate_batch (Q53).
-            if _is_toolchain_fault(_exc):
+            if _is_toolchain_fault(_exc) or isinstance(_exc, ActorStartRefused):
                 raise
             # Catch-all: anything else (serialization issue, malformed
             # return, etc.) is treated like a transient actor failure.
@@ -1199,8 +1199,10 @@ class CpuApproxPool:
                 # Ray re-raises the actor's exception as a RayTaskError
                 # that is ALSO an instance of the original class; the
                 # text match covers a pickling failure. This must stop
-                # the run, not become one more [SENTINEL] line.
-                if _is_toolchain_fault(_exc):
+                # the run, not become one more [SENTINEL] line. So must a
+                # refused actor start from the OOM recycle (dsnn-dfw.229).
+                if _is_toolchain_fault(_exc) or isinstance(
+                        _exc, ActorStartRefused):
                     raise
                 self._n_other_errors += 1
                 # THE FIRST ONE IN FULL. 120 characters of a RayTaskError

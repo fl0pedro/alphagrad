@@ -85,7 +85,8 @@ def _check(cfg, order, episode=0):
     """
     sub = envmod.grad_oracle_submission(cfg, list(_ARGS), episode)
     assert sub is not None, "this config has something to check"
-    probe_seed, args_np = sub
+    # (probe_seed, args_np, batch) since --grad-oracle-batch (dsnn-dfw.226).
+    probe_seed, args_np = sub[0], sub[1]
     return envmod.grad_oracle_cpu_check(cfg, args_np, order, probe_seed)
 
 
