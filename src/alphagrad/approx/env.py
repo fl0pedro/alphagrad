@@ -2667,8 +2667,6 @@ def _plan_compile_fields() -> dict:
            "compile_options_tried": _PLAN_COMPILE.get(
                "compile_options_tried", []),
            "ref_compile_options": _PLAN_COMPILE.get("ref_compile_options")}
-    if "cost_compile_options" in _PLAN_COMPILE:
-        out["cost_compile_options"] = _PLAN_COMPILE["cost_compile_options"]
     return out
 
 
@@ -4603,6 +4601,71 @@ def measured_program(config, order, consts, sparse=None, **jacve_kwargs):
     if is_full_rollout(config):
         return full_rollout_program(config, step)
     return step
+
+
+def measure_sparse_enabled() -> bool:
+    # Every plan is priced on its sparse representation (owner ruling
+    # 2026-09-25); 0 is the dense executable, for a paired proof only.
+    want = os.environ.get("ALPHAGRAD_MEASURE_SPARSE", "1")
+    if want == "1":
+        return True
+    if want == "0":
+        return False
+    raise ValueError(
+        "ALPHAGRAD_MEASURE_SPARSE must be 1 (the sparse executable, the "
+        "default) or 0 (the dense executable, for a paired proof), got "
+        f"{want!r}")
+
+
+def _nominal_gradient_shapes(config) -> list:
+    invars = [config.jaxpr.invars[int(i)] for i in config.argnums]
+    return [tuple(int(d) for d in o.aval.shape)
+            + tuple(int(d) for d in v.aval.shape)
+            for o in config.jaxpr.outvars for v in invars]
+
+
+def _densify_gradient(jac, shapes):
+    def _leaf(x):
+        return (x is None or _is_sparse_tensor(x)
+                or bool(getattr(x, "_is_deferred_output", False)))
+    leaves, treedef = jax.tree_util.tree_flatten(jac, is_leaf=_leaf)
+    if len(leaves) != len(shapes):
+        raise RuntimeError(
+            f"the sparse executable returned {len(leaves)} gradient leaves "
+            f"for {len(shapes)} (output, argument) pairs")
+    dense = []
+    for i, (leaf, shape) in enumerate(zip(leaves, shapes)):
+        if leaf is None:
+            d = jnp.zeros(shape)
+        elif _leaf(leaf):
+            d = leaf.dense()
+        else:
+            d = leaf
+        if tuple(int(v) for v in d.shape) != shape:
+            raise RuntimeError(
+                f"gradient leaf {i}: the densified sparse output has shape "
+                f"{tuple(d.shape)} and the dense executable's leaf {shape}")
+        dense.append(d)
+    return jax.tree_util.tree_unflatten(treedef, dense)
+
+
+def dense_measured_program(config, ex, sparse: bool):
+    # The quality channels read the form the dense executable returned: every
+    # sparse leaf materialised outside the timed executions, a skipped path
+    # the zeros of its nominal shape. A carried target's consumers read the
+    # stored classes as they are.
+    from alphagrad.approx.common.rsnn_shd import is_full_rollout
+    if (not sparse or int(getattr(config, "carried_outputs", 0) or 0) > 0
+            or is_full_rollout(config)):
+        return ex
+    shapes = _nominal_gradient_shapes(config)
+
+    def run(*a):
+        out = ex(*a)
+        if config.has_aux:
+            return out[0], _densify_gradient(out[1], shapes)
+        return _densify_gradient(out, shapes)
+    return run
 
 
 _LOSS_TARGETS: dict = {}
@@ -10090,6 +10153,10 @@ def _callback_measured(
         h.update(b"compile-tuple:" + bytes(int(b) for b in compile_tuple))
     h.update(int(stop).to_bytes(4, "little", signed=False))
     h.update(b"sparse" if bool(config.sparse) else b"dense")
+    # The measured representation is part of the key: the sparse executable
+    # and the dense opt-out are two executables of one plan.
+    _measure_sparse = measure_sparse_enabled()
+    h.update(b"measure-sparse" if _measure_sparse else b"measure-dense")
     # Include the shape signature of args_for_lower so we don't
     # collide across rollouts that share (order, specs) but differ
     # in batch shape.
@@ -10112,8 +10179,12 @@ def _callback_measured(
         this pair a statement about the approximation alone. Both the
         compiles below and the sparsity tally's abstract fallback walk
         go through here so a change to one cannot miss the other."""
+        # The measured program is the plan's sparse representation (owner
+        # ruling 2026-09-25); the same-order exact program keeps the dense
+        # layout the Jacobian cosine aligns against.
         _kw = ({"transforms": transforms,
-                "face_transforms": ft_by_vertex} if approx else {})
+                "face_transforms": ft_by_vertex,
+                "sparse": _measure_sparse} if approx else {})
         # The reference's layout, one dense array per gradient: the sparse
         # form adds a scalar_mult output per leaf (Q44 check a). A target
         # with carried outputs keeps the stored classes in its one-call step
@@ -10131,9 +10202,8 @@ def _callback_measured(
         # hook once per face while ``.lower()`` traces, and this is the only
         # elimination whose applied/skipped counts describe what was actually
         # measured -- so this is the ONE scope the per-face counters are armed
-        # in. NOT armed: the face-enum replay, the tokenizer replay, the count
-        # pass, and the sparse-boundary cost re-trace below (a second trace of
-        # the same plan). CAVEAT: a compile-cache HIT skips the trace, so the
+        # in. NOT armed: the face-enum replay, the tokenizer replay and the
+        # count pass. CAVEAT: a compile-cache HIT skips the trace, so the
         # counters describe distinct measured plans, not repeats of one.
         from alphagrad.approx.common.masks import (
             arm_face_counts, disarm_face_counts)
@@ -10145,12 +10215,29 @@ def _callback_measured(
         # SAME SCOPE, SAME REASON as the per-face counters: this is the
         # ONE trace that walks the elimination that is actually measured.
         _arm_store_tally(_sparsity_on)
+        # #46: factored outputs for the sparse measured executable only. The
+        # trace happens inside .lower(), so scoping the env var here keeps
+        # the exact and reference executables, the tokenizer and the replays
+        # byte-untouched. DEFAULT OFF: a respawned measure actor imports this
+        # file fresh, and a mid-campaign default flip would make its
+        # measurements incomparable with its siblings' -- opt in per
+        # campaign with ALPHAGRAD_FACTORED_OUTPUTS=1 in the sbatch.
+        _fo = (_measure_sparse and os.environ.get(
+            "ALPHAGRAD_FACTORED_OUTPUTS", "0") == "1")
+        _prev_fo = os.environ.get("GRAPHAX_FACTORED_OUTPUTS")
+        if _fo:
+            os.environ["GRAPHAX_FACTORED_OUTPUTS"] = "1"
         try:
             return _compile_measure(
                 jax.jit(_jacve_fn(approx=True), keep_unused=True)
                 .lower(*args_for_lower), compile_tuple=compile_tuple
             )
         finally:
+            if _fo:
+                if _prev_fo is None:
+                    os.environ.pop("GRAPHAX_FACTORED_OUTPUTS", None)
+                else:
+                    os.environ["GRAPHAX_FACTORED_OUTPUTS"] = _prev_fo
             disarm_face_counts()
             _read_store_tally(_sparsity_on, _APPROX_STORE_BYTES,
                               cache_key)
@@ -10535,75 +10622,24 @@ def _callback_measured(
         return _score_refusal(*_compile_refusal("approx compile", _exc),
                               None)
     _st["program"] = compiled_approx
-    # SPARSE-BOUNDARY COST MEASUREMENT (ALPHAGRAD_MEASURE_SPARSE=1). The
-    # dense executable drains every output to the full nominal Jacobian, so
-    # diag/compress plans measure byte-identical latency+peak to exact --
-    # the boundary write dominates both channels (nn256@512: 4.17GB output
-    # = 2.6ms at HBM rate, temps 0-3MB). That is the mechanism behind
-    # "approx cuts latency ~-8% but NEVER memory". Under the flag the COST
-    # channels (latency, peak) time a second executable compiled with
-    # sparse_representation=True -- same values, compact output buffers
-    # (measured: diag2 0.51x lat / -50% peak, compress ax1 0.12x / -89%) --
-    # while the dense executable stays the ONLY source of quality outputs:
-    # a compact output would shape-mismatch _quality_metrics into the
-    # worst score, and the cosine keeps its dense comparability.
+    # ONE EXECUTABLE PER PLAN, THE SPARSE ONE (owner rulings 2026-09-25, grill
+    # round 1 Q18 c and round 2 Q2). Until then the cost channels timed a
+    # second executable compiled with sparse_representation=True under
+    # ALPHAGRAD_MEASURE_SPARSE=1 (measured: diag2 0.51x latency / -50 percent
+    # peak, compress ax1 0.12x / -89 percent) while the dense executable
+    # stayed the source of the quality outputs, because the dense executable
+    # drains every output to the full nominal Jacobian and the cosine read
+    # that form. The cost channels and the static gate now read the one
+    # executable; the quality channels read its outputs through
+    # `dense_measured_program`, outside every timed execution.
     compiled_cost = compiled_approx
-    if os.environ.get("ALPHAGRAD_MEASURE_SPARSE", "0") == "1":
-        def _do_compile_approx_sparse():
-            # #46: factored outputs for the COST executable only — the trace
-            # happens inside .lower(), so scoping the env var here keeps the
-            # dense/quality/exact executables, tokenizer and replays
-            # byte-untouched. DEFAULT OFF: a respawned measure actor imports
-            # this file fresh, and a mid-campaign default flip would make its
-            # measurements incomparable with its siblings' — opt in per
-            # campaign with ALPHAGRAD_FACTORED_OUTPUTS=1 in the sbatch.
-            _fo = os.environ.get("ALPHAGRAD_FACTORED_OUTPUTS", "0") == "1"
-            _prev = os.environ.get("GRAPHAX_FACTORED_OUTPUTS")
-            if _fo:
-                os.environ["GRAPHAX_FACTORED_OUTPUTS"] = "1"
-            try:
-                return _compile_measure(
-                    jax.jit(
-                        measured_program(config, o_list, consts, sparse=True,
-                                         transforms=transforms,
-                                         face_transforms=ft_by_vertex),
-                        keep_unused=True,
-                    )
-                    .lower(*args_for_lower), compile_tuple=compile_tuple
-                )
-            finally:
-                if _fo:
-                    if _prev is None:
-                        os.environ.pop("GRAPHAX_FACTORED_OUTPUTS", None)
-                    else:
-                        os.environ["GRAPHAX_FACTORED_OUTPUTS"] = _prev
-        try:
-            compiled_cost, _s_note = _cached_measure_compile(
-                b"approx-sparse:" + cache_key, _do_compile_approx_sparse)
-            _PLAN_COMPILE["cost_compile_options"] = _s_note["used"]
-        except Exception as _exc:
-            _PLAN_COMPILE["cost_compile_options"] = None
-            if _is_graphax_trace_failure(_exc):
-                return _trace_truncate("approx-sparse compile", _exc,
-                                       compiled_approx)
-            if _is_oom(_exc):
-                return _oom_truncate("approx-sparse compile", _exc,
-                                     compiled_approx)
-            if not isinstance(_exc, MeasureCompileFailure):
-                raise
-            return _score_refusal(
-                *_compile_refusal("approx-sparse compile", _exc),
-                compiled_approx)
-        _st["program"] = compiled_cost
+    quality_program = dense_measured_program(config, compiled_approx,
+                                             _measure_sparse)
     # THE STATIC PEAK GATE (dsnn-dfw.121): the candidate only, never the
     # reference, read after its compile and before its first execution.
     # Since 2026-09-24 (dsnn-4eq) the refusal is SCORED: the timeout on
     # latency, the candidate's real static ratios on memory.
-    _gate = _static_peak_gate(
-        [compiled_approx] + ([compiled_cost]
-                             if compiled_cost is not compiled_approx
-                             else []),
-        _gate_dev)
+    _gate = _static_peak_gate([compiled_approx], _gate_dev)
     if _gate is not None:
         _record_truncated_plan()
         print(f"[refused] gate step={int(stop)} order={o_list} "
@@ -11124,10 +11160,9 @@ def _callback_measured(
             _quality_points = 1
         for i in range(_quality_points):
             eval_args_i = eval_args_all[i]
-            # DENSE by construction: `compiled_approx`, never the
-            # sparse-boundary `compiled_cost`, because the residual and the
-            # cosine both need leaf parity with the exact reference.
-            out_approx = compiled_approx(*eval_args_i)
+            # The dense form, because the residual and the cosine both need
+            # leaf parity with the exact reference.
+            out_approx = quality_program(*eval_args_i)
 
             # FIDELITY, approx half. Point 0 only, terminal only.
             if _fid_needs_ref and is_terminal and i == 0:
@@ -11208,7 +11243,7 @@ def _callback_measured(
         # timing/peak windows never contain it.
         if is_terminal and _qmetric == "grad_cosine":
             _gc = _grad_cosine_quality(
-                config, compiled_approx, _ref_ex, paired_ref_key, list(args),
+                config, quality_program, _ref_ex, paired_ref_key, list(args),
                 callback_device, _grad_cosine_k(config))
             if _gc is _QUALITY_NO_CHANNEL:
                 # NO CHANNEL IS NOT A REFUSAL. This configuration has no data
@@ -11266,7 +11301,7 @@ def _callback_measured(
                     _cos_logged.extend(float(x) for x in _gc_cos)
         if is_terminal and _qmetric == "loss_drop":
             _ld = _loss_drop_quality(
-                config, compiled_approx, list(args), callback_device)
+                config, quality_program, list(args), callback_device)
             if _ld is None:
                 # The walk is undefined for this env (no data generator, no
                 # updatable weight slot, or a plan whose output does not even
