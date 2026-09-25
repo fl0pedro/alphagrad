@@ -72,26 +72,29 @@ def sim_ray(monkeypatch):
 
 
 class _Remote:
-    def __init__(self, fn, dur, clock):
-        self._fn, self._dur, self._clock = fn, dur, clock
+    def __init__(self, fn, dur, clock, on_dispatch=None):
+        self._fn, self._dur, self._clock, self._on = fn, dur, clock, on_dispatch
 
     def remote(self, *a, **k):
+        if self._on is not None:
+            self._on(*a)
         return _Future(self._fn, self._dur(*a) if callable(self._dur) else self._dur,
                        self._clock, *a, **k)
 
 
 class _Actor:
-    # order[0] is the plan's duration in simulated seconds.
+    # order[0] is the plan's duration in simulated seconds, order[1] its slot; a slot is
+    # recorded at dispatch, so a killed slot names the actor it was sent to.
     def __init__(self, name, clock):
         self.name = name
         self.killed = False
         self.slots: list = []
-        self.evaluate = _Remote(self._evaluate, lambda order, *a: float(order[0]), clock)
+        self.evaluate = _Remote(self._evaluate, lambda order, *a: float(order[0]), clock,
+                                on_dispatch=lambda order, *a: self.slots.append(int(order[1])))
         self.pop_oom_flag = _Remote(lambda: False, 0.0, clock)
         self.ready = _Remote(lambda: True, 0.0, clock)
 
     def _evaluate(self, order, specs, step, **kw):
-        self.slots.append(int(order[1]))
         reward = np.full((NUM_REWARDS,), -100.0, np.float32)
         return (np.full((TOK,), 7, np.int32), np.full((TOK,), 3, np.int32), reward)
 
