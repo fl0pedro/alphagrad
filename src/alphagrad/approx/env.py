@@ -8827,6 +8827,8 @@ def _compile_measure(lowered):
                     False,
                 "xla_gpu_experimental_enable_triton_heroless_priority_fusion":
                     False,
+                # The softmax rewriter makes __triton fusions too (job 67947).
+                "xla_disable_hlo_passes": "triton-softmax-rewriter",
             })
         except Exception as _e2:
             raise MeasureCompileFailure(str(_e2)) from _e2
