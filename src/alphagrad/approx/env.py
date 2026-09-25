@@ -4575,8 +4575,16 @@ def measured_program(config, order, consts, sparse=None, **jacve_kwargs):
     # The program a plan is measured on: the elimination, dense unless the
     # caller asks for the sparse form (Q44 check a), and on a target with
     # carried outputs the one-call step on the stored classes (Q1c, Q11a).
+    from alphagrad.approx.common.rsnn_shd import (full_rollout_program,
+                                                  is_full_rollout,
+                                                  rsnn_one_call_step)
     carried = int(getattr(config, "carried_outputs", 0) or 0) > 0
+    full = is_full_rollout(config)
+    # The full rollout reads its step's rows dense inside the scan and its
+    # own boundary is the accumulated gradient, so the step of a rollout
+    # without a carry keeps the dense form.
     sparse_rep = (True if carried
+                  else False if full
                   else bool(sparse) if sparse is not None
                   else False)
     fn = jacve(
@@ -4589,16 +4597,13 @@ def measured_program(config, order, consts, sparse=None, **jacve_kwargs):
         consts=list(consts),
         **jacve_kwargs,
     )
-    from alphagrad.approx.common.rsnn_shd import (full_rollout_program,
-                                                  is_full_rollout,
-                                                  rsnn_one_call_step)
     if carried and config.has_aux:
         raise ValueError(
             "a target with carried outputs returns its state as outputs; "
             "has_aux on it has no reading")
     # The sparse measured program leaves its gradient leaves as value
     # buffers (`_fold_output`); a carried target keeps the stored classes.
-    if sparse_rep and not carried and not is_full_rollout(config):
+    if sparse_rep and not carried:
         fn = _folded_program(fn, config.has_aux)
     step = rsnn_one_call_step(fn) if carried else fn
     # THE FULL ROLLOUT (owner ruling 2026-09-25 Q24 a): the plan's step at

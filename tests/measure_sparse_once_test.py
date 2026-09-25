@@ -330,9 +330,13 @@ def test_the_policy_gates_plan_prices_one_sparse_executable(measure,
         latency_inner_reps=1, num_data_points=2)
     samples = generate_eval_samples(env, jax.random.PRNGKey(3), 2)
     order, (specs, faces, skips) = _gate_plan()
-    # The exact plan on the gate's graph and order: a full Jacobian target.
-    _paired(measure, env, samples, order, _exact_arrays(len(order)),
-            "gate-exact", exact=True)
+    # The exact plan on the gate's graph and order: a full Jacobian target,
+    # whose exact Jacobian is structurally compact (d(a*b)/dW2 is diagonal
+    # in the output and weight columns), so the sparse form is smaller than
+    # the reference's dense rows and never equal to them.
+    dense, sparse = _paired(measure, env, samples, order,
+                            _exact_arrays(len(order)), "gate-exact")
+    assert sparse["mem_output_bytes"] < dense["mem_output_bytes"]
     # The recorded plan skips every live face, so its gradient is zero on
     # both executables (the sparse one returns no leaf at all) and the claim
     # is the compile count.
