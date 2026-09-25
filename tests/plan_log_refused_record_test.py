@@ -144,7 +144,7 @@ def test_a_dedupe_hit_record_carries_the_carry_bytes_of_its_container(
     monkeypatch.setitem(
         envmod._PLAN_DEDUPE,
         envmod._plan_content_key(order, specs, faces, skips, None),
-        (0, [0.0] * envmod.NUM_REWARDS))
+        (0, [0.0] * envmod.NUM_REWARDS, {}))
     _measure(env, order, specs, faces, skips, *samples)
     records = envmod.consume_plan_records()["records"]
     assert len(records) == 1 and records[0]["measured_from"] == 0, records

@@ -1,10 +1,14 @@
 """Pin `_compile_measure`: INTERNAL GPU-compiler failures (ptxas exit-139,
-Triton fusion) retry once with the degraded-fusion option set; anything else
-(OOM, INVALID_ARGUMENT) re-raises untouched so the existing trunc/sentinel
-machinery keeps handling it. No GPU needed -- the lowered object is stubbed."""
+Triton fusion) go on to the allowed 0/1 compile tuples in their fixed order
+(owner ruling 2026-09-25); anything else (OOM, INVALID_ARGUMENT) re-raises
+untouched so the existing trunc/sentinel machinery keeps handling it. No GPU
+needed -- the lowered object is stubbed."""
 import pytest
 
 from alphagrad.approx import env as env_mod
+
+_TRY = env_mod.MEASURE_COMPILE_TRY_ORDER
+_LIVE = env_mod.measure_compile_live_tuple()
 
 
 class _Lowered:
@@ -24,9 +28,8 @@ def test_fallback_on_ptxas_segfault():
     before = env_mod._MEASURE_COMPILE_FALLBACKS["n"]
     assert env_mod._compile_measure(lo) == "EXE"
     assert len(lo.calls) == 2
-    # the retry really uses the degraded set, not the standard options
-    assert lo.calls[1]["xla_gpu_enable_dynamic_slice_fusion"] is False
-    assert lo.calls[1]["xla_gpu_use_runtime_fusion"] is False
+    # the retry is the first allowed tuple on top of the live options
+    assert lo.calls[1] == env_mod.measure_compile_options(_TRY[0])
     assert env_mod._MEASURE_COMPILE_FALLBACKS["n"] == before + 1
 
 
@@ -64,6 +67,126 @@ def test_fallback_on_fusion_cycle():
                   "instruction %fusion.113")
     assert env_mod._compile_measure(lo) == "EXE"
     assert len(lo.calls) == 2
+
+
+# The error text of job 67947: VmappedTransformerLM at B=64 under the Markowitz order.
+_SOFTMAX_TRITON = (
+    "INTERNAL: Failed to compile Triton kernel. Context: [Fusion: fusion.260 = "
+    "f32[64,32,128]{2,1,0} fusion(a_7_.1, constant_285_0, get-tuple-element.2.0, "
+    "constant_471_0, fusion.499, input_reduce_fusion.39, fusion.517), kind=kCustom, "
+    "calls=fused_computation.238, backend_config={\"operation_queue_id\":\"0\","
+    "\"fusion_backend_config\":{\"kind\":\"__triton\",\"block_level_fusion_config\":"
+    "{\"num_warps\":\"8\"}}}]")
+
+
+class _SoftmaxLowered:
+    def __init__(self):
+        self.calls = []
+
+    def compile(self, compiler_options=None):
+        self.calls.append(compiler_options)
+        off = str((compiler_options or {}).get("xla_disable_hlo_passes", ""))
+        if "triton-softmax-rewriter" not in off.split(","):
+            raise RuntimeError(_SOFTMAX_TRITON)
+        return "EXE"
+
+
+def test_fallback_turns_off_the_triton_softmax_rewriter():
+    lo = _SoftmaxLowered()
+    assert env_mod._compile_measure(lo) == "EXE"
+    assert len(lo.calls) == 2
+    assert "xla_disable_hlo_passes" not in (lo.calls[0] or {})
+    assert lo.calls[1]["xla_disable_hlo_passes"] == "triton-softmax-rewriter"
+    assert "xla_gpu_disable_gpuasm_optimizations" not in lo.calls[1]
+    assert env_mod._LAST_COMPILE_NOTE[0] == {
+        "used": list(_TRY[0]), "tried": [list(_LIVE), list(_TRY[0])]}
+
+
+# ---------------------------------------------------------------------------
+# THE ALLOWED LIST (owner ruling 2026-09-25): one constant, one fixed try
+# order, and each tuple's options on top of the live ones.
+# ---------------------------------------------------------------------------
+def test_the_allowed_list_and_its_try_order():
+    assert env_mod.measure_compile_layout() == [
+        "xla_disable_hlo_passes=triton-softmax-rewriter",
+        "xla_gpu_disable_gpuasm_optimizations=True"]
+    assert _LIVE == (0, 0)
+    assert _TRY == ((1, 0), (1, 1))
+    assert env_mod.measure_compile_options(_LIVE) == (
+        env_mod._measure_compiler_options())
+    for bad in ((1,), (1, 0, 0), (2, 0)):
+        with pytest.raises(ValueError, match="allowed list"):
+            env_mod.measure_compile_options(bad)
+
+
+def test_a_tuple_sets_its_entries_on_top_of_the_live_options(monkeypatch):
+    live = {"xla_gpu_autotune_level": 0, "xla_gpu_enable_triton_gemm": False,
+            "xla_gpu_enable_llvm_module_compilation_parallelism": True}
+    monkeypatch.setattr(env_mod, "_measure_compiler_options",
+                        lambda: dict(live))
+    assert env_mod.measure_compile_options((0, 0)) == live
+    assert env_mod.measure_compile_options((1, 0)) == {
+        **live, "xla_disable_hlo_passes": "triton-softmax-rewriter"}
+    assert env_mod.measure_compile_options((1, 1)) == {
+        **live, "xla_disable_hlo_passes": "triton-softmax-rewriter",
+        "xla_gpu_disable_gpuasm_optimizations": True}
+
+
+class _OnlyWith:
+    # Compiles only with these exact options; every other compile fails as ptxas did.
+    def __init__(self, ok):
+        self.ok = ok
+        self.calls = []
+
+    def compile(self, compiler_options=None):
+        self.calls.append(compiler_options)
+        if compiler_options != self.ok:
+            raise RuntimeError(
+                "INTERNAL: ptxas exited with non-zero error code 139, output:")
+        return "EXE"
+
+
+def test_the_live_compile_is_unchanged_when_it_compiles():
+    lo = _OkLowered()
+    assert env_mod._compile_measure(lo) == "EXE"
+    assert lo.calls == [env_mod._measure_compiler_options()]
+    assert env_mod._LAST_COMPILE_NOTE[0] == {
+        "used": list(_LIVE), "tried": [list(_LIVE)]}
+
+
+def test_the_try_order_is_walked_until_a_tuple_compiles():
+    lo = _OnlyWith(env_mod.measure_compile_options(_TRY[-1]))
+    assert env_mod._compile_measure(lo) == "EXE"
+    assert lo.calls == [env_mod._measure_compiler_options()] + [
+        env_mod.measure_compile_options(t) for t in _TRY]
+    assert env_mod._LAST_COMPILE_NOTE[0] == {
+        "used": list(_TRY[-1]),
+        "tried": [list(_LIVE)] + [list(t) for t in _TRY]}
+
+
+def test_a_plan_no_tuple_compiles_names_every_tuple_it_tried():
+    before = env_mod._MEASURE_COMPILE_FALLBACKS["n"]
+    lo = _OnlyWith({"never": True})
+    with pytest.raises(env_mod.MeasureCompileFailure) as ei:
+        env_mod._compile_measure(lo)
+    assert len(lo.calls) == 1 + len(_TRY)
+    assert ei.value.tried == [list(_LIVE)] + [list(t) for t in _TRY]
+    assert env_mod._LAST_COMPILE_NOTE[0]["used"] is None
+    assert env_mod._MEASURE_COMPILE_FALLBACKS["n"] == before + 1
+
+
+def test_a_replay_compiles_exactly_its_tuple_and_nothing_else():
+    want = _TRY[-1]
+    lo = _OnlyWith(env_mod.measure_compile_options(want))
+    assert env_mod._compile_measure(lo, compile_tuple=want) == "EXE"
+    assert lo.calls == [env_mod.measure_compile_options(want)]
+    assert env_mod._LAST_COMPILE_NOTE[0] == {
+        "used": list(want), "tried": [list(want)]}
+    lo = _OnlyWith({"never": True})
+    with pytest.raises(env_mod.MeasureCompileFailure) as ei:
+        env_mod._compile_measure(lo, compile_tuple=want)
+    assert len(lo.calls) == 1
+    assert ei.value.tried == [list(want)]
 
 
 # ---------------------------------------------------------------------------
@@ -121,8 +244,8 @@ def test_nvlink_is_not_fallbackable_under_abort(fresh_gate):
     assert fresh_gate["link_faults"] == 1
 
 
-def test_nvlink_takes_the_degraded_set_and_tags_under_warn(fresh_gate,
-                                                            monkeypatch):
+def test_nvlink_goes_on_to_the_allowed_tuples_and_tags_under_warn(
+        fresh_gate, monkeypatch):
     monkeypatch.setenv("ALPHAGRAD_MEASURE_TOOLCHAIN_GATE", "warn")
     lo = _Lowered(_NVLINK)
     before = env_mod._MEASURE_COMPILE_FALLBACKS["n"]

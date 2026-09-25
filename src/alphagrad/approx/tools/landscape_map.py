@@ -309,6 +309,11 @@ def make_argparser() -> argparse.ArgumentParser:
                         "measured, taken in order of best (lowest) recorded "
                         "latency -- that is the part of the front the "
                         "owner's question is about.")
+    p.add_argument("--replay-record", default="", metavar="PATH",
+                   help="Measure the plan of ONE plan-log record (a JSON "
+                        "file) or repro bundle --reps times, each time "
+                        "compiled with the record's 0/1 compile tuple (owner "
+                        "ruling 2026-09-25), and nothing else.")
     p.add_argument("--face-inventory", action="store_true",
                    help="Dump the (step, vertex, face-index, face-key, "
                         "primitive, operand shapes/dtypes) inventory of every "
@@ -1335,9 +1340,139 @@ def _point_to_plan(best, env, order, path):
 
 
 # ---------------------------------------------------------------------------
+# Plan-log record replay: the recorded plan, compiled with its recorded 0/1
+# compile tuple (owner ruling 2026-09-25)
+# ---------------------------------------------------------------------------
+# One plan-log record from a JSON file: the record itself, or the ``plan`` of a repro bundle.
+def record_of(path):
+    with open(path) as fh:
+        doc = json.load(fh)
+    if "exception" in doc and "plan" in doc:
+        doc = doc["plan"]
+        if doc is None:
+            raise ValueError(f"{path}: the repro bundle carries no plan record")
+    return doc
+
+
+# The 0/1 tuple the record's candidate executable compiled with.
+def record_compile_tuple(rec) -> tuple:
+    now = envmod.measure_compile_layout()
+    layout = rec.get("compile_option_layout")
+    if layout is None:
+        if int(rec.get("compile_fallbacks") or 0) > 0:
+            raise ValueError(
+                "the record is older than the allowed list and took the "
+                "retired degraded-fusion retry; no tuple compiles its program")
+        return envmod.measure_compile_live_tuple()
+    if list(layout) != now[:len(layout)]:
+        raise ValueError(
+            f"the record's allowed list {layout} is not a prefix of this "
+            f"code's {now}, so its tuple names other options here")
+    tup = rec.get("compile_options")
+    if tup is None:
+        raise ValueError(
+            f"the record names no executable: every tuple it tried failed "
+            f"({rec.get('compile_options_tried')})")
+    return tuple(int(b) for b in tup) + (0,) * (len(now) - len(layout))
+
+
+# ``(order, plan)`` for :func:`measure` from a plan-log record.
+def record_plan(env, rec):
+    from alphagrad.approx.common.masks import reduce_axis_space
+    from alphagrad.approx.common.plan_log import decode_wires
+    if rec.get("face_joins") is not None:
+        raise NotImplementedError(
+            "the record carries per-face join bits (--approx-add choose), "
+            "and this tool replays no join channel")
+    for field, now in (("approx_add", envmod.approx_add()),
+                       ("reduce_axis_space", reduce_axis_space())):
+        if rec.get(field) not in (None, now):
+            raise ValueError(f"the record was measured under {field}="
+                             f"{rec[field]!r} and this process runs {now!r}")
+    order, specs, faces, skips = decode_wires(rec)
+    return order, {
+        "specs": specs, "face_specs": faces, "face_skips": skips,
+        "op": "record", "budget": str(rec.get("plan_hash") or ""),
+        "n_faces_approx": int(rec.get("n_live_faces") or 0),
+        "n_slot_rows": int(np.sum(faces[..., 0] != -1)),
+        "total_live_faces": -1, "per_vertex_faces": [], "wires": [],
+    }
+
+
+# The lowered program the measurement compiles for the record's plan.
+def rebuild_record(env, rec):
+    from alphagrad.approx.common.rsnn_shd import measure_args
+    if rec.get("carry_container") is not None:
+        raise NotImplementedError(
+            "the record's plan is measured on the program of its carry "
+            "container, and this rebuild builds the policy's graph")
+    order, plan = record_plan(env, rec)
+    cfg = env.config
+    o = [int(v) for v in np.asarray(order).reshape(-1)]
+    sl = plan["specs"].tolist()
+    faces, skips = plan["face_specs"], plan["face_skips"]
+    transforms, _ = envmod._decode_vertex_transforms(cfg, o, sl)
+    live = bool(np.any(skips == 1) or np.any(faces[..., 0] >= 0)
+                or np.any(faces[..., 0] == COMPRESS_SENTINEL)
+                or np.any(faces[..., 0] == QUANT_SENTINEL))
+    face_transforms = (envmod._face_transforms_for_order(
+        cfg, env.consts, env.args, o, sl, faces, skips) if live else None)
+    fn = envmod.measured_program(cfg, o, env.consts, transforms=transforms,
+                                 face_transforms=face_transforms)
+    args = measure_args(cfg, env.args)
+    if cfg.exec_on_gpu:
+        args = jax.device_put(args, jax.devices()[0])
+    return jax.jit(fn, keep_unused=True).lower(*args)
+
+
+# The record's program compiled with its recorded tuple, or with ``compile_tuple``; a failure raises ``env.MeasureCompileFailure``.
+def compile_record(env, rec, compile_tuple=None):
+    tup = record_compile_tuple(rec) if compile_tuple is None else compile_tuple
+    return envmod._compile_measure(rebuild_record(env, rec),
+                                   compile_tuple=tup)
+
+
+# ``--replay-record``: measure the record's plan ``--reps`` times, each time compiled with the record's tuple, one row per measurement.
+def replay_record(args, env, eval_samples, csv_path):
+    rec = record_of(args.replay_record)
+    order, plan = record_plan(env, rec)
+    tup = record_compile_tuple(rec)
+    want_ref = rec.get("ref_compile_options")
+    stamp = config_stamp(args)
+    pid = f"record:{rec.get('plan_hash') or os.path.basename(args.replay_record)}"
+    for trial in range(int(args.reps)):
+        m = measure(env, eval_samples, order, plan, compile_tuple=tup)
+        if m["compile_options"] != _tuple_text(tup):
+            raise RuntimeError(
+                f"{pid}: the replay compiled with ({m['compile_options']}) "
+                f"and the record with {tup}: {m['refused'] or 'measured'}")
+        if (want_ref is not None and m["ref_compile_options"]
+                and m["ref_compile_options"] != _tuple_text(want_ref)):
+            raise RuntimeError(
+                f"{pid}: the reference compiled with "
+                f"({m['ref_compile_options']}) and the record's with "
+                f"{tuple(want_ref)}")
+        row = {"plan_id": pid, "op": plan["op"], "budget": plan["budget"],
+               "trial": trial, "role": "candidate",
+               "n_faces_approx": plan["n_faces_approx"],
+               "n_slot_rows": plan["n_slot_rows"],
+               "total_live_faces": plan["total_live_faces"],
+               "timestamp": f"{time.time():.3f}",
+               **{k: m[k] for k in (
+                   "latency_ns", "peak_memory", "static_temp", "quality",
+                   "frob_residual", "applied", "skipped", "applied_detail",
+                   "wall_s", "refused", "refusal", *COMPILE_FIELDS)},
+               **stamp}
+        append_row(csv_path, row)
+        print(f"[landscape] {pid} t{trial} compile tuple {tup} "
+              f"lat={m['latency_ns']:.0f}ns q={m['quality']:.4f} "
+              f"({m['wall_s']:.1f}s)", flush=True)
+
+
+# ---------------------------------------------------------------------------
 # Measurement
 # ---------------------------------------------------------------------------
-def measure(env, eval_samples, order, plan):
+def measure(env, eval_samples, order, plan, compile_tuple=None):
     """ONE independent measurement of one plan through the trainer's own
     reward harness. Returns a dict of the channels plus wall time."""
     consume_per_face_stats()          # drop whatever the plan-build replay left
@@ -1356,7 +1491,9 @@ def measure(env, eval_samples, order, plan):
         jnp.asarray(face_skips),
         int(len(order)),
         *eval_samples,
+        compile_tuple=compile_tuple,
     )
+    _cmp = envmod.last_measure_compile()
     wall = time.perf_counter() - t0
     # A refused plan's row carries its reason and its sentinel values (owner
     # ruling 2026-09-24 Q46); the reward slots above hold the sentinel.
@@ -1406,7 +1543,13 @@ def measure(env, eval_samples, order, plan):
         "refusal": ("" if refusal is None else json.dumps(
             {k: v for k, v in refusal.items() if k != "refused"},
             sort_keys=True, default=str)),
+        "compile_options": _tuple_text(_cmp.get("compile_options")),
+        "ref_compile_options": _tuple_text(_cmp.get("ref_compile_options")),
     }
+
+
+def _tuple_text(tup) -> str:
+    return "" if tup is None else ",".join(str(int(b)) for b in tup)
 
 
 # EVERY ROW CARRIES ITS CONFIG. The campaign's numbers are not comparable
@@ -1462,6 +1605,9 @@ CSV_FIELDS = [
     "refused",
     "refusal",
 ]
+# The 0/1 compile tuples of the row's candidate and reference executables (owner ruling 2026-09-25).
+COMPILE_FIELDS = ("compile_options", "ref_compile_options")
+CSV_FIELDS += list(COMPILE_FIELDS)
 
 
 def config_stamp(args):
@@ -1511,6 +1657,14 @@ def load_done(path):
 
 def append_row(path, row):
     new = not os.path.exists(path)
+    if not new:
+        with open(path, newline="") as fh:
+            head = next(csv.reader(fh), [])
+        if head != CSV_FIELDS:
+            raise ValueError(
+                f"{path} has the columns of another version of this tool; "
+                f"appending would shift every column. Use a new --out-dir or "
+                f"--tag. Missing: {sorted(set(CSV_FIELDS) - set(head))}")
     with open(path, "a", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=CSV_FIELDS)
         if new:
@@ -2157,6 +2311,9 @@ def main():
         return
 
     env, eval_samples, _cj = build_env(args)
+    if args.replay_record:
+        replay_record(args, env, eval_samples, csv_path)
+        return
     if args.order == "markowitz":
         order = markowitz_order(env)
     else:
@@ -2451,7 +2608,7 @@ def main():
                     **{k: m[k] for k in ("latency_ns", "peak_memory", "static_temp",
                                          "quality", "frob_residual", "applied", "skipped",
                                          "applied_detail", "wall_s",
-                                         "refused", "refusal")},
+                                         "refused", "refusal", *COMPILE_FIELDS)},
                     **stamp,
                 }
                 append_row(csv_path, row)
@@ -2496,7 +2653,7 @@ def main():
                                              "quality", "frob_residual",
                                              "applied", "skipped",
                                              "applied_detail", "wall_s",
-                                             "refused", "refusal")},
+                                             "refused", "refusal", *COMPILE_FIELDS)},
                         **stamp,
                     }
                     append_row(csv_path, row)
@@ -2577,7 +2734,7 @@ def main():
                 **{k: m[k] for k in ("latency_ns", "peak_memory", "static_temp",
                                      "quality", "frob_residual", "applied", "skipped",
                                      "applied_detail", "wall_s",
-                                     "refused", "refusal")},
+                                     "refused", "refusal", *COMPILE_FIELDS)},
                 **stamp,
             }
             append_row(csv_path, row)

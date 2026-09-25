@@ -81,10 +81,12 @@ def test_a_shared_memory_compile_failure_is_refused_as_compile(monkeypatch):
     compiles = []
     real_compile = jax.stages.Lowered.compile
 
+    tries = 1 + len(env_mod.MEASURE_COMPILE_TRY_ORDER)
+
     def _compile(self, compiler_options=None):
-        # the candidate's two attempts fail; the paired reference compiles
+        # the candidate's attempts (live, then every allowed tuple) fail; the paired reference compiles
         compiles.append(compiler_options)
-        if len(compiles) <= 2:
+        if len(compiles) <= tries:
             raise XlaRuntimeError(_SHMEM_TEXT)
         return real_compile(self, compiler_options=compiler_options)
 
@@ -110,8 +112,9 @@ def test_a_shared_memory_compile_failure_is_refused_as_compile(monkeypatch):
     finally:
         env_mod.set_measure_timeout_s(None)
 
-    assert len(compiles) == 3
-    assert compiles[1]["xla_gpu_use_runtime_fusion"] is False
+    assert len(compiles) == tries + 1
+    assert compiles[1:tries] == [env_mod.measure_compile_options(t)
+                                 for t in env_mod.MEASURE_COMPILE_TRY_ORDER]
     assert int(env_mod._MEASURE_COMPILE_FALLBACKS["n"]) == n_fallback + 1
 
     counts = env_mod.consume_refused_counts()
@@ -123,6 +126,10 @@ def test_a_shared_memory_compile_failure_is_refused_as_compile(monkeypatch):
     assert rec["refused"] == "compile:XlaRuntimeError"
     assert rec["sentinelled"] is True
     assert "Shared memory size limit" in rec["refusal_error"]
+    assert rec["compile_options"] is None
+    assert rec["compile_options_tried"] == [
+        list(env_mod.measure_compile_live_tuple())] + [
+        list(t) for t in env_mod.MEASURE_COMPILE_TRY_ORDER]
     reward = np.asarray(out[-1], dtype=np.float32)
     assert np.isfinite(reward).all()
     assert rec["refusal_latency_ns"] == 120.0 * 1e9

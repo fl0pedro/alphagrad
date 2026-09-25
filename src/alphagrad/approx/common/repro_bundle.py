@@ -36,6 +36,19 @@ def _tag(value):
     return "na" if value is None else str(int(value))
 
 
+# The 0/1 compile tuples (owner ruling 2026-09-25): from the plan record, else from this process's last measurement.
+def _compile_options(plan):
+    from alphagrad.approx import env
+    src = plan if plan is not None else env.last_measure_compile()
+    return {"layout": src.get("compile_option_layout")
+            or env.measure_compile_layout(),
+            "candidate": src.get("compile_options"),
+            "tried": src.get("compile_options_tried"),
+            "reference": src.get("ref_compile_options"),
+            "from": ("plan record" if plan is not None
+                     else "the last measurement of this process")}
+
+
 def write(run, *, source, episode, env_index, plan, exception):
     log = job_log()
     folder = os.path.dirname(log) if log else run["run_dir"]
@@ -59,6 +72,7 @@ def write(run, *, source, episode, env_index, plan, exception):
         "flags": run["flags"],
         "wandb_id": run["wandb_id"],
         "exception": exception,
+        "compile_options": _compile_options(plan),
         "plan": plan,
     }
     with open(path, "x") as fh:
