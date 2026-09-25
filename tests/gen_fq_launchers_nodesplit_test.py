@@ -35,7 +35,11 @@ NODES = ("pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu18", "pgi15-gpu19",
 EIGHT_GPU = ("pgi15-gpu19", "pgi15-gpu20")
 NN256_GPUS = 4
 NN256_CPUS = 64
+#: A frozen round's memory; a row `thesis_arm` emits asks for the node's
+#: (owner rulings 2026-09-25, sinfo RealMemory 770000 and 1540000 MB).
 NN256_MEM = "400G"
+NN256_ROW_MEM = "740G"
+PAIR_MEM = "1480G"
 NN256_ACTORS = "3"
 
 
@@ -88,13 +92,15 @@ def test_every_nn256_row_renders_the_four_gpu_profile_on_every_node(gen):
         assert a["gpus"] == NN256_GPUS, a["name"]
         cli = dict(gen._merge_cli(a.get("cli", {})))
         assert cli["--ray-measure"] == NN256_ACTORS, a["name"]
-        b = gen.THESIS_CORE_BUDGET[NN256_GPUS]
-        assert cli["--reserved-driver-cores"] == str(b["trainer"]), a["name"]
         # Owner ruling 2026-09-23: 8 on every row `thesis_arm` emits; the
-        # frozen rounds (the order-only baseline, the sweeps) keep the budget.
+        # frozen rounds (the order-only baseline, the sweeps) keep their own
+        # budget.
         frozen = any(a.get(k) for k in (
             "orderonly", "orderonly_final", "orderonly_tlm_final",
             "orderonly_rsnn", "sweepl", "sweepl2", "sweepl3"))
+        b = (gen.FROZEN_CORE_BUDGET if frozen
+             else gen.THESIS_CORE_BUDGET[NN256_GPUS])
+        assert cli["--reserved-driver-cores"] == str(b["trainer"]), a["name"]
         want = (str(b["per_actor"]) if frozen
                 else gen.THESIS_CORES_PER_ACTOR)
         assert cli["--cpu-cores-per-actor"] == want, a["name"]
@@ -102,7 +108,8 @@ def test_every_nn256_row_renders_the_four_gpu_profile_on_every_node(gen):
         assert f"#SBATCH --gres={gen.blackwell_gres(NN256_GPUS)}\n" in text, \
             a["name"]
         assert f"#SBATCH -c {NN256_CPUS}\n" in text, a["name"]
-        assert f"#SBATCH --mem={NN256_MEM}\n" in text, a["name"]
+        want_mem = NN256_MEM if frozen else NN256_ROW_MEM
+        assert f"#SBATCH --mem={want_mem}\n" in text, a["name"]
     # the profile is pinned ON EVERY NODE, so every node must carry one
     assert seen_nodes == set(NODES), sorted(seen_nodes)
 
@@ -178,7 +185,7 @@ def test_the_paired_launcher_asks_for_the_whole_node(gen):
         assert f"#SBATCH -w {p['node']}\n" in text, p["name"]
         assert f"#SBATCH --gres={gen.blackwell_gres(8)}\n" in text, p["name"]
         assert f"#SBATCH -c {gen.BLACKWELL_CPUS[8]}\n" in text, p["name"]
-        assert f"#SBATCH --mem={gen.BLACKWELL_MEM[8]}\n" in text, p["name"]
+        assert f"#SBATCH --mem={PAIR_MEM}\n" in text, p["name"]
         assert f"#SBATCH -J node-{p['node']}\n" in text, p["name"]
         assert "#SBATCH --dependency=singleton\n" in text, p["name"]
 

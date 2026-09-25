@@ -139,7 +139,8 @@ def test_no_other_row_changed(gen):
     """The sweep round 2 marker excludes these 12 rows (plus their pairs)
     from every matrix count the way round 1's marker does; the matrix and
     round 1's own rows are untouched by this file's grid."""
-    assert len(gen.thesis_core_arms()) == 50, len(gen.thesis_core_arms())
+    # 40 since condC left the matrix (owner rulings 2026-09-25)
+    assert len(gen.thesis_core_arms()) == 40, len(gen.thesis_core_arms())
     assert len(gen.sweepl_single_arms()) == 24, len(gen.sweepl_single_arms())
 
 

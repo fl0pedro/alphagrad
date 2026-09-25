@@ -480,12 +480,11 @@ def test_jax_cache_is_per_node_and_the_autotune_race_is_disabled(gen):
     # Every arm the generator renders (wave, cpu, tool, probe, campaign --
     # not just the campaign fixture) runs python and must carry the SAME
     # cache dir, created once, before python starts.  The one exception
-    # (owner ruling 2026-09-23): a thesis row under --fixed-order free
-    # exports none of it, since every plan is a new program there.
+    # (owner rulings 2026-09-23 and 2026-09-25, dsnn-dfw.230): a row
+    # `thesis_arm` emits exports none of it, under any order.
     for a in gen.ARMS:
         text = gen.render(a)
-        if (a.get("jax_cache_fixed_order_only") and dict(gen._merge_cli(
-                a.get("cli", {}))).get("--fixed-order") == "free"):
+        if a.get("jax_cache") is False:
             assert "export JAX_" not in text, a["name"]
             continue
         assert f"mkdir -p {gen.JAX_CACHE_DIR_EXPR}" in text, a["name"]

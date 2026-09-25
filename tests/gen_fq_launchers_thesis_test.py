@@ -4,9 +4,11 @@ Launchers are generated (`tools/gen_fq_launchers.py`), never hand-edited, so
 the owner's rulings of 2026-09-15 and 2026-09-16 are pinned on the generator
 rather than on 150 files:
 
-  1. THE CORE MATRIX: five arms (A, B, C, C_popart, condC) x two targets
-     (nn256, tlm) x five seeds (250197..250201) = 50 runs, named
-     `<arm>_<target>_s<seed>`.
+  1. THE CORE MATRIX: four arms (A, B, C, C_popart) x two targets
+     (nn256, tlm) x five seeds (250197..250201) = 40 runs, named
+     `<arm>_<target>_s<seed>`.  condC left the matrix (owner rulings
+     2026-09-25); the defense arms of dsnn-dfw.231 are 9 further NN256 rows,
+     pinned by tests/gen_fq_launchers_pilotbatch_test.py.
   2. THE FLAGS, per arm: the face-head init bias, the reward form, the
      advantage normalisation and the preference conditioning are the ONLY
      things that differ between arms; everything else is byte-equal.
@@ -18,34 +20,27 @@ rather than on 150 files:
      released to this agent in the generated set; --ray-measure 7 on the
      8-GPU nodes and 3 on the 4-GPU nodes.
   6. THE SMOKE: 20 episodes of arm C on TLM with --checkpoint-every 10 and
-     NO auto-stop, its resume twin, and a condC run on NN256.
+     NO auto-stop, and its resume twin.  The condC run on NN256 left with
+     condC.
   7. `thesis_arm` RAISES on a row outside the rulings.
   8. ppo.py's own argparse accepts every thesis command line.
   8b. RUNG 1 OF THE LADDER (owner rulings 2026-09-20 and 2026-09-21): arms C
      and C_popart on NN256, five seeds each, state the face-head init as a
      PLAN -- `--face-init-approx-per-plan 3 --face-init-skips-per-plan 0.3`
      -- instead of `--face-none-bias 2`.  The recurrent target's four rules
-     take the SAME rung, for C, C_popart AND condC (2026-09-21: the init
+     take the SAME rung, for C and C_popart (2026-09-21: the init
      probe reproduces on RSNN_SHD too), but its own approximation count
      dropped to 1 on a later ruling the same day (dsnn-dfw.84 and
      dsnn-dfw.78): `--face-init-approx-per-plan 1
      --face-init-skips-per-plan 0.3`.  No other arm, no other target and no
      other round (the order-only tuning rows are arm C on NN256 too) moves.
-  8c. THE LONG CONDITIONED ROWS (owner ruling 2026-09-20): condC on NN256,
-     five seeds, renders --episodes 2000.  Every other row keeps 1000.
-  8d. CONDC RENDERS ON THE POPART FORM ON NN256, TLM, AND NOW THE FOUR
-     RECURRENT TARGETS TOO (owner rulings 2026-09-21): the same three flags
-     as arm C_popart -- --advantage-norm popart, --no-symlog,
-     --symlog-channels none -- read from C_popart's own row on the SAME
-     target, not retyped, in place of the symlog form THESIS_ARM_SPEC
-     records for condC.  condC on TLM ALSO takes its own face-head init
-     plan (TLM_INIT_APPROX_PER_PLAN / TLM_INIT_SKIPS_PER_PLAN, not rung
-     1's).  Arm C itself never moved: it keeps the symlog form everywhere,
+  8c, 8d. The long conditioned rows and condC's PopArt form left with condC
+     (owner rulings 2026-09-25).  Arm C keeps the symlog form everywhere,
      recurrent targets included.
   9. THE RECURRENT BLOCK: --example RSNN_SHD --dataset shd crossed with four
-     temporal rules (tbptt, bptt, rtrl, window2), the same five arms and the
-     same five seeds = 100 further runs, named `<arm>_rsnn_<rule>_s<seed>`,
-     carrying the NN256/TLM flags unchanged (apart from 8b/8d above) and
+     temporal rules (tbptt, bptt, rtrl, window2), the same four arms and the
+     same five seeds = 80 further runs, named `<arm>_rsnn_<rule>_s<seed>`,
+     carrying the NN256/TLM flags unchanged (apart from 8b above) and
      GENERATED BUT HELD.  The rule is part of the target key, so a
      recurrent run is one (arm, target, seed) triple like every other row.
      rtrl renders on an 8-GPU node (round-robin by seed, gpu19 then gpu20,
@@ -71,7 +66,10 @@ _GEN = os.path.join(_ALPHAGRAD, "tools", "gen_fq_launchers.py")
 # a deliberate edit in this file as well as in the generator; that is the
 # whole point of a pin.
 SEEDS = ("250197", "250198", "250199", "250200", "250201")
-ARMS = ("A", "B", "C", "C_popart", "condC")
+ARMS = ("A", "B", "C", "C_popart")
+#: The defense arms (dsnn-dfw.231): NN256 only, three seeds.
+DEFENSE_ARMS = ("A_popart", "A_popart_lq4", "A_popart_lq64")
+DEFENSE_SEEDS = SEEDS[:3]
 #: The two targets of the core matrix.  The recurrent target's four rules are
 #: four FURTHER targets; RSNN_TARGETS below spells them.
 TARGETS = ("nn256", "tlm")
@@ -97,17 +95,7 @@ RSNN_FORM = {
         (RSNN_EXAMPLE, None),
 }
 EPISODES = "1000"
-#: THE LONG CONDITIONED ROWS (owner ruling 2026-09-20): condC on NN256, five
-#: seeds, runs twice the episodes.  No other coordinate moves.
-LONG_EPISODES = "2000"
-LONG_EPISODES_ARMS = ("condC",)
-LONG_EPISODES_TARGET = "nn256"
 CHECKPOINT_EVERY = "50"
-
-
-def _is_long_episodes(a) -> bool:
-    return (a["thesis_target"] == LONG_EPISODES_TARGET
-            and a["thesis_arm"] in LONG_EPISODES_ARMS)
 PARETO_DUMP_EVERY = "10"
 TAU = "0.90"
 LAMBDA_Q = "16"
@@ -156,9 +144,20 @@ PROACTIVE_RECYCLE_EVERY = "100"
 RECYCLE_ENV = {
     "ALPHAGRAD_PROACTIVE_RECYCLE_EVERY": PROACTIVE_RECYCLE_EVERY,
 }
+#: THE MEASURE PATH (dsnn-dfw.169, owner ruling 2026-09-25): every row
+#: `thesis_arm` emits exports both at 1; the frozen rounds keep neither.
+MEASURE_PATH_ENV = {"ALPHAGRAD_DIRECT_MEASURE": "1",
+                    "ALPHAGRAD_UNIFIED_FACE_ENUM": "1"}
 #: What every row `thesis_arm` emits now carries beside its target shape:
-#: the retention bound and the process recycle together.
-MATRIX_ENV = {**CLEAR_ENV, **RECYCLE_ENV}
+#: the retention bound, the process recycle and the measure path together.
+MATRIX_ENV = {**CLEAR_ENV, **RECYCLE_ENV, **MEASURE_PATH_ENV}
+#: THE TRAINED MEMORY CHANNEL (dsnn-mep, owner ruling 2026-09-25): slot 11 at
+#: weight 1, "mem" out of --rewards; slot 5 keeps the watermark, logged.
+MEM_OBJECTIVE_WEIGHT = "1"
+REWARDS = "cmp acc"
+#: The row's memory and the oracle's host budget by GPU profile (owner
+#: rulings 2026-09-25; sinfo RealMemory 770000 and 1540000 MB).
+ROW_MEM = {4: "740G", 8: "1480G"}
 #: THE FACE-ENTROPY WEIGHT PER FAMILY (owner ruling 2026-09-21, dsnn-dfw.84
 #: and dsnn-dfw.78): the recurrent target and TLM render the near-zero
 #: bonus; NN256 keeps the campaign's 0.05.
@@ -195,8 +194,9 @@ def gen():
 
 @pytest.fixture(scope="module")
 def matrix(gen):
-    """Every run of the matrix -- the 50 core rows AND the 100 recurrent
-    rows -- without the three smoke arms.  What is shared is asserted over
+    """Every run of the matrix -- the 40 core rows, the 80 recurrent rows
+    and the 9 defense rows -- without the smoke arms.  What is shared is
+    asserted over
     this whole set, so a recurrent row cannot quietly drift away from the
     NN256 and TLM rows.
 
@@ -228,7 +228,7 @@ def pairs(gen):
 
 @pytest.fixture(scope="module")
 def core(gen):
-    """The 50 NN256/TLM rows."""
+    """The 40 NN256/TLM rows."""
     arms = gen.thesis_core_arms()
     assert arms, "the generator emits no core thesis arm"
     return arms
@@ -236,9 +236,17 @@ def core(gen):
 
 @pytest.fixture(scope="module")
 def snn(gen):
-    """The 100 recurrent rows (--example RSNN_SHD)."""
+    """The 80 recurrent rows (--example RSNN_SHD)."""
     arms = gen.thesis_snn_arms()
     assert arms, "the generator emits no recurrent thesis arm"
+    return arms
+
+
+@pytest.fixture(scope="module")
+def defense(gen):
+    """The 9 defense rows (dsnn-dfw.231)."""
+    arms = gen.thesis_defense_arms()
+    assert arms, "the generator emits no defense arm"
     return arms
 
 
@@ -273,10 +281,10 @@ def _bash_n(text: str) -> str | None:
 
 # ------------------------------------------------------------- 1. the matrix
 
-def test_the_core_matrix_is_five_arms_two_targets_five_seeds(gen, core):
+def test_the_core_matrix_is_four_arms_two_targets_five_seeds(gen, core):
     assert gen.THESIS_SEEDS == SEEDS
     assert gen.THESIS_ARMS == ARMS
-    assert len(core) == len(ARMS) * len(TARGETS) * len(SEEDS) == 50
+    assert len(core) == len(ARMS) * len(TARGETS) * len(SEEDS) == 40
     got = {(a["thesis_arm"], a["thesis_target"], a["thesis_seed"])
            for a in core}
     want = {(arm, t, s) for arm in ARMS for t in TARGETS for s in SEEDS}
@@ -291,25 +299,26 @@ def test_the_core_matrix_is_five_arms_two_targets_five_seeds(gen, core):
     assert "C_popart_tlm_s250197" in names      # the owner's own example
 
 
-def test_the_whole_matrix_is_the_core_fifty_and_the_recurrent_hundred(
-        gen, matrix, core, snn):
+def test_the_whole_matrix_is_the_core_forty_the_recurrent_eighty_and_the_defense(
+        gen, matrix, core, snn, defense):
     """One naming rule, one (arm, target, seed) triple per row, six targets.
 
     The recurrent rules are TARGETS and not a fourth coordinate, so the whole
     matrix is still `THESIS_ARMS x THESIS_TARGETS x THESIS_SEEDS` and
-    `thesis_run_name` spells every row of it.
+    `thesis_run_name` spells every row of it; the defense arms add their own
+    NN256 rows at three seeds.
     """
     assert tuple(sorted(gen.THESIS_TARGETS)) == tuple(sorted(ALL_TARGETS))
     assert len(gen.THESIS_TARGETS) == 6
-    assert len(core) == 50 and len(snn) == 100
-    assert len(matrix) == len(core) + len(snn) == 150
-    assert len(matrix) == len(ARMS) * len(ALL_TARGETS) * len(SEEDS)
+    assert len(core) == 40 and len(snn) == 80 and len(defense) == 9
+    assert len(matrix) == len(core) + len(snn) + len(defense) == 129
     got = {(a["thesis_arm"], a["thesis_target"], a["thesis_seed"])
            for a in matrix}
     want = {(arm, t, s) for arm in ARMS for t in ALL_TARGETS for s in SEEDS}
+    want |= {(arm, "nn256", s) for arm in DEFENSE_ARMS for s in DEFENSE_SEEDS}
     assert got == want
     names = [a["name"] for a in matrix]
-    assert len(set(names)) == len(names) == 150
+    assert len(set(names)) == len(names) == 129
     for a in matrix:
         assert a["name"] == gen.thesis_run_name(
             a["thesis_arm"], a["thesis_target"], a["thesis_seed"])
@@ -318,37 +327,39 @@ def test_the_whole_matrix_is_the_core_fifty_and_the_recurrent_hundred(
 
 def test_the_priority_order_is_the_owners(gen):
     order = gen.thesis_submission_order()
-    assert len(order) == 50 and len(set(order)) == 50
-    # the owner's priority list is the CORE matrix; no recurrent row is
-    # released to be submitted, so none of them appears here
+    assert len(order) == 49 and len(set(order)) == 49
+    # the owner's priority list is the CORE matrix and the defense arms; no
+    # recurrent row is released to be submitted, so none of them appears here
     assert {o[1] for o in order} == set(TARGETS)
     # 1. C and C_popart, both targets, five seeds
     assert [o[0] for o in order[:20]] == ["C"] * 10 + ["C_popart"] * 10
     assert {o[2] for o in order[:20]} == set(SEEDS)
-    # 2. condC, both targets, five seeds
-    assert [o[0] for o in order[20:30]] == ["condC"] * 10
-    assert {o[1] for o in order[20:30]} == set(TARGETS)
-    # 3. A and B at seed 250197 only
-    assert sorted(order[30:34]) == sorted(
+    # 2. A and B at seed 250197 only (condC left the matrix, 2026-09-25)
+    assert sorted(order[20:24]) == sorted(
         [(arm, t, SEEDS[0]) for arm in ("A", "B") for t in TARGETS])
-    # 4. the rest is A and B at the other four seeds, and nothing else
-    assert {o[0] for o in order[34:]} == {"A", "B"}
-    assert {o[2] for o in order[34:]} == set(SEEDS[1:])
-    assert gen.THESIS_BLOCK1 == 34
+    # 3. A and B at the other four seeds
+    assert {o[0] for o in order[24:40]} == {"A", "B"}
+    assert {o[2] for o in order[24:40]} == set(SEEDS[1:])
+    # 4. the defense arms on NN256 at three seeds, and nothing else
+    assert order[40:] == [(arm, "nn256", s) for arm in DEFENSE_ARMS
+                          for s in DEFENSE_SEEDS]
+    assert gen.THESIS_BLOCK1 == 24
 
 
 def test_only_the_first_block_is_submittable_the_rest_is_held(gen, matrix):
     block = gen.thesis_block1_arms()
-    assert len(block) == gen.THESIS_BLOCK1 == 34
+    assert len(block) == gen.THESIS_BLOCK1 == 24
     assert not any(a.get("held") for a in block)
     held = [a for a in matrix if a.get("held")]
-    # 16 core rows (A and B at the four later seeds) and every recurrent row
-    assert len(held) == 16 + 100 == 116
+    # 16 core rows (A and B at the four later seeds), every recurrent row and
+    # every defense row
+    assert len(held) == 16 + 80 + 9 == 105
     for a in held:
         text = gen.render(a)
         assert "*** HELD" in text and "ABORT(73)" in text, a["name"]
     # every held CORE row is an A or B row at a seed other than the first
-    core_held = [a for a in held if not a.get("thesis_rule")]
+    core_held = [a for a in held if not a.get("thesis_rule")
+                 and a["thesis_arm"] not in DEFENSE_ARMS]
     assert len(core_held) == 16
     for a in core_held:
         assert a["thesis_arm"] in ("A", "B"), a["name"]
@@ -359,7 +370,7 @@ def test_only_the_first_block_is_submittable_the_rest_is_held(gen, matrix):
     # and the first block holds exactly the runs the owner authorised
     got = {(a["thesis_arm"], a["thesis_target"], a["thesis_seed"])
            for a in block}
-    want = {(arm, t, s) for arm in ("C", "C_popart", "condC")
+    want = {(arm, t, s) for arm in ("C", "C_popart")
             for t in TARGETS for s in SEEDS}
     want |= {(arm, t, SEEDS[0]) for arm in ("A", "B") for t in TARGETS}
     assert got == want
@@ -377,8 +388,7 @@ def test_every_arm_carries_the_shared_thesis_flags(gen, matrix):
     for a in matrix:
         cli = _cli(gen, a)
         # the run
-        assert cli["--episodes"] == (LONG_EPISODES if _is_long_episodes(a)
-                                     else EPISODES), a["name"]
+        assert cli["--episodes"] == EPISODES, a["name"]
         assert cli["--checkpoint-every"] == CHECKPOINT_EVERY, a["name"]
         assert cli["--grad-oracle-cadence"] == GRAD_ORACLE_CADENCE, a["name"]
         assert cli["--pareto-dump-every"] == PARETO_DUMP_EVERY, a["name"]
@@ -393,14 +403,18 @@ def test_every_arm_carries_the_shared_thesis_flags(gen, matrix):
         assert cli["--fixed-order"] == ORDER, a["name"]
         assert cli["--approx-profile"] == "all", a["name"]
         assert cli["--approx-add"] == gen.APPROX_ADD == "lossless", a["name"]
-        # the reward stack the campaign settled
+        # the reward stack the campaign settled; dsnn-mep (owner ruling
+        # 2026-09-25) trains the static memory objective of slot 11 and keeps
+        # the watermark in slot 5 for the log
         assert cli["--cost-form"] == "paired-log", a["name"]
         assert cli["--mem-channel"] == MEM_CHANNEL, a["name"]
+        assert cli["--mem-type"] == "peak_memory", a["name"]
         assert gen.THESIS_MEM_CHANNEL == MEM_CHANNEL
         assert cli["--quality-metric"] == "grad_cosine", a["name"]
         assert cli["--paired-cost-floor"] == PAIRED_COST_FLOOR, a["name"]
         assert gen.THESIS_PAIRED_COST_FLOOR == PAIRED_COST_FLOOR
-        assert cli["--rewards"] == "cmp mem acc", a["name"]
+        assert cli["--rewards"] == REWARDS, a["name"]
+        assert cli["--mem-objective-weight"] == MEM_OBJECTIVE_WEIGHT, a["name"]
         assert cli["--lambda-cmp"] == "1" and cli["--lambda-mem"] == "1"
         assert cli["--discount"] == "1.0" and cli["--gae-lambda"] == "1.0"
         assert "--terminal-rewards-only" in cli, a["name"]
@@ -458,8 +472,8 @@ def test_every_arm_carries_the_shared_thesis_flags(gen, matrix):
 def test_dual_clip_reaches_every_row_thesis_arm_emits_and_no_other(gen,
                                                                    matrix,
                                                                    smoke):
-    """dsnn-dfw.95.  The cap is on the matrix -- A, B, C, C_popart and condC,
-    on every target -- and on the smoke, which has to start the same command
+    """dsnn-dfw.95.  The cap is on the matrix -- A, B, C, C_popart and the
+    defense arms, on every target -- and on the smoke, which has to start the same command
     line the matrix runs.
 
     It is OFF on the order-only tuning rows and on the three Lagrangian
@@ -496,7 +510,7 @@ def test_target_kl_reaches_every_row_thesis_arm_emits_and_no_other(gen,
                                                                    matrix,
                                                                    smoke):
     """dsnn-dfw.98.  The trust-region bound is on the matrix -- A, B, C,
-    C_popart and condC, on every target -- and on the smoke, which has to
+    C_popart and the defense arms, on every target -- and on the smoke, which has to
     start the same command line the matrix runs.
 
     It is OFF on the order-only tuning rows and on the three Lagrangian
@@ -631,9 +645,9 @@ def test_arms_a_and_b_are_the_fixed_form_with_no_quality_floor(gen, matrix):
         assert "\n  --quality-floor" not in text, a["name"]
 
 
-def test_the_three_c_arms_are_the_lagrangian_dual(gen, matrix):
+def test_the_c_arms_are_the_lagrangian_dual(gen, matrix):
     for a in matrix:
-        if a["thesis_arm"] not in ("C", "C_popart", "condC"):
+        if a["thesis_arm"] not in ("C", "C_popart"):
             continue
         cli = _cli(gen, a)
         assert cli["--reward-mode"] == "lagrangian", a["name"]
@@ -647,7 +661,7 @@ def test_the_three_c_arms_are_the_lagrangian_dual(gen, matrix):
         assert gen.DUAL_LAMBDA_MIN == DUAL_MIN
         assert cli["--lag-init"] == LAMBDA_Q, a["name"]
         if _has_normalized_init(a):
-            # rung 1 (or condC-on-TLM's own init) states the plan instead of
+            # rung 1 states the plan instead of
             # the bias; the two are mutually exclusive and ppo.py refuses
             # both at once
             assert "--face-none-bias" not in cli, a["name"]
@@ -662,18 +676,12 @@ RUNG1_ARMS = ("C", "C_popart")
 RUNG1_TARGET = "nn256"
 RUNG1_A = "3"
 RUNG1_KAPPA = "0.3"
-#: The recurrent target's rung-1 arm set is WIDER than NN256's: condC moves
-#: with C and C_popart there because it has no PopArt-form ruling of its own
-#: on that target to hold it back (owner ruling 2026-09-21).
-RUNG1_RSNN_ARMS = ("C", "C_popart", "condC")
+#: The recurrent target's rung-1 arm set was WIDER than NN256's while condC
+#: was a matrix arm; condC left the matrix (owner rulings 2026-09-25).
+RUNG1_RSNN_ARMS = ("C", "C_popart")
 #: The recurrent target drops to a=1 (owner ruling 2026-09-21, dsnn-dfw.84
 #: and dsnn-dfw.78); NN256 keeps a=3 above.  kappa is unchanged for both.
 RUNG1_RSNN_A = "1"
-#: condC on TLM renders on PopArt (like NN256) but takes its OWN face-init
-#: plan, not rung 1's (owner ruling 2026-09-21; the orchestrator sets these
-#: from a running probe before the merge).
-TLM_INIT_A = "1"
-TLM_INIT_KAPPA = "0.1"
 
 
 def _is_nn256_rung1(a) -> bool:
@@ -694,13 +702,9 @@ def _is_rung1(a) -> bool:
     return _is_nn256_rung1(a) or _is_rsnn_rung1(a)
 
 
-def _is_condc_tlm_init(a) -> bool:
-    return a["thesis_target"] == "tlm" and a["thesis_arm"] == "condC"
-
-
 def _has_normalized_init(a) -> bool:
     """Any row whose face-head init is a PLAN rather than a bias."""
-    return _is_rung1(a) or _is_condc_tlm_init(a)
+    return _is_rung1(a)
 
 
 def test_rung1_reaches_nn256_and_the_recurrent_target_and_nothing_else(
@@ -708,17 +712,15 @@ def test_rung1_reaches_nn256_and_the_recurrent_target_and_nothing_else(
     """THE ROWS.  dsnn-dfw.74 is an NN256 C/C_popart defect, so rung 1 was
     those ten rows -- five seeds each.  The recurrent target's init probe
     (agent rsnnpace, 2026-09-21) reproduced the same finding for its four
-    rules, so rung 1 reaches it too, for C, C_popart AND condC -- a wider
-    arm set, since the recurrent target has no PopArt ruling to hold condC
-    back.  condC on TLM ALSO carries a face-init plan, but its own, not
-    rung 1's, so it is counted separately.  No other arm and no other
-    target moves, or the ladder's steps are not controlled ones."""
+    rules, so rung 1 reaches it too, for C and C_popart.  No other arm (the
+    defense arms keep arm A's bias 0) and no other target moves, or the
+    ladder's steps are not controlled ones."""
     seen = set()
     for a in matrix:
         cli = _cli(gen, a)
         normalized = "--face-init-approx-per-plan" in cli
         assert normalized == _has_normalized_init(a), a["name"]
-        if normalized and not _is_condc_tlm_init(a):
+        if normalized:
             seen.add((a["thesis_arm"], a["thesis_target"], a["thesis_seed"]))
     want = {(arm, RUNG1_TARGET, s) for arm in RUNG1_ARMS for s in SEEDS}
     want |= {(arm, t, s) for arm in RUNG1_RSNN_ARMS for t in RSNN_TARGETS
@@ -750,46 +752,11 @@ def test_rung1_asks_for_the_approximation_count_and_skip_fraction_per_family(
     assert gen.RUNG1_SKIPS_PER_PLAN == RUNG1_KAPPA
 
 
-def test_the_conditioned_nn256_rows_run_two_thousand_episodes(gen, matrix):
-    """Owner ruling 2026-09-20. The conditioning has to amortise over the
-    whole weight span, so those five rows get twice the budget; every other
-    coordinate, condC on TLM and on the four recurrent targets included,
-    keeps the thousand."""
-    long_rows = set()
-    for a in matrix:
-        cli = _cli(gen, a)
-        is_long = cli["--episodes"] == LONG_EPISODES
-        assert is_long == _is_long_episodes(a), (a["name"], cli["--episodes"])
-        if not is_long:
-            assert cli["--episodes"] == EPISODES, a["name"]
-        else:
-            long_rows.add((a["thesis_arm"], a["thesis_target"],
-                           a["thesis_seed"]))
-            # the rendered file says so, in the command line and in the header
-            text = gen.render(a)
-            assert f"--episodes {LONG_EPISODES}" in text, a["name"]
-            assert f"THIS ROW RUNS {LONG_EPISODES} EPISODES" in text, a["name"]
-    assert long_rows == {(arm, LONG_EPISODES_TARGET, s)
-                         for arm in LONG_EPISODES_ARMS for s in SEEDS}
-    assert gen.THESIS_EPISODES_LONG == LONG_EPISODES
-    assert gen.THESIS_EPISODES == EPISODES
-
-
-def test_the_long_budget_does_not_reach_a_row_that_names_its_own(gen, smoke):
-    """The smoke rows pass an episode count of their own -- 20, its resume
-    twin, and 5 for the condC NN256 smoke.  A default that overrode them
-    would turn a 5-episode smoke into a 2000-episode run on a node."""
-    for a in smoke:
-        cli = _cli(gen, a)
-        assert cli["--episodes"] != LONG_EPISODES, a["name"]
-        assert f"THIS ROW RUNS {LONG_EPISODES} EPISODES" not in gen.render(a)
-
-
 def test_only_a_normalized_init_launcher_greps_for_the_two_new_flags(gen,
                                                                      matrix):
     """Layer 1 of a launcher greps ppo.py for every flag its own command
-    line uses, so a row whose init is a plan (rung 1, or condC-on-TLM's own
-    plan) must name the two; and NO other row may, because that list is
+    line uses, so a row whose init is a plan (rung 1) must name the two;
+    and NO other row may, because that list is
     rendered into the file and a running comparison's launcher does not
     change for a guard its row does not need."""
     for a in matrix:
@@ -844,71 +811,11 @@ def test_rung1_keeps_the_four_gpu_profile_and_the_paired_slots(gen, matrix):
     assert paired_halves, "the paired slots are gone"
 
 
-# ---------------------------- 2c. condC renders on popart on nn256 and tlm
-
-#: The owner's condC-on-PopArt rulings, typed here on purpose (2026-09-21).
-CONDC_POPART_TARGETS = ("nn256", "tlm") + RSNN_TARGETS
-
-
-def _is_condc_popart(a) -> bool:
-    return (a["thesis_target"] in CONDC_POPART_TARGETS
-            and a["thesis_arm"] == "condC")
-
-
-def test_condc_on_all_six_targets_render_on_the_popart_form(gen, matrix):
-    """Owner rulings 2026-09-21: condC on NN256, then TLM, then the four
-    recurrent targets, all take arm C_popart's own magnitude scaling --
-    read from C_popart's own row on that SAME target, not retyped -- in
-    place of the symlog form.  All five seeds each, on every one of the
-    six targets, singles and pairs both building from this same `cli`."""
-    for t in CONDC_POPART_TARGETS:
-        c_popart_cli = next(
-            _cli(gen, a) for a in matrix
-            if a["thesis_arm"] == "C_popart" and a["thesis_target"] == t)
-        seen = set()
-        for a in matrix:
-            if not (_is_condc_popart(a) and a["thesis_target"] == t):
-                continue
-            cli = _cli(gen, a)
-            for flag in ("--advantage-norm", "--no-symlog",
-                        "--symlog-channels"):
-                assert cli.get(flag, _MISSING) == \
-                    c_popart_cli.get(flag, _MISSING), (a["name"], flag)
-            assert cli["--advantage-norm"] == "popart", a["name"]
-            assert "--no-symlog" in cli, a["name"]
-            assert cli["--symlog-channels"] == "none", a["name"]
-            seen.add(a["thesis_seed"])
-        assert seen == set(SEEDS), t
-
-
-def test_condc_on_tlm_takes_its_own_face_init_plan(gen, matrix):
-    """condC on TLM renders on PopArt like condC on NN256, but its
-    face-head init is its OWN plan (TLM_INIT_APPROX_PER_PLAN /
-    TLM_INIT_SKIPS_PER_PLAN), not rung 1's 3/0.3 -- rung 1 was probed on
-    NN256 alone (owner ruling 2026-09-21, orchestrator sets the final
-    numbers from a running probe before the merge)."""
-    assert gen.TLM_INIT_APPROX_PER_PLAN == TLM_INIT_A
-    assert gen.TLM_INIT_SKIPS_PER_PLAN == TLM_INIT_KAPPA
-    seen = set()
-    for a in matrix:
-        if not (a["thesis_target"] == "tlm" and a["thesis_arm"] == "condC"):
-            continue
-        cli = _cli(gen, a)
-        assert cli["--face-init-approx-per-plan"] == TLM_INIT_A, a["name"]
-        assert cli["--face-init-skips-per-plan"] == TLM_INIT_KAPPA, a["name"]
-        assert "--face-none-bias" not in cli, a["name"]
-        text = gen.render(a)
-        assert f"--face-init-approx-per-plan {TLM_INIT_A}" in text, a["name"]
-        assert f"--face-init-skips-per-plan {TLM_INIT_KAPPA}" in text, \
-            a["name"]
-        seen.add(a["thesis_seed"])
-    assert seen == set(SEEDS)
-
+# ------------------------------- 2c. condC left the matrix (2026-09-25)
 
 def test_c_on_the_recurrent_targets_keeps_the_symlog_form(gen, matrix):
-    """condC now renders on PopArt everywhere (owner ruling 2026-09-21
-    reaches the recurrent targets too), but arm C itself never moved: it
-    keeps the symlog form on every target, recurrent included."""
+    """Arm C never moved: it keeps the symlog form on every target,
+    recurrent included."""
     seen = set()
     for a in matrix:
         if a["thesis_arm"] != "C":
@@ -922,63 +829,37 @@ def test_c_on_the_recurrent_targets_keeps_the_symlog_form(gen, matrix):
     assert seen == set(RSNN_TARGETS)
 
 
-def test_only_a_matrix_coordinate_can_be_a_condc_popart_row(gen):
-    """Mirrors `test_only_a_matrix_coordinate_can_be_a_rung1_row`: the
-    order-only preference row (dsnn-dfw.29/.45's `orderonly_arm`/
-    `orderonly_rsnn_arm`, `pref=True`) is condC on NN256 too and builds its
-    command line with the same `thesis_cli`, but it is a different round
-    (quality inert, --approx-profile none) whose record reads "unchanged
-    from the matrix"; `matrix_row=False`, thesis_cli's own default,
-    protects it."""
-    for t in CONDC_POPART_TARGETS:
-        assert gen.condc_popart_row("condC", t, True)
-        assert not gen.condc_popart_row("condC", t, False)
-        assert not gen.condc_popart_row("C", t, True)
-    # and the default of thesis_cli is the safe one
-    cli = gen.thesis_cli(arm="condC", target="nn256",
-                         seed=SEEDS[0], node=gen.THESIS_NODES[0], name="x",
-                         episodes="1", checkpoint_every="1", auto_stop=False)
-    assert cli["--advantage-norm"] == "none"
-    assert "--no-symlog" not in cli
-
-
-def test_only_a_matrix_coordinate_can_be_a_condc_tlm_init_row(gen):
-    assert gen.condc_tlm_init_row("condC", "tlm", True)
-    assert not gen.condc_tlm_init_row("condC", "tlm", False)
-    assert not gen.condc_tlm_init_row("C", "tlm", True)
-    assert not gen.condc_tlm_init_row("condC", "nn256", True)
-    # and the default of thesis_cli is the safe one
-    cli = gen.thesis_cli(arm="condC", target="tlm", seed=SEEDS[0],
-                         node=gen.THESIS_NODES[0], name="x",
-                         episodes="1", checkpoint_every="1", auto_stop=False)
-    assert "--face-none-bias" in cli
-    assert "--face-init-approx-per-plan" not in cli
-
-
-def test_c_is_not_conditioned_and_condc_is(gen, matrix):
-    """The one composition nothing has run: ppo.py ties nothing here, but
-    `campaign_arm` does (its L rows are all conditioned), so C without the
-    conditioning and condC with it is the difference this matrix needs."""
+def test_no_matrix_row_is_conditioned_and_the_frozen_preference_rows_are(
+        gen, matrix):
+    """condC left the matrix (owner rulings 2026-09-25), so no matrix row
+    carries the preference conditioning.  The frozen order-only preference
+    rows (dsnn-dfw.29/.45, `pref=True`) keep the condC form they ran with,
+    read from FROZEN_ARM_SPEC through the same `thesis_cli`."""
     for a in matrix:
+        assert "--preference-conditioned" not in _cli(gen, a), a["name"]
+        assert a["thesis_arm"] != "condC", a["name"]
+    pref = [a for a in gen.orderonly_arms() + gen.orderonly_rsnn_arms()
+            if a["thesis_arm"] == "condC"]
+    assert len(pref) == 3 + 6
+    for a in pref:
         cli = _cli(gen, a)
-        conditioned = "--preference-conditioned" in cli
-        assert conditioned == (a["thesis_arm"] == "condC"), a["name"]
-    # and ppo.py really does compose them rather than refuse the pair
+        assert "--preference-conditioned" in cli, a["name"]
+        assert cli["--advantage-norm"] == "none", a["name"]
+        assert "--no-symlog" not in cli, a["name"]
     ppo = open(os.path.join(_ALPHAGRAD, "src", "alphagrad", "approx",
                             "ppo.py")).read()
     assert "lagrangian + preference-conditioned" in ppo
 
 
-def test_popart_sets_no_symlog_at_every_site_on_c_popart_and_condc_popart(
+def test_popart_sets_no_symlog_at_every_site_on_c_popart_and_the_defense(
         gen, matrix):
     """The recorded trap of ticket .53: PopArt needs --no-symlog, and ppo.py
-    refuses a command line whose two symlog sites disagree.  condC on NN256
-    and on TLM render on the PopArt form too (owner rulings 2026-09-21,
-    section 8d, `test_condc_on_nn256_and_tlm_render_on_the_popart_form`
-    pins the detail); every other row keeps the symlog form."""
+    refuses a command line whose two symlog sites disagree.  The defense
+    arms (dsnn-dfw.231) carry C_popart's PopArt form; every other row keeps
+    the symlog form."""
     for a in matrix:
         cli = _cli(gen, a)
-        if a["thesis_arm"] == "C_popart" or _is_condc_popart(a):
+        if a["thesis_arm"] == "C_popart" or a["thesis_arm"] in DEFENSE_ARMS:
             assert cli["--advantage-norm"] == "popart", a["name"]
             assert "--no-symlog" in cli, a["name"]
             assert cli["--symlog-channels"] == "none", a["name"]
@@ -997,23 +878,19 @@ def test_the_arms_differ_only_where_the_matrix_says_they_do(gen, matrix):
     matrix coordinate: it is the node's GPU count minus the trainer's one
     GPU, and the runs are spread round-robin over nodes of two sizes.
     `test_the_nodes_and_the_actors_per_node_size` is what pins it, per arm,
-    against that node's own size.
+    against that node's own size.  The oracle's host budget follows the
+    node's size the same way (owner rulings 2026-09-25).
     """
     node_derived = {"--ray-measure", "--cpu-cores-per-actor",
-                    "--reserved-driver-cores"}
+                    "--reserved-driver-cores", "--grad-oracle-host-budget-gb"}
     allowed_between_arms = {
         "--name", "--face-none-bias", "--reward-mode", "--quality-floor",
         "--advantage-norm", "--no-symlog", "--symlog-channels",
-        "--preference-conditioned", "--lag-eta", "--lag-init", "--lag-min",
-        "--lag-max",
+        "--lag-eta", "--lag-init", "--lag-min", "--lag-max",
         # rung 1 (owner 2026-09-20): the face-head init of the NN256 C rows
         # is stated as a plan, not as a bias.  It is the same coordinate as
         # --face-none-bias, expressed in the other of the two ways.
         "--face-init-approx-per-plan", "--face-init-skips-per-plan",
-        # and the conditioned NN256 rows run twice the episodes (owner
-        # 2026-09-20); `test_the_conditioned_nn256_rows_run_two_thousand_
-        # episodes` is what pins which rows that is.
-        "--episodes",
     }
     by_key = {(a["thesis_arm"], a["thesis_target"], a["thesis_seed"]): a
               for a in matrix}
@@ -1141,45 +1018,52 @@ def test_the_nodes_and_the_actors_per_node_size(gen, matrix, smoke):
         assert (f"#SBATCH --gres=gpu:nvidia_rtx_pro_6000_blackwell_max-q_"
                 f"workstation_edition:{gpus}\n") in text, a["name"]
         assert f"#SBATCH -c {gen.BLACKWELL_CPUS[gpus]}\n" in text, a["name"]
-        assert f"#SBATCH --mem={gen.BLACKWELL_MEM[gpus]}\n" in text, a["name"]
+        # the row asks for the node's memory (owner rulings 2026-09-25)
+        assert f"#SBATCH --mem={ROW_MEM[gpus]}\n" in text, a["name"]
         assert "#SBATCH -p pgi15\n" in text, a["name"]
 
 
 def test_the_core_budget_is_the_ruling_and_is_disjoint(gen, matrix, smoke):
-    """The node's 64 logical CPUs, per node type (owner ruling Q3,
-    2026-09-18): the trainer, the timing actors and the gradient oracle hold
-    DISJOINT slices, and no arm carries a budget the node cannot hold."""
+    """Every CPU of the row, per node type (owner rulings Q3, 2026-09-18;
+    2026-09-23; 2026-09-25): the trainer, the timing actors and the gradient
+    oracle hold DISJOINT slices, the oracle takes every core the two leave,
+    and no arm carries a budget the node cannot hold."""
     from alphagrad.approx.common.core_budget import check_disjoint
-    assert gen.THESIS_CORE_BUDGET_CPUS == 64
+    assert gen.THESIS_CORE_BUDGET_CPUS == {4: 64, 8: 128}
     assert gen.THESIS_CORE_BUDGET == {
-        8: {"trainer": 8, "per_actor": 2, "oracle": 4},
-        4: {"trainer": 8, "per_actor": 2, "oracle": 4},
+        8: {"trainer": 8, "per_actor": 8, "oracle": 64},
+        4: {"trainer": 8, "per_actor": 8, "oracle": 32},
     }
     for gpus in (4, 8):
         lay = gen.thesis_core_layout(gpus)
         check_disjoint(lay)
         assert len(lay.timing_actors) == int(gen.THESIS_RAY_MEASURE[gpus])
+        assert lay.spare == (), gpus
     for a in matrix + smoke:
         gpus = gen.thesis_row_gpus(a["thesis_target"], a["node"])
         b = gen.THESIS_CORE_BUDGET[gpus]
         cli = _cli(gen, a)
         assert cli["--reserved-driver-cores"] == str(b["trainer"]), a["name"]
-        assert cli["--cpu-cores-per-actor"] == gen.THESIS_CORES_PER_ACTOR, \
-            a["name"]
+        assert cli["--cpu-cores-per-actor"] == str(b["per_actor"]) \
+            == gen.THESIS_CORES_PER_ACTOR, a["name"]
+        assert cli["--grad-oracle-cores"] == "0", a["name"]
 
 
 def test_the_first_block_spreads_over_every_released_node(gen):
     """The node is assigned round-robin over THESIS_NODES IN SUBMISSION
     ORDER, so the authorised block occupies all five queues at once instead
-    of stacking behind one of them."""
+    of stacking behind one of them.  Without condC's ten rows the 24 rows
+    no longer split within one of each other: gpu19 carries the NN256 C pair
+    and the A and B rows of seed 250197 (rows, not jobs: a pair is one)."""
     block = gen.thesis_block1_arms()
     order = {a["name"]: i for i, a in enumerate(block)}
-    assert len(order) == 34
+    assert len(order) == 24
     counts = {}
     for a in block:
         counts[a["node"]] = counts.get(a["node"], 0) + 1
     assert set(counts) == set(gen.THESIS_NODES)
-    assert max(counts.values()) - min(counts.values()) <= 1, counts
+    assert counts == {"pgi15-gpu15": 5, "pgi15-gpu16": 4, "pgi15-gpu18": 5,
+                      "pgi15-gpu19": 6, "pgi15-gpu20": 4}, counts
     # the first submissions go to a different node each
     n = len(gen.THESIS_NODES)
     assert len({a["node"] for a in block[:n]}) == n
@@ -1201,9 +1085,8 @@ def test_the_campaign_hardware_did_not_move(gen):
 
 # --------------------------------------------------------------- 5. the smoke
 
-def test_the_smoke_is_the_three_runs_the_owner_asked_for(gen, smoke):
-    assert [a["name"] for a in smoke] == [
-        "smoke_C_tlm", "smoke_C_tlm_resume", "smoke_condC_nn256"]
+def test_the_smoke_is_the_two_runs_left_after_condc(gen, smoke):
+    assert [a["name"] for a in smoke] == ["smoke_C_tlm", "smoke_C_tlm_resume"]
     for a in smoke:
         assert a["node"] == gen.THESIS_SMOKE_NODE == "pgi15-gpu16", a["name"]
         cli = _cli(gen, a)
@@ -1217,10 +1100,11 @@ def test_the_smoke_is_the_three_runs_the_owner_asked_for(gen, smoke):
         assert cli["--ppo-epochs"] == "1", a["name"]
         assert cli["--minibatches"] == "4", a["name"]
 
-    first, resume, cond = smoke
+    first, resume = smoke
     assert _cli(gen, first)["--episodes"] == "20"
     assert _cli(gen, first)["--example"] == "VmappedTransformerLM"
     assert first["env"]["ALPHAGRAD_NN_BATCH"] == "64"
+    assert first["env"] == {"ALPHAGRAD_NN_BATCH": "64", **MATRIX_ENV}
     assert _cli(gen, first)["--reward-mode"] == "lagrangian"
     assert _cli(gen, first)["--grad-oracle-cadence"] == "10"
     assert "--preference-conditioned" not in _cli(gen, first)
@@ -1229,22 +1113,13 @@ def test_the_smoke_is_the_three_runs_the_owner_asked_for(gen, smoke):
     assert _cli(gen, first)["--face-wire-faces"] == TLM_FACE_WIRE_FACES
     assert _cli(gen, resume)["--face-wire-faces"] == TLM_FACE_WIRE_FACES
 
-    assert _cli(gen, cond)["--episodes"] == "5"
-    assert _cli(gen, cond)["--example"] == "VmappedNeuralNetwork"
-    assert _cli(gen, cond)["--dataset"] == "mnist"
-    assert "--preference-conditioned" in _cli(gen, cond)
-    assert _cli(gen, cond)["--reward-mode"] == "lagrangian"
-    assert _cli(gen, cond)["--face-wire-faces"] == FACE_WIRE_FACES
-    assert cond["env"] == {"ALPHAGRAD_NN_HIDDEN": "256",
-                           "ALPHAGRAD_NN_BATCH": "4096", **MATRIX_ENV}
-
 
 def test_the_resume_leg_differs_in_resume_alone(gen, smoke):
     """A resume refuses any command line that differs from the checkpoint's
     in anything but --episodes and --resume (common/checkpoint.py), and
     --name is one of the fields it compares.  So the two legs are generated
     from one call and this test is the proof that they did not drift."""
-    first, resume, _cond = smoke
+    first, resume = smoke
     a, b = _cli(gen, first), _cli(gen, resume)
     diff = {k for k in set(a) | set(b) if a.get(k, _MISSING) != b.get(k, _MISSING)}
     assert diff == {"--resume"}, sorted(diff)
@@ -1294,6 +1169,10 @@ def test_thesis_arm_raises_on_a_row_outside_the_rulings(gen):
     gen.ARMS.pop()
     for bad, frag in (
         ({"arm": "D"}, "is not one of"),
+        # condC left the matrix (owner rulings 2026-09-25)
+        ({"arm": "condC"}, "is not one of"),
+        # a defense arm runs on NN256 only (dsnn-dfw.231)
+        ({"arm": "A_popart"}, "defense arm"),
         ({"target": "snn"}, "is not one of"),
         # the recurrent targets are the four RULED rules and nothing else: a
         # plausible-looking fifth is refused like any other unknown target
@@ -1367,7 +1246,7 @@ def test_auto_stop_needs_the_checkpoint_the_matrix_gives_it(gen, matrix):
         _auto.check_auto_stop_args(ns)          # raises on a bad pair
         assert _auto.check_points(ns) == (250, 500), a["name"]
         checked += 1
-    assert checked == 150
+    assert checked == 129
 
 
 def test_target_nodes_routing(monkeypatch):
@@ -1398,19 +1277,19 @@ def test_target_nodes_routing(monkeypatch):
 
 # ------------------------------------------------- 9. the recurrent block
 
-def test_the_recurrent_block_is_four_rules_five_arms_five_seeds(gen, snn):
-    """4 x 5 x 5 = 100 rows (owner ruling 2026-09-16)."""
+def test_the_recurrent_block_is_four_rules_four_arms_five_seeds(gen, snn):
+    """4 x 4 x 5 = 80 rows (owner rulings 2026-09-16 and 2026-09-25)."""
     assert gen.THESIS_TEMPORAL_RULES == TEMPORAL_RULES
     assert gen.THESIS_RSNN_TARGETS == RSNN_TARGETS
-    assert len(snn) == len(TEMPORAL_RULES) * len(ARMS) * len(SEEDS) == 100
+    assert len(snn) == len(TEMPORAL_RULES) * len(ARMS) * len(SEEDS) == 80
     got = {(a["thesis_rule"], a["thesis_arm"], a["thesis_seed"]) for a in snn}
     want = {(r, arm, s) for r in TEMPORAL_RULES for arm in ARMS
             for s in SEEDS}
     assert got == want
-    # each rule carries the whole five-arm five-seed block
+    # each rule carries the whole four-arm five-seed block
     for rule in TEMPORAL_RULES:
         rows = [a for a in snn if a["thesis_rule"] == rule]
-        assert len(rows) == 25, rule
+        assert len(rows) == 20, rule
         assert {a["thesis_arm"] for a in rows} == set(ARMS), rule
         assert {a["thesis_seed"] for a in rows} == set(SEEDS), rule
         assert {a["thesis_target"] for a in rows} == {f"rsnn_{rule}"}, rule
@@ -1430,7 +1309,7 @@ def test_every_recurrent_row_is_the_rsnn_shd_target(gen, snn):
         assert (f"\n  --example {RSNN_FORM[a['thesis_rule']][0]}\n"
                 in text), a["name"]
         assert "\n  --dataset shd\n" in text, a["name"]
-    # all four rules are present, each on 25 rows
+    # all four rules are present, each on 20 rows
     assert {a["thesis_rule"] for a in snn} == set(TEMPORAL_RULES)
     # --dataset shd is a value ppo.py's own argparse offers
     ppo = open(os.path.join(_ALPHAGRAD, "src", "alphagrad", "approx",
@@ -1454,16 +1333,17 @@ def test_the_recurrent_seeds_are_the_five_the_owner_named(gen, snn):
 def test_the_recurrent_run_names_are_unique_and_spelled_as_ruled(gen, snn,
                                                                  matrix):
     names = [a["name"] for a in snn]
-    assert len(set(names)) == len(names) == 100
+    assert len(set(names)) == len(names) == 80
     for a in snn:
         assert a["name"] == (f"{a['thesis_arm']}_rsnn_{a['thesis_rule']}"
                              f"_s{a['thesis_seed']}"), a["name"]
         assert _cli(gen, a)["--name"] == a["name"], a["name"]
     assert "C_rsnn_bptt_s250199" in names
     assert "C_popart_rsnn_tbptt_s250197" in names
-    assert "condC_rsnn_rtrl_s250201" in names
+    assert "B_rsnn_rtrl_s250201" in names
+    assert not any(n.startswith("condC_") for n in names)
     # and no recurrent name collides with a core name
-    assert len({a["name"] for a in matrix}) == 150
+    assert len({a["name"] for a in matrix}) == 129
 
 
 def test_every_recurrent_row_carries_the_nn256_and_tlm_flags_unchanged(
@@ -1472,22 +1352,23 @@ def test_every_recurrent_row_carries_the_nn256_and_tlm_flags_unchanged(
     row against its own arm-and-seed twin on each core target.  The ONLY
     keys allowed to differ are the run name, the three that say which
     target this is, the face-head init, the face-entropy weight, the PopArt
-    magnitude-scaling flags and (for condC on NN256) the episode count.
+    magnitude-scaling flags and the oracle's batch.
 
     --ray-measure is excluded because it is the node's GPU count minus one
     and the rows are spread over nodes of several sizes;
     `test_the_nodes_and_the_actors_per_node_size` and
     `test_the_recurrent_scheduling_matches_the_rest_of_the_matrix` pin it
-    per row.
+    per row.  The oracle's host budget follows the node the same way.
 
     The face-head init and the PopArt flags are excluded WHOLESALE rather
     than case-by-case: which rows carry the normalized init (rung 1, section
-    8b) and which render on PopArt (section 8d) is pinned by their own
-    dedicated tests, on both the NN256 and the TLM side (a recurrent C row
-    now shares rung 1's numbers with its NN256 twin but not with its TLM
-    one, and a recurrent condC row shares neither TLM condC's own init nor
-    either twin's PopArt form) -- this test's job is that NOTHING ELSE
-    differs.
+    8b) is pinned by its own dedicated tests, on both the NN256 and the TLM
+    side (a recurrent C row shares rung 1's numbers with its NN256 twin but
+    not with its TLM one) -- this test's job is that NOTHING ELSE differs.
+
+    The oracle's batch (report dsnn-dfw.237) is 2 on TLM and 0 on NN256 and
+    on the recurrent target: always a diff against the TLM twin, never
+    against the NN256 twin.
 
     The face-entropy weight is excluded too (owner ruling 2026-09-21,
     dsnn-dfw.84 and dsnn-dfw.78), but NOT wholesale: the recurrent row
@@ -1501,7 +1382,7 @@ def test_every_recurrent_row_carries_the_nn256_and_tlm_flags_unchanged(
     stays on the campaign's 64, same as its NN256 twin (never a diff), but
     its TLM twin renders 128 (always a diff).
     """
-    node_derived = {"--ray-measure"}
+    node_derived = {"--ray-measure", "--grad-oracle-host-budget-gb"}
     face_init = {"--face-none-bias", "--face-init-approx-per-plan",
                  "--face-init-skips-per-plan"}
     popart_flags = {"--advantage-norm", "--no-symlog", "--symlog-channels"}
@@ -1539,11 +1420,10 @@ def test_every_recurrent_row_carries_the_nn256_and_tlm_flags_unchanged(
                 # NN256 is on the SAME 64 as the recurrent target.
                 assert "--face-wire-faces" not in diff, (a["name"], t)
             diff -= {"--face-wire-faces"}
-            if _is_long_episodes(twin):
-                # the NN256 twin runs the long budget; the recurrent row is
-                # not on that ruling
-                assert "--episodes" in diff, (a["name"], t)
-                diff -= {"--episodes"}
+            # the oracle checks 2 recordings on TLM, the whole batch here
+            assert ("--grad-oracle-batch" in diff) == (t == "tlm"), \
+                (a["name"], t)
+            diff -= {"--grad-oracle-batch"}
             assert diff == target_keys, (a["name"], t, sorted(diff))
 
 
@@ -1586,17 +1466,17 @@ def test_the_recurrent_scheduling_matches_the_rest_of_the_matrix(gen, snn):
         text = gen.render(a)
         assert "#SBATCH --dependency=singleton\n" in text, a["name"]
         assert f"#SBATCH -w {a['node']}\n" in text, a["name"]
-    # 100 rows, NOT one even round robin any more (owner ruling 2026-09-21):
-    # the 75 non-rtrl rows split evenly over the three 4-GPU nodes, and the
-    # 25 rtrl rows split over the two 8-GPU nodes BY SEED (uneven, since the
+    # 80 rows, NOT one even round robin any more (owner ruling 2026-09-21):
+    # the 60 non-rtrl rows split evenly over the three 4-GPU nodes, and the
+    # 20 rtrl rows split over the two 8-GPU nodes BY SEED (uneven, since the
     # five seeds do not divide two nodes evenly).
     counts = {}
     for a in snn:
         counts[a["node"]] = counts.get(a["node"], 0) + 1
-    assert counts == {"pgi15-gpu15": 25, "pgi15-gpu16": 25,
-                      "pgi15-gpu18": 25, "pgi15-gpu19": 15,
-                      "pgi15-gpu20": 10}, counts
-    assert sum(counts.values()) == 100
+    assert counts == {"pgi15-gpu15": 20, "pgi15-gpu16": 20,
+                      "pgi15-gpu18": 20, "pgi15-gpu19": 12,
+                      "pgi15-gpu20": 8}, counts
+    assert sum(counts.values()) == 80
 
 
 def test_rtrl_renders_on_an_eight_gpu_node_round_robin_by_seed(gen, snn):
@@ -1769,7 +1649,7 @@ def test_the_measure_timeout_and_the_actor_cores_of_a_thesis_row(
     """Owner rulings 2026-09-23 and 2026-09-24 Q48: every row `thesis_arm`
     emits measures under --ray-measure-timeout 300, one deadline without a
     cold budget, and gives each timing actor 8 cores, on every node class.  The
-    frozen rounds keep 600 and the budget's per-actor width."""
+    frozen rounds keep 600 and the per-actor width of their own budget."""
     assert gen.THESIS_RAY_MEASURE_TIMEOUT == "300"
     assert gen.CAMPAIGN_RAY_MEASURE_TIMEOUT == "600"
     assert gen.THESIS_CORES_PER_ACTOR == "8"
@@ -1780,16 +1660,18 @@ def test_the_measure_timeout_and_the_actor_cores_of_a_thesis_row(
         text = gen.render(a)
         assert "--ray-measure-timeout 300" in text, a["name"]
         assert "--cpu-cores-per-actor 8" in text, a["name"]
+    assert gen.FROZEN_CORE_BUDGET == {"trainer": 8, "per_actor": 2}
     for a in _frozen_rounds(gen):
         cli = _cli(gen, a)
-        gpus = gen.thesis_row_gpus(a["thesis_target"], a["node"])
         assert cli["--ray-measure-timeout"] == \
             gen.CAMPAIGN_RAY_MEASURE_TIMEOUT, a["name"]
         assert cli["--cpu-cores-per-actor"] == \
-            str(gen.THESIS_CORE_BUDGET[gpus]["per_actor"]), a["name"]
+            str(gen.FROZEN_CORE_BUDGET["per_actor"]), a["name"]
+        assert cli["--reserved-driver-cores"] == \
+            str(gen.FROZEN_CORE_BUDGET["trainer"]), a["name"]
     from alphagrad.approx.common.core_budget import check_disjoint
     for gpus in (4, 8):
-        lay = gen.thesis_row_core_layout(gpus)
+        lay = gen.thesis_core_layout(gpus)
         check_disjoint(lay)
         assert lay.n_logical == gen.BLACKWELL_CPUS[gpus]
         assert all(w == 8 for _, w in lay.timing_actors)
@@ -1802,26 +1684,20 @@ def _jax_cache_lines_in(gen, text):
     return [ln for ln in lines if ln + "\n" in text]
 
 
-def test_the_compile_cache_is_exported_only_under_a_fixed_order(
+def test_no_row_thesis_arm_emits_exports_the_compile_cache(
         gen, matrix, smoke, pairs):
-    """Owner ruling 2026-09-23: under a free order every plan is a new
-    program and the per-node compile cache does not hit, so a thesis row
-    with --fixed-order free exports none of JAX_COMPILATION_CACHE_DIR and
-    its JAX_PERSISTENT_CACHE_* siblings; a fixed order exports all four.
-    The frozen rounds keep what they ran with."""
-    import copy
+    """Owner rulings 2026-09-23 and 2026-09-25 (dsnn-dfw.230): no row
+    `thesis_arm` emits exports JAX_COMPILATION_CACHE_DIR or its
+    JAX_PERSISTENT_CACHE_* siblings, under a free order or a fixed one.  The
+    frozen rounds keep what they ran with."""
     for a in matrix + smoke + pairs:
         assert _cli(gen, a)["--fixed-order"] == "free", a["name"]
-        text = gen.render(a)
-        assert _jax_cache_lines_in(gen, text) == [], a["name"]
-        assert "JAX_COMPILATION_CACHE_DIR" not in text, a["name"]
-        assert "JAX_PERSISTENT_CACHE_" not in text, a["name"]
-    for order in ("markowitz", "reverse"):
-        for a in (matrix[0], smoke[0], pairs[0]):
-            b = copy.deepcopy(a)
-            b["cli"]["--fixed-order"] = order
+        for order in ("free", "markowitz", "reverse"):
+            b = dict(a, cli=dict(a["cli"], **{"--fixed-order": order}))
             text = gen.render(b)
-            assert len(_jax_cache_lines_in(gen, text)) == 5, (a["name"], order)
+            assert _jax_cache_lines_in(gen, text) == [], (a["name"], order)
+            assert "JAX_COMPILATION_CACHE_DIR" not in text, (a["name"], order)
+            assert "JAX_PERSISTENT_CACHE_" not in text, (a["name"], order)
     for a in _frozen_rounds(gen):
         assert len(_jax_cache_lines_in(gen, gen.render(a))) == 5, a["name"]
 
@@ -1830,8 +1706,8 @@ def test_the_tlm_face_wire_budget_reaches_every_tlm_row_and_no_other(
         gen, matrix, smoke):
     """dsnn-dfw.104, owner ruling 2026-09-22.  Vertex 40 of a TLM plan
     carried 72 live faces at episode 55, past the campaign's 64, and the
-    trainer raised by design.  Its footprint mirrors `rung1_row`,
-    `condc_popart_row` and `condc_tlm_init_row`: ONLY A MATRIX COORDINATE
+    trainer raised by design.  Its footprint mirrors `rung1_row`: ONLY A
+    MATRIX COORDINATE
     (everything `thesis_arm` emits -- the matrix, the pair launchers and
     the smoke) renders it.  The order-only TLM final row is also target
     "tlm" and also goes through `thesis_cli`, but it is a DIFFERENT round

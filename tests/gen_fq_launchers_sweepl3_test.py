@@ -143,7 +143,8 @@ def test_no_other_row_changed(gen):
     from every matrix count the way rounds 1 and 2's markers do; the
     matrix and the earlier rounds' own rows are untouched by this file's
     grid."""
-    assert len(gen.thesis_core_arms()) == 50, len(gen.thesis_core_arms())
+    # 40 since condC left the matrix (owner rulings 2026-09-25)
+    assert len(gen.thesis_core_arms()) == 40, len(gen.thesis_core_arms())
     assert len(gen.sweepl_single_arms()) == 24, len(gen.sweepl_single_arms())
     assert len(gen.sweepl2_single_arms()) == 12, \
         len(gen.sweepl2_single_arms())

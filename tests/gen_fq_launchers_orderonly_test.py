@@ -499,7 +499,12 @@ def test_no_arm_that_existed_before_this_round_moved(gen):
             assert (f"#SBATCH --gres={gen.blackwell_gres(gpus)}\n"
                     in text), a["name"]
             assert f"#SBATCH -c {gen.BLACKWELL_CPUS[gpus]}\n" in text
-            assert f"#SBATCH --mem={gen.BLACKWELL_MEM[gpus]}\n" in text
+            # a row `thesis_arm` emits asks for the node's memory since the
+            # owner rulings of 2026-09-25 (THESIS_ROW_MEM); every other row
+            # keeps the old expression
+            assert (f"#SBATCH --mem="
+                    f"{a.get('mem') or gen.BLACKWELL_MEM[gpus]}\n") in text
+            assert a.get("mem") in (None, gen.THESIS_ROW_MEM[gpus]), a["name"]
         # and nothing outside gpu14 gained a PATH prepend
         assert "hpc_sdk" not in text, a["name"]
 
@@ -507,8 +512,9 @@ def test_no_arm_that_existed_before_this_round_moved(gen):
 def test_the_matrix_and_the_campaign_still_have_their_own_counts(gen):
     """The order-only rows are thesis arms -- they carry the singleton and the
     target shape -- but they are not matrix coordinates, and the matrix plus
-    the three smoke runs must still be exactly what the rulings say: the 50
-    core rows of 2026-09-15 and the 100 recurrent rows of 2026-09-16."""
+    the two smoke runs must still be exactly what the rulings say: the 40
+    core rows and the 80 recurrent rows once condC left (2026-09-25), plus
+    the 9 defense rows of dsnn-dfw.231."""
     # dsnn-dfw.45 added a second order-only round (the recurrent target,
     # `orderonly_rsnn`), excluded here exactly as `orderonly` (NN256) is, the
     # 2026-09-19 ruling added the five-seed BASELINE (`orderonly_final`),
@@ -522,20 +528,22 @@ def test_the_matrix_and_the_campaign_still_have_their_own_counts(gen):
               and not a.get("orderonly_tlm_final")
               and not a.get("paired") and not a.get("sweepl")
               and not a.get("sweepl2") and not a.get("sweepl3")]
-    assert len(gen.thesis_core_arms()) == 50
-    assert len(gen.thesis_snn_arms()) == 100
-    assert len(matrix) == 150
-    assert len(gen.thesis_smoke_arms()) == 3
+    assert len(gen.thesis_core_arms()) == 40
+    assert len(gen.thesis_snn_arms()) == 80
+    assert len(gen.thesis_defense_arms()) == 9
+    assert len(matrix) == 129
+    assert len(gen.thesis_smoke_arms()) == 2
     assert len(gen.orderonly_arms()) == N_RUNS
     assert len(gen.orderonly_final_arms()) == FINAL_N_RUNS
     assert len(gen.orderonly_tlm_final_arms()) == 1
     assert all(a.get("thesis") for a in gen.orderonly_arms())
     # the matrix rows never carry --approx-profile none
     assert {_cli(gen, a)["--approx-profile"] for a in matrix} == {"all"}
-    # block 1 is the 34 the owner authorised on 2026-09-16, and a tuning row
-    # is not one of them: a stray `sbatch` over the block must not start one
+    # block 1 is the 24 the owner authorised (2026-09-16, condC out since
+    # 2026-09-25), and a tuning row is not one of them: a stray `sbatch` over
+    # the block must not start one
     block = gen.thesis_block1_arms()
-    assert len(block) == gen.THESIS_BLOCK1 == 34
+    assert len(block) == gen.THESIS_BLOCK1 == 24
     assert not any(a.get("orderonly") for a in block)
     assert not any(a.get("orderonly_rsnn") for a in block)
 
@@ -672,16 +680,16 @@ def test_the_baseline_runs_one_seed_per_blackwell_node(gen, final_rows):
 
 def test_the_baseline_is_not_a_matrix_row_and_not_a_tuning_row(
         gen, final_rows, rows):
-    """It is its own kind: out of the 50 core rows, out of block 1, and out
+    """It is its own kind: out of the 40 core rows, out of block 1, and out
     of the three-seed tuning round it is the baseline for."""
     names = {a["name"] for a in final_rows}
     assert not (names & {a["name"] for a in rows})
     assert not any(a.get("orderonly") for a in final_rows)
     assert not any(a.get("orderonly_rsnn") for a in final_rows)
     assert not (names & {a["name"] for a in gen.thesis_core_arms()})
-    assert len(gen.thesis_core_arms()) == 50
+    assert len(gen.thesis_core_arms()) == 40
     assert not any(a.get("orderonly_final") for a in gen.thesis_block1_arms())
-    assert len(gen.thesis_block1_arms()) == gen.THESIS_BLOCK1 == 34
+    assert len(gen.thesis_block1_arms()) == gen.THESIS_BLOCK1 == 24
     # it IS a thesis arm, so every sweep over thesis arms reaches it
     assert names <= {a["name"] for a in gen.thesis_arms()}
 
@@ -794,8 +802,8 @@ def test_the_tlm_final_row_is_not_a_matrix_row_and_not_a_tuning_row(
     assert not a.get("orderonly") and not a.get("orderonly_final") \
         and not a.get("orderonly_rsnn"), a["name"]
     assert a["name"] not in {r["name"] for r in gen.thesis_core_arms()}
-    assert len(gen.thesis_core_arms()) == 50
+    assert len(gen.thesis_core_arms()) == 40
     assert not any(a2.get("orderonly_tlm_final")
                   for a2 in gen.thesis_block1_arms())
-    assert len(gen.thesis_block1_arms()) == gen.THESIS_BLOCK1 == 34
+    assert len(gen.thesis_block1_arms()) == gen.THESIS_BLOCK1 == 24
     assert a["name"] in {r["name"] for r in gen.thesis_arms()}

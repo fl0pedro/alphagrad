@@ -2158,6 +2158,9 @@ not a summary.""",
 #   run name   <arm>_<target>_s<seed>, e.g. C_popart_tlm_s250197 and
 #              C_rsnn_bptt_s250199
 #
+# 2026-09-25 (owner rulings, grill rounds 1-3): condC left the matrix, and the
+# defense arms A_popart, A_popart_lq4 and A_popart_lq64 joined it on NN256.
+#
 # THE RECURRENT TARGET IS FOUR TARGETS, NOT ONE.  --example RSNN_SHD
 # --dataset shd is shared by all four and --temporal-rule is the one flag
 # that separates them, so the rule is part of the TARGET KEY rather than a
@@ -2166,8 +2169,8 @@ not a summary.""",
 # triple `<arm>_<target>_s<seed>`; with the key `rsnn_bptt` that spelling IS
 # the `<arm>_rsnn_<rule>_s<seed>` the owner asked for, and there is no second
 # naming rule to keep in step with the first.  The recurrent block is
-# therefore 4 rules x 5 arms x 5 seeds = 100 rows, and the whole thesis
-# section is 50 + 100 = 150 rows plus the three smoke runs.
+# therefore 4 rules x 4 arms x 5 seeds = 80 rows, and the whole thesis
+# section is 40 + 80 rows, the 9 defense rows and the two smoke runs.
 #
 # --example STAYS RSNN_SHD ON ALL FOUR, window2 INCLUDED.  window2 builds a
 # different graph -- two step copies joined by the temporal edge -- but
@@ -2193,7 +2196,9 @@ not a summary.""",
 # the same dual WITH it.  ppo.py has composed the two since 2026-09-04 (it
 # prints "[cfg] lagrangian + preference-conditioned: Dirichlet over (latency,
 # memory) only; the quality preference IS lambda") but NO run has ever used
-# the composition, which is why the smoke includes one condC run.
+# the composition, which is why the smoke included one condC run.  Since
+# 2026-09-25 only the frozen order-only preference rows carry condC
+# (FROZEN_ARM_SPEC).
 # ---------------------------------------------------------------------------
 
 #: `thesis_arm(arm=...)` takes the ARM NAME in a parameter called `arm`, which
@@ -2235,8 +2240,18 @@ THESIS_PAIRED_COST_FLOOR = "byte"
 THESIS_DUAL_LAMBDA_MAX = "64"
 #: THE MEMORY CHANNEL (c).  watermark, not the campaign's static temp bytes:
 #: the runtime water level is the real quantity and it carries the allocator
-#: step.
+#: step.  Since 2026-09-25 slot 5 is logged and not trained on a row that
+#: carries THESIS_MEM_OBJECTIVE_WEIGHT below.
 THESIS_MEM_CHANNEL = "watermark"
+#: THE TRAINED MEMORY CHANNEL (dsnn-mep; owner ruling 2026-09-25, round 1 Q4;
+#: dsnn-xvi): reward slot 11, the three static memory_analysis() log ratios
+#: against rev-exact, at weight 1.  "mem" leaves --rewards, so the value head
+#: of slot 5 gets weight 0.
+THESIS_MEM_OBJECTIVE_WEIGHT = "1"
+#: THE MEASURE PATH (dsnn-dfw.169; owner ruling 2026-09-25, round 1 Q2):
+#: env.py reads both; ppo.py has no flag for them.
+THESIS_MEASURE_PATH_ENV = {"ALPHAGRAD_DIRECT_MEASURE": "1",
+                           "ALPHAGRAD_UNIFIED_FACE_ENUM": "1"}
 #: AUTO-STOP IS OFF ON A FINAL ROW (d).  A FINAL row is one `thesis_arm`
 #: emits: the A/B/C arms of the matrix and the recurrent block.  A TUNING row
 #: (orderonly_nn256_*, orderonly_rsnn_*) calls `thesis_cli` itself with
@@ -2366,7 +2381,7 @@ PROACTIVE_RECYCLE_EVERY_VAR = "ALPHAGRAD_PROACTIVE_RECYCLE_EVERY"
 #: CAMPAIGN_RAY_MEASURE_TIMEOUT.
 THESIS_RAY_MEASURE_TIMEOUT = "300"
 #: THE CORES OF ONE TIMING ACTOR ON A THESIS ROW, on every node class (owner
-#: ruling 2026-09-23).  Frozen rounds keep THESIS_CORE_BUDGET's per_actor.
+#: ruling 2026-09-23).  Frozen rounds keep FROZEN_CORE_BUDGET's per_actor.
 THESIS_CORES_PER_ACTOR = "8"
 
 # ---------------------------------------------------------------------------
@@ -2411,17 +2426,47 @@ def thesis_row_gpus(target: str, node: str) -> int:
     if target in THESIS_UNIFORM_GPUS and node in THESIS_NODE_GPUS:
         return THESIS_UNIFORM_GPUS[target]
     return node_gpu_count(node)
-#: THE NODE'S CORE BUDGET, per node type, on 64 logical CPUs (owner ruling Q3,
-#: 2026-09-18; the measurement is dsnn-dfw.30 and the probe dsnn-dfw.40).  The
-#: trainer had no slice of its own and its host work ran on the same cores as
-#: the timing actors, which is what made the candidate latency bimodal.  A
-#: timing actor needs 2 logical CPUs: the timing is one second on the GPU.
-#: Everything the budget does not name stays spare.
-THESIS_CORE_BUDGET_CPUS = 64
-THESIS_CORE_BUDGET = {
-    8: {"trainer": 8, "per_actor": 2, "oracle": 4},
-    4: {"trainer": 8, "per_actor": 2, "oracle": 4},
-}
+#: -c and --mem by node size.  The 8-GPU values are the campaign's.  -c is
+#: every CPU of the node (sinfo 2026-09-25: 64 on pgi15-gpu15 to 18, 128 on
+#: pgi15-gpu19 and 20).  BLACKWELL_MEM stays what the campaign and the frozen
+#: rounds ask for; a row `thesis_arm` emits asks for THESIS_ROW_MEM.
+BLACKWELL_CPUS = {4: 64, 8: CAMPAIGN_CPUS}
+BLACKWELL_MEM = {4: "400G", 8: CAMPAIGN_MEM}
+#: THE ROW'S MEMORY AND THE ORACLE'S HOST BUDGET, by GPU profile (owner rulings
+#: 2026-09-25, dsnn-dfw.208; report dsnn-dfw.237).  sinfo RealMemory is
+#: 770000 MB on a 4-GPU node and 1540000 MB on an 8-GPU node (752 and 1504
+#: GiB): 740G and 1480G leave 12 and 24 GiB to the OS.  The peak RSS of a
+#: check is 1.03 to 1.34 times the size the budget bars, so an admitted check
+#: holds at most 1.34 x 300 = 402 GiB of 740 (338 GiB stay) and 1.34 x 600 =
+#: 804 GiB of 1480 (676 GiB stay) for the trainer and the timing actors, whose
+#: own host memory is not measured yet.
+THESIS_ROW_MEM = {4: "740G", 8: "1480G"}
+THESIS_GRAD_ORACLE_HOST_BUDGET_GB = {4: "300", 8: "600"}
+#: --grad-oracle-cores 0: every core the trainer and the timing actors leave
+#: (owner ruling 2026-09-25, round 1 Q11).  ppo.py computes that number at
+#: run time; THESIS_CORE_BUDGET's oracle entry is the same number.
+THESIS_GRAD_ORACLE_CORES = "0"
+#: THE ROW'S CORE BUDGET, by GPU profile, over every CPU the row asks for.
+#: Owner ruling Q3, 2026-09-18 (the measurement is dsnn-dfw.30 and the probe
+#: dsnn-dfw.40): the trainer had no slice of its own and its host work ran on
+#: the same cores as the timing actors, which is what made the candidate
+#: latency bimodal.  2026-09-23: 8 cores per timing actor.  2026-09-25: the
+#: oracle takes every core the two leave.
+THESIS_CORE_BUDGET_CPUS = BLACKWELL_CPUS
+
+
+def _thesis_core_budget(gpus: int) -> dict:
+    trainer, per_actor = 8, int(THESIS_CORES_PER_ACTOR)
+    return {"trainer": trainer, "per_actor": per_actor,
+            "oracle": (THESIS_CORE_BUDGET_CPUS[gpus] - trainer
+                       - int(THESIS_RAY_MEASURE[gpus]) * per_actor)}
+
+
+THESIS_CORE_BUDGET = {g: _thesis_core_budget(g) for g in (8, 4)}
+#: THE CORE BUDGET A FROZEN ROUND RAN UNDER (owner ruling Q3, 2026-09-18: a
+#: timing actor needs 2 logical CPUs, the timing is one second on the GPU).
+#: The order-only rounds and the three sweep rounds render these two flags.
+FROZEN_CORE_BUDGET = {"trainer": 8, "per_actor": 2}
 
 
 def thesis_core_layout(gpus: int):
@@ -2433,7 +2478,7 @@ def thesis_core_layout(gpus: int):
             f"{sorted(THESIS_CORE_BUDGET)} GPUs")
     b = THESIS_CORE_BUDGET[gpus]
     return node_core_layout(
-        THESIS_CORE_BUDGET_CPUS, int(THESIS_RAY_MEASURE[gpus]),
+        THESIS_CORE_BUDGET_CPUS[gpus], int(THESIS_RAY_MEASURE[gpus]),
         trainer_cores=b["trainer"], cores_per_actor=b["per_actor"],
         oracle_cores=b["oracle"])
 
@@ -2441,25 +2486,10 @@ def thesis_core_layout(gpus: int):
 # The budget must fit and be disjoint on every node type, checked at import so
 # a launcher can never be generated from a budget that oversubscribes a node.
 for _budget_gpus in sorted(THESIS_CORE_BUDGET):
-    thesis_core_layout(_budget_gpus)
-#: -c and --mem by node size.  The 8-GPU values are the campaign's.
-BLACKWELL_CPUS = {4: 64, 8: CAMPAIGN_CPUS}
-BLACKWELL_MEM = {4: "400G", 8: CAMPAIGN_MEM}
-
-
-# The layout a matrix row builds: its own -c CPUs and THESIS_CORES_PER_ACTOR.
-def thesis_row_core_layout(gpus: int):
-    from alphagrad.approx.common.core_budget import node_core_layout
-    b = THESIS_CORE_BUDGET[gpus]
-    return node_core_layout(
-        BLACKWELL_CPUS[gpus], int(THESIS_RAY_MEASURE[gpus]),
-        trainer_cores=b["trainer"],
-        cores_per_actor=int(THESIS_CORES_PER_ACTOR),
-        oracle_cores=b["oracle"])
-
-
-for _budget_gpus in sorted(THESIS_CORE_BUDGET):
-    thesis_row_core_layout(_budget_gpus)
+    if thesis_core_layout(_budget_gpus).spare:
+        raise ValueError(
+            f"the {_budget_gpus}-GPU core budget leaves cores spare; the "
+            f"oracle takes every core the trainer and the timing actors leave")
 #: The node the smoke runs on (owner: "SMOKE on gpu16").
 THESIS_SMOKE_NODE = "pgi15-gpu16"
 
@@ -2672,10 +2702,20 @@ THESIS_TARGET_ENV = {
 #: any other key, exactly as it refuses every per-arm export on a campaign arm.
 THESIS_TARGET_ENV_ALLOWED = frozenset(
     k for env in THESIS_TARGET_ENV.values() for k in env
-) | {MEASURE_CACHE_CLEAR_EVERY_VAR, PROACTIVE_RECYCLE_EVERY_VAR, NN_BATCH_VAR}
+) | {MEASURE_CACHE_CLEAR_EVERY_VAR, PROACTIVE_RECYCLE_EVERY_VAR, NN_BATCH_VAR
+     } | set(THESIS_MEASURE_PATH_ENV)
 #: Every `export NAME=` a THESIS launcher may contain: the campaign's allowed
 #: set plus the target-shape variables above.
 THESIS_ENV_ALLOWED = frozenset(CAMPAIGN_ENV_ALLOWED) | THESIS_TARGET_ENV_ALLOWED
+
+
+#: THE ORACLE'S BATCH BY TARGET (report dsnn-dfw.237).  NN256 checks its whole
+#: batch: 8 to 70 GiB RSS at B=4096 over 4 random orders.  One TLM recording
+#: asks 4.4 to 101.5 GiB of XLA temp per order, so the batch of 64 fits no
+#: node and TLM checks its first 2: 10.7 to 138.3 GiB over 16 orders.  A
+#: full-rollout recurrent target checks its whole batch whatever the flag says.
+THESIS_GRAD_ORACLE_BATCH = {"nn256": "0", "tlm": "2",
+                            **{t: "0" for t in THESIS_RSNN_TARGETS}}
 
 
 def thesis_target_form(target: str, batched: bool) -> tuple[dict, dict]:
@@ -2708,8 +2748,8 @@ def thesis_temporal_rule(target: str) -> str | None:
 #: `thesis_arm` emits (`matrix_row=True`) -- renders this instead of the
 #: campaign constant.  The order-only TLM final row is also target "tlm"
 #: and also goes through `thesis_cli`, but it is a DIFFERENT round with its
-#: own record (mirroring `rung1_row`/`condc_popart_row`/
-#: `condc_tlm_init_row`), so it keeps 64.  Every other thesis target (nn256
+#: own record (mirroring `rung1_row`), so it keeps 64.  Every other thesis
+#: target (nn256
 #: and the four recurrent rules) keeps CAMPAIGN_FACE_WIRE_FACES regardless
 #: of `matrix_row`.
 THESIS_TLM_FACE_WIRE_FACES = "128"
@@ -2720,15 +2760,28 @@ THESIS_TLM_FACE_WIRE_FACES = "128"
 # the face-head init bias, the reward form, the advantage normalisation and
 # whether the preference conditioning is composed on top.
 # ---------------------------------------------------------------------------
-THESIS_ARMS = ("A", "B", "C", "C_popart", "condC")
+#: condC left the matrix (owner rulings 2026-09-25, round 1 Q1, round 2 Q1).
+THESIS_ARMS = ("A", "B", "C", "C_popart")
+#: THE DEFENSE ARMS (dsnn-dfw.231; owner ruling 2026-09-25, round 3 Q1 b):
+#: arm A with C_popart's PopArt form at lambda_q 16, 4 and 64, so that A, C,
+#: C_popart and these span {fixed, L} x {symlog, PopArt}.  NN256 only, three
+#: seeds per point, the full experiments only.
+THESIS_DEFENSE_ARMS = ("A_popart", "A_popart_lq4", "A_popart_lq64")
+THESIS_DEFENSE_TARGET = "nn256"
+THESIS_DEFENSE_SEEDS = THESIS_SEEDS[:3]
 THESIS_ARM_SPEC = {
-    # arm: (face_none_bias, form, advantage_norm, conditioned)
-    "A": ("0", "fixed", "none", False),
-    "B": ("4", "fixed", "none", False),
-    "C": ("2", "L", "none", False),
-    "C_popart": ("2", "L", "popart", False),
-    "condC": ("2", "L", "none", True),
+    # arm: (face_none_bias, form, advantage_norm, conditioned, lambda_q)
+    "A": ("0", "fixed", "none", False, THESIS_LAMBDA_Q),
+    "B": ("4", "fixed", "none", False, THESIS_LAMBDA_Q),
+    "C": ("2", "L", "none", False, THESIS_LAMBDA_Q),
+    "C_popart": ("2", "L", "popart", False, THESIS_LAMBDA_Q),
+    "A_popart": ("0", "fixed", "popart", False, THESIS_LAMBDA_Q),
+    "A_popart_lq4": ("0", "fixed", "popart", False, "4"),
+    "A_popart_lq64": ("0", "fixed", "popart", False, "64"),
 }
+#: The arm the frozen order-only preference rows ran (ORDERONLY_PREF_ARM).
+#: `thesis_cli` reads it; `thesis_arm` refuses it.
+FROZEN_ARM_SPEC = {"condC": ("2", "L", "none", True, THESIS_LAMBDA_Q)}
 
 # ---------------------------------------------------------------------------
 # RUNG 1 OF THE LADDER: THE NORMALIZED FACE-HEAD INIT (owner ruling
@@ -2757,12 +2810,8 @@ RUNG1_SKIPS_PER_PLAN = "0.3"
 #: 36-56 approximations per plan (F = 42 bptt / 65 rtrl), pins the quality
 #: median at exactly 0 and holds the PopArt quality head frozen from episode
 #: 0; the SAME plan as NN256's rung 1 -- 3 approximations, 0.3 skips -- gives
-#: q median 0.80 (bptt) / 0.46 (rtrl) and a feasible plan by episode 0. condC
-#: moves WITH C and C_popart here, unlike on NN256: the recurrent target has
-#: no PopArt-form ruling of its own to hold condC's init back (that ruling
-#: is NN256-only, `condc_popart_row`), so nothing keeps it on the ladder's
-#: first rung with its two siblings.
-RUNG1_RSNN_ARMS = ("C", "C_popart", "condC")
+#: q median 0.80 (bptt) / 0.46 (rtrl) and a feasible plan by episode 0.
+RUNG1_RSNN_ARMS = ("C", "C_popart")
 
 #: RUNG 1 ON THE RECURRENT TARGET DROPS TO a=1 (owner ruling 2026-09-21,
 #: dsnn-dfw.84 and dsnn-dfw.78).  a=3 above (RUNG1_APPROX_PER_PLAN, NN256's
@@ -2772,27 +2821,10 @@ RUNG1_RSNN_ARMS = ("C", "C_popart", "condC")
 #: zvmfnj2g, approx_prob/none 0.95 -> 0.78 -> 0.65 -> 0.57 at ep
 #: 50/150/290/410).  THESIS_FACE_ENTROPY_WEIGHT_LOW above is the other half
 #: of the fix; this constant is the first half, on the recurrent target
-#: ONLY -- TLM already uses a=1 (TLM_INIT_APPROX_PER_PLAN, below) and NN256
-#: keeps RUNG1_APPROX_PER_PLAN (3), unmeasured by dsnn-dfw.84's finding.
+#: ONLY -- NN256 keeps RUNG1_APPROX_PER_PLAN (3), unmeasured by dsnn-dfw.84's
+#: finding.
 #: kappa is unchanged: RUNG1_SKIPS_PER_PLAN (0.3) stays for both families.
 RUNG1_RSNN_APPROX_PER_PLAN = "1"
-
-#: THE LONG CONDITIONED ROWS (owner ruling 2026-09-20).  The
-#: preference-conditioned NN256 rows run TWICE the episodes of every other
-#: row: the conditioning has to amortise over the whole weight span before
-#: its front can be compared with the fixed-weight fronts, and a thousand
-#: episodes is the budget one weighting gets.  Only condC on NN256 moves.
-LONG_EPISODES_ARMS = ("condC",)
-LONG_EPISODES_TARGET = "nn256"
-THESIS_EPISODES_LONG = "2000"
-
-
-def thesis_row_episodes(arm: str, target: str) -> str:
-    """How many episodes the (arm, target) row runs when its caller does
-    not name a number of its own (the smoke rows do)."""
-    if target == LONG_EPISODES_TARGET and arm in LONG_EPISODES_ARMS:
-        return THESIS_EPISODES_LONG
-    return THESIS_EPISODES
 
 
 def rung1_row(arm: str, target: str, matrix_row: bool = True) -> bool:
@@ -2808,61 +2840,12 @@ def rung1_row(arm: str, target: str, matrix_row: bool = True) -> bool:
 
     THE RECURRENT TARGET IS ON THE SAME RUNG (owner ruling 2026-09-21): its
     four rules all take the same plan, RUNG1_APPROX_PER_PLAN /
-    RUNG1_SKIPS_PER_PLAN, for RUNG1_RSNN_ARMS -- a wider arm set than NN256's,
-    since condC has no PopArt-form ruling on this target to hold it back.
+    RUNG1_SKIPS_PER_PLAN, for RUNG1_RSNN_ARMS.
     """
     return (matrix_row
             and ((target == RUNG1_TARGET and arm in RUNG1_ARMS)
                  or (target in THESIS_RSNN_TARGETS and arm in RUNG1_RSNN_ARMS)))
 
-#: CONDC RENDERS ON THE POPART FORM ON NN256, TLM, AND NOW THE FOUR
-#: RECURRENT TARGETS TOO (owner rulings 2026-09-21).  Rung 1 (C symlog vs
-#: C_popart on NN256, dsnn-dfw epic comment 2026-09-21 06:30) found PopArt
-#: dominating symlog on every column at feasible fraction, q and
-#: feasible-plan latency; condC on NN256, then condC on TLM, then condC on
-#: the recurrent target, were each held on "the scaling ruling" until their
-#: turn.  condC on all six targets now takes exactly arm C_popart's own
-#: magnitude scaling: --advantage-norm popart, --no-symlog,
-#: --symlog-channels none (values read from THESIS_ARM_SPEC["C_popart"] and
-#: the popart branch below, not retyped).  The ruling has now reached the
-#: recurrent targets: condC no longer keeps the symlog form on any target.
-CONDC_POPART_TARGETS = ("nn256", "tlm") + THESIS_RSNN_TARGETS
-
-
-def condc_popart_row(arm: str, target: str, matrix_row: bool = True) -> bool:
-    """Is this (arm, target) a condC-on-PopArt row (owner ruling 2026-09-21)?
-
-    ONLY A MATRIX COORDINATE CAN BE ONE, mirroring `rung1_row`.  The
-    order-only preference row (dsnn-dfw.29/.45's `orderonly_arm`/
-    `orderonly_rsnn_arm`, `pref=True`) is also condC on NN256 and also goes
-    through `thesis_cli`, but it is a DIFFERENT round -- quality is inert
-    there (--approx-profile none) and its record reads "unchanged from the
-    matrix" -- so `matrix_row` is False for it and it does not move.
-    """
-    return (matrix_row and target in CONDC_POPART_TARGETS and arm == "condC")
-
-
-#: CONDC ON TLM TAKES ITS OWN FACE-HEAD INIT (owner ruling 2026-09-21).  It
-#: renders on the PopArt form like condC on NN256 (`condc_popart_row`
-#: above), but NN256's rung-1 plan (3 approximations, 0.3 skips) was probed
-#: on NN256 alone; TLM gets its own two numbers instead of borrowing NN256's.
-#: THE ORCHESTRATOR SETS THE FINAL VALUES FROM A RUNNING PROBE BEFORE THE
-#: MERGE (init probes in flight 2026-09-21: a=1 kappa=0.1 on pgi15-gpu15,
-#: a=0.5 kappa=0.05 on pgi15-gpu18) -- these two lines are the one place to
-#: change.
-TLM_INIT_APPROX_PER_PLAN = "1"
-TLM_INIT_SKIPS_PER_PLAN = "0.1"
-CONDC_TLM_INIT_TARGET = "tlm"
-
-
-def condc_tlm_init_row(arm: str, target: str, matrix_row: bool = True) -> bool:
-    """Is this (arm, target) the condC-on-TLM init row (owner ruling
-    2026-09-21)?
-
-    ONLY A MATRIX COORDINATE CAN BE ONE, mirroring `rung1_row` and
-    `condc_popart_row`.
-    """
-    return (matrix_row and target == CONDC_TLM_INIT_TARGET and arm == "condC")
 
 THESIS_FLAGS_FILES = REQUIRED_FLAGS_FILES + [
     # --checkpoint-every and --resume live in common/checkpoint.py and
@@ -2909,17 +2892,37 @@ DUAL_CLIP_REQUIRED_FLAGS = ["--dual-clip"]
 #: and to no other row's, exactly as DUAL_CLIP_REQUIRED_FLAGS above.
 TARGET_KL_REQUIRED_FLAGS = ["--target-kl"]
 
-THESIS_HEAD = f"""THE THESIS MATRIX (epic dsnn-dfw, ticket dsnn-dfw.4) under
+#: dsnn-mep's flag and the three oracle flags (dsnn-dfw.208, report
+#: dsnn-dfw.237), each added to the list of a row that passes it and to no
+#: other row's, exactly as DUAL_CLIP_REQUIRED_FLAGS above.
+MEM_OBJECTIVE_REQUIRED_FLAGS = ["--mem-objective-weight"]
+GRAD_ORACLE_REQUIRED_FLAGS = ["--grad-oracle-cores", "--grad-oracle-batch",
+                              "--grad-oracle-host-budget-gb"]
+
+_THESIS_SHARED_WATERMARK = f"""WHAT IS SHARED BY EVERY ARM.  Three trained channels -- paired log-difference
+latency, paired log-difference runtime watermark memory (both against
+rev-exact measured back to back in the same actor; --cost-form paired-log,
+--mem-channel {THESIS_MEM_CHANNEL}) and grad-cosine quality -- weighted
+--lambda-cmp 1 --lambda-mem 1."""
+
+_THESIS_SHARED_MEM_OBJECTIVE = f"""WHAT IS SHARED BY EVERY ARM.  Three trained channels -- paired log-difference
+latency (against rev-exact measured back to back in the same actor;
+--cost-form paired-log), the static memory objective (reward slot 11: the
+three memory_analysis() log ratios against the same rev-exact,
+--mem-objective-weight {THESIS_MEM_OBJECTIVE_WEIGHT}) and grad-cosine quality
+-- with --rewards cmp acc and --lambda-cmp 1.  The runtime watermark stays in
+slot 5 (--mem-channel {THESIS_MEM_CHANNEL}), logged and not trained (dsnn-mep,
+owner ruling 2026-09-25)."""
+
+
+def _thesis_head(shared: str) -> str:
+    return f"""THE THESIS MATRIX (epic dsnn-dfw, ticket dsnn-dfw.4) under
 the owner's rulings of 2026-09-15 and 2026-09-16.  Data collection, not a
 comparison of reward designs: the campaign's phases 1-5 decided the class set,
 the channels and the reward form, and these runs collect the fronts the thesis
 reports.
 
-WHAT IS SHARED BY EVERY ARM.  Three trained channels -- paired log-difference
-latency, paired log-difference runtime watermark memory (both against
-rev-exact measured back to back in the same actor; --cost-form paired-log,
---mem-channel {THESIS_MEM_CHANNEL}) and grad-cosine quality -- weighted
---lambda-cmp 1 --lambda-mem 1.
+{shared}
 Terminal rewards only, gamma = GAE lambda = 1, classic init with the MVP face
 head (--scale-face-head {SCALE_FACE_HEAD_MVP}, --face-logit-clamp
 {FACE_LOGIT_CLAMP_MVP}), the face ADD --approx-add {APPROX_ADD}, the paired
@@ -2951,6 +2954,12 @@ checkpoints and auto_stop.json all land, by common/checkpoint.run_directory --
 to the home export's thesis-runs directory whenever that export accepts
 writes, and marks a copy complete only after a checksum list verifies."""
 
+
+#: The header of a frozen round, as it ran.
+THESIS_HEAD = _thesis_head(_THESIS_SHARED_WATERMARK)
+#: The header of a row that trains the static memory objective.
+THESIS_MATRIX_HEAD = _thesis_head(_THESIS_SHARED_MEM_OBJECTIVE)
+
 _THESIS_ARM_WHAT = {
     "A": """CONTROL A: the fixed additive form at lambda_q """ + THESIS_LAMBDA_Q
          + """ with RAW quality
@@ -2976,11 +2985,13 @@ debiased-EMA normalisation of the value targets and sigma-scaled advantages.
 --no-symlog AND --symlog-channels none ride with it (ppo.py checks the two
 sites agree): symlog and PopArt address the same dynamic range and stacking
 them shrinks the memory channel about 14x instead of normalising it.""",
-    "condC": """ARM C composed with the PREFERENCE CONDITIONING: the policy
-reads a Dirichlet preference over (latency, memory) -- the quality
-preference IS lambda -- so one run amortises a whole front instead of one
-point.  ppo.py has allowed the composition since 2026-09-04 and no run has
-used it; the smoke runs one.""",
+    **{a: """DEFENSE ARM """ + a + """ (dsnn-dfw.231, owner ruling 2026-09-25,
+round 3 Q1 b): arm A -- the fixed additive form with RAW quality, NO floor,
+face-head init bias 0 -- at lambda_q """ + THESIS_ARM_SPEC[a][4] + """, with
+the PopArt form arm C_popart carries: --advantage-norm popart, --no-symlog,
+--symlog-channels none.  A, C, C_popart and the three A_popart arms span
+{fixed, L} x {symlog, PopArt}.  NN256 only, three seeds, the full experiments
+only: not in block 1 and not in the pilot.""" for a in THESIS_DEFENSE_ARMS},
 }
 
 _THESIS_ARM_PREDICTION = {
@@ -2997,11 +3008,21 @@ least 20 percent of terminal plans 250 episodes later.""",
     "C_popart": """REGISTERED BEFORE THE RUN, NEVER EDITED AFTER: the same
 front as C, reached no later, with a visibly smaller spread of the scalarized
 advantage across channels.""",
-    "condC": """REGISTERED BEFORE THE RUN, NEVER EDITED AFTER: one conditioned
-run covers the front that the unconditioned C seeds cover between them -- the
-readout at the final checkpoint over 40 preference points spans at least the
-latency range the five C seeds span.""",
+    **{a: """REGISTERED BEFORE THE RUN, NEVER EDITED AFTER (owner ruling
+2026-09-25, round 3 Q1 b): PopArt alone does not save the fixed form.  At
+lambda_q """ + THESIS_ARM_SPEC[a][4] + """ the front holds no terminal plan
+with paired latency ratio <= 0.6 at quality >= 0.9: the arm collapses to
+q = 0 as A does, or stays at the identity as B does.  PopArt rescales each
+head, so only the multiplier of the L form moves the trade-off when the floor
+breaks.""" for a in THESIS_DEFENSE_ARMS},
 }
+
+_THESIS_DEFENSE_HELD = """The defense arms run in the full experiments only
+(owner ruling 2026-09-25, round 3 Q1 b): not in block 1 and not in the pilot.
+They are GENERATED so that the 2x2 {fixed, L} x {symlog, PopArt} is
+reviewable, and HELD so that a stray `sbatch fq_*.sbatch` cannot start one.
+Remove `held=` from the row in tools/gen_fq_launchers.py and regenerate when
+the owner releases them."""
 
 _THESIS_FALSIFIER = """If the arm neither collapses nor produces a front but
 drifts (approx_prob/none > 0.99 with no plan outside the drift floor by
@@ -3010,8 +3031,8 @@ The arm is NOT retuned mid-matrix and no seed is dropped: the five seeds of an
 arm are reported together or not at all."""
 
 _THESIS_HELD = """The owner authorised the FIRST BLOCK only: C and C_popart on
-both targets at all five seeds, then condC on both targets at all five seeds,
-then A and B at seed """ + THESIS_SEEDS[0] + """ only.  The remaining A and B
+both targets at all five seeds, then A and B at seed """ + THESIS_SEEDS[0] + """
+only (condC left the matrix on 2026-09-25).  The remaining A and B
 seeds are GENERATED so that the matrix is complete and reviewable, and they
 are HELD so that a stray `sbatch fq_*.sbatch` cannot start one.  Remove
 `held=` from the row in tools/gen_fq_launchers.py and regenerate when the
@@ -3021,7 +3042,8 @@ owner releases them."""
 def thesis_run_name(arm: str, target: str, seed: str) -> str:
     """`<arm>_<target>_s<seed>` (owner ruling 2026-09-16)."""
     if arm not in THESIS_ARM_SPEC:
-        raise CampaignRowError(f"arm {arm!r} is not one of {THESIS_ARMS}")
+        raise CampaignRowError(
+            f"arm {arm!r} is not one of {tuple(THESIS_ARM_SPEC)}")
     if target not in THESIS_TARGET_CLI:
         raise CampaignRowError(
             f"target {target!r} is not one of {THESIS_TARGETS}")
@@ -3041,14 +3063,21 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
                dual_clip: str | None = None,
                target_kl: str | None = None,
                ray_measure_timeout: str = CAMPAIGN_RAY_MEASURE_TIMEOUT,
-               cores_per_actor: str | None = None) -> dict:
+               cores_per_actor: str | None = None,
+               mem_objective_weight: str | None = None,
+               whole_node: bool = False) -> dict:
     """The `cli` override dict of one thesis run.
 
     Everything the owner fixed is HERE, once, so the block and the smoke
     cannot disagree about anything except the three arguments the smoke
     changes on purpose (episodes, checkpoint interval, auto-stop).
     """
-    bias, form, advantage_norm, conditioned = THESIS_ARM_SPEC[arm]
+    spec = THESIS_ARM_SPEC.get(arm) or FROZEN_ARM_SPEC.get(arm)
+    if spec is None:
+        raise CampaignRowError(
+            f"arm {arm!r} is not one of {tuple(THESIS_ARM_SPEC)} or the "
+            f"frozen {tuple(FROZEN_ARM_SPEC)}")
+    bias, form, advantage_norm, conditioned, lambda_q = spec
     if face_entropy_weight is None:
         # dsnn-dfw.84 and dsnn-dfw.78 (owner ruling 2026-09-21): the
         # recurrent target and TLM render the near-zero bonus; NN256 is
@@ -3058,18 +3087,7 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
         face_entropy_weight = (THESIS_FACE_ENTROPY_WEIGHT_NN256
                                if target == "nn256"
                                else THESIS_FACE_ENTROPY_WEIGHT_LOW)
-    if condc_popart_row(arm, target, matrix_row):
-        # Owner ruling 2026-09-21: condC on NN256 and on TLM render on the
-        # PopArt magnitude scaling, arm C_popart's own advantage_norm, in
-        # place of the "none" (symlog) form THESIS_ARM_SPEC records for
-        # condC.
-        advantage_norm = THESIS_ARM_SPEC["C_popart"][2]
-    if condc_tlm_init_row(arm, target, matrix_row):
-        # condC on TLM takes its own face-init plan, not rung 1's (that
-        # plan was probed on NN256 alone).
-        face_init_cli = {"--face-init-approx-per-plan": TLM_INIT_APPROX_PER_PLAN,
-                          "--face-init-skips-per-plan": TLM_INIT_SKIPS_PER_PLAN}
-    elif rung1_row(arm, target, matrix_row):
+    if rung1_row(arm, target, matrix_row):
         # The recurrent target takes a=1 (dsnn-dfw.84 and dsnn-dfw.78, owner
         # ruling 2026-09-21); NN256 keeps a=3.  kappa is the same number for
         # both (RUNG1_SKIPS_PER_PLAN).
@@ -3089,7 +3107,7 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
         "--approx-profile": THESIS_PROFILE,
         "--fixed-order": THESIS_ORDER,
         "--approx-add": APPROX_ADD,
-        # --- the face head at init.  A rung-1 row (or condC on TLM) states
+        # --- the face head at init.  A rung-1 row states
         #     the PLAN it wants and lets ppo.py derive B and Bs from the
         #     reference order's face count; every other row keeps its
         #     recorded bias.  The two ways are mutually exclusive: ppo.py
@@ -3100,11 +3118,15 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
         "--face-entropy-weight": face_entropy_weight,
         "--face-entropy-floor": face_entropy_floor,
         "--face-entropy-floor-weight": "10.0",
-        # --- the reward
-        "--rewards": "cmp mem acc",
+        # --- the reward.  dsnn-mep: a row with the memory objective trains
+        #     slot 11 and logs slot 5; a frozen round keeps "mem".
+        "--rewards": ("cmp mem acc" if mem_objective_weight is None
+                      else "cmp acc"),
         "--lambda-cmp": "1",
         "--lambda-mem": "1",
-        "--lambda-acc": THESIS_LAMBDA_Q,
+        "--lambda-acc": lambda_q,
+        **({} if mem_objective_weight is None
+           else {"--mem-objective-weight": mem_objective_weight}),
         "--paired-cost-floor": THESIS_PAIRED_COST_FLOOR,
         "--mem-channel": THESIS_MEM_CHANNEL,
         "--advantage-norm": advantage_norm,
@@ -3112,10 +3134,19 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
         "--ray-measure": THESIS_RAY_MEASURE[gpus],
         "--ray-measure-timeout": ray_measure_timeout,
         # --- the node's core budget, disjoint by construction
-        "--reserved-driver-cores": str(THESIS_CORE_BUDGET[gpus]["trainer"]),
+        "--reserved-driver-cores": str(
+            FROZEN_CORE_BUDGET["trainer"] if cores_per_actor is None
+            else THESIS_CORE_BUDGET[gpus]["trainer"]),
         "--cpu-cores-per-actor": (
-            str(THESIS_CORE_BUDGET[gpus]["per_actor"])
+            str(FROZEN_CORE_BUDGET["per_actor"])
             if cores_per_actor is None else cores_per_actor),
+        # --- the gradient oracle of a row that holds the whole node
+        #     (dsnn-dfw.208, report dsnn-dfw.237)
+        **({} if not whole_node else {
+            "--grad-oracle-cores": THESIS_GRAD_ORACLE_CORES,
+            "--grad-oracle-batch": THESIS_GRAD_ORACLE_BATCH[target],
+            "--grad-oracle-host-budget-gb":
+                THESIS_GRAD_ORACLE_HOST_BUDGET_GB[gpus]}),
         "--measure-pipeline": CAMPAIGN_MEASURE_PIPELINE,
         "--rollout-shards": CAMPAIGN_ROLLOUT_SHARDS,
         # --- the actor's update budget (owner ruling 2026-09-20).  A matrix
@@ -3128,7 +3159,7 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
         # dsnn-dfw.104: TLM matrix coordinates (the matrix, the pair
         # launchers and the smoke -- everything `thesis_arm` emits) render
         # the raised budget.  ONLY A MATRIX COORDINATE CAN, mirroring
-        # `rung1_row`/`condc_popart_row`/`condc_tlm_init_row`: the
+        # `rung1_row`: the
         # order-only TLM final row is also target "tlm" and also goes
         # through `thesis_cli`, but it is a DIFFERENT round with its own
         # record, so `matrix_row` is False for it and it keeps 64.  Every
@@ -3166,7 +3197,7 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
         cli["--lag-eta"] = DUAL_ETA
         cli["--lag-min"] = DUAL_LAMBDA_MIN
         cli["--lag-max"] = THESIS_DUAL_LAMBDA_MAX
-        cli["--lag-init"] = THESIS_LAMBDA_Q
+        cli["--lag-init"] = lambda_q
     else:
         # ARMS A AND B: the fixed additive form with RAW quality and NO
         # floor (owner ruling 2026-09-16, night).  --quality-floor is not in
@@ -3208,7 +3239,10 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
                THESIS_PROACTIVE_RECYCLE_EVERY,
                ray_measure_timeout: str = THESIS_RAY_MEASURE_TIMEOUT,
                cores_per_actor: str | None = THESIS_CORES_PER_ACTOR,
-               jax_cache_fixed_order_only: bool = True,
+               jax_cache: bool = False,
+               measure_path: bool = True,
+               mem_objective_weight: str | None = THESIS_MEM_OBJECTIVE_WEIGHT,
+               whole_node: bool = True,
                batched: bool = True) -> dict:
     """One thesis run -> one `arm(...)`.  Returns the arm."""
     _require(node in THESIS_NODES,
@@ -3217,19 +3251,19 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
              f"12.9 ptxas and is never a node source; pgi15-gpu19 was "
              f"released back to us on 2026-09-20).")
     name = name or thesis_run_name(arm, target, seed)
-    _require(arm in THESIS_ARM_SPEC, f"arm {arm!r} is not one of {THESIS_ARMS}")
+    _require(arm in THESIS_ARM_SPEC,
+             f"arm {arm!r} is not one of {tuple(THESIS_ARM_SPEC)}")
     _require(target in THESIS_TARGET_CLI,
              f"target {target!r} is not one of {THESIS_TARGETS}")
+    _require(arm not in THESIS_DEFENSE_ARMS or target == THESIS_DEFENSE_TARGET,
+             f"arm {arm!r} is a defense arm and runs on "
+             f"{THESIS_DEFENSE_TARGET} only (dsnn-dfw.231), not on {target!r}")
     # The seed is checked here as well as in `thesis_run_name`, because a row
     # that passes its own `name` (the smoke rows do) never reaches that
     # helper, and a run on an unruled seed is not part of the matrix.
     _require(seed in THESIS_SEEDS,
              f"seed {seed!r} is not one of {THESIS_SEEDS}")
-    # A row that names no episode count gets the matrix's, which is 1000 for
-    # every coordinate but the long conditioned NN256 rows.  The smoke rows
-    # name their own and are unaffected.
-    episodes = thesis_row_episodes(arm, target) if episodes is None \
-        else episodes
+    episodes = THESIS_EPISODES if episodes is None else episodes
     cli = thesis_cli(arm=arm, target=target, seed=seed, node=node, name=name,
                      episodes=episodes, checkpoint_every=checkpoint_every,
                      auto_stop=auto_stop,
@@ -3241,10 +3275,21 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
                      dual_clip=dual_clip,
                      target_kl=target_kl,
                      ray_measure_timeout=ray_measure_timeout,
-                     cores_per_actor=cores_per_actor)
+                     cores_per_actor=cores_per_actor,
+                     mem_objective_weight=mem_objective_weight,
+                     whole_node=whole_node)
     if extra_cli:
         cli.update(extra_cli)
     gpus = thesis_row_gpus(target, node)
+    if whole_node:
+        b = THESIS_CORE_BUDGET[gpus]
+        _require(cli["--reserved-driver-cores"] == str(b["trainer"])
+                 and cli["--cpu-cores-per-actor"] == str(b["per_actor"]),
+                 f"{name}: --reserved-driver-cores "
+                 f"{cli['--reserved-driver-cores']} and --cpu-cores-per-actor "
+                 f"{cli['--cpu-cores-per-actor']} are not the {gpus}-GPU core "
+                 f"budget {b}, so the oracle's spare cores at run time are not "
+                 f"the budget's")
     a = dict(
         name=name, job=thesis_job_name(node), kind="train", runtime="scratch",
         node=node, time=time, gpus=gpus, singleton=True, thesis=True,
@@ -3253,56 +3298,43 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
         # coordinate a reader wants and it is DERIVED from the target, never
         # passed in, so the two cannot disagree.
         thesis_rule=thesis_temporal_rule(target),
-        # Owner ruling 2026-09-23: the per-node JAX compile cache is
-        # exported only when the order is fixed; under a free order every
-        # plan is a new program and the cache does not hit.
-        jax_cache_fixed_order_only=jax_cache_fixed_order_only,
+        # dsnn-dfw.230 (owner ruling 2026-09-25, round 1 Q19 b): no JAX
+        # compile cache under any order.  A frozen round passes True and
+        # keeps the cache it ran with.
+        jax_cache=jax_cache,
         # dsnn-dfw.99: the retention bound and the process recycle ride
         # with the target shape, and a row that renders `None` for either of
-        # the two drops that one export again.
+        # the two drops that one export again.  dsnn-dfw.169: the measure
+        # path rides the same way.
         env=dict(thesis_target_form(target, batched)[1],
                  **({MEASURE_CACHE_CLEAR_EVERY_VAR: cache_clear_every}
                     if cache_clear_every is not None else {}),
                  **({PROACTIVE_RECYCLE_EVERY_VAR: proactive_recycle_every}
-                    if proactive_recycle_every is not None else {})),
+                    if proactive_recycle_every is not None else {}),
+                 **(THESIS_MEASURE_PATH_ENV if measure_path else {})),
         required_flags=(THESIS_REQUIRED_FLAGS
                         + (DUAL_CLIP_REQUIRED_FLAGS
                            if dual_clip is not None else [])
                         + (TARGET_KL_REQUIRED_FLAGS
                            if target_kl is not None else [])
+                        + (MEM_OBJECTIVE_REQUIRED_FLAGS
+                           if mem_objective_weight is not None else [])
+                        + (GRAD_ORACLE_REQUIRED_FLAGS if whole_node else [])
                         + (RUNG1_REQUIRED_FLAGS
-                           if rung1_row(arm, target)
-                           or condc_tlm_init_row(arm, target) else [])),
+                           if rung1_row(arm, target) else [])),
         required_flags_file=" ".join(THESIS_FLAGS_FILES),
         cli=cli,
-        purpose=THESIS_HEAD + f"\n\nARM {arm} ON {target.upper()}, SEED "
-                              f"{seed}: " + (what or _THESIS_ARM_WHAT[arm])
-                + (f"\n\nTHIS ROW RUNS {THESIS_EPISODES_LONG} EPISODES, not "
-                   f"{THESIS_EPISODES} (owner ruling 2026-09-20): the "
-                   "conditioning has to amortise over the whole weight span "
-                   "before its front can be compared with the fixed-weight "
-                   "fronts, and the shared budget is what one weighting "
-                   "gets."
-                   if cli["--episodes"] == THESIS_EPISODES_LONG
-                   and target == LONG_EPISODES_TARGET
-                   and arm in LONG_EPISODES_ARMS else "")
-                + (f"\n\nTHIS ROW RENDERS ON THE POPART FORM, not symlog "
-                   "(owner ruling 2026-09-21): rung 1 found PopArt "
-                   "dominating symlog on every column, and condC on this "
-                   "target was held on the scaling ruling until this one.  "
-                   "condC on the four recurrent targets keeps the symlog "
-                   "form."
-                   if condc_popart_row(arm, target) else "")
-                + (f"\n\nTHIS ROW'S FACE-HEAD INIT IS ITS OWN, not rung "
-                   "1's: --face-init-approx-per-plan "
-                   f"{TLM_INIT_APPROX_PER_PLAN} --face-init-skips-per-plan "
-                   f"{TLM_INIT_SKIPS_PER_PLAN} (owner ruling 2026-09-21, "
-                   "the orchestrator sets the final numbers from a running "
-                   "probe before the merge)."
-                   if condc_tlm_init_row(arm, target) else ""),
+        purpose=(THESIS_HEAD if mem_objective_weight is None
+                 else THESIS_MATRIX_HEAD)
+                + f"\n\nARM {arm} ON {target.upper()}, SEED "
+                  f"{seed}: " + (what or _THESIS_ARM_WHAT[arm]),
         prediction=prediction or _THESIS_ARM_PREDICTION[arm],
         falsifier=_THESIS_FALSIFIER,
     )
+    if whole_node:
+        # One job of ours runs per node, so the row asks for the node's
+        # memory; THESIS_ROW_MEM carries the arithmetic.
+        a["mem"] = THESIS_ROW_MEM[gpus]
     if held:
         a["held"] = held
     arm_(**a)
@@ -3310,12 +3342,13 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
 
 
 def thesis_submission_order() -> list[tuple[str, str, str]]:
-    """(arm, target, seed) in THE OWNER'S PRIORITY ORDER (2026-09-16).
+    """(arm, target, seed) in THE OWNER'S PRIORITY ORDER (2026-09-16 and
+    2026-09-25: condC left the matrix, the defense arms joined it).
 
     1. C and C_popart, both targets, five seeds.
-    2. condC, both targets, five seeds.
-    3. A and B at seed 250197 only.
-    4. the remaining A and B seeds -- generated, HELD, not submitted.
+    2. A and B at seed 250197 only.
+    3. the remaining A and B seeds -- generated, HELD, not submitted.
+    4. the defense arms on NN256 at three seeds -- generated, HELD.
 
     The node of a run is assigned round-robin over THESIS_NODES IN THIS
     ORDER, so the first block spreads over every released node instead of
@@ -3326,9 +3359,6 @@ def thesis_submission_order() -> list[tuple[str, str, str]]:
         for t in ("tlm", "nn256"):
             for s in THESIS_SEEDS:
                 order.append((a, t, s))
-    for t in ("tlm", "nn256"):
-        for s in THESIS_SEEDS:
-            order.append(("condC", t, s))
     for a in ("A", "B"):
         for t in ("tlm", "nn256"):
             order.append((a, t, THESIS_SEEDS[0]))
@@ -3336,13 +3366,16 @@ def thesis_submission_order() -> list[tuple[str, str, str]]:
         for t in ("tlm", "nn256"):
             for s in THESIS_SEEDS[1:]:
                 order.append((a, t, s))
+    for a in THESIS_DEFENSE_ARMS:
+        for s in THESIS_DEFENSE_SEEDS:
+            order.append((a, THESIS_DEFENSE_TARGET, s))
     return order
 
 
 #: How many entries of `thesis_submission_order` the owner authorised to
-#: start after the smoke: C and C_popart (20), condC (10), A and B at one
-#: seed (4).  The rest are held.
-THESIS_BLOCK1 = 20 + 10 + 4
+#: start after the smoke: C and C_popart (20), A and B at one seed (4).  The
+#: rest are held.
+THESIS_BLOCK1 = 20 + 4
 
 
 def thesis_arms() -> list[dict]:
@@ -3362,8 +3395,9 @@ def thesis_pair_arms() -> list[dict]:
 
 def thesis_block1_arms() -> list[dict]:
     # The order-only tuning rows (tickets dsnn-dfw.29 and dsnn-dfw.45) are
-    # thesis arms but not matrix coordinates: block 1 is the 34 runs of the
-    # matrix the owner authorised on 2026-09-16 and nothing else.
+    # thesis arms but not matrix coordinates: block 1 is the 24 runs of the
+    # matrix the owner authorised (2026-09-16, without condC since
+    # 2026-09-25) and nothing else.
     return [a for a in thesis_arms()
             if not a.get("held") and not a.get("smoke") and not a.get("paired")
             and not a.get("orderonly") and not a.get("orderonly_rsnn")
@@ -3374,7 +3408,7 @@ def thesis_block1_arms() -> list[dict]:
 
 
 def thesis_snn_arms() -> list[dict]:
-    """The 100 rows of the recurrent target, in generation order.
+    """The 80 rows of the recurrent target, in generation order.
 
     The order-only recurrent rows (ticket dsnn-dfw.45) carry a
     `thesis_rule` too -- that is what a reader wants from them -- but they
@@ -3388,13 +3422,22 @@ def thesis_snn_arms() -> list[dict]:
 
 
 def thesis_core_arms() -> list[dict]:
-    """The 50 NN256/TLM rows: the matrix without the recurrent target, the
-    smoke, the order-only tuning rows and the order-only baseline."""
+    """The 40 NN256/TLM rows: the matrix without the recurrent target, the
+    defense arms, the smoke, the order-only tuning rows and the order-only
+    baseline."""
     return [a for a in thesis_arms()
             if not a.get("smoke") and not a.get("thesis_rule")
             and not a.get("orderonly") and not a.get("orderonly_final")
             and not a.get("orderonly_tlm_final") and not a.get("paired")
-            and not a.get("sweepl") and not a.get("sweepl2") and not a.get("sweepl3")]
+            and not a.get("sweepl") and not a.get("sweepl2") and not a.get("sweepl3")
+            and a.get("thesis_arm") not in THESIS_DEFENSE_ARMS]
+
+
+def thesis_defense_arms() -> list[dict]:
+    """The 9 defense rows (dsnn-dfw.231): three arms, NN256, three seeds."""
+    return [a for a in thesis_arms()
+            if a.get("thesis_arm") in THESIS_DEFENSE_ARMS
+            and not a.get("paired")]
 
 
 # Target-pinned nodes (owner ruling 2026-09-17: "max 4* 2 tlm 2 nn256").
@@ -3406,12 +3449,10 @@ def thesis_core_arms() -> list[dict]:
 THESIS_TARGET_ARM_NODES = {
     ("tlm", "C"): "pgi15-gpu20",
     ("tlm", "C_popart"): "pgi15-gpu16",
-    ("tlm", "condC"): "pgi15-gpu20",
     ("tlm", "A"): "pgi15-gpu16",
     ("tlm", "B"): "pgi15-gpu20",
     ("nn256", "C"): "pgi15-gpu18",
     ("nn256", "C_popart"): "pgi15-gpu15",
-    ("nn256", "condC"): "pgi15-gpu18",
     ("nn256", "A"): "pgi15-gpu15",
     ("nn256", "B"): "pgi15-gpu18",
 }
@@ -3507,7 +3548,7 @@ def thesis_pair_arm(rows: list[dict]) -> dict:
         name=name, job=thesis_job_name(node), kind="train", runtime="scratch",
         node=node, time=a["time"], gpus=gpus, singleton=True, thesis=True,
         paired=True, halves=halves,
-        jax_cache_fixed_order_only=bool(a.get("jax_cache_fixed_order_only")),
+        jax_cache=a["jax_cache"],
         thesis_arm=arm_name, thesis_target=target,
         thesis_rule=thesis_temporal_rule(target),
         env=dict(a["env"]),
@@ -3524,13 +3565,16 @@ def thesis_pair_arm(rows: list[dict]) -> dict:
                 f"sibling job of this user on the same node.",
         prediction=a["prediction"], falsifier=a["falsifier"],
     )
+    if a.get("mem"):
+        # The two halves hold the whole node, so the pair asks for its memory.
+        p["mem"] = THESIS_ROW_MEM[gpus]
     if a.get("held"):
         p["held"] = a["held"]
     arm_(**p)
     return p
 
 
-# --- the 50 runs of the matrix ----------------------------------------------
+# --- the 49 runs of the matrix and the defense arms ------------------------
 _HALVES: dict[tuple[str, str], list[dict]] = {}
 _SLOT = 0
 _row: dict = {}
@@ -3547,7 +3591,9 @@ for _i, (_arm, _target, _seed) in enumerate(thesis_submission_order()):
     thesis_arm(
         arm=_arm, target=_target, seed=_seed,
         node=_node,
-        held=None if _i < THESIS_BLOCK1 else _THESIS_HELD,
+        held=(None if _i < THESIS_BLOCK1
+              else _THESIS_DEFENSE_HELD if _arm in THESIS_DEFENSE_ARMS
+              else _THESIS_HELD),
     )
     if _half is not None:
         # ARMS[-1], not the dict `thesis_arm` returns: `arm(**kw)` re-packs
@@ -3567,9 +3613,10 @@ del _i, _arm, _target, _seed, _node, _half, _row, _rows, _HALVES, _SLOT
 
 
 # ---------------------------------------------------------------------------
-# THE RECURRENT BLOCK (owner ruling 2026-09-16).  The same five arms and the
+# THE RECURRENT BLOCK (owner ruling 2026-09-16).  The same four arms and the
 # same five seeds as the matrix above, on --example RSNN_SHD --dataset shd,
-# crossed with the four temporal rules: 4 x 5 x 5 = 100 rows.
+# crossed with the four temporal rules: 4 x 4 x 5 = 80 rows (100 before condC
+# left the matrix on 2026-09-25).
 #
 # NOTHING ELSE MOVES.  These rows go through the same `thesis_cli`, so the
 # reward form per arm, the free spatial order, the thousand episodes, the
@@ -3581,7 +3628,7 @@ del _i, _arm, _target, _seed, _node, _half, _row, _rows, _HALVES, _SLOT
 #
 # THE ORDER of generation is rule, then arm, then seed.  It is a GENERATION
 # order and not a submission order: `thesis_submission_order` is the owner's
-# priority list and it still holds the 50 rows it always did, because no
+# priority list and it holds the NN256 and TLM rows only, because no
 # recurrent row is released to be submitted.
 #
 # THE NODE, per rule (owner ruling 2026-09-21, agent rsnnpace's pace
@@ -3592,8 +3639,8 @@ del _i, _arm, _target, _seed, _node, _half, _row, _rows, _HALVES, _SLOT
 # over the two released 8-GPU nodes (gpu19 first) so a seed always lands on
 # the same node and no rtrl row is paired with another on the same node
 # (`thesis_pair_arm` is never called here).  tbptt, bptt and window2 keep
-# the 4-GPU profile, round-robin over the three released 4-GPU nodes: 75
-# rows over 3 nodes is 25 each, exactly.
+# the 4-GPU profile, round-robin over the three released 4-GPU nodes: 60
+# rows over 3 nodes is 20 each, exactly.
 # ---------------------------------------------------------------------------
 #: The two 8-GPU nodes, in round-robin order (gpu19 first, owner ruling).
 THESIS_RSNN_RTRL_NODES = ("pgi15-gpu19", "pgi15-gpu20")
@@ -3639,7 +3686,7 @@ the rule and nothing else.""",
 }
 
 _THESIS_SNN_HELD = """The recurrent block is GENERATED so that the matrix is
-complete and reviewable, and every one of its 100 rows is HELD: the owner
+complete and reviewable, and every one of its 80 rows is HELD: the owner
 authorised the NN256/TLM first block only and released no RSNN_SHD run.  A
 held launcher that is submitted by mistake aborts 73 before it starts
 anything.  Remove `held=` from the recurrent loop in
@@ -3647,7 +3694,7 @@ tools/gen_fq_launchers.py and regenerate when the owner releases them."""
 
 
 def thesis_snn_order() -> list[tuple[str, str, str]]:
-    """(arm, target, seed) for the 100 recurrent rows, in GENERATION order.
+    """(arm, target, seed) for the 80 recurrent rows, in GENERATION order.
 
     Rule, then arm, then seed.  Not a submission order: every row is held.
     """
@@ -3659,7 +3706,7 @@ def thesis_snn_order() -> list[tuple[str, str, str]]:
     return order
 
 
-# --- the 100 runs of the recurrent block ------------------------------------
+# --- the 80 runs of the recurrent block -------------------------------------
 _rsnn_other_i = 0
 for _i, (_arm, _target, _seed) in enumerate(thesis_snn_order()):
     if thesis_temporal_rule(_target) == "rtrl":
@@ -3678,8 +3725,8 @@ del _i, _arm, _target, _seed, _node, _rsnn_other_i
 
 
 # ---------------------------------------------------------------------------
-# THE SMOKE (owner ruling 2026-09-16).  Three short runs on gpu16 that prove
-# the block can start, BEFORE 50 jobs are queued:
+# THE SMOKE (owner ruling 2026-09-16).  Two short runs on gpu16 that prove
+# the block can start, BEFORE the block is queued:
 #
 #   1. arm C on TLM, 20 episodes, --checkpoint-every 10, --auto-stop OFF.
 #      Auto-stop is off because its first check point is after 250 episodes;
@@ -3691,26 +3738,22 @@ del _i, _arm, _target, _seed, _node, _rsnn_other_i
 #      to arm 1 apart from that one flag -- which is why both are generated
 #      from one `thesis_cli` call instead of being written twice.  The
 #      checkpoint path is a shell placeholder the submitter exports.
-#   3. condC on NN256, 5 episodes: the ONE combination no run has ever
-#      executed (the Lagrangian dual composed with the preference
-#      conditioning) on the target whose shape comes from an env var.
 #
-# All three carry the per-node singleton name of gpu16, so they queue behind
-# each other and behind the block instead of sharing the node with it (the
-# epilog kills siblings).
+# The third run, condC on NN256, left with condC (owner rulings 2026-09-25).
+# Both carry the per-node singleton name of gpu16, so they queue behind each
+# other and behind the block instead of sharing the node with it (the epilog
+# kills siblings).
 # ---------------------------------------------------------------------------
 THESIS_SMOKE_EPISODES = "20"
 THESIS_SMOKE_CHECKPOINT_EVERY = "10"
-THESIS_SMOKE_NN_EPISODES = "5"
 _THESIS_RESUME_PLACEHOLDER = (
     "${THESIS_RESUME:?export THESIS_RESUME to the episode-10 checkpoint "
     "directory of the smoke run, e.g. .../ppo_ckpt_ep000000010}")
 
 _SMOKE_WHAT = """THE SMOKE, not a result.  It proves that the thesis command
-line starts on this stack, that a checkpoint is written, that a resume
+line starts on this stack, that a checkpoint is written, and that a resume
 continues the SAME run (the plan log appends and the front dumps keep
-coming), and that the Lagrangian dual composed with the preference
-conditioning runs at all.  No claim is made about learning in 20 episodes."""
+coming).  No claim is made about learning in 20 episodes."""
 
 _SMOKE_PREDICTION = """REGISTERED BEFORE THE RUN: the run reaches episode 20,
 writes ppo_ckpt_ep000000010 and ppo_ckpt_ep000000020, appends to
@@ -3758,18 +3801,6 @@ ARMS[-1]["falsifier"] = _SMOKE_FALSIFIER
 # whose --name differed from the checkpoint's is refused, and that refusal
 # already cost one agent a suite run (agent-ckpt-report section 9).
 ARMS[-1]["name"] = "smoke_C_tlm_resume"
-
-thesis_arm(
-    arm="condC", target="nn256", seed=THESIS_SEEDS[0], node=THESIS_SMOKE_NODE,
-    name="smoke_condC_nn256", episodes=THESIS_SMOKE_NN_EPISODES,
-    # dsnn-dfw.78 and owner ruling 2026-09-20: smoke is outside the thesis
-    # matrix, on both the entropy floor and the update budget.
-    face_entropy_floor="0.3", ppo_epochs="1", minibatches="4",
-    checkpoint_every=THESIS_SMOKE_CHECKPOINT_EVERY, auto_stop=False,
-    time="04:00:00", what=_SMOKE_WHAT, prediction=_SMOKE_PREDICTION,
-)
-ARMS[-1]["smoke"] = True
-ARMS[-1]["falsifier"] = _SMOKE_FALSIFIER
 
 
 def thesis_smoke_arms() -> list[dict]:
@@ -3959,7 +3990,13 @@ for _sweepl_tag, _sweepl_overrides in sweepl_configs():
             # frozen and keeps its timeout, cores and compile cache.
             ray_measure_timeout=CAMPAIGN_RAY_MEASURE_TIMEOUT,
             cores_per_actor=None,
-            jax_cache_fixed_order_only=False,
+            jax_cache=True,
+            # The rulings of 2026-09-25 (dsnn-dfw.169, dsnn-mep, dsnn-dfw.208)
+            # move the matrix rows; this round keeps its measure path, its
+            # memory channel, its oracle and its memory request.
+            measure_path=False,
+            mem_objective_weight=None,
+            whole_node=False,
             # dsnn-dfw.191: same reason, keeps the unbatched target too.
             batched=False,
         )
@@ -4133,7 +4170,13 @@ for _sweepl2_tag, _sweepl2_overrides in sweepl2_configs():
             # frozen and keeps its timeout, cores and compile cache.
             ray_measure_timeout=CAMPAIGN_RAY_MEASURE_TIMEOUT,
             cores_per_actor=None,
-            jax_cache_fixed_order_only=False,
+            jax_cache=True,
+            # The rulings of 2026-09-25 (dsnn-dfw.169, dsnn-mep, dsnn-dfw.208)
+            # move the matrix rows; this round keeps its measure path, its
+            # memory channel, its oracle and its memory request.
+            measure_path=False,
+            mem_objective_weight=None,
+            whole_node=False,
             # dsnn-dfw.191: same reason, keeps the unbatched target too.
             batched=False,
         )
@@ -4294,7 +4337,13 @@ for _sweepl3_tag, _sweepl3_overrides in sweepl3_configs():
             # frozen and keeps its timeout, cores and compile cache.
             ray_measure_timeout=CAMPAIGN_RAY_MEASURE_TIMEOUT,
             cores_per_actor=None,
-            jax_cache_fixed_order_only=False,
+            jax_cache=True,
+            # The rulings of 2026-09-25 (dsnn-dfw.169, dsnn-mep, dsnn-dfw.208)
+            # move the matrix rows; this round keeps its measure path, its
+            # memory channel, its oracle and its memory request.
+            measure_path=False,
+            mem_objective_weight=None,
+            whole_node=False,
             # dsnn-dfw.191: same reason, keeps the unbatched target too.
             batched=False,
         )
@@ -5466,6 +5515,15 @@ def _scratch_stack_block(target_env: dict | None = None,
         L.append("# device memory to the pool; only recycling the actor PROCESS")
         L.append("# does.  ppo.py has no flag for it.")
         L.append(f"export {PROACTIVE_RECYCLE_EVERY_VAR}={_proactive_recycle}")
+    _measure_path = {k: target_env.pop(k) for k in THESIS_MEASURE_PATH_ENV
+                     if k in target_env}
+    if _measure_path:
+        L.append("")
+        L.append("# THE MEASURE PATH (thesis matrix, dsnn-dfw.169): the direct")
+        L.append("# measurement and the unified face enumeration.  env.py reads")
+        L.append("# both, and ppo.py has no flag for them.")
+        for k in sorted(_measure_path):
+            L.append(f"export {k}={_measure_path[k]}")
     _batch = target_env.pop(NN_BATCH_VAR, None)
     if target_env:
         L.append("")
@@ -5484,8 +5542,9 @@ def _scratch_stack_block(target_env: dict | None = None,
     if jax_cache:
         L.extend(_jax_cache_lines())
     else:
-        L.append("# NO JAX COMPILE CACHE (owner ruling 2026-09-23): under a free")
-        L.append("# order every plan is a new program and the cache does not hit.")
+        L.append("# NO JAX COMPILE CACHE, under any order (owner rulings")
+        L.append("# 2026-09-23 and 2026-09-25, dsnn-dfw.230): writing it takes time")
+        L.append("# and most plans are never compiled again.")
     return L
 
 
@@ -5510,7 +5569,7 @@ def render(a: dict) -> str:
         # is 8 GPUs and renders the identical three lines it always did.
         L.append(f"#SBATCH --gres={node_gres(a['node'], gpus)}")
         L.append(f"#SBATCH -c {node_cpus(a['node'], gpus)}")
-        L.append(f"#SBATCH --mem={node_mem(a['node'], gpus)}")
+        L.append(f"#SBATCH --mem={a.get('mem') or node_mem(a['node'], gpus)}")
     elif gpus:
         L.append(f"#SBATCH --gres=gpu:{gpus}")
         L.append("#SBATCH -c 64")
@@ -5644,11 +5703,8 @@ def render(a: dict) -> str:
                 f"carry only {sorted(THESIS_TARGET_ENV_ALLOWED)}, the target "
                 f"shape that common/examples.py reads at import time and for "
                 f"which ppo.py has no flag.")
-        _order = dict(_merge_cli(a.get("cli") or {})).get("--fixed-order")
         L.extend(_scratch_stack_block(
-            a.get("env") or {},
-            jax_cache=not (a.get("jax_cache_fixed_order_only")
-                           and _order == "free")))
+            a.get("env") or {}, jax_cache=a.get("jax_cache", True)))
     else:
         # A wave/cpu/tool arm (owner ruling 2026-09-14): the same stack, the
         # same node-local $HOME for wandb, and the same ABORT(66) check as a
