@@ -157,7 +157,8 @@ def rsnn_one_call_step(program):
         given = tuple(args[RSNN_HEAD_SLOTS:])
         c = rsnn_given_container(states, weights, given)
         new = project_rsnn_carry(rows[1:], c, weights,
-                                 [tuple(jnp.shape(s)) for s in states])
+                                 [tuple(jnp.shape(s)) for s in states],
+                                 given=given, a_out=args[12])
         nxt = tuple(primal[1:])
         for a, b in zip(new + nxt, given + states):
             if a.dtype != b.dtype or jnp.shape(a) != jnp.shape(b):
@@ -1104,7 +1105,8 @@ def carry_from_program(seq, y, t, weights, program, container="exact"):
                 f"the plan's program returned {len(out)} rows; the rtrl "
                 f"target has the loss and {len(RSNN_STATE_NAMES)} state "
                 f"outputs")
-        new = project_rsnn_carry(out[1:], c, weights, state_shapes)
+        new = project_rsnn_carry(out[1:], c, weights, state_shapes,
+                                 given=given, a_out=consts[2])
         nxt = cell(x, *st, W, V, Wo, *consts)
         keep = u < t
         return (tuple(_select(keep, a, b) for a, b in zip(nxt, st)),

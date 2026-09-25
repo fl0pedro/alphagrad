@@ -515,7 +515,9 @@ def transport_order(o_list, variant) -> list:
     """
     vmap = variant["vertex_map"]
     valid = variant["valid"]
-    alt_carry = [v for v in variant["alt_carry"] if v in valid]
+    # Descending: the block is eliminated from the attached states back to
+    # the weights, so a readout factor meets the loss before the trace.
+    alt_carry = [v for v in variant["alt_carry"] if v in valid][::-1]
     base_carry = [int(v) for v in o_list if int(v) not in vmap]
     n_a, n_b = len(alt_carry), len(base_carry)
     out: list = []
