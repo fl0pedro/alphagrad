@@ -3181,6 +3181,10 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
         # --no-symlog; both are passed and ppo.py checks they agree.
         cli["--no-symlog"] = None
         cli["--symlog-channels"] = "none"
+    if cli["--example"].startswith("Vmapped"):
+        # dsnn-qaht: every G1 winners table was recorded on the unbatched
+        # TransformerLM graph, so its vertex ids do not name a batched graph.
+        cli["--gate-winners-table"] = _DELETE
     return cli
 
 

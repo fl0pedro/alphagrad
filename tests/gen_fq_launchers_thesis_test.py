@@ -446,9 +446,11 @@ def test_every_arm_carries_the_shared_thesis_flags(gen, matrix):
         assert gen.THESIS_TLM_FACE_WIRE_FACES == TLM_FACE_WIRE_FACES
         assert cli["--ray-measure-timeout"] == "300", a["name"]
         assert cli["--rollout-shards"] == "1", a["name"]
-        # the gate inputs, resolved from THIS arm's order
-        assert (cli["--gate-winners-table"]
-                == gen.CAMPAIGN_GATE_WINNERS_TABLES[ORDER]), a["name"]
+        # the gate inputs, resolved from THIS arm's order; a batched row
+        # passes no winners table (dsnn-qaht)
+        assert (cli.get("--gate-winners-table")
+                == (None if cli["--example"].startswith("Vmapped")
+                    else gen.CAMPAIGN_GATE_WINNERS_TABLES[ORDER])), a["name"]
         assert (cli["--gate-offline-contrast"]
                 == gen.GATE_OFFLINE_CONTRAST[ORDER]), a["name"]
 
@@ -582,6 +584,25 @@ def test_a_vmapped_row_carries_its_batch_and_no_frozen_round_moves(
     ds = open(os.path.join(_ALPHAGRAD, "src", "alphagrad", "approx", "common",
                            "datasets.py")).read()
     assert 'environ.get("ALPHAGRAD_NN_BATCH"' in ds
+
+
+def test_a_batched_row_passes_no_gate_winners_table(gen, matrix, smoke,
+                                                     pairs):
+    table = gen.CAMPAIGN_GATE_WINNERS_TABLES[ORDER]
+    assert table == "/Scratch/assmuth/sweep64/runs/markowitz/winners.csv"
+    for a in matrix + smoke + pairs:
+        cli = _cli(gen, a)
+        text = gen.render(a)
+        batched = cli["--example"].startswith("Vmapped")
+        passed = f"  --gate-winners-table {table}\n" in text
+        assert passed is not batched, a["name"]
+        assert ("--gate-winners-table" in cli) is not batched, a["name"]
+        assert ("gate G1 winners table" in text) is not batched, a["name"]
+    for a in _frozen_rounds(gen):
+        cli = _cli(gen, a)
+        assert (cli["--gate-winners-table"]
+                == gen.CAMPAIGN_GATE_WINNERS_TABLES[cli["--fixed-order"]]), \
+            a["name"]
 
 
 def test_arms_a_and_b_are_the_fixed_form_with_no_quality_floor(gen, matrix):
@@ -1498,6 +1519,9 @@ def test_every_recurrent_row_carries_the_nn256_and_tlm_flags_unchanged(
             diff -= node_derived
             diff -= face_init
             diff -= popart_flags
+            # dsnn-qaht: a batched row drops the G1 winners table; which rows
+            # do is pinned by test_a_batched_row_passes_no_gate_winners_table.
+            diff -= {"--gate-winners-table"}
             if t == "nn256":
                 # the recurrent row renders 0.005 (dsnn-dfw.84 and
                 # dsnn-dfw.78) against NN256's 0.05: always a real diff.
