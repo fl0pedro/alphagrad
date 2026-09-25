@@ -88,6 +88,7 @@ class _Instrument:
     def __init__(self, monkeypatch):
         self.refs: list = []
         self.windows: list = []
+        self.episode_ref_secs: list = []
         self.swell = False
         real_rep = env_mod._time_one_rep
 
@@ -118,6 +119,8 @@ class _Instrument:
         env_mod._callback(
             env.config, env.args, env.consts, jnp.asarray(order), specs,
             faces, skips, len(order), *samples)
+        self.episode_ref_secs.append(
+            list(env_mod._MEASURE_EPISODE["ref_secs"]))
         rec = env_mod.consume_plan_records()["records"][-1]
         mine = self.windows[start:]
         ref = [(lat, peak) for ex, lat, peak in mine if self._is_ref(ex)]
@@ -190,8 +193,9 @@ def test_the_second_plan_runs_no_reference_window_and_pairs_against_the_first(
     for k in ("ref_measure_inner", "ref_measure_windows", "ref_measure_secs"):
         assert rec_b[k] == rec_a[k], k
     assert rec_b["ref_measure_windows"] == REF_POINTS * REF_REPS
-    assert env_mod._MEASURE_EPISODE["ref_secs"][-2] > 0.0
-    assert env_mod._MEASURE_EPISODE["ref_secs"][-1] == 0.0
+    secs_a, secs_b = paired.episode_ref_secs
+    assert len(secs_a) == 1 and secs_a[0] > 0.0
+    assert secs_b == [0.0]
 
 
 def test_a_refused_plan_pairs_against_the_reference_of_the_plan_before(
@@ -253,3 +257,28 @@ def test_another_reference_protocol_times_its_own_reference(paired):
     assert len(ref_a) == REF_POINTS * REF_REPS
     assert len(ref_b) == REF_POINTS * (REF_REPS + 1)
     assert rec_b["ref_timing"] == "timed"
+
+
+def test_a_plan_refused_after_its_reference_windows_records_them_as_timed(
+        paired, monkeypatch):
+    env = _toy_env()
+    fwd, rev = _orders(env)
+    samples = _samples(2)
+    real = env_mod._prof_add
+
+    def boom(key, dt):
+        if key == "cb.exec_measure":
+            raise RuntimeError("RESOURCE_EXHAUSTED: Out of memory")
+        return real(key, dt)
+
+    monkeypatch.setattr(env_mod, "_prof_add", boom)
+    rec_a, ref_a, _ = paired.measure(env, fwd, samples)
+    monkeypatch.setattr(env_mod, "_prof_add", real)
+    env_mod.pop_measure_oom()
+    assert rec_a["refused"] == "oom:measurement"
+    assert len(ref_a) == REF_POINTS * REF_REPS
+    assert rec_a["ref_timing"] == "timed"
+    assert rec_a["ref_latency_ns"] == _median(lat for lat, _ in ref_a)
+    rec_b, ref_b, _ = paired.measure(env, rev, samples)
+    assert ref_b == [] and rec_b["ref_timing"] == "reused"
+    assert rec_b["ref_latency_ns"] == rec_a["ref_latency_ns"]

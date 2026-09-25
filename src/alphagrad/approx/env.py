@@ -9965,7 +9965,7 @@ def _callback_measured(
     # never executed; the reference is measured here with the window count a
     # measured plan's reference gets. `program` is the compiled candidate,
     # or None when none exists.
-    _st = {"program": None}
+    _st = {"program": None, "ref_timed": False}
 
     def _score_refusal(kind: str, reason: str, detail: dict, program):
         _REFUSAL_SCORER[0] = None
@@ -10014,7 +10014,8 @@ def _callback_measured(
                     (_r_points, _r_reps, bool(config.measure_latency),
                      _r_cfg_inner, _r_window_s, _r_warmup))
                 _r_once = _REF_ONCE.get(_r_key)
-                _r_timing = "timed" if _r_once is None else "reused"
+                _r_timing = ("timed" if _r_once is None or _st["ref_timed"]
+                             else "reused")
                 if _r_once is None:
                     if config.measure_latency:
                         _t_ref = 0.0
@@ -10683,6 +10684,7 @@ def _callback_measured(
                 "secs": float(sum(_ref_lat_samples)) * _ref_inner / 1e9,
                 "static": _static_memory_bytes(_ref_ex)}
             _REF_ONCE[_ref_once_k] = _ref_once
+            _st["ref_timed"] = True
         elif _paired:
             _ref_lat_samples = list(_ref_once["lat"])
             _ref_peak_samples = list(_ref_once["peak"])
