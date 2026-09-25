@@ -5219,6 +5219,20 @@ def resolve_measure_windows(t_exec_s: float, inner: int, budget_s: float,
     return int(min(cap, max(1, want)))
 
 
+def probe_counts_fixed(t_s: float, window_s: float, budget_s: float, hi: int,
+                       cap: int, cold_factor: float = 10.0) -> bool:
+    # Both counts fall as the time grows, so equal counts at t_s and at
+    # t_s / cold_factor are the counts everywhere between them.
+    if not math.isfinite(t_s) or t_s <= 0.0:
+        return False
+    warm = float(t_s) / float(cold_factor)
+    inner = resolve_measure_inner(t_s, window_s, hi)
+    if inner != resolve_measure_inner(warm, window_s, hi):
+        return False
+    return (resolve_measure_windows(t_s, inner, budget_s, cap)
+            == resolve_measure_windows(warm, inner, budget_s, cap))
+
+
 def interleave_windows(n_a: int, n_b: int) -> list:
     """The A/B schedule of `n_a` candidate windows and `n_b` reference ones.
 
@@ -10897,6 +10911,12 @@ def _callback_measured(
                 _p0 = time.perf_counter()
                 jax.block_until_ready(ex(*eval_args))
                 _t = time.perf_counter() - _p0
+                # The extra execution buys the counts; a first reading that
+                # fixes them already has bought them (dsnn-dfw.223).
+                if _w + 1 >= _warmup and probe_counts_fixed(
+                        _t, _window_s, _budget_s, _cfg_inner,
+                        n_points * n_reps):
+                    break
             return _t
 
         # ---- THE CANDIDATE'S BUDGET (owner ruling 2026-09-14) -----------
