@@ -422,10 +422,16 @@ def test_on_rsnn_shd_a_diag_on_the_carried_face_moves_the_args_term():
     # one-call step (owner rulings 2026-09-24 Q1c, Q11a) the program also
     # writes its next carry in its container, so the Diag carry moves the
     # output term by the same factor as the args term.
+    # Since the full rollout (owner ruling 2026-09-25 Q24 a) the program's
+    # arguments are the recordings and its output the gradient, whatever the
+    # container, and the carry lives in the scan's state: the Diag moves the
+    # TEMP term. Measured on the CPU (job 67987): 636,466,160 B of
+    # temporaries exact against 13,189,760 B diag, args and output equal.
     assert diag["mem_objective_eps"] == exact["mem_objective_eps"]
-    assert diag["mem_ratios"]["out"] < exact["mem_ratios"]["out"] / 50.0
-    assert diag["mem_ratios"]["args"] < exact["mem_ratios"]["args"] / 50.0
+    assert diag["mem_ratios"]["out"] == exact["mem_ratios"]["out"] == 1.0
+    assert diag["mem_ratios"]["args"] == exact["mem_ratios"]["args"] == 1.0
+    assert diag["mem_ratios"]["temp"] < exact["mem_ratios"]["temp"] / 20.0
     assert diag["rewards"][MSLOT] == -(math.log(diag["mem_ratios"]["temp"])
                                        + math.log(diag["mem_ratios"]["args"])
                                        + math.log(diag["mem_ratios"]["out"]))
-    assert diag["rewards"][MSLOT] - exact["rewards"][MSLOT] > 4.0
+    assert diag["rewards"][MSLOT] - exact["rewards"][MSLOT] > 3.0
