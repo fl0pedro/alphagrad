@@ -59,6 +59,11 @@ def stub(monkeypatch):
     monkeypatch.setenv("ALPHAGRAD_MEASURE_DEDUPE", "0")
     monkeypatch.delenv("ALPHAGRAD_MEASURE_TOOLCHAIN_GATE", raising=False)
     monkeypatch.delenv("ALPHAGRAD_MEASURE_COMPILE_FALLBACK", raising=False)
+    # Each switch adds a compile to the measurement, and an earlier test in the same process can leave it set.
+    for k in ("ALPHAGRAD_FIDELITY", "ALPHAGRAD_FIDELITY_WEIGHT",
+              "ALPHAGRAD_COS_LOG_EVERY", "ALPHAGRAD_REV_EXACT_TELEMETRY",
+              "ALPHAGRAD_MEASURE_SPARSE"):
+        monkeypatch.delenv(k, raising=False)
     monkeypatch.setattr(E, "_MEASURE_TOOLCHAIN", dict(
         E._MEASURE_TOOLCHAIN, checked=False, ok=True, detail="", mode="",
         link_faults=0))

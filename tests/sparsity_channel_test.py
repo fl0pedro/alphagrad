@@ -222,7 +222,8 @@ def _restore_head_globals():
     saved = (ppo.HEAD_REWARD_INDICES, ppo.NUM_VALUE_HEADS, ppo.HEAD_NAMES,
              ppo.VALUE_HEAD_ATTRS, ppo._HEAD_REWARD_INDICES_ARR)
     env_saved = {k: os.environ.get(k) for k in
-                 ("ALPHAGRAD_SPARSITY", "ALPHAGRAD_SPARSITY_WEIGHT")}
+                 ("ALPHAGRAD_SPARSITY", "ALPHAGRAD_SPARSITY_WEIGHT",
+                  "ALPHAGRAD_FIDELITY_WEIGHT", "ALPHAGRAD_COS_LOG_EVERY")}
     yield
     (ppo.HEAD_REWARD_INDICES, ppo.NUM_VALUE_HEADS, ppo.HEAD_NAMES,
      ppo.VALUE_HEAD_ATTRS, ppo._HEAD_REWARD_INDICES_ARR) = saved

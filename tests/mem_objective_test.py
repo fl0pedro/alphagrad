@@ -289,11 +289,20 @@ def _restore_head_globals():
     saved = (ppo.HEAD_REWARD_INDICES, ppo.NUM_VALUE_HEADS, ppo.HEAD_NAMES,
              ppo.VALUE_HEAD_ATTRS, ppo._HEAD_REWARD_INDICES_ARR)
     symlog = (tuple(ppo._NO_SYMLOG_REWARD_INDICES), bool(ppo._NO_SYMLOG_ALL[0]))
+    # configure_fidelity and configure_sparsity write these into the process environment.
+    env_saved = {k: os.environ.get(k) for k in
+                 ("ALPHAGRAD_FIDELITY_WEIGHT", "ALPHAGRAD_COS_LOG_EVERY",
+                  "ALPHAGRAD_SPARSITY", "ALPHAGRAD_SPARSITY_WEIGHT")}
     yield
     (ppo.HEAD_REWARD_INDICES, ppo.NUM_VALUE_HEADS, ppo.HEAD_NAMES,
      ppo.VALUE_HEAD_ATTRS, ppo._HEAD_REWARD_INDICES_ARR) = saved
     ppo._set_no_symlog_indices(symlog[0])
     ppo._NO_SYMLOG_ALL[0] = symlog[1]
+    for k, v in env_saved.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
 
 
 def test_flag_off_is_inert(_restore_head_globals):
