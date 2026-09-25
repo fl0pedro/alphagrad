@@ -3386,8 +3386,8 @@ def thesis_pair_arms() -> list[dict]:
     """The paired launchers: two half rows of one arm inside one sbatch.
 
     A pair is not a matrix coordinate -- its two halves are, and they are
-    still rows of `thesis_core_arms` -- so it is excluded from every count
-    of the matrix and listed here instead.
+    still rows of `thesis_core_arms` or `thesis_defense_arms` -- so it is
+    excluded from every count of the matrix and listed here instead.
     """
     return [a for a in ARMS if a.get("paired") and not a.get("sweepl")
             and not a.get("sweepl2") and not a.get("sweepl3")]

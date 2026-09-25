@@ -171,8 +171,10 @@ def test_a_pair_is_two_seeds_of_one_arm_on_one_eight_gpu_node(gen):
             p["thesis_arm"], p["thesis_target"], tuple(seeds)), p["name"]
         assert p["job"] == f"node-{p['node']}", p["name"]
         assert p["singleton"], p["name"]
-    # a pair is NOT a matrix coordinate; its two halves are
-    core = {a["name"] for a in gen.thesis_core_arms()}
+    # a pair is NOT a matrix coordinate; its two halves are (core rows, or
+    # the defense rows of dsnn-dfw.231, which are NN256 rows too)
+    core = {a["name"] for a in gen.thesis_core_arms()
+            + gen.thesis_defense_arms()}
     for p in pairs:
         assert p["name"] not in core, p["name"]
         for h in p["halves"]:
