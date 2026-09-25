@@ -148,9 +148,13 @@ RECYCLE_ENV = {
 #: `thesis_arm` emits exports both at 1; the frozen rounds keep neither.
 MEASURE_PATH_ENV = {"ALPHAGRAD_DIRECT_MEASURE": "1",
                     "ALPHAGRAD_UNIFIED_FACE_ENUM": "1"}
+#: dsnn-dfw.247: every row `thesis_arm` emits turns the code's disk cache off.
+NO_DISK_CACHE_ENV = {"ALPHAGRAD_DISABLE_JIT_DISK_CACHE": "1"}
 #: What every row `thesis_arm` emits now carries beside its target shape:
-#: the retention bound, the process recycle and the measure path together.
-MATRIX_ENV = {**CLEAR_ENV, **RECYCLE_ENV, **MEASURE_PATH_ENV}
+#: the retention bound, the process recycle, the measure path and the switch
+#: that turns the disk cache off.
+MATRIX_ENV = {**CLEAR_ENV, **RECYCLE_ENV, **MEASURE_PATH_ENV,
+              **NO_DISK_CACHE_ENV}
 #: THE TRAINED MEMORY CHANNEL (dsnn-mep, owner ruling 2026-09-25): slot 11 at
 #: weight 1, "mem" out of --rewards; slot 5 keeps the watermark, logged.
 MEM_OBJECTIVE_WEIGHT = "1"

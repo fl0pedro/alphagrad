@@ -2252,6 +2252,9 @@ THESIS_MEM_OBJECTIVE_WEIGHT = "1"
 #: env.py reads both; ppo.py has no flag for them.
 THESIS_MEASURE_PATH_ENV = {"ALPHAGRAD_DIRECT_MEASURE": "1",
                            "ALPHAGRAD_UNIFIED_FACE_ENUM": "1"}
+#: NO DISK CACHE (dsnn-dfw.247, dsnn-dfw.230): without this, ppo.py and
+#: cpu_approx_worker.py write /tmp/dsnn-jax-cache-<job>-<host>.
+THESIS_NO_DISK_CACHE_ENV = {"ALPHAGRAD_DISABLE_JIT_DISK_CACHE": "1"}
 #: AUTO-STOP IS OFF ON A FINAL ROW (d).  A FINAL row is one `thesis_arm`
 #: emits: the A/B/C arms of the matrix and the recurrent block.  A TUNING row
 #: (orderonly_nn256_*, orderonly_rsnn_*) calls `thesis_cli` itself with
@@ -2703,7 +2706,7 @@ THESIS_TARGET_ENV = {
 THESIS_TARGET_ENV_ALLOWED = frozenset(
     k for env in THESIS_TARGET_ENV.values() for k in env
 ) | {MEASURE_CACHE_CLEAR_EVERY_VAR, PROACTIVE_RECYCLE_EVERY_VAR, NN_BATCH_VAR
-     } | set(THESIS_MEASURE_PATH_ENV)
+     } | set(THESIS_MEASURE_PATH_ENV) | set(THESIS_NO_DISK_CACHE_ENV)
 #: Every `export NAME=` a THESIS launcher may contain: the campaign's allowed
 #: set plus the target-shape variables above.
 THESIS_ENV_ALLOWED = frozenset(CAMPAIGN_ENV_ALLOWED) | THESIS_TARGET_ENV_ALLOWED
@@ -3311,7 +3314,8 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
                     if cache_clear_every is not None else {}),
                  **({PROACTIVE_RECYCLE_EVERY_VAR: proactive_recycle_every}
                     if proactive_recycle_every is not None else {}),
-                 **(THESIS_MEASURE_PATH_ENV if measure_path else {})),
+                 **(THESIS_MEASURE_PATH_ENV if measure_path else {}),
+                 **({} if jax_cache else THESIS_NO_DISK_CACHE_ENV)),
         required_flags=(THESIS_REQUIRED_FLAGS
                         + (DUAL_CLIP_REQUIRED_FLAGS
                            if dual_clip is not None else [])
@@ -5524,6 +5528,8 @@ def _scratch_stack_block(target_env: dict | None = None,
         L.append("# both, and ppo.py has no flag for them.")
         for k in sorted(_measure_path):
             L.append(f"export {k}={_measure_path[k]}")
+    _no_disk_cache = {k: target_env.pop(k) for k in THESIS_NO_DISK_CACHE_ENV
+                      if k in target_env}
     _batch = target_env.pop(NN_BATCH_VAR, None)
     if target_env:
         L.append("")
@@ -5545,6 +5551,10 @@ def _scratch_stack_block(target_env: dict | None = None,
         L.append("# NO JAX COMPILE CACHE, under any order (owner rulings")
         L.append("# 2026-09-23 and 2026-09-25, dsnn-dfw.230): writing it takes time")
         L.append("# and most plans are never compiled again.")
+        L.append("# ppo.py and cpu_approx_worker.py write one to /tmp unless this")
+        L.append("# is 1 (dsnn-dfw.247).")
+        for k in sorted(_no_disk_cache):
+            L.append(f"export {k}={_no_disk_cache[k]}")
     return L
 
 
@@ -5703,6 +5713,13 @@ def render(a: dict) -> str:
                 f"carry only {sorted(THESIS_TARGET_ENV_ALLOWED)}, the target "
                 f"shape that common/examples.py reads at import time and for "
                 f"which ppo.py has no flag.")
+        _jc = bool(a.get("jax_cache", True))
+        if bool(set(THESIS_NO_DISK_CACHE_ENV) & set(a.get("env") or {})) == _jc:
+            raise CampaignRowError(
+                f"{a['name']}: jax_cache={_jc} and "
+                f"{sorted(THESIS_NO_DISK_CACHE_ENV)} "
+                f"{'set' if _jc else 'unset'}; a row without the JAX compile "
+                f"cache sets it, a row with the cache does not (dsnn-dfw.247)")
         L.extend(_scratch_stack_block(
             a.get("env") or {}, jax_cache=a.get("jax_cache", True)))
     else:

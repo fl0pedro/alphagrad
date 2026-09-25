@@ -12,6 +12,8 @@ dsnn-dfw, grill rounds 1-3), pinned on `tools/gen_fq_launchers.py`:
      the row's memory by node size.
   7. condC left the matrix.
   8. dsnn-dfw.231: the defense arms A_popart at lambda_q 16, 4 and 64.
+  9. dsnn-dfw.247: ALPHAGRAD_DISABLE_JIT_DISK_CACHE=1, so that the code
+     writes no disk cache either.
 
 "Every row `thesis_arm` emits" is the matrix, the defense rows, the pair
 launchers and the smoke.  The frozen rounds (the order-only rounds and the
@@ -32,6 +34,7 @@ _GEN = os.path.join(_ALPHAGRAD, "tools", "gen_fq_launchers.py")
 SEEDS = ("250197", "250198", "250199", "250200", "250201")
 MEASURE_PATH_ENV = {"ALPHAGRAD_DIRECT_MEASURE": "1",
                     "ALPHAGRAD_UNIFIED_FACE_ENUM": "1"}
+NO_DISK_CACHE_VAR = "ALPHAGRAD_DISABLE_JIT_DISK_CACHE"
 MEM_OBJECTIVE_WEIGHT = "1"
 REWARDS = "cmp acc"
 FROZEN_REWARDS = "cmp mem acc"
@@ -401,3 +404,38 @@ def test_the_defense_arms_are_arm_a_on_popart_at_three_lambdas(gen):
     with pytest.raises(gen.CampaignRowError):
         gen.thesis_arm(arm="A_popart", target="tlm", seed=SEEDS[0],
                        node=gen.THESIS_NODES[0], name="throwaway_defense")
+
+
+# ------------------------------------------- 9. no disk cache in the code
+
+def test_every_row_thesis_arm_emits_turns_the_code_s_disk_cache_off(
+        gen, emitted, frozen):
+    for a in emitted:
+        text = gen.render(a)
+        assert f"\nexport {NO_DISK_CACHE_VAR}=1\n" in text, a["name"]
+        assert text.count(f"export {NO_DISK_CACHE_VAR}=") == 1, a["name"]
+        assert (a.get("env") or {}).get(NO_DISK_CACHE_VAR) == "1", a["name"]
+        assert a.get("jax_cache") is False, a["name"]
+    for a in frozen:
+        assert NO_DISK_CACHE_VAR not in (a.get("env") or {}), a["name"]
+        assert NO_DISK_CACHE_VAR not in gen.render(a), a["name"]
+    assert gen.THESIS_NO_DISK_CACHE_ENV == {NO_DISK_CACHE_VAR: "1"}
+    assert NO_DISK_CACHE_VAR in gen.THESIS_TARGET_ENV_ALLOWED
+    assert NO_DISK_CACHE_VAR not in gen.CAMPAIGN_ENV_ALLOWED
+    row, old = emitted[0], frozen[0]
+    with pytest.raises(gen.CampaignRowError):
+        gen.render(dict(row, env={k: v for k, v in row["env"].items()
+                                  if k != NO_DISK_CACHE_VAR}))
+    with pytest.raises(gen.CampaignRowError):
+        gen.render(dict(old, env=dict(old.get("env") or {},
+                                      **{NO_DISK_CACHE_VAR: "1"})))
+    # ppo.py and the measure worker call the cache setup once, under the switch.
+    approx = os.path.join(_ALPHAGRAD, "src", "alphagrad", "approx")
+    call = re.compile(r"^\s+_setup_jax_compile_cache\(\)\s*$", re.M)
+    gated = re.compile(r'environ\.get\(\s*"%s",\s*"0"\)\s*!=\s*"1":\n'
+                       r"\s+_setup_jax_compile_cache\(\)\s*$"
+                       % NO_DISK_CACHE_VAR, re.M)
+    for f in ("ppo.py", "cpu_approx_worker.py"):
+        src = open(os.path.join(approx, f)).read()
+        assert len(call.findall(src)) == 1, f
+        assert len(gated.findall(src)) == 1, f
