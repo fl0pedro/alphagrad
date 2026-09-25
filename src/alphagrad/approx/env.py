@@ -5920,11 +5920,13 @@ def grad_oracle_submission(config, base_args, episode):
     if is_full_rollout(config):
         # The rollout draws whole recordings; the oracle checks the step on
         # its own tuple, the given slots drawn so every path carries a value.
-        a = list(jax.device_get(list(base_args)))
+        # Only a given slot's shape and dtype are read; it stays on the device.
+        given = list(base_args)[RSNN_HEAD_SLOTS:]
+        a = list(jax.device_get(list(base_args)[:RSNN_HEAD_SLOTS]))
         rng = np.random.default_rng(int(probe_seed))
-        for i in range(RSNN_HEAD_SLOTS, len(a)):
-            a[i] = rng.standard_normal(np.shape(a[i]), dtype=np.float32) \
-                .astype(np.asarray(a[i]).dtype)
+        for x in given:
+            a.append(rng.standard_normal(np.shape(x), dtype=np.float32)
+                     .astype(x.dtype))
         return int(probe_seed), a
     data = _probe_batch(config, base_args, role="train", index=0, episode=ep)
     if data is None:
