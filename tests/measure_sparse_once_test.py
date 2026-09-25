@@ -1,18 +1,26 @@
 """ONE SPARSE EXECUTABLE PER MEASURED PLAN (owner rulings 2026-09-25, grill
-round 1 Q18 c and round 2 Q2; dsnn-dfw.228).
+round 1 Q18 c and round 2 Q2; dsnn-dfw.228, dsnn-dfw.234).
 
 Every plan compiles one executable, the plan's sparse representation. The
 cost channels and the static gate read it; the quality channels read its
-outputs after a dense conversion outside the timed executions. Pinned here:
+outputs after a dense conversion outside the timed executions. At the
+measurement boundary every gradient leaf leaves the executable as its value
+buffer with the scalar folded in (dsnn-dfw.234), so the static output bytes
+of an exact plan equal the reference's. Pinned here:
 
 * exactly one measure compile per plan, and it is the sparse one;
 * ``ALPHAGRAD_MEASURE_SPARSE=0`` is the only dense opt-out, any other value
   raises;
+* the fold: a literal scalar of 1 leaves the val untouched, a scalar folds
+  into it, a uniform tensor's buffer is its scalar, and the densified leaf
+  equals the tensor's own dense form;
 * the quality from the densified sparse outputs equals the dense executable's
   quality within float32 rounding, on the policy gate's recorded plan
   (``tests/golden/policy_gate_golden.json``: skips and quant rows on the
-  gate's branched MLP) and on one diag and one compress plan of NN256 and TLM
-  at a small batch, measured back to back in one process.
+  gate's branched MLP) and on the exact plan, one diag and one compress plan
+  of NN256 and TLM at a small batch, measured back to back in one process;
+* on the exact plans the static output bytes of the sparse executable equal
+  the reference's exactly (the toy scalar loss, NN256, TLM).
 
 The gate module pins ten ALPHAGRAD_* variables at import, so its target is
 copied here (``_mlp``, the same arguments) instead of imported.
@@ -118,9 +126,12 @@ def measure(monkeypatch):
         return {
             "quality": float(r[REWARD_INDEX["quality"]]),
             "fidelity": float(r[REWARD_INDEX["fidelity"]]),
-            "latency_ns": float(-r[REWARD_INDEX["latency_ns"]]),
-            "peak_memory": float(-r[REWARD_INDEX["peak_memory"]]),
+            "latency_ns": float(recs[0].get("candidate_latency_ns") or 0.0),
+            "ref_latency_ns": float(recs[0].get("ref_latency_ns") or 0.0),
             "mem_output_bytes": recs[0].get("mem_output_bytes"),
+            "ref_output_bytes": recs[0].get("ref_output_bytes"),
+            "mem_args_bytes": recs[0].get("mem_args_bytes"),
+            "ref_args_bytes": recs[0].get("ref_args_bytes"),
             "mem_temp_bytes": recs[0].get("mem_temp_bytes"),
             "programs": list(seen["programs"]),
             "compiles": int(seen["compiles"]),
@@ -132,7 +143,7 @@ def measure(monkeypatch):
     E.consume_refused_counts()
 
 
-def _paired(run, env, samples, order, plan_arrays, label):
+def _paired(run, env, samples, order, plan_arrays, label, exact=False):
     """The dense opt-out and the default, back to back; the default second so
     its reference and exact executables are already cached and its compile
     count is the candidate's alone."""
@@ -144,22 +155,39 @@ def _paired(run, env, samples, order, plan_arrays, label):
     assert sparse["compiles"] == 1, (label, sparse["compiles"])
     gap_q = abs(sparse["quality"] - dense["quality"])
     gap_f = abs(sparse["fidelity"] - dense["fidelity"])
-    _GAPS[label] = {"quality": gap_q, "fidelity": gap_f,
-                    "dense_quality": dense["quality"],
-                    "sparse_quality": sparse["quality"],
-                    "dense_output_bytes": dense["mem_output_bytes"],
-                    "sparse_output_bytes": sparse["mem_output_bytes"]}
+    _GAPS[label] = {"quality": gap_q, "fidelity": gap_f}
     print(f"[sparseonce] {label}: quality dense {dense['quality']:.7f} "
           f"sparse {sparse['quality']:.7f} (gap {gap_q:.3e}); fidelity dense "
           f"{dense['fidelity']:.7f} sparse {sparse['fidelity']:.7f} "
           f"(gap {gap_f:.3e}); static output bytes dense "
-          f"{dense['mem_output_bytes']} sparse {sparse['mem_output_bytes']}; "
-          f"compiles dense {dense['compiles']} sparse {sparse['compiles']}",
-          flush=True)
+          f"{dense['mem_output_bytes']} sparse {sparse['mem_output_bytes']} "
+          f"reference {sparse['ref_output_bytes']}; latency us dense "
+          f"{dense['latency_ns'] / 1e3:.1f} sparse "
+          f"{sparse['latency_ns'] / 1e3:.1f} reference "
+          f"{sparse['ref_latency_ns'] / 1e3:.1f}; compiles dense "
+          f"{dense['compiles']} sparse {sparse['compiles']}", flush=True)
     assert np.isfinite(dense["quality"]) and np.isfinite(sparse["quality"])
     assert gap_q <= TOL, (label, dense["quality"], sparse["quality"])
     assert gap_f <= TOL, (label, dense["fidelity"], sparse["fidelity"])
+    # No scalar crosses the boundary (dsnn-dfw.234): the value buffers of
+    # the sparse form never exceed the dense form's, and the exact plan's
+    # equal the reference's to the byte.
+    assert sparse["mem_output_bytes"] <= dense["mem_output_bytes"], label
+    assert sparse["mem_output_bytes"] <= sparse["ref_output_bytes"], label
+    if exact:
+        assert (sparse["mem_output_bytes"] == sparse["ref_output_bytes"]
+                == dense["mem_output_bytes"]), (
+            label, sparse["mem_output_bytes"], sparse["ref_output_bytes"],
+            dense["mem_output_bytes"])
     return dense, sparse
+
+
+def _exact_arrays(n):
+    specs = np.full((n, MAX_RULES_PER_VERTEX, 3), -1, np.int32)
+    specs[..., 2] = 0
+    faces = np.full((n, E.MAX_FACES, FACE_SLOTS, 3), -1, np.int32)
+    skips = np.zeros((n, E.MAX_FACES), np.int32)
+    return specs, faces, skips
 
 
 def test_the_flag_accepts_the_two_values_only(monkeypatch):
@@ -175,6 +203,46 @@ def test_the_flag_accepts_the_two_values_only(monkeypatch):
             E.measure_sparse_enabled()
 
 
+def test_the_fold_leaves_value_buffers_only():
+    from graphax.sparse.indexes import DenseIndex, DiagonalIndex
+    from graphax.sparse.tensor import SparseTensor
+    val = jnp.arange(2 * 3, dtype=jnp.float32).reshape(2, 3) + 1.0
+    dims = ([DenseIndex(0, 2, 0)], [DenseIndex(1, 3, 1)])
+    one = SparseTensor(*dims, val)
+    folded = E._fold_leaf(one)
+    assert isinstance(folded, E.CompactLeaf) and not folded.uniform
+    assert folded.val is val
+    scaled = SparseTensor(*dims, val, scalar_mult=jnp.asarray(2.5))
+    folded = E._fold_leaf(scaled)
+    np.testing.assert_array_equal(np.asarray(folded.val),
+                                  np.asarray(val) * 2.5)
+    np.testing.assert_array_equal(np.asarray(folded.dense()),
+                                  np.asarray(scaled.dense()))
+    uniform = SparseTensor(*dims, None, scalar_mult=jnp.asarray(3.0))
+    folded = E._fold_leaf(uniform)
+    assert folded.uniform and folded.val.shape == ()
+    np.testing.assert_array_equal(np.asarray(folded.dense()),
+                                  np.asarray(uniform.dense()))
+    diag = SparseTensor([DiagonalIndex(0, 4, 0, 1)],
+                        [DiagonalIndex(1, 4, 0, 0)],
+                        jnp.arange(4, dtype=jnp.float32),
+                        scalar_mult=jnp.asarray(0.5))
+    folded = E._fold_leaf(diag)
+    assert folded.val.shape == (4,)
+    np.testing.assert_array_equal(np.asarray(folded.dense()),
+                                  np.asarray(diag.dense()))
+    # The pytree: one value child per leaf, the structure in the aux data.
+    leaves, treedef = jax.tree_util.tree_flatten((folded, None, val))
+    assert len(leaves) == 2
+    back = jax.tree_util.tree_unflatten(treedef, leaves)
+    assert isinstance(back[0], E.CompactLeaf) and back[1] is None
+    # Traced inside a program: the scalar folds, the buffer is compact.
+    out = jax.eval_shape(lambda v: E._fold_output(
+        SparseTensor(*dims, v, scalar_mult=v[0, 0]), False), val)
+    assert isinstance(out, E.CompactLeaf) and out.val.shape == (2, 3)
+    assert len(jax.tree_util.tree_leaves(out)) == 1
+
+
 def test_a_skipped_path_densifies_to_the_zeros_of_its_nominal_shape():
     from graphax.sparse.indexes import DenseIndex
     from graphax.sparse.tensor import SparseTensor
@@ -188,12 +256,13 @@ def test_a_skipped_path_densifies_to_the_zeros_of_its_nominal_shape():
     st = SparseTensor([DenseIndex(0, 2, 0), DenseIndex(1, 16, 1)],
                       [DenseIndex(2, 8, 2), DenseIndex(3, 32, 3)], val)
     plain = jnp.ones((2, 16, 32, 16))
-    dense = E._densify_gradient((st, None, plain), shapes)
-    assert len(dense) == 3
-    np.testing.assert_array_equal(np.asarray(dense[0]), np.asarray(val))
-    assert dense[1].shape == (2, 16, 32, 16)
-    assert float(jnp.abs(dense[1]).sum()) == 0.0
-    assert dense[2] is plain
+    for leaf in (st, E._fold_leaf(st)):
+        dense = E._densify_gradient((leaf, None, plain), shapes)
+        assert len(dense) == 3
+        np.testing.assert_array_equal(np.asarray(dense[0]), np.asarray(val))
+        assert dense[1].shape == (2, 16, 32, 16)
+        assert float(jnp.abs(dense[1]).sum()) == 0.0
+        assert dense[2] is plain
     with pytest.raises(RuntimeError, match="gradient leaves"):
         E._densify_gradient((st, None), shapes)
     with pytest.raises(RuntimeError, match="leaf 2"):
@@ -208,10 +277,7 @@ def _gate_plan():
               if int(v) not in order]
     n = len(order)
     assert E.MAX_FACES >= max(len(s.get("face_skip") or []) for s in steps)
-    specs = np.full((n, MAX_RULES_PER_VERTEX, 3), -1, np.int32)
-    specs[..., 2] = 0
-    faces = np.full((n, E.MAX_FACES, FACE_SLOTS, 3), -1, np.int32)
-    skips = np.zeros((n, E.MAX_FACES), np.int32)
+    specs, faces, skips = _exact_arrays(n)
     n_quant = 0
     for k, st in enumerate(steps):
         for i, row in enumerate(st["rule_specs"]):
@@ -225,6 +291,29 @@ def _gate_plan():
     # would pin the exact plan and nothing else.
     assert int(skips.sum()) > 0 and n_quant > 0
     return order, (specs, faces, skips)
+
+
+def test_the_toy_scalar_loss_exact_plan_ties_the_reference_to_the_byte(
+        measure, monkeypatch):
+    monkeypatch.setenv("ALPHAGRAD_QUALITY_METRIC", "jac_cosine")
+    rng = np.random.default_rng(0)
+    W = jnp.asarray(rng.standard_normal((16, 16), dtype=np.float32) / 4.0)
+    x = jnp.asarray(np.linspace(-1.0, 1.0, 16, dtype=np.float32))
+
+    def toy(v):
+        return jnp.sum(jnp.tanh(W @ v) ** 2)
+
+    closed = jax.make_jaxpr(toy)(x)
+    env = E.VertexEliminationEnv.from_jaxpr(
+        closed, args=[x], argnums=(0,), num_envs=0, target_fun=toy,
+        measure_latency=True, terminal_rewards_only=True,
+        latency_inner_reps=1)
+    order = sorted(int(v) for v in np.asarray(env.valid_vertices))
+    samples = (jnp.asarray(np.stack(
+        [np.linspace(-1.0, 1.0, 16, dtype=np.float32)])),)
+    dense, sparse = _paired(measure, env, samples, order,
+                            _exact_arrays(len(order)), "toy-exact", exact=True)
+    assert dense["quality"] > 0.99
 
 
 def test_the_policy_gates_plan_prices_one_sparse_executable(measure,
@@ -241,6 +330,9 @@ def test_the_policy_gates_plan_prices_one_sparse_executable(measure,
         latency_inner_reps=1, num_data_points=2)
     samples = generate_eval_samples(env, jax.random.PRNGKey(3), 2)
     order, (specs, faces, skips) = _gate_plan()
+    # The exact plan on the gate's graph and order: a full Jacobian target.
+    _paired(measure, env, samples, order, _exact_arrays(len(order)),
+            "gate-exact", exact=True)
     # The recorded plan skips every live face, so its gradient is zero on
     # both executables (the sparse one returns no leaf at all) and the claim
     # is the compile count.
@@ -265,14 +357,15 @@ def _landscape(monkeypatch, tmp_path, example, dataset):
     inv = lm.face_inventory(env, order, capture_tensors=True)
     plans, _orders = lm.build_singleton_sweep_plans(
         env, order, inv, ops=("reduce", "diag"))
-    picked = {}
+    picked = {"exact": ("exact", lm.get_plan_arrays({"wires": []},
+                                                     len(order)))}
     for op in ("diag", "compress"):
         pid = next(p for p, pl in plans.items() if pl["op"] == op)
         picked[op] = (pid, lm.get_plan_arrays(plans[pid], len(order)))
     return env, samples, [int(v) for v in order], picked
 
 
-def test_nn256_diag_and_compress_plans_price_one_sparse_executable(
+def test_nn256_exact_diag_and_compress_plans_price_one_sparse_executable(
         measure, monkeypatch, tmp_path):
     from alphagrad.approx.common import examples as ex
     monkeypatch.setattr(ex, "_EQ_NN_HIDDEN", 8)
@@ -282,11 +375,11 @@ def test_nn256_diag_and_compress_plans_price_one_sparse_executable(
     assert env.config.scalar_target
     for op, (pid, arrays) in picked.items():
         dense, _sparse = _paired(measure, env, samples, order, arrays,
-                                 f"nn256-{pid}")
+                                 f"nn256-{pid}", exact=(op == "exact"))
         assert dense["quality"] > 0.1, (pid, dense["quality"])
 
 
-def test_tlm_diag_and_compress_plans_price_one_sparse_executable(
+def test_tlm_exact_diag_and_compress_plans_price_one_sparse_executable(
         measure, monkeypatch, tmp_path):
     from alphagrad.approx.common import datasets as ds
     from alphagrad.approx.common import examples as ex
@@ -303,7 +396,7 @@ def test_tlm_diag_and_compress_plans_price_one_sparse_executable(
     assert env.config.scalar_target
     for op, (pid, arrays) in picked.items():
         dense, _sparse = _paired(measure, env, samples, order, arrays,
-                                 f"tlm-{pid}")
+                                 f"tlm-{pid}", exact=(op == "exact"))
         assert dense["quality"] > 0.1, (pid, dense["quality"])
 
 

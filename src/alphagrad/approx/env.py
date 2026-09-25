@@ -4576,14 +4576,15 @@ def measured_program(config, order, consts, sparse=None, **jacve_kwargs):
     # caller asks for the sparse form (Q44 check a), and on a target with
     # carried outputs the one-call step on the stored classes (Q1c, Q11a).
     carried = int(getattr(config, "carried_outputs", 0) or 0) > 0
+    sparse_rep = (True if carried
+                  else bool(sparse) if sparse is not None
+                  else False)
     fn = jacve(
         config.target_fun,
         list(order),
         argnums=config.argnums,
         has_aux=True if carried else config.has_aux,
-        sparse_representation=(True if carried
-                               else bool(sparse) if sparse is not None
-                               else False),
+        sparse_representation=sparse_rep,
         jaxpr=config.jaxpr,
         consts=list(consts),
         **jacve_kwargs,
@@ -4595,6 +4596,10 @@ def measured_program(config, order, consts, sparse=None, **jacve_kwargs):
         raise ValueError(
             "a target with carried outputs returns its state as outputs; "
             "has_aux on it has no reading")
+    # The sparse measured program leaves its gradient leaves as value
+    # buffers (`_fold_output`); a carried target keeps the stored classes.
+    if sparse_rep and not carried and not is_full_rollout(config):
+        fn = _folded_program(fn, config.has_aux)
     step = rsnn_one_call_step(fn) if carried else fn
     # THE FULL ROLLOUT (owner ruling 2026-09-25 Q24 a): the plan's step at
     # every step of each recording, as one program.
@@ -4624,11 +4629,126 @@ def _nominal_gradient_shapes(config) -> list:
             for o in config.jaxpr.outvars for v in invars]
 
 
+@jax.tree_util.register_pytree_node_class
+class CompactLeaf:
+    # A returned gradient leaf as its value buffer (owner ruling dsnn-dfw.234):
+    # the compact val with the scalar folded in, the structure as aux data so
+    # it travels with a cached executable. A uniform tensor's buffer is its
+    # scalar.
+    def __init__(self, val, out_dims, primal_dims, uniform, fill_value=None,
+                 dynamic=()):
+        self.val = val
+        self.out_dims = tuple(out_dims)
+        self.primal_dims = tuple(primal_dims)
+        self.uniform = bool(uniform)
+        self.fill_value = fill_value
+        self.dynamic = tuple(dynamic)
+
+    def tree_flatten(self):
+        return ((self.val, self.fill_value),
+                (self.out_dims, self.primal_dims, self.uniform, self.dynamic))
+
+    @classmethod
+    def tree_unflatten(cls, aux, children):
+        val, fill_value = children
+        out_dims, primal_dims, uniform, dynamic = aux
+        return cls(val, out_dims, primal_dims, uniform, fill_value=fill_value,
+                   dynamic=dynamic)
+
+    @property
+    def shape(self):
+        return tuple(int(d.logical_size)
+                     for d in self.out_dims + self.primal_dims)
+
+    def tensor(self):
+        from graphax.sparse.tensor import SparseTensor
+        if self.uniform:
+            return SparseTensor(list(self.out_dims), list(self.primal_dims),
+                                None, scalar_mult=self.val,
+                                fill_value=self.fill_value,
+                                **dict(self.dynamic))
+        return SparseTensor(list(self.out_dims), list(self.primal_dims),
+                            self.val, fill_value=self.fill_value,
+                            **dict(self.dynamic))
+
+    def dense(self):
+        return self.tensor().dense()
+
+
+@jax.tree_util.register_pytree_node_class
+class CompactProduct:
+    # A factored output (#46) as its two value buffers.
+    def __init__(self, post, pre):
+        self.post = post
+        self.pre = pre
+
+    def tree_flatten(self):
+        return (self.post, self.pre), None
+
+    @classmethod
+    def tree_unflatten(cls, aux, children):
+        return cls(*children)
+
+    def dense(self):
+        from graphax.sparse.ops.matmul import matmul
+        return matmul(self.post.tensor(), self.pre.tensor()).dense()
+
+
+def _is_compact(x) -> bool:
+    return isinstance(x, (CompactLeaf, CompactProduct))
+
+
+def _boundary_leaf(x) -> bool:
+    return (x is None or _is_sparse_tensor(x) or _is_compact(x)
+            or bool(getattr(x, "_is_deferred_output", False)))
+
+
+def _fold_leaf(x):
+    if x is None or _is_compact(x):
+        return x
+    if bool(getattr(x, "_is_deferred_output", False)):
+        return CompactProduct(_fold_leaf(x.post), _fold_leaf(x.pre))
+    if not _is_sparse_tensor(x):
+        return x
+    if x.pre_transforms or x.post_transforms:
+        raise RuntimeError(
+            "a returned gradient leaf still queues transforms at the "
+            "boundary; draining them there is graphax's contract")
+    dynamic = tuple((k, getattr(x, k))
+                    for k in getattr(x, "_dynamic_keys", ()))
+    sm = x.scalar_mult
+    if x.val is None:
+        return CompactLeaf(sm, x.out_dims, x.primal_dims, True,
+                           fill_value=x.fill_value, dynamic=dynamic)
+    val = x.val
+    if isinstance(sm, jax.core.Tracer) or float(np.asarray(sm)) != 1.0:
+        from graphax.sparse.dtype_compute import _scaled_mul
+        val = _scaled_mul(val, sm)
+    return CompactLeaf(val, x.out_dims, x.primal_dims, False,
+                       fill_value=x.fill_value, dynamic=dynamic)
+
+
+def _fold_output(out, has_aux: bool):
+    # THE MEASUREMENT BOUNDARY (owner ruling dsnn-dfw.234): every returned
+    # leaf leaves the executable as its value buffer, compact or full, with
+    # the scalar folded in, and no scalar crosses. The reference and the
+    # dense executable deliver folded values, so the timed work, the static
+    # bytes and the values are like for like by construction.
+    def fold(tree):
+        return jax.tree_util.tree_map(_fold_leaf, tree, is_leaf=_boundary_leaf)
+    if has_aux:
+        return out[0], fold(out[1])
+    return fold(out)
+
+
+def _folded_program(fn, has_aux: bool):
+    def program(*a):
+        return _fold_output(fn(*a), has_aux)
+    return program
+
+
 def _densify_gradient(jac, shapes):
-    def _leaf(x):
-        return (x is None or _is_sparse_tensor(x)
-                or bool(getattr(x, "_is_deferred_output", False)))
-    leaves, treedef = jax.tree_util.tree_flatten(jac, is_leaf=_leaf)
+    leaves, treedef = jax.tree_util.tree_flatten(jac, is_leaf=_boundary_leaf)
     if len(leaves) != len(shapes):
         raise RuntimeError(
             f"the sparse executable returned {len(leaves)} gradient leaves "
@@ -4637,7 +4757,7 @@ def _densify_gradient(jac, shapes):
     for i, (leaf, shape) in enumerate(zip(leaves, shapes)):
         if leaf is None:
             d = jnp.zeros(shape)
-        elif _leaf(leaf):
+        elif _boundary_leaf(leaf):
             d = leaf.dense()
         else:
             d = leaf
