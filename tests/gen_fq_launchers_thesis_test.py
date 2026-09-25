@@ -92,7 +92,7 @@ RSNN_FORM = {
     "bptt":
         (RSNN_VMAP_EXAMPLE, "256"),
     "rtrl":
-        (RSNN_EXAMPLE, None),
+        (RSNN_VMAP_EXAMPLE, "64"),
     "window2":
         (RSNN_EXAMPLE, None),
 }
