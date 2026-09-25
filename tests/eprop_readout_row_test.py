@@ -232,11 +232,41 @@ def test_the_two_diag_plans_rollout_is_still_the_eprop_gradient(step, example):
     assert step[example]["eprop_vs_oracle"] < 1e-10, step
 
 
-def test_the_transported_carry_block_runs_from_the_states_to_the_weights():
+def _attachment_jaxpr():
+    # a readout chain through a contraction and a hidden chain, sharing the
+    # weight's difference vertex, like attach_rsnn_past's diag container
+    import jax
+    import jax.numpy as jnp
+
+    def f(w, J, Jh, Wo, s, sh):
+        d = w - jax.lax.stop_gradient(w)               # 1 sg, 2 sub
+        rows = jnp.sum(J * d, axis=-1)                  # 3 mul, 4 reduce_sum
+        s_att = s + Wo @ rows                           # 5 dot_general, 6 add
+        sh_att = sh + jnp.sum(Jh * d, axis=-1)          # 7 mul, 8 reduce_sum, 9 add
+        return s_att, sh_att
+    args = (jnp.ones((4, 6)), jnp.ones((4, 6)), jnp.ones((4, 6)),
+            jnp.ones((3, 4)), jnp.ones((3,)), jnp.ones((4,)))
+    return jax.make_jaxpr(f)(*args).jaxpr
+
+
+def test_a_contractions_chain_stops_at_the_shared_difference():
     from alphagrad.approx.common import carry_plan as CP
-    variant = {"vertex_map": {1: 1, 2: 2, 3: 3}, "alt_carry": (4, 5, 6, 7),
-               "valid": {1, 2, 3, 4, 5, 6, 7}}
+    jx = _attachment_jaxpr()
+    names = [e.primitive.name for e in jx.eqns]
+    assert names == ["stop_gradient", "sub", "mul", "reduce_sum",
+                     "dot_general", "add", "mul", "reduce_sum", "add"], names
+    chain = CP.contraction_chains(jx, range(1, 10))
+    assert chain == {3, 4, 5, 6}, chain
+
+
+def test_the_transported_block_runs_a_contractions_chain_backward_first():
+    import types
+    from alphagrad.approx.common import carry_plan as CP
+    jx = _attachment_jaxpr()
+    variant = {"vertex_map": {11: 11, 12: 12}, "alt_carry": tuple(range(1, 10)),
+               "valid": set(range(1, 10)) | {11, 12},
+               "config": types.SimpleNamespace(jaxpr=jx)}
     # the policy's carry vertices 20 and 21 sit between its body vertices
-    moved = CP.transport_order([3, 20, 2, 21, 1], variant)
-    assert moved == [3, 7, 6, 2, 5, 4, 1], moved
+    moved = CP.transport_order([12, 20, 21, 11], variant)
+    assert moved == [12, 6, 5, 4, 3, 1, 2, 7, 8, 9, 11], moved
     assert sorted(moved) == sorted(variant["valid"])

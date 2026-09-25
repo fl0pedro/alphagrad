@@ -501,6 +501,51 @@ def _alignment(base_jaxpr, alt_jaxpr):
     return vertex_map, alt_carry
 
 
+def contraction_chains(jaxpr, carry) -> set:
+    """The carry-scope vertices in the chain of an attachment contraction.
+
+    A ``dot_general`` inside the carry scope, its descendants inside the
+    scope, and the ancestors inside the scope whose every consumer is in
+    the chain. On RSNN_SHD's diag container that is the readout trace's
+    chain up to the attached readout membrane; the weight's shared
+    difference vertex, which the hidden chains read too, stays outside.
+    """
+    scope = set(int(v) for v in carry)
+    producer = {}
+    for i, e in enumerate(jaxpr.eqns, 1):
+        for ov in e.outvars:
+            producer[ov] = i
+    consumers: dict = {v: set() for v in scope}
+    parents: dict = {v: set() for v in scope}
+    for i, e in enumerate(jaxpr.eqns, 1):
+        for iv in e.invars:
+            p = producer.get(iv)
+            if p in scope:
+                consumers[p].add(i)
+                if i in scope:
+                    parents[i].add(p)
+    chain: set = set()
+    for d in scope:
+        if jaxpr.eqns[d - 1].primitive.name != "dot_general":
+            continue
+        stack = [d]
+        while stack:
+            v = stack.pop()
+            if v in chain:
+                continue
+            chain.add(v)
+            stack.extend(c for c in consumers[v] if c in scope)
+    grew = True
+    while grew:
+        grew = False
+        for v in list(chain):
+            for p in parents[v]:
+                if p not in chain and consumers[p] <= chain:
+                    chain.add(p)
+                    grew = True
+    return chain
+
+
 def transport_order(o_list, variant) -> list:
     """The elimination order, carried onto the variant's graph.
 
@@ -515,9 +560,14 @@ def transport_order(o_list, variant) -> list:
     """
     vmap = variant["vertex_map"]
     valid = variant["valid"]
-    # Descending: the block is eliminated from the attached states back to
-    # the weights, so a readout factor meets the loss before the trace.
-    alt_carry = [v for v in variant["alt_carry"] if v in valid][::-1]
+    # A contraction's chain runs from the attached state back to its
+    # operands, ahead of the rest of the block, which runs from the weights
+    # to the states: the readout factor meets the loss before the trace,
+    # and a hidden trace meets the step's coefficients once, at the state.
+    carry = [v for v in variant["alt_carry"] if v in valid]
+    chain = contraction_chains(variant["config"].jaxpr, carry)
+    alt_carry = (sorted((v for v in carry if v in chain), reverse=True)
+                 + sorted(v for v in carry if v not in chain))
     base_carry = [int(v) for v in o_list if int(v) not in vmap]
     n_a, n_b = len(alt_carry), len(base_carry)
     out: list = []
