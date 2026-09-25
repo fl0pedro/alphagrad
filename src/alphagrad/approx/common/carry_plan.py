@@ -388,8 +388,9 @@ def _build_variant(container: str, entry: dict) -> dict:
         "vertex_map": vmap,
         "alt_carry": alt_carry,
         "valid": valid,
-        "chain": contraction_chains(cj.jaxpr,
-                                    [v for v in alt_carry if v in valid]),
+        "chain": (contraction_chains(cj.jaxpr,
+                                     [v for v in alt_carry if v in valid])
+                  if chain_applies(container) else set()),
     }
 
 
@@ -504,6 +505,13 @@ def _alignment(base_jaxpr, alt_jaxpr):
     return vertex_map, alt_carry
 
 
+def chain_applies(container) -> bool:
+    # The chain rule serves the readout trace's factored attachment, which
+    # only the diag container has; the other containers' contractions are
+    # the dense rows' tensordots, and those run cheaper forward.
+    return "diag" in str(container).split("+")
+
+
 def contraction_chains(jaxpr, carry) -> set:
     """The carry-scope vertices in the chain of an attachment contraction.
 
@@ -574,7 +582,7 @@ def transport_order(o_list, variant) -> list:
     chain = variant.get("chain")
     if chain is None:
         chain = (contraction_chains(variant["config"].jaxpr, carry)
-                 if carry else set())
+                 if carry and chain_applies(variant["container"]) else set())
     alt_carry = (sorted((v for v in carry if v in chain), reverse=True)
                  + sorted(v for v in carry if v not in chain))
     base_carry = [int(v) for v in o_list if int(v) not in vmap]
