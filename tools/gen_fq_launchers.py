@@ -2613,6 +2613,8 @@ def thesis_job_name(node: str) -> str:
 #: tuple ppo.py builds `--temporal-rule`'s choices from.
 THESIS_TEMPORAL_RULES = ("tbptt", "bptt", "rtrl", "window2")
 THESIS_RSNN_EXAMPLE = "RSNN_SHD"
+#: The batched one-step body, rsnn_shd.RSNN_VMAP_TARGET; window2 has none.
+THESIS_RSNN_VMAP_EXAMPLE = "VmappedRSNN_SHD"
 THESIS_RSNN_DATASET = "shd"
 #: The target key of a temporal rule.  `rsnn_bptt`, so `thesis_run_name`
 #: spells the run `<arm>_rsnn_bptt_s<seed>`.
@@ -2629,10 +2631,19 @@ THESIS_TARGET_CLI = {
     # rows; --temporal-rule is the only difference between them, and it is
     # the only flag the recurrent rows carry that the NN256 and TLM rows do
     # not.  Everything else comes from `thesis_cli`, unchanged.
-    **{f"rsnn_{r}": {"--example": THESIS_RSNN_EXAMPLE,
+    # dsnn-dfw.191: a batched rule names THESIS_RSNN_VMAP_EXAMPLE instead.
+    "rsnn_tbptt": {"--example": THESIS_RSNN_EXAMPLE,
+                   "--dataset": THESIS_RSNN_DATASET,
+                   "--temporal-rule": "tbptt"},
+    "rsnn_bptt": {"--example": THESIS_RSNN_EXAMPLE,
+                  "--dataset": THESIS_RSNN_DATASET,
+                  "--temporal-rule": "bptt"},
+    "rsnn_rtrl": {"--example": THESIS_RSNN_EXAMPLE,
+                  "--dataset": THESIS_RSNN_DATASET,
+                  "--temporal-rule": "rtrl"},
+    "rsnn_window2": {"--example": THESIS_RSNN_EXAMPLE,
                      "--dataset": THESIS_RSNN_DATASET,
-                     "--temporal-rule": r}
-       for r in THESIS_TEMPORAL_RULES},
+                     "--temporal-rule": "window2"},
 }
 THESIS_TARGET_ENV = {
     # Decision D1 (dsnn-dfw.152): 43 percent of the card under Markowitz.
@@ -2646,7 +2657,16 @@ THESIS_TARGET_ENV = {
     # WEIGHT_SCALE), chosen by the learning gate, and nothing reads an env
     # var for them.  So these rows export nothing of their own and
     # THESIS_TARGET_ENV_ALLOWED below does not grow.
-    **{t: {} for t in THESIS_RSNN_TARGETS},
+    # dsnn-dfw.191: a batched rule exports its batch.  One entry per rule, the
+    # value on its own line, so that each rule's batch is its own commit.
+    "rsnn_tbptt":
+        {},
+    "rsnn_bptt":
+        {},
+    "rsnn_rtrl":
+        {},
+    "rsnn_window2":
+        {},
 }
 #: The ONLY per-arm exports a thesis launcher may carry.  `render` refuses
 #: any other key, exactly as it refuses every per-arm export on a campaign arm.
@@ -4938,7 +4958,7 @@ def orderonly_rsnn_arm(*, rule: str, seed: str, lam_cmp: str | None = None,
         thesis_rule=thesis_temporal_rule(target),
         thesis_seed=seed, orderonly_weights=(None if pref
                                              else (lam_cmp, lam_mem)),
-        env=dict(THESIS_TARGET_ENV[target]),
+        env=thesis_target_form(target, batched=False)[1],
         required_flags=ORDERONLY_REQUIRED_FLAGS,
         required_flags_file=" ".join(THESIS_FLAGS_FILES),
         cli=cli,
@@ -5013,7 +5033,7 @@ def orderonly_rsnn_tbptt_arm(*, seed: str) -> dict:
         orderonly_rsnn=True, thesis_arm=ORDERONLY_ARM, thesis_target=target,
         thesis_rule=thesis_temporal_rule(target),
         thesis_seed=seed, orderonly_weights=(lam_cmp, lam_mem),
-        env=dict(THESIS_TARGET_ENV[target]),
+        env=thesis_target_form(target, batched=False)[1],
         required_flags=ORDERONLY_REQUIRED_FLAGS,
         required_flags_file=" ".join(THESIS_FLAGS_FILES),
         cli=cli,
