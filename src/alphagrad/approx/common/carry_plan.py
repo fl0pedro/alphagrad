@@ -617,8 +617,10 @@ def transport_wires(o_list, variant, rule_specs, face_specs, face_skips,
             # the containers carry different ones. An all-exact row has
             # nothing to carry and is dropped; a row that carries a decision
             # would have it vanish, so it raises.
-            if (int(fs[k][..., 0].max()) != -1 or int(sk[k].max()) != 0
-                    or int(rs[k][:, 0].max()) != -1):
+            # Every row but the end row (-1) is a decision; the Quant and
+            # Reduce sentinels lie below it, so a maximum does not see them.
+            if (bool(np.any(fs[k][..., 0] != -1)) or bool(np.any(sk[k] != 0))
+                    or bool(np.any(rs[k][:, 0] != -1))):
                 raise ValueError(
                     f"vertex {int(v)} of the policy's graph carries an "
                     f"approximation and its image {j} is not eliminable on "
