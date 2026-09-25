@@ -259,14 +259,31 @@ def test_a_contractions_chain_stops_at_the_shared_difference():
     assert chain == {3, 4, 5, 6}, chain
 
 
-def test_the_transported_block_runs_a_contractions_chain_backward_first():
+def _variant(container):
     import types
-    from alphagrad.approx.common import carry_plan as CP
     jx = _attachment_jaxpr()
-    variant = {"vertex_map": {11: 11, 12: 12}, "alt_carry": tuple(range(1, 10)),
-               "valid": set(range(1, 10)) | {11, 12},
-               "config": types.SimpleNamespace(jaxpr=jx)}
+    return {"container": container, "vertex_map": {11: 11, 12: 12},
+            "alt_carry": tuple(range(1, 10)),
+            "valid": set(range(1, 10)) | {11, 12},
+            "config": types.SimpleNamespace(jaxpr=jx)}
+
+
+def test_the_transported_block_runs_a_contractions_chain_backward_first():
+    from alphagrad.approx.common import carry_plan as CP
     # the policy's carry vertices 20 and 21 sit between its body vertices
-    moved = CP.transport_order([12, 20, 21, 11], variant)
-    assert moved == [12, 6, 5, 4, 3, 1, 2, 7, 8, 9, 11], moved
-    assert sorted(moved) == sorted(variant["valid"])
+    for container in ("diag", "diag+reduce", "diag+quant"):
+        moved = CP.transport_order([12, 20, 21, 11], _variant(container))
+        assert moved == [12, 6, 5, 4, 3, 1, 2, 7, 8, 9, 11], (container, moved)
+        assert sorted(moved) == sorted(_variant(container)["valid"])
+
+
+def test_the_chain_rule_serves_the_diag_container_only():
+    # the other containers attach the dense rows through a tensordot, a
+    # contraction too, and their block stays ascending (the quant plan ran
+    # 24 percent slower under the chain, job 68169)
+    from alphagrad.approx.common import carry_plan as CP
+    for container in ("exact", "reduce", "quant", "reduce+quant"):
+        moved = CP.transport_order([12, 20, 21, 11], _variant(container))
+        assert moved == [12, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11], (container, moved)
+        assert not CP.chain_applies(container)
+    assert CP.chain_applies("diag") and CP.chain_applies("diag+quant")
