@@ -24,10 +24,18 @@ _TRAINER_LINE = re.compile(
     r'^\s*src/alphagrad/approx/ppo\.py "\$\{ARGS\[@\]\}"\s*$', re.M)
 
 
-def _gen():
-    spec = importlib.util.spec_from_file_location("gen_fq_launchers", _GEN)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+def _gen(pairs: bool = False):
+    old = os.environ.pop("THESIS_PAIRS", None)
+    if pairs:
+        os.environ["THESIS_PAIRS"] = "1"
+    try:
+        spec = importlib.util.spec_from_file_location("gen_fq_launchers", _GEN)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    finally:
+        os.environ.pop("THESIS_PAIRS", None)
+        if old is not None:
+            os.environ["THESIS_PAIRS"] = old
     return mod
 
 
@@ -119,7 +127,7 @@ def test_a_crashed_trainer_is_the_exit_code_of_the_rendered_launcher():
 
 
 def test_a_paired_launcher_exits_with_the_worse_of_its_two_trainers():
-    gen = _gen()
+    gen = _gen(pairs=True)
     pairs = gen.thesis_pair_arms()
     assert pairs, "the generator emits no paired launcher"
     text = gen.render(pairs[0])

@@ -43,12 +43,35 @@ PAIR_MEM = "1480G"
 NN256_ACTORS = "3"
 
 
+def _load(pairs: bool):
+    old = os.environ.pop("THESIS_PAIRS", None)
+    if pairs:
+        os.environ["THESIS_PAIRS"] = "1"
+    try:
+        spec = importlib.util.spec_from_file_location("gen_fq_launchers", _GEN)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    finally:
+        os.environ.pop("THESIS_PAIRS", None)
+        if old is not None:
+            os.environ["THESIS_PAIRS"] = old
+    return mod
+
+
 @pytest.fixture(scope="module")
 def gen():
-    spec = importlib.util.spec_from_file_location("gen_fq_launchers", _GEN)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    # The pair path, switched on: the default keeps it off (dsnn-dfw.245).
+    return _load(pairs=True)
+
+
+@pytest.fixture(scope="module")
+def gen_off():
+    return _load(pairs=False)
+
+
+def _args(text: str) -> str:
+    i = text.index("\nARGS=(\n")
+    return text[i:text.index("\n)\n", i)]
 
 
 def _nn256_rows(gen):
@@ -334,3 +357,34 @@ def test_thesis_pair_arm_refuses_a_mismatched_pair(gen):
     finally:
         del gen.ARMS[n0:]
     assert len(gen.ARMS) == n0
+
+
+# ------------------------------------------- 4. the switch (dsnn-dfw.245)
+
+def test_with_the_pairs_off_every_nn256_seed_is_a_single_row(gen, gen_off):
+    assert gen_off.THESIS_PAIRS is False and gen.THESIS_PAIRS is True
+    assert gen_off.thesis_pair_arms() == []
+    assert not [a["name"] for a in gen_off.ARMS if a.get("paired_into")]
+    on = {a["name"]: a for a in gen.ARMS}
+    off = {a["name"]: a for a in gen_off.ARMS}
+    assert set(off) == set(on) - {p["name"] for p in gen.thesis_pair_arms()}
+    n_halves = 0
+    for name, a in off.items():
+        text = gen_off.render(a)
+        assert "ABORT(74)" not in text and "exit 74" not in text, name
+        ref = gen.render(on[name])
+        if on[name].get("paired_into"):
+            n_halves += 1
+            assert _args(text) == _args(ref), name
+            assert '\n  src/alphagrad/approx/ppo.py "${ARGS[@]}"\n' in text, \
+                name
+            assert f"#SBATCH --gres={gen_off.blackwell_gres(NN256_GPUS)}\n" \
+                in text, name
+            assert f"#SBATCH -c {NN256_CPUS}\n" in text, name
+            assert f"#SBATCH --mem={NN256_ROW_MEM}\n" in text, name
+        else:
+            assert text == ref, name
+    assert n_halves == 2 * len(gen.thesis_pair_arms()) > 0
+    for s in ("250197", "250198"):
+        a = off[f"C_popart_nn256_s{s}"]
+        assert a["node"] in EIGHT_GPU and not a.get("paired_into"), a["name"]

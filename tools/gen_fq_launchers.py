@@ -3609,9 +3609,11 @@ for _i, (_arm, _target, _seed) in enumerate(thesis_submission_order()):
 # A slot that no sibling joined stays a whole single-node job of four GPUs on
 # an 8-GPU node: legal, one job on the node, the same profile as every other
 # NN256 row.  Only a node that carries TWO rows of one arm becomes a pair.
+# The pairs stay off until the pair fix lands (dsnn-dfw.245): each NN256 seed is a single 4-GPU row.
+THESIS_PAIRS = os.environ.get("THESIS_PAIRS", "0") == "1"
 _rows: list[dict] = []
 for _rows in _HALVES.values():
-    if len(_rows) == 2:
+    if THESIS_PAIRS and len(_rows) == 2:
         thesis_pair_arm(_rows)
 del _i, _arm, _target, _seed, _node, _half, _row, _rows, _HALVES, _SLOT
 

@@ -72,12 +72,24 @@ class _Missing:
 _MISSING = _Missing()
 
 
+def _load(pairs: bool = False):
+    old = os.environ.pop("THESIS_PAIRS", None)
+    if pairs:
+        os.environ["THESIS_PAIRS"] = "1"
+    try:
+        spec = importlib.util.spec_from_file_location("gen_fq_launchers", _GEN)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    finally:
+        os.environ.pop("THESIS_PAIRS", None)
+        if old is not None:
+            os.environ["THESIS_PAIRS"] = old
+    return mod
+
+
 @pytest.fixture(scope="module")
 def gen():
-    spec = importlib.util.spec_from_file_location("gen_fq_launchers", _GEN)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    return _load()
 
 
 @pytest.fixture(scope="module")
@@ -85,7 +97,10 @@ def emitted(gen):
     rows = [a for a in gen.thesis_arms()
             if not any(a.get(k) for k in _FROZEN_KEYS)]
     assert rows
-    return rows
+    # The pair launchers come from the switch on (dsnn-dfw.245 keeps it off).
+    pairs = _load(pairs=True).thesis_pair_arms()
+    assert pairs
+    return rows + pairs
 
 
 @pytest.fixture(scope="module")
