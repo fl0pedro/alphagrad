@@ -113,18 +113,18 @@ def _profile(gen, a) -> int:
 
 def test_every_row_thesis_arm_emits_exports_the_measure_path(gen, emitted,
                                                              frozen):
-    assert gen.THESIS_MEASURE_PATH_ENV == MEASURE_PATH_ENV
     for a in emitted:
         text = gen.render(a)
         for k, v in MEASURE_PATH_ENV.items():
-            assert a["env"][k] == v, (a["name"], k)
             assert f"\nexport {k}={v}\n" in text, (a["name"], k)
             assert text.count(f"export {k}=") == 1, (a["name"], k)
+            assert (a.get("env") or {}).get(k) == v, (a["name"], k)
     for a in frozen:
         text = gen.render(a)
         for k in MEASURE_PATH_ENV:
             assert k not in (a.get("env") or {}), (a["name"], k)
             assert f"export {k}=" not in text, (a["name"], k)
+    assert gen.THESIS_MEASURE_PATH_ENV == MEASURE_PATH_ENV
     assert set(MEASURE_PATH_ENV) <= gen.THESIS_TARGET_ENV_ALLOWED
     assert not set(MEASURE_PATH_ENV) & set(gen.CAMPAIGN_ENV_ALLOWED)
     env_py = open(os.path.join(_ALPHAGRAD, "src", "alphagrad", "approx",
@@ -156,13 +156,13 @@ def test_no_rendered_row_turns_the_block_diagonal_off(gen):
 
 def test_every_row_thesis_arm_emits_trains_the_static_memory_objective(
         gen, emitted, frozen):
-    assert gen.THESIS_MEM_OBJECTIVE_WEIGHT == MEM_OBJECTIVE_WEIGHT
     # the wave arms inherit SHARED_CLI; its value does not move
     assert dict(gen.SHARED_CLI)["--rewards"] == FROZEN_REWARDS
     for a in emitted:
         cli = _cli(gen, a)
         assert cli["--rewards"] == REWARDS, a["name"]
-        assert cli["--mem-objective-weight"] == MEM_OBJECTIVE_WEIGHT, a["name"]
+        assert cli.get("--mem-objective-weight") == MEM_OBJECTIVE_WEIGHT, \
+            a["name"]
         # slot 5 still holds the watermark and is logged, with weight 0
         assert cli["--mem-channel"] == "watermark", a["name"]
         assert cli["--mem-type"] == "peak_memory", a["name"]
@@ -186,6 +186,7 @@ def test_every_row_thesis_arm_emits_trains_the_static_memory_objective(
         assert a["purpose"].startswith(gen.THESIS_HEAD), a["name"]
     assert "slot 11" in gen.THESIS_MATRIX_HEAD
     assert "runtime watermark memory" in gen.THESIS_HEAD
+    assert gen.THESIS_MEM_OBJECTIVE_WEIGHT == MEM_OBJECTIVE_WEIGHT
 
 
 # ------------------------------------------------- 4. no compile cache
@@ -193,8 +194,7 @@ def test_every_row_thesis_arm_emits_trains_the_static_memory_objective(
 def test_no_row_thesis_arm_emits_sets_a_compile_cache_under_any_order(
         gen, emitted, frozen):
     for a in emitted:
-        assert a["jax_cache"] is False, a["name"]
-        for order in ("free", "markowitz", "reverse"):
+        for order in ("markowitz", "reverse", "free"):
             b = dict(a, cli=dict(a["cli"], **{"--fixed-order": order}))
             if a.get("halves"):
                 b["halves"] = [dict(h, cli=dict(h["cli"],
@@ -205,6 +205,7 @@ def test_no_row_thesis_arm_emits_sets_a_compile_cache_under_any_order(
             assert "JAX_PERSISTENT_CACHE_" not in text, (a["name"], order)
             assert f"mkdir -p {gen.JAX_CACHE_DIR_EXPR}" not in text, \
                 (a["name"], order)
+        assert a.get("jax_cache") is False, a["name"]
     for a in frozen:
         text = gen.render(a)
         assert (f"export JAX_COMPILATION_CACHE_DIR={gen.JAX_CACHE_DIR_EXPR}\n"
@@ -217,20 +218,10 @@ def test_the_oracle_takes_every_core_the_trainer_and_the_actors_leave(
         gen, emitted, frozen):
     from alphagrad.approx.common.core_budget import (check_disjoint,
                                                       node_core_layout)
-    assert gen.BLACKWELL_CPUS == NODE_CPUS
-    assert gen.THESIS_CORE_BUDGET == {
-        g: {"trainer": TRAINER_CORES, "per_actor": CORES_PER_ACTOR,
-            "oracle": ORACLE_CORES[g]} for g in (4, 8)}
-    for g in (4, 8):
-        lay = gen.thesis_core_layout(g)
-        check_disjoint(lay)
-        assert lay.n_logical == NODE_CPUS[g]
-        assert lay.spare == ()
-        assert lay.oracle == (NODE_CPUS[g] - ORACLE_CORES[g], ORACLE_CORES[g])
     for a in emitted:
         g = _profile(gen, a)
         cli = _cli(gen, a)
-        assert cli["--grad-oracle-cores"] == "0", a["name"]
+        assert cli.get("--grad-oracle-cores") == "0", a["name"]
         for flag in ORACLE_FLAGS:
             assert flag in a["required_flags"], (a["name"], flag)
         ns = _parse(gen, a)
@@ -265,17 +256,41 @@ def test_the_oracle_takes_every_core_the_trainer_and_the_actors_leave(
         cli = _cli(gen, a)
         assert "--grad-oracle-cores" not in cli, a["name"]
         assert cli["--cpu-cores-per-actor"] == "2", a["name"]
+    assert gen.BLACKWELL_CPUS == NODE_CPUS
+    assert gen.THESIS_CORE_BUDGET == {
+        g: {"trainer": TRAINER_CORES, "per_actor": CORES_PER_ACTOR,
+            "oracle": ORACLE_CORES[g]} for g in (4, 8)}
+    for g in (4, 8):
+        lay = gen.thesis_core_layout(g)
+        check_disjoint(lay)
+        assert lay.n_logical == NODE_CPUS[g]
+        assert lay.spare == ()
+        assert lay.oracle == (NODE_CPUS[g] - ORACLE_CORES[g], ORACLE_CORES[g])
 
 
 # --------------------------------- 6. the oracle's batch, budget and memory
 
 def test_the_oracle_batch_and_host_budget_follow_the_target_and_the_node(
         gen, emitted, frozen):
-    assert gen.THESIS_GRAD_ORACLE_BATCH == {
-        **ORACLE_BATCH, **{t: RSNN_ORACLE_BATCH
-                           for t in gen.THESIS_RSNN_TARGETS}}
-    assert gen.THESIS_GRAD_ORACLE_HOST_BUDGET_GB == HOST_BUDGET_GB
-    assert gen.THESIS_ROW_MEM == ROW_MEM
+    for a in emitted:
+        cli = _cli(gen, a)
+        want = ORACLE_BATCH.get(a["thesis_target"], RSNN_ORACLE_BATCH)
+        assert cli.get("--grad-oracle-batch") == want, a["name"]
+        assert cli.get("--grad-oracle-host-budget-gb") == \
+            HOST_BUDGET_GB[_profile(gen, a)], a["name"]
+        text = gen.render(a)
+        assert f"#SBATCH --mem={ROW_MEM[a['gpus']]}\n" in text, a["name"]
+        ns = _parse(gen, a)
+        assert ns.grad_oracle_batch == int(want), a["name"]
+        assert ns.grad_oracle_host_budget_gb == \
+            float(HOST_BUDGET_GB[_profile(gen, a)]), a["name"]
+    for a in frozen:
+        cli = _cli(gen, a)
+        for flag in ORACLE_FLAGS:
+            assert flag not in cli, (a["name"], flag)
+        text = gen.render(a)
+        assert (f"#SBATCH --mem={gen.node_mem(a['node'], a['gpus'])}\n"
+                in text), a["name"]
     for g in (4, 8):
         mem_gib = int(ROW_MEM[g].rstrip("G"))
         # schedulable under sinfo's RealMemory, with a margin left to the OS
@@ -285,36 +300,22 @@ def test_the_oracle_batch_and_host_budget_follow_the_target_and_the_node(
     # a pair runs two 4-GPU rows and their two checks on one 8-GPU node
     assert (2 * RSS_OVER_BUDGET * float(HOST_BUDGET_GB[4])
             < int(ROW_MEM[8].rstrip("G")))
-    for a in emitted:
-        cli = _cli(gen, a)
-        want = ORACLE_BATCH.get(a["thesis_target"], RSNN_ORACLE_BATCH)
-        assert cli["--grad-oracle-batch"] == want, a["name"]
-        assert cli["--grad-oracle-host-budget-gb"] == \
-            HOST_BUDGET_GB[_profile(gen, a)], a["name"]
-        ns = _parse(gen, a)
-        assert ns.grad_oracle_batch == int(want), a["name"]
-        assert ns.grad_oracle_host_budget_gb == \
-            float(HOST_BUDGET_GB[_profile(gen, a)]), a["name"]
-        text = gen.render(a)
-        assert f"#SBATCH --mem={ROW_MEM[a['gpus']]}\n" in text, a["name"]
-    for a in frozen:
-        cli = _cli(gen, a)
-        for flag in ORACLE_FLAGS:
-            assert flag not in cli, (a["name"], flag)
-        text = gen.render(a)
-        assert (f"#SBATCH --mem={gen.node_mem(a['node'], a['gpus'])}\n"
-                in text), a["name"]
+    assert gen.THESIS_GRAD_ORACLE_BATCH == {
+        **ORACLE_BATCH, **{t: RSNN_ORACLE_BATCH
+                           for t in gen.THESIS_RSNN_TARGETS}}
+    assert gen.THESIS_GRAD_ORACLE_HOST_BUDGET_GB == HOST_BUDGET_GB
+    assert gen.THESIS_ROW_MEM == ROW_MEM
 
 
 # ------------------------------------------------------- 7. condC out
 
 def test_condc_left_the_matrix_and_the_frozen_preference_rows_keep_it(
         gen, emitted):
-    assert gen.THESIS_ARMS == ARMS
-    assert "condC" not in gen.THESIS_ARM_SPEC
     for a in emitted:
         assert a["thesis_arm"] != "condC", a["name"]
         assert "--preference-conditioned" not in _cli(gen, a), a["name"]
+    assert gen.THESIS_ARMS == ARMS
+    assert "condC" not in gen.THESIS_ARM_SPEC
     assert all(arm != "condC" for arm, _t, _s in
                gen.thesis_submission_order())
     got = {(a["thesis_arm"], a["thesis_target"], a["thesis_seed"])
@@ -347,13 +348,16 @@ def test_condc_left_the_matrix_and_the_frozen_preference_rows_keep_it(
 # ---------------------------------------------------- 8. the defense arms
 
 def test_the_defense_arms_are_arm_a_on_popart_at_three_lambdas(gen):
-    assert gen.THESIS_DEFENSE_ARMS == tuple(DEFENSE_LAMBDA_Q)
-    rows = gen.thesis_defense_arms()
+    rows = [a for a in gen.thesis_arms()
+            if a.get("thesis_arm") in DEFENSE_LAMBDA_Q and not a.get("paired")]
     got = {(a["thesis_arm"], a["thesis_target"], a["thesis_seed"])
            for a in rows}
     assert got == {(arm, "nn256", s) for arm in DEFENSE_LAMBDA_Q
                    for s in DEFENSE_SEEDS}
     assert len(rows) == 9
+    assert gen.THESIS_DEFENSE_ARMS == tuple(DEFENSE_LAMBDA_Q)
+    assert [a["name"] for a in gen.thesis_defense_arms()] == \
+        [a["name"] for a in rows]
     block = {a["name"] for a in gen.thesis_block1_arms()}
     a_rows = {a["thesis_seed"]: a for a in gen.thesis_core_arms()
               if a["thesis_arm"] == "A" and a["thesis_target"] == "nn256"}
