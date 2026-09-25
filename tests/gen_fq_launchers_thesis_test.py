@@ -541,6 +541,24 @@ def test_the_targets_are_the_ones_the_owner_named(gen, matrix):
     assert '"--nn-hidden"' not in ppo
 
 
+def test_a_vmapped_row_carries_its_batch_and_no_frozen_round_moves(
+        gen, matrix, smoke):
+    var = gen.NN_BATCH_VAR
+    assert var == "ALPHAGRAD_NN_BATCH"
+    for a in matrix + smoke:
+        vmapped = _cli(gen, a)["--example"].startswith("Vmapped")
+        assert (var in a["env"]) == vmapped, a["name"]
+    for a in _frozen_rounds(gen):
+        assert not _cli(gen, a)["--example"].startswith("Vmapped"), a["name"]
+        assert var not in (a.get("env") or {}), a["name"]
+        assert var not in gen.render(a), a["name"]
+    assert var in gen.THESIS_ENV_ALLOWED
+    assert var not in gen.CAMPAIGN_ENV_ALLOWED
+    ds = open(os.path.join(_ALPHAGRAD, "src", "alphagrad", "approx", "common",
+                           "datasets.py")).read()
+    assert 'environ.get("ALPHAGRAD_NN_BATCH"' in ds
+
+
 def test_arms_a_and_b_are_the_fixed_form_with_no_quality_floor(gen, matrix):
     """Owner ruling 2026-09-16 (night): A and B run the fixed additive form
     at lambda_q 16 with RAW quality and NO floor.  A starts at bias 0 and is
@@ -997,7 +1015,8 @@ def test_no_thesis_launcher_exports_an_xla_flag_or_a_promoted_var(gen,
 def test_every_export_in_a_thesis_launcher_is_allowed(gen, matrix, smoke):
     allowed = set(gen.THESIS_ENV_ALLOWED)
     assert allowed == (set(gen.CAMPAIGN_ENV_ALLOWED)
-                       | {"ALPHAGRAD_NN_HIDDEN"} | set(MATRIX_ENV))
+                       | {"ALPHAGRAD_NN_HIDDEN", "ALPHAGRAD_NN_BATCH"}
+                       | set(MATRIX_ENV))
     for a in matrix + smoke:
         exported = set(_EXPORT.findall(gen.render(a)))
         assert exported <= allowed, (a["name"], sorted(exported - allowed))

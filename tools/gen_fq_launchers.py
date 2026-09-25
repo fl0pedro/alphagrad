@@ -2618,9 +2618,13 @@ THESIS_RSNN_DATASET = "shd"
 #: spells the run `<arm>_rsnn_bptt_s<seed>`.
 THESIS_RSNN_TARGETS = tuple(f"rsnn_{r}" for r in THESIS_TEMPORAL_RULES)
 THESIS_TARGETS = ("nn256", "tlm") + THESIS_RSNN_TARGETS
+#: The batch of a Vmapped target; common/datasets.py reads it at import time.
+NN_BATCH_VAR = "ALPHAGRAD_NN_BATCH"
 THESIS_TARGET_CLI = {
-    "nn256": {"--example": "NeuralNetwork", "--dataset": "mnist"},
-    "tlm": {"--example": "TransformerLM", "--dataset": "wikitext2"},
+    "nn256": {"--example": "NeuralNetwork",
+              "--dataset": "mnist"},
+    "tlm": {"--example": "TransformerLM",
+            "--dataset": "wikitext2"},
     # THE RECURRENT TARGET.  --example and --dataset are the same in all four
     # rows; --temporal-rule is the only difference between them, and it is
     # the only flag the recurrent rows carry that the NN256 and TLM rows do
@@ -2632,7 +2636,8 @@ THESIS_TARGET_CLI = {
 }
 THESIS_TARGET_ENV = {
     "nn256": {"ALPHAGRAD_NN_HIDDEN": "256"},
-    "tlm": {},          # the ALPHAGRAD_TLM_* triple is in CAMPAIGN_ENV
+    # the ALPHAGRAD_TLM_* triple is in CAMPAIGN_ENV
+    "tlm": {},
     # The recurrent target's shape is NOT an environment variable: the hidden
     # width, the time constants and the init scale are module constants of
     # common/rsnn_shd.py (RSNN_HIDDEN = 128, the seven measured constants and
@@ -2645,10 +2650,20 @@ THESIS_TARGET_ENV = {
 #: any other key, exactly as it refuses every per-arm export on a campaign arm.
 THESIS_TARGET_ENV_ALLOWED = frozenset(
     k for env in THESIS_TARGET_ENV.values() for k in env
-) | {MEASURE_CACHE_CLEAR_EVERY_VAR, PROACTIVE_RECYCLE_EVERY_VAR}
+) | {MEASURE_CACHE_CLEAR_EVERY_VAR, PROACTIVE_RECYCLE_EVERY_VAR, NN_BATCH_VAR}
 #: Every `export NAME=` a THESIS launcher may contain: the campaign's allowed
 #: set plus the target-shape variables above.
 THESIS_ENV_ALLOWED = frozenset(CAMPAIGN_ENV_ALLOWED) | THESIS_TARGET_ENV_ALLOWED
+
+
+def thesis_target_form(target: str, batched: bool) -> tuple[dict, dict]:
+    cli = dict(THESIS_TARGET_CLI[target])
+    env = dict(THESIS_TARGET_ENV[target])
+    if not batched:
+        # A frozen round keeps the unbatched target it ran on (dsnn-dfw.191).
+        cli["--example"] = cli["--example"].removeprefix("Vmapped")
+        env.pop(NN_BATCH_VAR, None)
+    return cli, env
 
 
 def thesis_temporal_rule(target: str) -> str | None:
@@ -2997,6 +3012,7 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
                episodes: str, checkpoint_every: str,
                auto_stop: bool, grad_oracle_cadence: str = "50",
                matrix_row: bool = False,
+               batched: bool = False,
                face_entropy_floor: str = "0.3",
                face_entropy_weight: str | None = None,
                ppo_epochs: str = "1", minibatches: str = "4",
@@ -3046,7 +3062,7 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
         "--name": name,
         "--seed": seed,
         # --- the target
-        **THESIS_TARGET_CLI[target],
+        **thesis_target_form(target, batched)[0],
         # --- the search space
         "--approx-profile": THESIS_PROFILE,
         "--fixed-order": THESIS_ORDER,
@@ -3166,7 +3182,8 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
                THESIS_PROACTIVE_RECYCLE_EVERY,
                ray_measure_timeout: str = THESIS_RAY_MEASURE_TIMEOUT,
                cores_per_actor: str | None = THESIS_CORES_PER_ACTOR,
-               jax_cache_fixed_order_only: bool = True) -> dict:
+               jax_cache_fixed_order_only: bool = True,
+               batched: bool = True) -> dict:
     """One thesis run -> one `arm(...)`.  Returns the arm."""
     _require(node in THESIS_NODES,
              f"node {node!r} is not one of the permitted thesis nodes "
@@ -3191,7 +3208,7 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
                      episodes=episodes, checkpoint_every=checkpoint_every,
                      auto_stop=auto_stop,
                      grad_oracle_cadence=grad_oracle_cadence,
-                     matrix_row=True,
+                     matrix_row=True, batched=batched,
                      face_entropy_floor=face_entropy_floor,
                      face_entropy_weight=face_entropy_weight,
                      ppo_epochs=ppo_epochs, minibatches=minibatches,
@@ -3217,7 +3234,7 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
         # dsnn-dfw.99: the retention bound and the process recycle ride
         # with the target shape, and a row that renders `None` for either of
         # the two drops that one export again.
-        env=dict(THESIS_TARGET_ENV[target],
+        env=dict(thesis_target_form(target, batched)[1],
                  **({MEASURE_CACHE_CLEAR_EVERY_VAR: cache_clear_every}
                     if cache_clear_every is not None else {}),
                  **({PROACTIVE_RECYCLE_EVERY_VAR: proactive_recycle_every}
@@ -3917,6 +3934,8 @@ for _sweepl_tag, _sweepl_overrides in sweepl_configs():
             ray_measure_timeout=CAMPAIGN_RAY_MEASURE_TIMEOUT,
             cores_per_actor=None,
             jax_cache_fixed_order_only=False,
+            # dsnn-dfw.191: same reason, keeps the unbatched target too.
+            batched=False,
         )
         ARMS[-1]["sweepl"] = True
         ARMS[-1]["sweepl_tag"] = _sweepl_tag
@@ -4089,6 +4108,8 @@ for _sweepl2_tag, _sweepl2_overrides in sweepl2_configs():
             ray_measure_timeout=CAMPAIGN_RAY_MEASURE_TIMEOUT,
             cores_per_actor=None,
             jax_cache_fixed_order_only=False,
+            # dsnn-dfw.191: same reason, keeps the unbatched target too.
+            batched=False,
         )
         ARMS[-1]["sweepl2"] = True
         ARMS[-1]["sweepl2_tag"] = _sweepl2_tag
@@ -4248,6 +4269,8 @@ for _sweepl3_tag, _sweepl3_overrides in sweepl3_configs():
             ray_measure_timeout=CAMPAIGN_RAY_MEASURE_TIMEOUT,
             cores_per_actor=None,
             jax_cache_fixed_order_only=False,
+            # dsnn-dfw.191: same reason, keeps the unbatched target too.
+            batched=False,
         )
         ARMS[-1]["sweepl3"] = True
         ARMS[-1]["sweepl3_tag"] = _sweepl3_tag
@@ -4465,7 +4488,7 @@ def orderonly_arm(*, seed: str, lam_cmp: str | None = None,
         orderonly=True, thesis_arm=arm_name, thesis_target=ORDERONLY_TARGET,
         thesis_seed=seed, orderonly_weights=(None if pref
                                              else (lam_cmp, lam_mem)),
-        env=dict(THESIS_TARGET_ENV[ORDERONLY_TARGET]),
+        env=thesis_target_form(ORDERONLY_TARGET, batched=False)[1],
         required_flags=ORDERONLY_REQUIRED_FLAGS,
         required_flags_file=" ".join(THESIS_FLAGS_FILES),
         cli=cli,
@@ -4614,7 +4637,7 @@ def orderonly_final_arm(*, seed: str) -> dict:
         orderonly_final=True, thesis_arm=ORDERONLY_ARM,
         thesis_target=ORDERONLY_TARGET, thesis_seed=seed,
         orderonly_weights=(lam_cmp, lam_mem),
-        env=dict(THESIS_TARGET_ENV[ORDERONLY_TARGET]),
+        env=thesis_target_form(ORDERONLY_TARGET, batched=False)[1],
         required_flags=ORDERONLY_REQUIRED_FLAGS,
         required_flags_file=" ".join(THESIS_FLAGS_FILES),
         cli=cli,
@@ -4725,7 +4748,7 @@ def orderonly_tlm_final_arm() -> dict:
         orderonly_tlm_final=True, thesis_arm=ORDERONLY_ARM,
         thesis_target="tlm", thesis_seed=ORDERONLY_TLM_FINAL_SEED,
         orderonly_weights=(lam_cmp, lam_mem),
-        env=dict(THESIS_TARGET_ENV["tlm"]),
+        env=thesis_target_form("tlm", batched=False)[1],
         required_flags=ORDERONLY_REQUIRED_FLAGS,
         required_flags_file=" ".join(THESIS_FLAGS_FILES),
         cli=cli,
@@ -5417,6 +5440,7 @@ def _scratch_stack_block(target_env: dict | None = None,
         L.append("# device memory to the pool; only recycling the actor PROCESS")
         L.append("# does.  ppo.py has no flag for it.")
         L.append(f"export {PROACTIVE_RECYCLE_EVERY_VAR}={_proactive_recycle}")
+    _batch = target_env.pop(NN_BATCH_VAR, None)
     if target_env:
         L.append("")
         L.append("# THE TARGET SHAPE (thesis matrix, ticket dsnn-dfw.4).  The")
@@ -5425,6 +5449,11 @@ def _scratch_stack_block(target_env: dict | None = None,
         L.append("# ALPHAGRAD_TLM_* triple above is, and ppo.py has no flag for it.")
         for k in sorted(target_env):
             L.append(f"export {k}={target_env[k]}")
+    if _batch is not None:
+        L.append("")
+        L.append("# THE BATCH (dsnn-4ay).  common/datasets.py reads it at")
+        L.append("# IMPORT time, and ppo.py has no flag for it.")
+        L.append(f"export {NN_BATCH_VAR}={_batch}")
     L.append("")
     if jax_cache:
         L.extend(_jax_cache_lines())
