@@ -380,28 +380,33 @@ class CpuApproxPool:
             holders = ([self._handles.get(i) for i, s in self._slot_of.items()
                         if s == slot] if slot is not None else [])
         if holders:
-            self._n_respawn_refused += 1
-            raise ActorStartRefused(
+            raise self._refused(ActorStartRefused(
                 f"slot {slot} is held by the live actor {holders[0]!r}; the "
-                f"replacement for {dead!r} is not started (dsnn-dfw.229)")
+                f"replacement for {dead!r} is not started (dsnn-dfw.229)"))
         if self._factory_takes_slot and slot is None:
-            self._n_respawn_refused += 1
-            raise ActorStartRefused(
+            raise self._refused(ActorStartRefused(
                 f"the pool holds no slot for {dead!r}, so its replacement has "
-                f"no device to take; nothing is started (dsnn-dfw.229)")
+                f"no device to take; nothing is started (dsnn-dfw.229)"))
         try:
             if self._factory_takes_slot:
                 new_handle = self._respawn_factory(slot=slot)
             else:
                 new_handle = self._respawn_factory()
-        except ActorStartRefused:
-            self._n_respawn_refused += 1
-            raise
+        except ActorStartRefused as exc:
+            raise self._refused(exc)
         with self._lock:
             if slot is not None:
                 self._slot_of[id(new_handle)] = slot
             self._handles[id(new_handle)] = new_handle
         return new_handle
+
+    def _refused(self, exc: ActorStartRefused) -> ActorStartRefused:
+        # Counted and stored in one step, so a caller that saw the count
+        # also finds the error at its next call.
+        with self._lock:
+            self._n_respawn_refused += 1
+            self._respawn_error = exc
+        return exc
 
     def _raise_refused(self) -> None:
         with self._lock:
