@@ -53,6 +53,7 @@ numbering and one order can name a plan on either of them (owner ruling
 
 from __future__ import annotations
 
+import math
 import queue
 import threading
 import time
@@ -206,6 +207,8 @@ class AsyncGradOracle:
         self.n_timeout = 0
         self.n_late = 0          # answers that arrived after their timeout
         self.n_submitted = 0
+        # The largest rel_l2 given out. None until the first; a NaN stays.
+        self.rel_l2_max = None
         # -- actor mode only --
         self._actor_factory = actor_factory
         self._arg_resolver = arg_resolver
@@ -340,6 +343,10 @@ class AsyncGradOracle:
             self.n_timeout += 1
         else:
             self.n_fail += 1
+        rel = res["rel_l2"]
+        if rel is not None and (self.rel_l2_max is None or math.isnan(rel)
+                                or rel > self.rel_l2_max):
+            self.rel_l2_max = float(rel)
 
     def take_results(self, now: float | None = None) -> list:
         """Every answer that has arrived, plus a ``timeout`` for every job that

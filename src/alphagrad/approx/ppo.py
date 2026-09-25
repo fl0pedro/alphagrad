@@ -719,13 +719,14 @@ def _resolve_plan_log_path(args) -> str | None:
 #
 # The oracle is a SANITY CHECK and not part of the scoring. The scheduling
 # lives in `common/grad_oracle_async.py` and the check itself in
-# `env.grad_oracle_cpu_check`; these three functions are the trainer's own
+# `env.grad_oracle_cpu_check`; these four functions are the trainer's own
 # half, at module level so they can be tested without running a campaign.
 #
 #   `_grad_oracle_jobs`     what to check, read off the episode's plan records
 #   `_grad_oracle_write`    the late records, appended to the plan log
 #   `_grad_oracle_boundary` the episode boundary: take the answers, write them,
 #                           and RAISE on a fail
+#   `_grad_oracle_exit_summary` the line printed at the drain at exit
 #
 # THE BOUNDARY IS CALLED AFTER `_ckpt_write`. That order is the whole reason a
 # fail is allowed to stop the run: the checkpoint at that episode exists before
@@ -826,6 +827,17 @@ def _grad_oracle_boundary(oracle, path, episode, tol, log=print):
         f"this is a graphax defect and not noise. {len(fails)} order(s) failed "
         f"at this boundary. The checkpoint at episode {int(episode)} is "
         f"written: fix the defect and resume from it.")
+
+
+def _grad_oracle_exit_summary(oracle, seconds):
+    # Max from the results taken: the check can run in another process.
+    c = oracle.counts()
+    rel = oracle.rel_l2_max
+    shown = "none" if rel is None else f"{rel:.3e}"
+    return (f"[grad-oracle] drained at exit in {float(seconds):.1f}s: "
+            f"{c['pass']} pass, {c['fail']} fail, {c['timeout']} timeout, "
+            f"{c['pending']} pending of {c['submitted']} submitted "
+            f"(max rel_l2 seen {shown})")
 
 
 # Slot 2 was named "cos" until 2026-08-07; it is the value head for reward
@@ -1833,11 +1845,31 @@ def _popart_derive(m1, m2, w, sigma_min, sigma_max):
     return jnp.where(warm, mu, 0.0), jnp.where(warm, sigma, 1.0)
 
 
-def _popart_update(m1, m2, w, returns, beta, sigma_min, sigma_max, winsor_k):
+def _popart_live_moments(flat, live):
+    # Mean and mean square of the live rows of (B, K), and their count.
+    keep = jnp.reshape(live, (-1, 1)) > 0.5
+    n = jnp.sum(keep.astype(flat.dtype))
+    x = jnp.where(keep, flat, 0.0)
+    d = jnp.maximum(n, 1.0)
+    return jnp.sum(x, axis=0) / d, jnp.sum(jnp.square(x), axis=0) / d, n
+
+
+def _popart_seed_stats(returns, live, sigma_min):
+    # The cold seed's (mu, sigma) over the live samples, and their count.
+    m1, m2, n = _popart_live_moments(
+        returns.reshape(-1, returns.shape[-1]), live)
+    sigma = jnp.clip(jnp.sqrt(jnp.maximum(m2 - jnp.square(m1), 1e-12)),
+                     sigma_min, 1e12)
+    return m1, sigma, n
+
+
+def _popart_update(m1, m2, w, returns, beta, sigma_min, sigma_max, winsor_k,
+                   live=None):
     """One debiased-EMA PopArt step on the RAW accumulators, jax-native so it
     runs inside the jit.
 
-    ``returns`` is ``(E, T, K)`` raw per-channel value targets. Mirrors
+    ``returns`` is ``(E, T, K)`` raw per-channel value targets. ``live``
+    ``(E, T)``, when given, keeps only the environments the update uses. Mirrors
     ``common.popart.PopArtStats`` (numpy/host-side, hence unusable inside
     ``train_episode``): winsorize each channel to ``mu +/- winsor_k*sigma``
     so one extreme cost outlier can't spike a channel's sigma and crush the
@@ -1856,12 +1888,20 @@ def _popart_update(m1, m2, w, returns, beta, sigma_min, sigma_max, winsor_k):
     warm = w > 1e-8
     lo, hi = mu - winsor_k * sigma, mu + winsor_k * sigma
     flat = jnp.where(warm, jnp.clip(flat, lo, hi), flat)
-    batch_m1 = jnp.mean(flat, axis=0)
-    batch_m2 = jnp.mean(jnp.square(flat), axis=0)
+    if live is None:
+        batch_m1 = jnp.mean(flat, axis=0)
+        batch_m2 = jnp.mean(jnp.square(flat), axis=0)
+    else:
+        batch_m1, batch_m2, n_live = _popart_live_moments(flat, live)
     new_m1 = m1 * (1.0 - beta) + batch_m1 * beta
     new_m2 = m2 * (1.0 - beta) + batch_m2 * beta
     new_w = w + beta * (1.0 - w)
-    return new_m1, new_m2, new_w
+    if live is None:
+        return new_m1, new_m2, new_w
+    # A batch with no live sample measured nothing, so the statistics stay.
+    moved = n_live > 0
+    return (jnp.where(moved, new_m1, m1), jnp.where(moved, new_m2, m2),
+            jnp.where(moved, new_w, w))
 
 
 def _popart_seed_returns(rewards, done, discount):
@@ -7885,6 +7925,65 @@ def _validate_checkpoint_keep_at(checkpoint_every: int, keep_at) -> frozenset:
     return pinned
 
 
+def _plan_census_line(ep, rows, live, paired_log):
+    # The [plan ep=N] line; under paired-log latency_ns is -log(cand/ref).
+    live = np.asarray(live, bool)
+    idx = np.flatnonzero(live)
+    if not idx.size:
+        return f"[plan ep={ep}] n={live.size} live=0 | no live row"
+
+    def col(k):
+        a = np.asarray(rows.get(k, []), np.float64)
+        return a[idx] if a.size else a
+
+    def fmt(a, sign=""):
+        return (f"med={np.median(a):{sign}.4g} "
+                f"[{a.min():{sign}.4g},{a.max():{sign}.4g}] "
+                f"sd={a.std():.4g}")
+
+    parts = [f"[plan ep={ep}] n={live.size} live={int(live.sum())}"]
+    q, ac = col("quality"), col("approx_count")
+    ae, sk = col("approx_applied_est"), col("skip_count")
+    lat = -col("latency_ns")
+    if not paired_log:
+        lat = lat / 1e3
+    if q.size:
+        parts.append("q " + fmt(q, sign="+"))
+    if lat.size:
+        parts.append(("lat_logratio " + fmt(lat, sign="+")) if paired_log
+                     else ("lat_us " + fmt(lat)))
+    if ac.size:
+        # `req` is EXACT per plan; `applied~` is req x the batch-wide
+        # per-kind applied fraction -- an estimate, marked as one.
+        parts.append("req " + fmt(ac))
+        parts.append("req d/c/q=" + "/".join(
+            str(int(col(f"req_{k}").sum()))
+            for k in ("diag", "compress", "quant")))
+    if ae.size:
+        parts.append("applied~ " + fmt(ae))
+    if sk.size:
+        parts.append(f"skips={int(sk.sum())}")
+    # THE WIN TEST (sec 14.7): <= 20 approximations REQUESTED (an
+    # upper bound on applied, so this cannot miss a real win), q >=
+    # 0.8, and a latency at or below 0.9x this episode's own live
+    # median. Under paired-log: a log ratio below 0, faster than the reference.
+    if q.size and lat.size and ac.size:
+        if paired_log:
+            fast = lat < 0.0
+        else:
+            fast = lat <= 0.9 * float(np.median(lat))
+        hit = np.flatnonzero((ac <= 20) & (q >= 0.8) & fast)
+        if hit.size:
+            b = int(hit[np.argmin(lat[hit])])
+            shown = (f"lat_logratio={lat[b]:+.4g}" if paired_log
+                     else f"lat={lat[b]:.4g}us")
+            parts.append(f"WIN env={int(idx[b])} {shown} "
+                         f"q={q[b]:+.3f} ops={int(ac[b])}")
+        else:
+            parts.append("WIN none")
+    return " | ".join(parts)
+
+
 def main(args=None):
     # `args` is given by `tools/preference_sweep.py`, which does not build a
     # command line at all: it rebuilds the namespace from the checkpoint's own
@@ -13253,6 +13352,8 @@ def main(args=None):
         use_popart = args.advantage_norm == "popart"
         popart_mu, popart_sigma = _popart_derive(
             popart_m1, popart_m2, popart_w, args.popart_sigma_min, 1e12)
+        # The live environments. The PopArt statistics read only these.
+        _env_refused, _live_step = refused_env_mask(traj.reward)
         # --popart-init-episodes 0 (owner ruling 2026-09-14, the new
         # default): no warm-up rollouts. The FIRST REAL EPISODE instead
         # seeds the DECODE above from its own returns, computed straight off
@@ -13271,13 +13372,10 @@ def main(args=None):
         if use_popart and int(getattr(args, "popart_init_episodes", 0)) == 0:
             _cold = jnp.all(popart_w <= 1e-8)
             _seed_ret = _popart_seed_returns(head_rewards, traj.done, traj.discount)
-            _flat_seed = _seed_ret.reshape(-1, _seed_ret.shape[-1])
-            _seed_mu = jnp.mean(_flat_seed, axis=0)
-            _seed_var = (jnp.mean(jnp.square(_flat_seed), axis=0)
-                         - jnp.square(_seed_mu))
-            _seed_sigma = jnp.clip(
-                jnp.sqrt(jnp.maximum(_seed_var, 1e-12)),
-                args.popart_sigma_min, 1e12)
+            _seed_mu, _seed_sigma, _seed_n = _popart_seed_stats(
+                _seed_ret, _live_step, args.popart_sigma_min)
+            # No live environment: the decode stays the identity.
+            _cold = _cold & (_seed_n > 0)
             popart_mu = jnp.where(_cold, _seed_mu, popart_mu)
             popart_sigma = jnp.where(_cold, _seed_sigma, popart_sigma)
         # TRUE OPTIMIZED RETURN (owner 2026-08-09): preference-weighted
@@ -13395,7 +13493,6 @@ def main(args=None):
         # as the worst result"). In a terminal-reward-only MDP a missing
         # terminal reward leaves the WHOLE episode without a measured return,
         # so no transition of that environment may train anything.
-        _env_refused, _live_step = refused_env_mask(traj.reward)
         _live = _live_step[..., None]                                      # (E,T,1)
         advantages = advantages * _live
 
@@ -13403,6 +13500,7 @@ def main(args=None):
             new_m1, new_m2, new_w = _popart_update(
                 popart_m1, popart_m2, popart_w, estim_returns,
                 args.popart_beta, args.popart_sigma_min, 1e12, 5.0,
+                live=_live_step,
             )
             if args.reward_mode == "lagrangian" and args.popart_basin_freeze:
                 # Section-3 ratchet guard: a majority-in-the-basin batch
@@ -16299,50 +16397,7 @@ def main(args=None):
         # progress bar cannot overwrite it.
         _pr = host_state.get("_last_plan_rows")
         if _pr:
-            def _fmt(a, scale=1.0, sign=""):
-                a = np.asarray(a, np.float64) * scale
-                return (f"med={np.median(a):{sign}.4g} "
-                        f"[{a.min():{sign}.4g},{a.max():{sign}.4g}] "
-                        f"sd={a.std():.4g}")
-            _q = np.asarray(_pr.get("quality", []), np.float64)
-            _lt = -np.asarray(_pr.get("latency_ns", []), np.float64) / 1e3
-            _ac = np.asarray(_pr.get("approx_count", []), np.float64)
-            _ae = np.asarray(_pr.get("approx_applied_est", []), np.float64)
-            _sk = np.asarray(_pr.get("skip_count", []), np.float64)
-            _parts = [f"[plan ep={ep}] n={all_rets.shape[0]} "
-                      f"live={int(_live_env.sum())}"]
-            if _q.size:
-                _parts.append("q " + _fmt(_q, sign="+"))
-            if _lt.size:
-                _parts.append("lat_us " + _fmt(_lt))
-            if _ac.size:
-                # `req` is EXACT per plan; `applied~` is req x the batch-wide
-                # per-kind applied fraction -- an estimate, marked as one.
-                _parts.append("req " + _fmt(_ac))
-                _rk = "/".join(
-                    str(int(np.sum(_pr.get(f"req_{k}", 0))))
-                    for k in ("diag", "compress", "quant"))
-                _parts.append(f"req d/c/q={_rk}")
-            if _ae.size:
-                _parts.append("applied~ " + _fmt(_ae))
-            if _sk.size:
-                _parts.append(f"skips={int(_sk.sum())}")
-            # THE WIN TEST (sec 14.7): <= 20 approximations REQUESTED (an
-            # upper bound on applied, so this cannot miss a real win), q >=
-            # 0.8, and a latency at or below 0.9x this episode's own live
-            # median.
-            if _q.size and _lt.size and _ac.size:
-                _base = float(np.median(_lt[_live_env])) if _live_env.any() \
-                    else float(np.median(_lt))
-                _hit = np.where((_ac <= 20) & (_q >= 0.8)
-                                & (_lt <= 0.9 * _base) & _live_env)[0]
-                if _hit.size:
-                    _b = int(_hit[np.argmin(_lt[_hit])])
-                    _parts.append(f"WIN env={_b} lat={_lt[_b]:.4g}us "
-                                  f"q={_q[_b]:+.3f} ops={int(_ac[_b])}")
-                else:
-                    _parts.append("WIN none")
-            tqdm.write(" | ".join(_parts))
+            tqdm.write(_plan_census_line(ep, _pr, _live_env, _paired_costs))
         # ALPHAGRAD_DEBUG_APPROX_PROB=1: mirror the approximation telemetry to
         # stdout, so a --wandb disabled probe (or a crashed run's log) still
         # answers "is skip/none ever chosen, or is it masked?".
@@ -18859,15 +18914,8 @@ def main(args=None):
         _or_left = _GRAD_ORACLE.drain(float(args.grad_oracle_timeout))
         _grad_oracle_write(_resolve_plan_log_path(args), _or_left,
                            _EPISODES_DONE[0], _GRAD_ORACLE_TOL)
-        _or_c = _GRAD_ORACLE.counts()
-        print(f"[grad-oracle] drained at exit in "
-              f"{_prof_time.perf_counter() - _or_t0:.1f}s: "
-              f"{_or_c['pass']} pass, {_or_c['fail']} fail, "
-              f"{_or_c['timeout']} timeout, {_or_c['pending']} pending of "
-              f"{_or_c['submitted']} submitted "
-              f"(max rel_l2 seen "
-              f"{_ep_env_mod._GRAD_ORACLE_STATS['rel_l2_max']:.3e})",
-              flush=True)
+        print(_grad_oracle_exit_summary(
+            _GRAD_ORACLE, _prof_time.perf_counter() - _or_t0), flush=True)
         _GRAD_ORACLE.close()
         _or_fails = [r for r in _or_left if r["status"] == "fail"]
         if _or_fails:

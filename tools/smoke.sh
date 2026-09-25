@@ -45,13 +45,14 @@ export JAX_COMPILATION_CACHE_DIR=${JAX_COMPILATION_CACHE_DIR:-$ROOT/../.jc_smoke
 export ALPHAGRAD_HEALTH_EPISODES=${ALPHAGRAD_HEALTH_EPISODES:-99}
 
 # The canonical config. Keep in sync with docs/VALIDATION_GATES.md.
+# The gradient oracle is on by default and reads its orders from the plan log.
 COMMON="--variant full --face-actions --unified-face-head --live-faces \
 --set-pointer --dynamic-substeps --max-substeps 1 --incremental-encode \
 --grad-window 0 --dataset none \
 --cmp-type flops --mem-type peak_memory --terminal-rewards-only \
 --rewards cmp mem --lambda-cmp 1 --lambda-mem 1 --lambda-frob 1 \
 --advantage-norm popart --episodes 2 --seed 42 --num-envs 2 --minibatches 1 \
---vocab-size 512 --wandb disabled"
+--vocab-size 512 --wandb disabled --plan-log auto"
 
 FAIL=0
 for EX in "${EXAMPLES[@]}"; do
