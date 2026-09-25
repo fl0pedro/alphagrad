@@ -4366,6 +4366,9 @@ def _loss_rows(config, out):
     # The loss row of a program's output (owner ruling 2026-09-24, Q27b): a
     # target with carried outputs returns one row tuple per output and the
     # quality channel reads the first; the state rows are the next carry.
+    from alphagrad.approx.common.rsnn_shd import is_full_rollout
+    if is_full_rollout(config):
+        return out
     if int(getattr(config, "carried_outputs", 0) or 0) > 0:
         return out[0]
     return out
@@ -4388,14 +4391,19 @@ def measured_program(config, order, consts, sparse=None, **jacve_kwargs):
         consts=list(consts),
         **jacve_kwargs,
     )
-    if not carried:
-        return fn
-    if config.has_aux:
+    from alphagrad.approx.common.rsnn_shd import (full_rollout_program,
+                                                  is_full_rollout,
+                                                  rsnn_one_call_step)
+    if carried and config.has_aux:
         raise ValueError(
             "a target with carried outputs returns its state as outputs; "
             "has_aux on it has no reading")
-    from alphagrad.approx.common.rsnn_shd import rsnn_one_call_step
-    return rsnn_one_call_step(fn)
+    step = rsnn_one_call_step(fn) if carried else fn
+    # THE FULL ROLLOUT (owner ruling 2026-09-25 Q24 a): the plan's step at
+    # every step of each recording, as one program.
+    if is_full_rollout(config):
+        return full_rollout_program(config, step)
+    return step
 
 
 _LOSS_TARGETS: dict = {}
@@ -4614,6 +4622,9 @@ def _ref_once_key(paired_ref_key, devices, ref_args_all, protocol) -> bytes:
 
 
 def reference_kind(config) -> str:
+    from alphagrad.approx.common.rsnn_shd import is_full_rollout
+    if is_full_rollout(config):
+        return "jax.grad"
     if bool(config.has_aux):
         return "jax.value_and_grad"
     outs = list(config.jaxpr.outvars)
@@ -4627,6 +4638,11 @@ def reference_program(config):
         raise ValueError(
             "the paired reference is jax.grad of the target function and "
             "this configuration has no target_fun")
+    from alphagrad.approx.common.rsnn_shd import (full_rollout_reference,
+                                                  is_full_rollout)
+    if is_full_rollout(config):
+        # jax.grad of the sequence loss, BPTT through its scan (Q24 a).
+        return full_rollout_reference(config)
     argnums = tuple(int(i) for i in config.argnums)
     kind = reference_kind(config)
     if int(getattr(config, "carried_outputs", 0) or 0) > 0:
@@ -5894,6 +5910,17 @@ def grad_oracle_submission(config, base_args, episode):
     # late under --measure-pipeline and must freeze that episode's batch.
     ep = int(episode) if walk_rotate_enabled() else 0
     probe_seed = _walk_seed("train", ep)
+    from alphagrad.approx.common.rsnn_shd import (RSNN_HEAD_SLOTS,
+                                                  is_full_rollout)
+    if is_full_rollout(config):
+        # The rollout draws whole recordings; the oracle checks the step on
+        # its own tuple, the given slots drawn so every path carries a value.
+        a = list(jax.device_get(list(base_args)))
+        rng = np.random.default_rng(int(probe_seed))
+        for i in range(RSNN_HEAD_SLOTS, len(a)):
+            a[i] = rng.standard_normal(np.shape(a[i]), dtype=np.float32) \
+                .astype(np.asarray(a[i]).dtype)
+        return int(probe_seed), a
     data = _probe_batch(config, base_args, role="train", index=0, episode=ep)
     if data is None:
         return None
@@ -9686,6 +9713,12 @@ def _callback_measured(
         # the device that is running the policy update.
         callback_device = _next_measure_device(gpu_devices[1:])
 
+    # THE FULL ROLLOUT (owner ruling 2026-09-25 Q24 a): the measured programs
+    # read whole recordings, so their arguments are the rollout tuple.
+    from alphagrad.approx.common.rsnn_shd import measure_args as _measure_args
+    _ref_is_args = _ref_args is args
+    args = _measure_args(config, args)
+    _ref_args = args if _ref_is_args else _measure_args(_ref_cfg, _ref_args)
     args_for_lower = (
         jax.device_put(args, callback_device)
         if callback_device is not None

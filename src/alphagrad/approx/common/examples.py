@@ -31,16 +31,21 @@ from alphagrad.approx.common.snn_shd import (
     shd_data_gen,
 )
 from alphagrad.approx.common.rsnn_shd import (
+    FULL_ROLLOUT_RULES,
     RSNN_ARGNUMS,
     RSNN_TARGET,
     RSNN_VMAP_TARGET,
     RSNN_W2_ARGNUMS,
     RSNN_W2_TARGET,
     is_rsnn,
+    is_window2,
     resolve_temporal_rule,
     rsnn_args,
+    rsnn_argnums,
     rsnn_batch,
     rsnn_data_gen,
+    rsnn_rollout_gen,
+    rule_of_tuple,
     vmapped_step_body,
     vmapped_step_target,
 )
@@ -172,11 +177,13 @@ def data_gen(fn_str: str, dataset: str | None = None, dataset_size: int | None =
                 f"recording and a weight set that must be the run's own. "
                 f"Call data_gen(example, ..., key=args_key, "
                 f"temporal_rule=args.temporal_rule).")
-        return rsnn_data_gen(key, dataset=dataset, dataset_size=dataset_size,
-                             temporal_rule=resolve_temporal_rule(
-                                 fn_str, temporal_rule),
-                             carry_container=carry_container,
-                             batch=rsnn_batch(fn_str))
+        _rule = resolve_temporal_rule(fn_str, temporal_rule)
+        # The full rollout draws whole recordings (owner ruling 2026-09-25 Q24 a).
+        _gen = (rsnn_rollout_gen if _rule in FULL_ROLLOUT_RULES
+                else rsnn_data_gen)
+        return _gen(key, dataset=dataset, dataset_size=dataset_size,
+                    temporal_rule=_rule, carry_container=carry_container,
+                    batch=rsnn_batch(fn_str))
     if fn_str in SHD_TARGETS:
         # THE SAME DEFECT, THE SAME FIX, on the two multi-copy SHD targets.
         # They have no temporal rule and no step position; what moves in a
@@ -939,6 +946,8 @@ def grad_target_setup(args_like, base_fn, xs, example):
         return bool(getattr(args_like, name, False))
 
     base_argnums = infer_argnums(example)
+    if is_rsnn(example) and not is_window2(example):
+        base_argnums = rsnn_argnums(rule_of_tuple(xs))
     if _seed_vertices_requested(_flag):
         return (
             seed_loss_fn(base_fn, base_argnums),

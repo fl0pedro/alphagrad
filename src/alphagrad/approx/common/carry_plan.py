@@ -350,7 +350,10 @@ def _build_variant(container: str, entry: dict) -> dict:
     fn, xs, argnums = grad_target_setup(spec["args_like"], get_fn(example),
                                         xs, example)
     cj = _traced_inlined(fn, xs)
-    if container == SKIP_CONTAINER:
+    from alphagrad.approx.common.rsnn_shd import is_full_rollout
+    # Under the full rollout the paired reference is jax.grad of the sequence
+    # loss for every container, so the skip variant needs no oracle of its own.
+    if container == SKIP_CONTAINER and not is_full_rollout(base_cfg):
         # THE QUALITY REFERENCE IS THE ARM'S RULE, NOT THIS PROGRAM'S. A
         # truncated program's own exact gradient is the truncated gradient, so
         # scoring against it would read 1.0 for a plan that threw the whole
@@ -427,6 +430,10 @@ def eval_samples_for(container: str, eval_samples, config=None,
     entry = _entry(config)
     if entry is None:
         return None
+    from alphagrad.approx.common.rsnn_shd import is_full_rollout
+    if is_full_rollout(entry["base"]["config"]):
+        # Whole recordings do not depend on the container.
+        return eval_samples
     var = measurement_env(container, config)
     if var is None and generator is None:
         return None

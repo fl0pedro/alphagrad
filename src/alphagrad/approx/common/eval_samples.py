@@ -25,6 +25,10 @@ def generate_eval_samples(env_obj, key, num_samples: int = 10):
     """
     config = env_obj.config
     args = env_obj.args
+    # The full rollout's samples are rollout tuples (owner ruling 2026-09-25 Q24 a).
+    _base = getattr(config.data_gen, "measure_base", None)
+    if _base is not None:
+        args = tuple(_base(tuple(args)))
 
     def _slots_of(data):
         slots = getattr(config.data_gen, "data_slots", None)
