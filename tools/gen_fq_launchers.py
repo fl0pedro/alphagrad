@@ -2621,7 +2621,7 @@ THESIS_TARGETS = ("nn256", "tlm") + THESIS_RSNN_TARGETS
 #: The batch of a Vmapped target; common/datasets.py reads it at import time.
 NN_BATCH_VAR = "ALPHAGRAD_NN_BATCH"
 THESIS_TARGET_CLI = {
-    "nn256": {"--example": "NeuralNetwork",
+    "nn256": {"--example": "VmappedNeuralNetwork",
               "--dataset": "mnist"},
     "tlm": {"--example": "TransformerLM",
             "--dataset": "wikitext2"},
@@ -2635,7 +2635,8 @@ THESIS_TARGET_CLI = {
        for r in THESIS_TEMPORAL_RULES},
 }
 THESIS_TARGET_ENV = {
-    "nn256": {"ALPHAGRAD_NN_HIDDEN": "256"},
+    # Decision D1 (dsnn-dfw.152): 43 percent of the card under Markowitz.
+    "nn256": {"ALPHAGRAD_NN_HIDDEN": "256", NN_BATCH_VAR: "4096"},
     # the ALPHAGRAD_TLM_* triple is in CAMPAIGN_ENV
     "tlm": {},
     # The recurrent target's shape is NOT an environment variable: the hidden

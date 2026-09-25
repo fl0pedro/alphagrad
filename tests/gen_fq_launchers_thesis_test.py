@@ -508,13 +508,15 @@ def test_the_targets_are_the_ones_the_owner_named(gen, matrix):
     for a in matrix:
         cli = _cli(gen, a)
         if a["thesis_target"] == "nn256":
-            assert cli["--example"] == "NeuralNetwork", a["name"]
+            assert cli["--example"] == "VmappedNeuralNetwork", a["name"]
             assert cli["--dataset"] == "mnist", a["name"]
             assert a["env"] == {"ALPHAGRAD_NN_HIDDEN": "256",
+                                "ALPHAGRAD_NN_BATCH": "4096",
                                 **MATRIX_ENV}, a["name"]
             assert cli["--face-wire-faces"] == FACE_WIRE_FACES, a["name"]
             text = gen.render(a)
             assert "export ALPHAGRAD_NN_HIDDEN=256\n" in text, a["name"]
+            assert "export ALPHAGRAD_NN_BATCH=4096\n" in text, a["name"]
         elif a["thesis_target"] == "tlm":
             assert cli["--example"] == "TransformerLM", a["name"]
             assert cli["--dataset"] == "wikitext2", a["name"]
@@ -1183,12 +1185,13 @@ def test_the_smoke_is_the_three_runs_the_owner_asked_for(gen, smoke):
     assert _cli(gen, resume)["--face-wire-faces"] == TLM_FACE_WIRE_FACES
 
     assert _cli(gen, cond)["--episodes"] == "5"
-    assert _cli(gen, cond)["--example"] == "NeuralNetwork"
+    assert _cli(gen, cond)["--example"] == "VmappedNeuralNetwork"
     assert _cli(gen, cond)["--dataset"] == "mnist"
     assert "--preference-conditioned" in _cli(gen, cond)
     assert _cli(gen, cond)["--reward-mode"] == "lagrangian"
     assert _cli(gen, cond)["--face-wire-faces"] == FACE_WIRE_FACES
-    assert cond["env"] == {"ALPHAGRAD_NN_HIDDEN": "256", **MATRIX_ENV}
+    assert cond["env"] == {"ALPHAGRAD_NN_HIDDEN": "256",
+                           "ALPHAGRAD_NN_BATCH": "4096", **MATRIX_ENV}
 
 
 def test_the_resume_leg_differs_in_resume_alone(gen, smoke):
