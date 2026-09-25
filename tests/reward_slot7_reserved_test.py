@@ -260,6 +260,17 @@ def _restore_head_config():
             os.environ[k] = v
 
 
+@pytest.fixture(autouse=True)
+def _restore_symlog_state():
+    # configure_symlog sets module state that the next test module reads.
+    saved = (ppo._NO_SYMLOG_ALL[0], ppo._NO_SYMLOG_REWARD_INDICES,
+             ppo._NO_SYMLOG_MASK, ppo._NO_SYMLOG_MASK_NP)
+    yield
+    ppo._NO_SYMLOG_ALL[0] = saved[0]
+    (ppo._NO_SYMLOG_REWARD_INDICES, ppo._NO_SYMLOG_MASK,
+     ppo._NO_SYMLOG_MASK_NP) = saved[1:]
+
+
 def test_default_heads_never_include_slot7():
     ppo.configure_fidelity(_args())
     ppo.configure_sparsity(_args())
