@@ -15,6 +15,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import re
+import subprocess
 
 _ALPHAGRAD = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _GEN = os.path.join(_ALPHAGRAD, "tools", "gen_fq_launchers.py")
@@ -94,3 +95,39 @@ def test_the_tail_never_ends_on_a_bare_echo():
         assert last_line.strip().startswith("exit "), (
             f"{a['name']}: the rendered script must end with an explicit "
             f"`exit` of the trainer's captured code, not fall through")
+
+
+def _shell_options(text):
+    return "".join(line + "\n" for line in text.splitlines()
+                   if line.startswith("set "))
+
+
+def _bash(script):
+    return subprocess.run(["bash", "-c", script], capture_output=True,
+                          text=True, timeout=60)
+
+
+def test_a_crashed_trainer_is_the_exit_code_of_the_rendered_launcher():
+    gen = _gen()
+    for a in (gen.thesis_core_arms()[0], gen.orderonly_final_arms()[0]):
+        text = gen.render(a)
+        m = _TRAINER_LINE.search(text)
+        assert m, a["name"]
+        r = _bash(_shell_options(text) + "(exit 3)" + text[m.end():])
+        assert r.returncode == 3, (
+            a["name"], r.returncode, r.stdout[-500:], r.stderr[-500:])
+
+
+def test_a_paired_launcher_exits_with_the_worse_of_its_two_trainers():
+    gen = _gen()
+    pairs = gen.thesis_pair_arms()
+    assert pairs, "the generator emits no paired launcher"
+    text = gen.render(pairs[0])
+    tail = text[text.index('wait "$PID_A"'):]
+    for code_a, code_b in ((0, 3), (5, 3), (0, 0)):
+        stub = (f"(exit {code_a}) &\nPID_A=$!\n"
+                f"(exit {code_b}) &\nPID_B=$!\n")
+        r = _bash(_shell_options(text) + stub + tail)
+        assert r.returncode == max(code_a, code_b), (
+            pairs[0]["name"], code_a, code_b, r.returncode,
+            r.stdout[-500:], r.stderr[-500:])

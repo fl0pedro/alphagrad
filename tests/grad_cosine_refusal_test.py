@@ -382,3 +382,28 @@ def test_the_refusal_count_is_on_the_health_line():
     import alphagrad.approx.ppo as ppomod
     src = inspect.getsource(ppomod)
     assert "refused=%s" in src and '_hk("refused/total"' in src
+
+
+@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
+    "dsnn-dfw.55 is still true at f825993: an undefined loss-drop walk "
+    "appends 0.0 to the quality slot and is not refused"))
+def test_an_undefined_loss_drop_walk_is_a_refused_measurement(monkeypatch):
+    monkeypatch.setenv("ALPHAGRAD_QUALITY_METRIC", "loss_drop")
+    monkeypatch.setenv("ALPHAGRAD_PLAN_LOG", "1")
+    monkeypatch.setattr(envmod, "_loss_drop_quality", lambda *a, **k: None)
+    envmod._WALK_UNDEFINED_WARNED.clear()
+    envmod.consume_refused_counts()
+    envmod.consume_plan_records()
+    try:
+        reward = _run_terminal(_toy_env())
+        counts = envmod.consume_refused_counts()
+        records = envmod.consume_plan_records()["records"]
+    finally:
+        envmod.consume_refused_counts()
+        envmod.consume_plan_records()
+        envmod._WALK_UNDEFINED_WARNED.clear()
+    quality = float(reward[envmod.REWARD_INDEX["quality"]])
+    refused = records[-1].get("refused") if records else None
+    assert counts.get("quality-undefined") == 1, (
+        f"an undefined loss-drop walk was not refused: refusal counts "
+        f"{counts}, plan record refused={refused!r}, quality slot {quality}")
