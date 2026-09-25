@@ -72,10 +72,12 @@ class _Missing:
 _MISSING = _Missing()
 
 
-def _load(pairs: bool = False):
+@pytest.fixture(scope="module")
+def gen():
+    # The switch on, so that the pair launchers are emitted rows here; the
+    # nodesplit test pins what the default without it changes (dsnn-dfw.245).
     old = os.environ.pop("THESIS_PAIRS", None)
-    if pairs:
-        os.environ["THESIS_PAIRS"] = "1"
+    os.environ["THESIS_PAIRS"] = "1"
     try:
         spec = importlib.util.spec_from_file_location("gen_fq_launchers", _GEN)
         mod = importlib.util.module_from_spec(spec)
@@ -88,19 +90,12 @@ def _load(pairs: bool = False):
 
 
 @pytest.fixture(scope="module")
-def gen():
-    return _load()
-
-
-@pytest.fixture(scope="module")
 def emitted(gen):
     rows = [a for a in gen.thesis_arms()
             if not any(a.get(k) for k in _FROZEN_KEYS)]
     assert rows
-    # The pair launchers come from the switch on (dsnn-dfw.245 keeps it off).
-    pairs = _load(pairs=True).thesis_pair_arms()
-    assert pairs
-    return rows + pairs
+    assert any(a.get("paired") for a in rows)
+    return rows
 
 
 @pytest.fixture(scope="module")

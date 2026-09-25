@@ -18,6 +18,7 @@ Two facts are pinned here.
 """
 from __future__ import annotations
 
+import difflib
 import importlib.util
 import os
 import re
@@ -375,6 +376,18 @@ def test_with_the_pairs_off_every_nn256_seed_is_a_single_row(gen, gen_off):
         ref = gen.render(on[name])
         if on[name].get("paired_into"):
             n_halves += 1
+            # the off file is the half's file without its stub, line for line
+            a_ln, b_ln = ref.splitlines(), text.splitlines()
+            gone = []
+            for op, i1, i2, j1, j2 in difflib.SequenceMatcher(
+                    a=a_ln, b=b_ln, autojunk=False).get_opcodes():
+                if op != "equal":
+                    assert op == "delete", (name, op, b_ln[j1:j2])
+                    gone += a_ln[i1:i2]
+            assert any("ABORT(74)" in ln for ln in gone), name
+            assert all(ln.startswith("#") or ln in ("", "fi", "  exit 74")
+                       or "FQ_RELEASE_HALF" in ln or "ABORT(74)" in ln
+                       for ln in gone), (name, gone)
             assert _args(text) == _args(ref), name
             assert '\n  src/alphagrad/approx/ppo.py "${ARGS[@]}"\n' in text, \
                 name

@@ -190,9 +190,18 @@ _MISSING = _Missing()
 
 @pytest.fixture(scope="module")
 def gen():
-    spec = importlib.util.spec_from_file_location("gen_fq_launchers", _GEN)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    # The switch on: the pair path is tested here, and the nodesplit test
+    # pins what the default without it changes (dsnn-dfw.245).
+    old = os.environ.pop("THESIS_PAIRS", None)
+    os.environ["THESIS_PAIRS"] = "1"
+    try:
+        spec = importlib.util.spec_from_file_location("gen_fq_launchers", _GEN)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    finally:
+        os.environ.pop("THESIS_PAIRS", None)
+        if old is not None:
+            os.environ["THESIS_PAIRS"] = old
     return mod
 
 
@@ -227,19 +236,7 @@ def pairs(gen):
     """The paired launchers (owner ruling 2026-09-20): two NN256 seeds of
     one arm inside ONE sbatch on an 8-GPU node.  Not matrix coordinates --
     their two halves are, and both halves are rows of `core`."""
-    # Built with the switch on: the default keeps the pairs off (dsnn-dfw.245).
-    old = os.environ.pop("THESIS_PAIRS", None)
-    os.environ["THESIS_PAIRS"] = "1"
-    try:
-        spec = importlib.util.spec_from_file_location("gen_fq_launchers", _GEN)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-    finally:
-        os.environ.pop("THESIS_PAIRS", None)
-        if old is not None:
-            os.environ["THESIS_PAIRS"] = old
-    assert mod.thesis_pair_arms(), "the switch emits no paired launcher"
-    return mod.thesis_pair_arms()
+    return gen.thesis_pair_arms()
 
 
 @pytest.fixture(scope="module")
