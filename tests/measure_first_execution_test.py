@@ -20,8 +20,12 @@ import pytest                                                   # noqa: E402
 from alphagrad.approx import env as env_mod                     # noqa: E402
 from alphagrad.approx.common import compile_cache as _cc        # noqa: E402
 from alphagrad.approx.env import (                              # noqa: E402
-    MEASURE_INNER_MIN, REWARD_INDEX, first_execution_counts,
-    resolve_measure_inner, resolve_measure_windows)
+    MEASURE_INNER_MIN, REWARD_INDEX, resolve_measure_inner,
+    resolve_measure_windows)
+
+# Looked up, not imported, so the end-to-end tests below run on a tree without
+# the rule and fail on their assertions rather than at collection.
+first_execution_counts = getattr(env_mod, "first_execution_counts", None)
 
 WINDOW, BUDGET, HI, CAP = 0.05, 1.0, 50, 20
 POINTS, REPS = 5, 4
@@ -32,6 +36,7 @@ LAT = int(REWARD_INDEX["latency_ns"])
 
 
 def test_the_first_execution_sets_the_counts_or_is_the_whole_sample():
+    assert first_execution_counts is not None, "env has no first-execution rule"
     # Past the budget: one timed run.
     assert first_execution_counts(1.5, WINDOW, BUDGET, HI, CAP) == (1, 1, True)
     assert first_execution_counts(BUDGET + 1e-6, WINDOW, BUDGET, HI, CAP) == (
@@ -198,19 +203,17 @@ def test_a_fast_plan_takes_the_windows_the_rule_gives_and_its_cold_first_executi
     env = _toy_env()
     fwd, _rev = _orders(env)
     rec = _measure(env, fwd, _samples(POINTS))
-    inner, windows, whole = first_execution_counts(0.02, WINDOW, BUDGET, HI,
-                                                   POINTS * REPS)
-    assert (inner, windows, whole) == (MEASURE_INNER_MIN, 10, False)
+    inner, windows = MEASURE_INNER_MIN, 10
     assert rec["measure_inner"] == inner
     assert rec["measure_windows"] == windows
-    assert rec["measure_first_s"] == pytest.approx(0.02)
+    assert rec.get("measure_first_s") == pytest.approx(0.02)
     assert rec["candidate_latency_ns"] == pytest.approx(2e6)
     assert rec["measure_secs"] == pytest.approx(0.02 + inner * windows * 0.002)
     assert hook.cand[-1].calls == _executions(rec)
     ref_inner = resolve_measure_inner(0.005, WINDOW, HI)
     assert rec["ref_measure_inner"] == ref_inner == 10
     assert rec["ref_measure_windows"] == REF_POINTS * REF_REPS
-    assert rec["ref_measure_first_s"] == pytest.approx(0.005)
+    assert rec.get("ref_measure_first_s") == pytest.approx(0.005)
     assert rec["ref_latency_ns"] == pytest.approx(5e5)
     assert rec["ref_timing"] == "timed"
     assert hook.ref_calls() == _executions(rec, "ref_")
@@ -225,7 +228,7 @@ def test_a_slow_plan_is_one_timed_run_even_when_that_run_is_cold(
     rec = _measure(env, fwd, _samples(POINTS))
     assert hook.cand[-1].calls == 1
     assert (rec["measure_inner"], rec["measure_windows"]) == (1, 1)
-    assert rec["measure_first_s"] == pytest.approx(1.8)
+    assert rec.get("measure_first_s") == pytest.approx(1.8)
     assert rec["candidate_latency_ns"] == pytest.approx(1.8e9)
     assert rec["measure_secs"] == pytest.approx(1.8)
     assert rec["ratio_log"]["latency"]["n"] == 1
@@ -239,7 +242,7 @@ def test_a_plan_between_keeps_the_floor_of_five(paired, clock, monkeypatch):
     assert hook.cand[-1].calls == 1 + MEASURE_INNER_MIN
     assert (rec["measure_inner"], rec["measure_windows"]) == (
         MEASURE_INNER_MIN, 1)
-    assert rec["measure_first_s"] == pytest.approx(0.3)
+    assert rec.get("measure_first_s") == pytest.approx(0.3)
     assert rec["candidate_latency_ns"] == pytest.approx(3e8)
     assert rec["measure_secs"] == pytest.approx(0.3 + 5 * 0.3)
 
@@ -252,7 +255,7 @@ def test_a_slow_reference_is_one_timed_run_reused_by_the_plans_after_it(
     rec_a = _measure(env, fwd, _samples(POINTS))
     assert hook.ref_calls() == 1
     assert (rec_a["ref_measure_inner"], rec_a["ref_measure_windows"]) == (1, 1)
-    assert rec_a["ref_measure_first_s"] == pytest.approx(1.2)
+    assert rec_a.get("ref_measure_first_s") == pytest.approx(1.2)
     assert rec_a["ref_latency_ns"] == pytest.approx(1.2e9)
     assert rec_a["ref_measure_secs"] == pytest.approx(1.2)
     assert rec_a["ref_timing"] == "timed"
@@ -274,6 +277,6 @@ def test_a_refused_plan_times_the_reference_under_the_same_rule(
     assert hook.cand[-1].calls == 0
     assert hook.ref_calls() == 1
     assert (rec["ref_measure_inner"], rec["ref_measure_windows"]) == (1, 1)
-    assert rec["ref_measure_first_s"] == pytest.approx(1.2)
+    assert rec.get("ref_measure_first_s") == pytest.approx(1.2)
     assert rec["ref_latency_ns"] == pytest.approx(1.2e9)
     assert rec["ref_timing"] == "timed"
