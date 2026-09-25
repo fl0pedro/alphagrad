@@ -187,13 +187,17 @@ def test_a_skipped_path_densifies_to_the_zeros_of_its_nominal_shape():
     val = jnp.arange(2 * 16 * 8 * 32, dtype=jnp.float32).reshape(2, 16, 8, 32)
     st = SparseTensor([DenseIndex(0, 2, 0), DenseIndex(1, 16, 1)],
                       [DenseIndex(2, 8, 2), DenseIndex(3, 32, 3)], val)
-    dense = E._densify_gradient((st, None, val[..., :16]), shapes)
+    plain = jnp.ones((2, 16, 32, 16))
+    dense = E._densify_gradient((st, None, plain), shapes)
     assert len(dense) == 3
     np.testing.assert_array_equal(np.asarray(dense[0]), np.asarray(val))
     assert dense[1].shape == (2, 16, 32, 16)
     assert float(jnp.abs(dense[1]).sum()) == 0.0
+    assert dense[2] is plain
     with pytest.raises(RuntimeError, match="gradient leaves"):
         E._densify_gradient((st, None), shapes)
+    with pytest.raises(RuntimeError, match="leaf 2"):
+        E._densify_gradient((st, None, plain[..., :8]), shapes)
 
 
 def _gate_plan():
@@ -236,8 +240,17 @@ def test_the_policy_gates_plan_prices_one_sparse_executable(measure,
         measure_latency=True, terminal_rewards_only=True,
         latency_inner_reps=1, num_data_points=2)
     samples = generate_eval_samples(env, jax.random.PRNGKey(3), 2)
-    order, arrays = _gate_plan()
-    dense, sparse = _paired(measure, env, samples, order, arrays, "gate-plan")
+    order, (specs, faces, skips) = _gate_plan()
+    # The recorded plan skips every live face, so its gradient is zero on
+    # both executables (the sparse one returns no leaf at all) and the claim
+    # is the compile count.
+    _paired(measure, env, samples, order, (specs, faces, skips),
+            "gate-plan-recorded")
+    # The same wires with the skips lifted: the quant rows land and the
+    # gradient is real.
+    dense, _sparse = _paired(measure, env, samples, order,
+                             (specs, faces, np.zeros_like(skips)),
+                             "gate-plan-unskipped")
     assert dense["quality"] > 0.1
 
 
