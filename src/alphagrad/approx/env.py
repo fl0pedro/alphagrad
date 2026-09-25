@@ -661,6 +661,59 @@ _INCR_STREAM_CACHE_CAP = 64
 # Engagement counters (proof instrumentation, not behavior): how often the
 # append-only stream cache hit the full key / EXTENDED a parent / went cold.
 _INCR_STREAM_STATS = {"hit": 0, "ext": 0, "cold": 0, "nostore": 0}
+# The stream key's steps per prefix, keyed by the int64 bytes of the prefix.
+_STREAM_STEPS: dict = {}
+_STREAM_STEPS_STATS = {"hit": 0, "ext": 0, "cold": 0}
+
+
+def _stream_steps_rebuilt(o_list, specs_list):
+    steps = []
+    for v_idx, v in enumerate(o_list):
+        rows = tuple(tuple(int(x) for x in row)
+                     for row in np.asarray(specs_list[v_idx]).reshape(-1, 3))
+        steps.append((int(v), rows))
+    return tuple(steps)
+
+
+def _int64_exact(a):
+    return (a.dtype.kind == "i"
+            or (a.dtype.kind == "u" and a.dtype.itemsize < 8))
+
+
+def _stream_steps(base_key, o_list, specs_list):
+    n = len(o_list)
+    if n == 0:
+        return ()
+    o = np.asarray(o_list)
+    try:
+        s = np.asarray(specs_list)
+    except ValueError:
+        return _stream_steps_rebuilt(o_list, specs_list)
+    if (o.ndim != 1 or s.ndim != 3 or s.shape[0] != n or s.shape[2] != 3
+            or not _int64_exact(o) or not _int64_exact(s)):
+        return _stream_steps_rebuilt(o_list, specs_list)
+    ob = np.ascontiguousarray(o, np.int64).tobytes()
+    sb = np.ascontiguousarray(s, np.int64).tobytes()
+    key = (base_key, ob, sb)
+    steps = _STREAM_STEPS.get(key)
+    if steps is not None:
+        _STREAM_STEPS_STATS["hit"] += 1
+        return steps
+    parent = _STREAM_STEPS.pop(
+        (base_key, ob[:-8], sb[:len(sb) - len(sb) // n]), None)
+    if parent is not None:
+        rows = tuple(tuple(int(x) for x in row)
+                     for row in s[-1].reshape(-1, 3))
+        steps = parent + ((int(o[-1]), rows),)
+        _STREAM_STEPS_STATS["ext"] += 1
+    else:
+        steps = _stream_steps_rebuilt(o_list, specs_list)
+        _STREAM_STEPS_STATS["cold"] += 1
+    while len(_STREAM_STEPS) >= _INCR_STREAM_CACHE_CAP:
+        _STREAM_STEPS.pop(next(iter(_STREAM_STEPS)))
+    _STREAM_STEPS[key] = steps
+    return steps
+
 
 if os.environ.get("ALPHAGRAD_TOKENS_MID_COMPRESS") is not None:
     raise RuntimeError(
@@ -789,15 +842,11 @@ def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
     # same function, or the base and the deltas would be tokenized at
     # different vocabularies and would not concatenate.
     vocab = incr_token_vocab()
-    steps = []
-    for v_idx, v in enumerate(o_list):
-        rows = tuple(tuple(int(x) for x in row)
-                     for row in np.asarray(specs_list[v_idx]).reshape(-1, 3))
-        steps.append((int(v), rows))
     base_key = (id(config.jaxpr), tuple(config.argnums))
+    steps = _stream_steps(base_key, o_list, specs_list)
     # Face actions change the stream (approx/SKIP blocks + downstream path
     # structure) — they must be part of the cache identity.
-    key = base_key + (tuple(steps), face_key)
+    key = base_key + (steps, face_key)
 
     hit = _INCR_STREAM_CACHE.get(key)
     if hit is not None:
