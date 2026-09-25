@@ -1660,6 +1660,9 @@ def record_pool_refusal(reason: str, *, order, rule_specs, face_specs,
         face_specs = np.full((n, MAX_FACES, wire_slots(), 3), -1, np.int32)
         face_skips = np.zeros((n, MAX_FACES), np.int32)
     _PLAN_LOG_TERMINALS[0] += 1
+    # The actor's compile is not visible in this process: tried None means unknown.
+    _PLAN_COMPILE.clear()
+    _PLAN_COMPILE["compile_options_tried"] = None
     _record_terminal_plan(
         order=[int(x) for x in np.asarray(order).reshape(-1)[:n].tolist()],
         rule_specs=np.asarray(rule_specs)[:n],
@@ -2650,6 +2653,24 @@ def plan_log_attempt() -> int:
 _PLAN_CARRY: list = [None]
 _PLAN_CARRY_BYTES: list = [None]
 
+# The compile tuples of the plan being measured; `_record_terminal_plan` writes them into its record.
+_PLAN_COMPILE: dict = {}
+
+
+def last_measure_compile() -> dict:
+    return dict(_PLAN_COMPILE)
+
+
+def _plan_compile_fields() -> dict:
+    out = {"compile_option_layout": measure_compile_layout(),
+           "compile_options": _PLAN_COMPILE.get("compile_options"),
+           "compile_options_tried": _PLAN_COMPILE.get(
+               "compile_options_tried", []),
+           "ref_compile_options": _PLAN_COMPILE.get("ref_compile_options")}
+    if "cost_compile_options" in _PLAN_COMPILE:
+        out["cost_compile_options"] = _PLAN_COMPILE["cost_compile_options"]
+    return out
+
 
 def _plan_carry_bytes(container: str, base_cfg) -> int:
     entry = _carry._entry(base_cfg)
@@ -2959,6 +2980,7 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
         rec["compile_fallbacks_total"] = _fb_n
         rec["toolchain_ok"] = bool(_MEASURE_TOOLCHAIN["ok"])
         _MEASURE_FALLBACKS_AT_LAST_RECORD[0] = _fb_n
+        rec.update(_plan_compile_fields())
         if refused is not None:
             rec["refused"] = str(refused)
             rec["sentinelled"] = True
@@ -8561,7 +8583,10 @@ class MemChannelFault(MeasureToolchainFault):
 # OOM, which keep their own classes and text. The callback scores it as a
 # `compile` refusal (owner ruling 2026-09-24, dsnn-4eq). `__cause__` is XLA's.
 class MeasureCompileFailure(RuntimeError):
-    pass
+    # `tried`: the 0/1 compile tuples that failed, in the order they were tried.
+    def __init__(self, msg="", tried=()):
+        super().__init__(msg)
+        self.tried = [list(t) for t in tried]
 
 
 # Check (b) of Q44: a scored plan's arguments or outputs exceed the
@@ -8754,24 +8779,81 @@ _MEASURE_COMPILE_FALLBACKS = {"n": 0}
 _MEASURE_FALLBACKS_AT_LAST_RECORD = [0]
 _MEASURE_FALLBACKS_AT_LAST_DRAIN = [0]
 
+# The allowed fallback options in order, one 0/1 tuple entry each, tried only after the live compile fails (owner ruling 2026-09-25).
+MEASURE_COMPILE_FALLBACK_OPTIONS = (
+    # The softmax rewriter's __triton fusions fail verification, Triton compile or shared memory on Blackwell (dsnn-dfw.212).
+    ("xla_disable_hlo_passes", "triton-softmax-rewriter"),
+    # ptxas -O0: ptxas 12.9 exits 139 on some TLM programs (dsnn-6k9, dsnn-dfw.212).
+    ("xla_gpu_disable_gpuasm_optimizations", True),
+)
+# Each fallback adds the next allowed option to the ones before it.
+MEASURE_COMPILE_TRY_ORDER = ((1, 0), (1, 1))
 
-def _compile_measure(lowered):
-    """Compile a MEASURE executable; on an INTERNAL GPU-compiler failure
-    (ptxas exit-139 segfault / Triton fusion compile error -- both observed
-    on Blackwell TLM plans, v53 jobs 59279/59306, across actors and order
-    families) retry ONCE with a degraded-fusion option set instead of
-    sentineling the whole plan. Option names are PROBED-VALID on this
-    jax/XLA build (an unknown name raises INVALID_ARGUMENT and would
-    defeat the fallback). The fallback executable is less fused, so its
-    latency reads conservatively -- a real measurement, not a sentinel;
-    every use is printed and counted so the bias stays visible.
-    ALPHAGRAD_MEASURE_COMPILE_FALLBACK=0 disables.
+
+def measure_compile_layout() -> list:
+    return [f"{k}={v}" for k, v in MEASURE_COMPILE_FALLBACK_OPTIONS]
+
+
+def measure_compile_live_tuple() -> tuple:
+    return (0,) * len(MEASURE_COMPILE_FALLBACK_OPTIONS)
+
+
+# The live options plus the allowed entries the tuple sets; the live tuple gives the live options.
+def measure_compile_options(compile_tuple):
+    tup = tuple(int(b) for b in compile_tuple)
+    if (len(tup) != len(MEASURE_COMPILE_FALLBACK_OPTIONS)
+            or not set(tup) <= {0, 1}):
+        raise ValueError(
+            f"compile tuple {tuple(compile_tuple)} does not fit the allowed "
+            f"list {measure_compile_layout()}: one 0 or 1 per option")
+    live = _measure_compiler_options()
+    if not any(tup):
+        return live
+    opts = dict(live or {})
+    for bit, (name, value) in zip(tup, MEASURE_COMPILE_FALLBACK_OPTIONS):
+        if not bit:
+            continue
+        if name in opts:
+            if name != "xla_disable_hlo_passes":
+                raise ValueError(f"two allowed options set {name}")
+            value = f"{opts[name]},{value}"
+        opts[name] = value
+    return opts
+
+
+# The last `_compile_measure` call: the tuple it compiled with ("used", None if none) and the tuples it tried.
+_LAST_COMPILE_NOTE: list = [None]
+
+
+def _compile_measure(lowered, compile_tuple=None):
+    """Compile a MEASURE executable with the live options. On an INTERNAL
+    GPU-compiler failure (Triton fusion verification or compile errors,
+    Blackwell's shared-memory limit, ptxas exit-139) try the tuples of
+    MEASURE_COMPILE_TRY_ORDER, in order, instead of refusing the plan at
+    once. Every fallback is printed and counted, and the tuple that compiled
+    goes on the plan's record. ALPHAGRAD_MEASURE_COMPILE_FALLBACK=0 disables.
+
+    ``compile_tuple`` is a replay: exactly those options, no search.
 
     A LINK-toolchain fault (nvlink refusing a newer ptxas cubin) is NOT
     fallbackable: see the MEASURE TOOLCHAIN GATE block above."""
     _measure_toolchain_check()
+    if compile_tuple is not None:
+        tup = tuple(int(b) for b in compile_tuple)
+        opts = measure_compile_options(tup)
+        _LAST_COMPILE_NOTE[0] = {"used": None, "tried": [list(tup)]}
+        try:
+            exe = lowered.compile(compiler_options=opts)
+        except Exception as _e:
+            raise MeasureCompileFailure(str(_e), tried=[tup]) from _e
+        _LAST_COMPILE_NOTE[0] = {"used": list(tup), "tried": [list(tup)]}
+        return exe
+    _live = measure_compile_live_tuple()
+    _LAST_COMPILE_NOTE[0] = {"used": None, "tried": [list(_live)]}
     try:
-        return lowered.compile(compiler_options=_measure_compiler_options())
+        exe = lowered.compile(compiler_options=_measure_compiler_options())
+        _LAST_COMPILE_NOTE[0] = {"used": list(_live), "tried": [list(_live)]}
+        return exe
     except Exception as _e:
         _m = str(_e)
         # A LINK-toolchain fault is an ENVIRONMENT fault, not a plan-specific
@@ -8780,7 +8862,7 @@ def _compile_measure(lowered):
         # the per-plan retry is how it hid inside wave 1 (finding 03). The
         # gate above should have caught it; reaching here means the
         # environment changed mid-run. Only --measure-toolchain-gate warn
-        # takes the degraded set, and then the plan is TAGGED
+        # goes on to the allowed tuples, and then the plan is TAGGED
         # (compile_fallbacks / toolchain_ok in its record).
         _link_fault = _is_link_toolchain_fault(_m)
         if _link_fault:
@@ -8793,45 +8875,65 @@ def _compile_measure(lowered):
                 raise MeasureToolchainFault(_toolchain_fault_message(
                     "measure compile, mid-run", _m)) from _e
         if os.environ.get("ALPHAGRAD_MEASURE_COMPILE_FALLBACK", "1") == "0":
-            raise MeasureCompileFailure(_m) from _e
+            raise MeasureCompileFailure(_m, tried=[_live]) from _e
         # "Shared memory size limit exceeded" is labelled
         # RESOURCE_EXHAUSTED but is a compiler KERNEL-CONFIG failure
         # (XLA chose a tile above the SM's shared-mem budget -- observed
         # on Blackwell per-order exact compiles: requested 131072,
-        # available 101376), not a real allocation OOM -- degraded
-        # fusion legitimately avoids it. True OOMs still re-raise.
-        # "A cycle is detected" (FAILED_PRECONDITION) is an XLA
+        # available 101376), not a real allocation OOM. True OOMs still
+        # re-raise. "A cycle is detected" (FAILED_PRECONDITION) is an XLA
         # fusion-pass graph bug -- observed on an exact TLM plan
-        # (fusion.113, Blackwell); by construction a degraded-fusion
-        # retry can avoid the offending fusion.
+        # (fusion.113, Blackwell).
         if not _link_fault and not any(_sig in _m for _sig in (
                 "ptxas exited", "Triton kernel", "INTERNAL",
                 "Shared memory size limit", "A cycle is detected")):
-            raise MeasureCompileFailure(_m) from _e
+            raise MeasureCompileFailure(_m, tried=[_live]) from _e
         _MEASURE_COMPILE_FALLBACKS["n"] += 1
-        print(
-            f"[measure] compile FALLBACK #{_MEASURE_COMPILE_FALLBACKS['n']} "
-            f"(degraded fusion) after: {_m[:200]}", flush=True)
-        try:
-            return lowered.compile(compiler_options={
-                "xla_gpu_autotune_level": 0,
-                "xla_gpu_enable_triton_gemm": False,
-                "xla_gpu_enable_dynamic_slice_fusion": False,
-                "xla_gpu_use_runtime_fusion": False,
-                # The observed Blackwell failures are kCustom __triton
-                # fusions with block_level_fusion_config -- produced by the
-                # BLOCK-LEVEL rewriter, which the four knobs above do not
-                # touch (observed: fallback #1 fired and still died on
-                # fusion.205). Both names probed-valid on this build.
-                "xla_gpu_experimental_enable_fusion_block_level_rewriter":
-                    False,
-                "xla_gpu_experimental_enable_triton_heroless_priority_fusion":
-                    False,
-                # The softmax rewriter makes __triton fusions too (job 67947).
-                "xla_disable_hlo_passes": "triton-softmax-rewriter",
-            })
-        except Exception as _e2:
-            raise MeasureCompileFailure(str(_e2)) from _e2
+        _n = _MEASURE_COMPILE_FALLBACKS["n"]
+        print(f"[measure] compile FALLBACK #{_n}: the live options failed: "
+              f"{_m[:200]}", flush=True)
+        _tried, _last = [_live], _e
+        for _tup in MEASURE_COMPILE_TRY_ORDER:
+            _tried.append(tuple(_tup))
+            try:
+                exe = lowered.compile(
+                    compiler_options=measure_compile_options(_tup))
+            except Exception as _e2:
+                _last = _e2
+                continue
+            print(f"[measure] compile FALLBACK #{_n}: tuple {tuple(_tup)} of "
+                  f"{measure_compile_layout()} compiled", flush=True)
+            _LAST_COMPILE_NOTE[0] = {"used": list(_tup),
+                                     "tried": [list(t) for t in _tried]}
+            return exe
+        print(f"[measure] compile FALLBACK #{_n}: no allowed tuple compiled "
+              f"(tried {_tried[1:]} of {measure_compile_layout()})",
+              flush=True)
+        _LAST_COMPILE_NOTE[0] = {"used": None,
+                                 "tried": [list(t) for t in _tried]}
+        raise MeasureCompileFailure(str(_last), tried=_tried) from _last
+
+
+# The compile note of each measure executable of this process, by cache key (LRU), for a cache hit.
+_COMPILE_NOTES: dict = {}
+_COMPILE_NOTES_CAP = 4096
+
+
+def _cached_measure_compile(key: bytes, compile_fn):
+    from alphagrad.approx.common.compile_cache import cached_compile
+    _LAST_COMPILE_NOTE[0] = None
+    exe = cached_compile(key, compile_fn)
+    note = _LAST_COMPILE_NOTE[0]
+    _LAST_COMPILE_NOTE[0] = None
+    if note is None:
+        # None/None: another process compiled it (the shared Ray cache).
+        note = _COMPILE_NOTES.pop(key, None) or {"used": None, "tried": None}
+    else:
+        _COMPILE_NOTES.pop(key, None)
+    _COMPILE_NOTES[key] = note
+    while len(_COMPILE_NOTES) > _COMPILE_NOTES_CAP:
+        _COMPILE_NOTES.pop(next(iter(_COMPILE_NOTES)))
+    return exe, note
 
 
 # ---------------------------------------------------------------------------
@@ -9167,6 +9269,7 @@ def _callback(
     *eval_samples,
     init: bool = False,
     face_joins=None,
+    compile_tuple=None,
 ):
     """THE PLAN LOG'S LAST GUARANTEE: a counted terminal is a record.
 
@@ -9189,7 +9292,8 @@ def _callback(
     try:
         return _callback_measured(
             config, args, consts, order, sparsity_specs, face_specs,
-            face_skips, stop, *eval_samples, init=init, face_joins=face_joins)
+            face_skips, stop, *eval_samples, init=init, face_joins=face_joins,
+            compile_tuple=compile_tuple)
     except BaseException as _exc:
         # Owner ruling 2026-09-24 Q42: a raise inside the terminal
         # measurement is a refused plan and is scored; an apparatus fault
@@ -9248,6 +9352,7 @@ def _callback_measured(
     *eval_samples,
     init: bool = False,
     face_joins=None,
+    compile_tuple=None,
 ):
     """Stage A reward harness: returns `(tokens, rewards)` where `rewards` is
     the canonical `(NUM_REWARDS,)` float32 vector documented at the top of this
@@ -9267,6 +9372,7 @@ def _callback_measured(
     # A record names this plan's carry or none, never the previous plan's.
     _PLAN_CARRY[0] = None
     _PLAN_CARRY_BYTES[0] = None
+    _PLAN_COMPILE.clear()
     partial_order, partial_specs = _get_partials(order, sparsity_specs, stop)
     is_terminal = int(stop) >= len(order)
     # SPARSITY (reward slot 10). Read ONCE per callback, like `_fid_on`
@@ -9571,11 +9677,13 @@ def _callback_measured(
     # probe and every direct caller of `_callback`) therefore never dedupes:
     # a cache that could not be bounded to an episode would live for the whole
     # process and turn a deliberate re-measurement into a replay.
-    if is_terminal and measure_dedupe_enabled() and eval_samples:
+    if (is_terminal and measure_dedupe_enabled() and eval_samples
+            and compile_tuple is None):
         _dedupe_key = bytes.fromhex(_PLAN_HASH[0])
         _hit = _PLAN_DEDUPE.get(_dedupe_key)
         if _hit is not None:
-            _from_idx, _hit_slots = _hit
+            _from_idx, _hit_slots, _hit_compile = _hit
+            _PLAN_COMPILE.update(_hit_compile)
             if _plan_log_on:
                 # A dedupe hit is measured, so its record is complete (Q9).
                 if _carry_container is not None:
@@ -9964,6 +10072,9 @@ def _callback_measured(
     # to before there.
     if face_joins is not None:
         h.update(np.asarray(face_joins, dtype=np.int32).tobytes())
+    # A replay's forced tuple is another executable; the live key is unchanged.
+    if compile_tuple is not None:
+        h.update(b"compile-tuple:" + bytes(int(b) for b in compile_tuple))
     h.update(int(stop).to_bytes(4, "little", signed=False))
     h.update(b"sparse" if bool(config.sparse) else b"dense")
     # Include the shape signature of args_for_lower so we don't
@@ -10024,7 +10135,7 @@ def _callback_measured(
         try:
             return _compile_measure(
                 jax.jit(_jacve_fn(approx=True), keep_unused=True)
-                .lower(*args_for_lower)
+                .lower(*args_for_lower), compile_tuple=compile_tuple
             )
         finally:
             disarm_face_counts()
@@ -10181,8 +10292,10 @@ def _callback_measured(
 
     def _compile_reference():
         try:
-            return cached_compile(
+            _r_exe, _r_note = _cached_measure_compile(
                 b"paired-ref:" + paired_ref_key, _do_compile_paired_ref)
+            _PLAN_COMPILE["ref_compile_options"] = _r_note["used"]
+            return _r_exe
         except MeasureToolchainFault:
             raise
         except Exception as _exc:
@@ -10392,9 +10505,14 @@ def _callback_measured(
         return _score_refusal(*_early_refusal, None)
     compiled_approx = None
     try:
-        compiled_approx = cached_compile(
+        compiled_approx, _c_note = _cached_measure_compile(
             b"approx:" + cache_key, _do_compile_approx)
+        _PLAN_COMPILE.update(compile_options=_c_note["used"],
+                             compile_options_tried=_c_note["tried"])
     except Exception as _exc:
+        _c_note = _LAST_COMPILE_NOTE[0] or {"used": None, "tried": []}
+        _PLAN_COMPILE.update(compile_options=_c_note["used"],
+                             compile_options_tried=_c_note["tried"])
         if _is_graphax_trace_failure(_exc):
             return _trace_truncate("approx compile", _exc, None)
         if _is_oom(_exc):
@@ -10438,7 +10556,7 @@ def _callback_measured(
                                          face_transforms=ft_by_vertex),
                         keep_unused=True,
                     )
-                    .lower(*args_for_lower)
+                    .lower(*args_for_lower), compile_tuple=compile_tuple
                 )
             finally:
                 if _fo:
@@ -10447,9 +10565,11 @@ def _callback_measured(
                     else:
                         os.environ["GRAPHAX_FACTORED_OUTPUTS"] = _prev
         try:
-            compiled_cost = cached_compile(
+            compiled_cost, _s_note = _cached_measure_compile(
                 b"approx-sparse:" + cache_key, _do_compile_approx_sparse)
+            _PLAN_COMPILE["cost_compile_options"] = _s_note["used"]
         except Exception as _exc:
+            _PLAN_COMPILE["cost_compile_options"] = None
             if _is_graphax_trace_failure(_exc):
                 return _trace_truncate("approx-sparse compile", _exc,
                                        compiled_approx)
@@ -11573,7 +11693,8 @@ def _callback_measured(
     # duplicate's own `jnp.array` is built from and what its plan record
     # carries -- no device array is retained.
     if _dedupe_key is not None:
-        _PLAN_DEDUPE[_dedupe_key] = (int(_plan_index), list(_reward_slots))
+        _PLAN_DEDUPE[_dedupe_key] = (int(_plan_index), list(_reward_slots),
+                                     dict(_PLAN_COMPILE))
 
     # ---- A6 PLAN LOG: this plan, win or lose -------------------------
     if _plan_log_on:
