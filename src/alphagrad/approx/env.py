@@ -2736,6 +2736,7 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
             "ref_measure_inner": (measure_counts or {}).get("ref_inner"),
             "ref_measure_windows": (measure_counts or {}).get("ref_windows"),
             "ref_measure_secs": (measure_counts or {}).get("ref_secs"),
+            "ref_timing": (measure_counts or {}).get("ref_timing"),
             # THE PLAN THIS ONE'S NUMBERS CAME FROM (owner ruling
             # 2026-09-14). None on every measured plan. An integer names the
             # index, within this episode and this measure actor, of the
@@ -4592,6 +4593,24 @@ def _gradient_similarity(jac_exact, jac_approx, site: str):
 _PAIRED_REF: list = []
 _PAIRED_REF_DROPPED = [0]
 _PAIRED_REF_CAP = 65536
+
+# Q17 b (2026-09-25): the reference is timed once per process and program.
+_REF_ONCE: dict = {}
+
+
+def _ref_once_key(paired_ref_key, devices, ref_args_all, protocol) -> bytes:
+    import hashlib as _hl
+    h = _hl.blake2b(digest_size=16)
+    h.update(bytes(paired_ref_key))
+    for d in devices:
+        h.update(repr(d).encode())
+    h.update(repr(tuple(protocol)).encode())
+    for point in ref_args_all:
+        h.update(b"|")
+        for a in point:
+            h.update(repr(tuple(getattr(a, "shape", ()))).encode())
+            h.update(repr(getattr(a, "dtype", type(a).__name__)).encode())
+    return h.digest()
 
 
 def reference_kind(config) -> str:
@@ -9957,7 +9976,8 @@ def _callback_measured(
                           "measure_latency": bool(config.measure_latency)}
         _ref_rec = None
         _counts_r = {"inner": 0, "windows": 0, "secs": 0.0,
-                     "ref_inner": 0, "ref_windows": 0, "ref_secs": 0.0}
+                     "ref_inner": 0, "ref_windows": 0, "ref_secs": 0.0,
+                     "ref_timing": None}
         _r_static = None
         if _paired:
             _r_ex = _compile_reference()
@@ -9989,33 +10009,47 @@ def _callback_measured(
                 }.values())
                 if not _r_devs:
                     _r_devs = jax.local_devices()
-                if config.measure_latency:
-                    _t_ref = 0.0
-                    for _w in range(max(2, _r_warmup)):
-                        _p0 = time.perf_counter()
-                        jax.block_until_ready(_r_ex(*_r_args_all[0]))
-                        _t_ref = time.perf_counter() - _p0
-                    _r_inner = resolve_measure_inner(
-                        _t_ref, _r_window_s, _r_cfg_inner)
-                else:
-                    _r_inner = _r_cfg_inner
-                    for _w in range(_r_warmup):
-                        jax.block_until_ready(_r_ex(*_r_args_all[0]))
-                _r_windows = _r_points * _r_reps
-                _r_warmed = {0}
-                _r_lat_s: list = []
-                _r_pk_s: list = []
-                for _ib in range(_r_windows):
-                    _p = _ib % _r_points
-                    if _p not in _r_warmed:
+                _r_key = _ref_once_key(
+                    paired_ref_key, _r_devs, _r_args_all,
+                    (_r_points, _r_reps, bool(config.measure_latency),
+                     _r_cfg_inner, _r_window_s, _r_warmup))
+                _r_once = _REF_ONCE.get(_r_key)
+                _r_timing = "timed" if _r_once is None else "reused"
+                if _r_once is None:
+                    if config.measure_latency:
+                        _t_ref = 0.0
+                        for _w in range(max(2, _r_warmup)):
+                            _p0 = time.perf_counter()
+                            jax.block_until_ready(_r_ex(*_r_args_all[0]))
+                            _t_ref = time.perf_counter() - _p0
+                        _r_inner = resolve_measure_inner(
+                            _t_ref, _r_window_s, _r_cfg_inner)
+                    else:
+                        _r_inner = _r_cfg_inner
                         for _w in range(_r_warmup):
-                            jax.block_until_ready(_r_ex(*_r_args_all[_p]))
-                        _r_warmed.add(_p)
-                    _l, _pk, _s, _o = _time_one_rep(
-                        _r_ex, _r_args_all[_p], _r_devs, _r_inner)
-                    del _o, _s
-                    _r_lat_s.append(_l)
-                    _r_pk_s.append(_pk)
+                            jax.block_until_ready(_r_ex(*_r_args_all[0]))
+                    _r_windows = _r_points * _r_reps
+                    _r_warmed = {0}
+                    _r_lat_s: list = []
+                    _r_pk_s: list = []
+                    for _ib in range(_r_windows):
+                        _p = _ib % _r_points
+                        if _p not in _r_warmed:
+                            for _w in range(_r_warmup):
+                                jax.block_until_ready(
+                                    _r_ex(*_r_args_all[_p]))
+                            _r_warmed.add(_p)
+                        _l, _pk, _s, _o = _time_one_rep(
+                            _r_ex, _r_args_all[_p], _r_devs, _r_inner)
+                        del _o, _s
+                        _r_lat_s.append(_l)
+                        _r_pk_s.append(_pk)
+                    _r_once = {
+                        "lat": tuple(_r_lat_s), "peak": tuple(_r_pk_s),
+                        "inner": int(_r_inner), "windows": int(_r_windows),
+                        "secs": float(sum(_r_lat_s)) * _r_inner / 1e9,
+                        "static": _static_memory_bytes(_r_ex)}
+                    _REF_ONCE[_r_key] = _r_once
             except MeasureToolchainFault:
                 raise
             except Exception as _exc:
@@ -10024,6 +10058,10 @@ def _callback_measured(
                     f"the refused plan cannot be scored: "
                     f"{type(_exc).__name__}: "
                     f"{' '.join(str(_exc).split())[:300]}") from _exc
+            _r_lat_s = list(_r_once["lat"])
+            _r_pk_s = list(_r_once["peak"])
+            _r_inner = int(_r_once["inner"])
+            _r_windows = int(_r_once["windows"])
             _r_lat = (float(_aggregate_samples(_r_lat_s,
                                                want_top_quartile=True))
                       if _r_lat_s else 0.0)
@@ -10034,7 +10072,7 @@ def _callback_measured(
             _r_peak = (float(_aggregate_samples(_r_pk_s,
                                                 want_top_quartile=True))
                        if _r_pk_s else 0.0)
-            _r_static = _static_memory_bytes(_r_ex)
+            _r_static = _r_once["static"]
             if _r_static is None:
                 raise MemChannelFault(
                     "paired reference: memory_analysis() returned "
@@ -10046,7 +10084,7 @@ def _callback_measured(
                                   static=_r_static)
             _counts_r.update(
                 ref_inner=int(_r_inner), ref_windows=int(_r_windows),
-                ref_secs=float(sum(_r_lat_s)) * _r_inner / 1e9)
+                ref_secs=float(_r_once["secs"]), ref_timing=_r_timing)
             _ref_rec = {
                 "latency_ns": float(_r_lat),
                 "temp_bytes": float(_r_static[0]),
@@ -10544,7 +10582,16 @@ def _callback_measured(
         # of 50, where the candidate takes the floor of 5.
         _ref_inner = 0
         _ref_windows = 0
+        _ref_once = None
+        _ref_timed_now = False
         if _paired:
+            _ref_once_k = _ref_once_key(
+                paired_ref_key, unique_devices,
+                ref_eval_args_all[:n_ref_points],
+                (n_ref_points, n_ref_reps, bool(config.measure_latency),
+                 _cfg_inner, _window_s, _warmup))
+            _ref_once = _REF_ONCE.get(_ref_once_k)
+        if _paired and _ref_once is None:
             with _reference_errors(
                     f"the reference ({_ref_kind}) failed in its probe or "
                     f"warm-up"):
@@ -10558,7 +10605,11 @@ def _callback_measured(
                     for _w in range(_warmup):
                         jax.block_until_ready(_ref_ex(*ref_eval_args_all[0]))
             _ref_windows = n_ref_points * n_ref_reps
+            _ref_timed_now = True
             _warmed_ref.add(0)
+        elif _paired:
+            _ref_inner = int(_ref_once["inner"])
+            _ref_windows = int(_ref_once["windows"])
 
         # ---- THE INTERLEAVED TIMING LOOP --------------------------------
         # A B A B ... (see `interleave_windows`), not two blocks: the paired
@@ -10587,7 +10638,8 @@ def _callback_measured(
         _ref_peak_samples: list[float] = []
         _ia = 0
         _ib = 0
-        for _who in interleave_windows(_n_windows, _ref_windows):
+        for _who in interleave_windows(
+                _n_windows, _ref_windows if _ref_timed_now else 0):
             if _who == 0:
                 _p = _ia % n_points
                 if _p not in _warmed_cand:
@@ -10623,6 +10675,17 @@ def _callback_measured(
                 _ref_lat_samples.append(_l)
                 _ref_peak_samples.append(_pk)
                 _ib += 1
+        if _ref_timed_now:
+            _ref_once = {
+                "lat": tuple(_ref_lat_samples),
+                "peak": tuple(_ref_peak_samples),
+                "inner": int(_ref_inner), "windows": int(_ref_windows),
+                "secs": float(sum(_ref_lat_samples)) * _ref_inner / 1e9,
+                "static": _static_memory_bytes(_ref_ex)}
+            _REF_ONCE[_ref_once_k] = _ref_once
+        elif _paired:
+            _ref_lat_samples = list(_ref_once["lat"])
+            _ref_peak_samples = list(_ref_once["peak"])
         # THE GRAPHAX REV-EXACT, TELEMETRY ONLY (dsnn-xta): one paired ratio
         # per episode against the reference, behind
         # ALPHAGRAD_REV_EXACT_TELEMETRY (off by default). Its windows are
@@ -10637,6 +10700,8 @@ def _callback_measured(
                 _rev_ex = cached_compile(
                     b"rev-exact:" + paired_ref_key, _do_compile_rev_exact)
                 if config.measure_latency:
+                    if not _ref_timed_now:
+                        _probe_one(_ref_ex, ref_eval_args_all[0])
                     _rv_inner = resolve_measure_inner(
                         _probe_one(_rev_ex, ref_eval_args_all[0]), _window_s,
                         _cfg_inner)
@@ -10665,6 +10730,7 @@ def _callback_measured(
         # outside the timing windows themselves.
         _meas_secs = float(sum(latency_samples)) * _inner / 1e9
         _ref_secs = float(sum(_ref_lat_samples)) * _ref_inner / 1e9
+        _ref_secs_now = _ref_secs if _ref_timed_now else 0.0
         _pf("cb.exec_measure")
 
         # ---- PER-POINT QUALITY, OUTSIDE every timed window --------------
@@ -10753,7 +10819,7 @@ def _callback_measured(
                 float(_aggregate_samples(_ref_peak_samples,
                                          want_top_quartile=True))
                 if _ref_peak_samples else 0.0)
-            _ref_static = _static_memory_bytes(_ref_ex)
+            _ref_static = _ref_once["static"]
             _ref_temp = None if _ref_static is None else _ref_static[0]
             _pf("cb.paired_ref")
 
@@ -11257,14 +11323,16 @@ def _callback_measured(
         "ref_inner": int(_ref_inner),
         "ref_windows": int(_ref_windows),
         "ref_secs": float(_ref_secs),
+        "ref_timing": (None if not _paired
+                       else "timed" if _ref_timed_now else "reused"),
     }
     _LAST_MEASURE_COUNTS.clear()
     _LAST_MEASURE_COUNTS.update(_measure_counts)
     if is_terminal:
         _MEASURE_EPISODE["n_measured"] += 1
-        _MEASURE_EPISODE["secs"].append(float(_meas_secs) + float(_ref_secs))
+        _MEASURE_EPISODE["secs"].append(float(_meas_secs) + _ref_secs_now)
         _MEASURE_EPISODE["cand_secs"].append(float(_meas_secs))
-        _MEASURE_EPISODE["ref_secs"].append(float(_ref_secs))
+        _MEASURE_EPISODE["ref_secs"].append(float(_ref_secs_now))
     # ---- THE DUPLICATE CACHE: this episode, this actor ----------------
     # Stored AFTER the whole reward vector exists, so a plan that raised or
     # was truncated on the way here leaves nothing behind for a duplicate to
