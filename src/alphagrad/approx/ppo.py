@@ -7925,6 +7925,63 @@ def _validate_checkpoint_keep_at(checkpoint_every: int, keep_at) -> frozenset:
     return pinned
 
 
+def _plan_census_line(ep, rows, live, paired_log):
+    # The [plan ep=N] line; under paired-log latency_ns is -log(cand/ref).
+    live = np.asarray(live, bool)
+
+    def col(k):
+        return np.asarray(rows.get(k, []), np.float64)
+
+    def fmt(a, sign=""):
+        return (f"med={np.median(a):{sign}.4g} "
+                f"[{a.min():{sign}.4g},{a.max():{sign}.4g}] "
+                f"sd={a.std():.4g}")
+
+    parts = [f"[plan ep={ep}] n={live.size} live={int(live.sum())}"]
+    q, ac = col("quality"), col("approx_count")
+    ae, sk = col("approx_applied_est"), col("skip_count")
+    lat = -col("latency_ns")
+    if not paired_log:
+        lat = lat / 1e3
+    if q.size:
+        parts.append("q " + fmt(q, sign="+"))
+    if lat.size:
+        parts.append(("lat_logratio " + fmt(lat, sign="+")) if paired_log
+                     else ("lat_us " + fmt(lat)))
+    if ac.size:
+        # `req` is EXACT per plan; `applied~` is req x the batch-wide
+        # per-kind applied fraction -- an estimate, marked as one.
+        parts.append("req " + fmt(ac))
+        parts.append("req d/c/q=" + "/".join(
+            str(int(np.sum(rows.get(f"req_{k}", 0))))
+            for k in ("diag", "compress", "quant")))
+    if ae.size:
+        parts.append("applied~ " + fmt(ae))
+    if sk.size:
+        parts.append(f"skips={int(sk.sum())}")
+    # THE WIN TEST (sec 14.7): <= 20 approximations REQUESTED (an
+    # upper bound on applied, so this cannot miss a real win), q >=
+    # 0.8, and a latency at or below 0.9x this episode's own live
+    # median. Under paired-log: a log ratio below 0, faster than the reference.
+    if q.size and lat.size and ac.size:
+        if paired_log:
+            fast = lat < 0.0
+        else:
+            base = (float(np.median(lat[live])) if live.any()
+                    else float(np.median(lat)))
+            fast = lat <= 0.9 * base
+        hit = np.flatnonzero((ac <= 20) & (q >= 0.8) & fast & live)
+        if hit.size:
+            b = int(hit[np.argmin(lat[hit])])
+            shown = (f"lat_logratio={lat[b]:+.4g}" if paired_log
+                     else f"lat={lat[b]:.4g}us")
+            parts.append(f"WIN env={b} {shown} "
+                         f"q={q[b]:+.3f} ops={int(ac[b])}")
+        else:
+            parts.append("WIN none")
+    return " | ".join(parts)
+
+
 def main(args=None):
     # `args` is given by `tools/preference_sweep.py`, which does not build a
     # command line at all: it rebuilds the namespace from the checkpoint's own
@@ -16338,50 +16395,7 @@ def main(args=None):
         # progress bar cannot overwrite it.
         _pr = host_state.get("_last_plan_rows")
         if _pr:
-            def _fmt(a, scale=1.0, sign=""):
-                a = np.asarray(a, np.float64) * scale
-                return (f"med={np.median(a):{sign}.4g} "
-                        f"[{a.min():{sign}.4g},{a.max():{sign}.4g}] "
-                        f"sd={a.std():.4g}")
-            _q = np.asarray(_pr.get("quality", []), np.float64)
-            _lt = -np.asarray(_pr.get("latency_ns", []), np.float64) / 1e3
-            _ac = np.asarray(_pr.get("approx_count", []), np.float64)
-            _ae = np.asarray(_pr.get("approx_applied_est", []), np.float64)
-            _sk = np.asarray(_pr.get("skip_count", []), np.float64)
-            _parts = [f"[plan ep={ep}] n={all_rets.shape[0]} "
-                      f"live={int(_live_env.sum())}"]
-            if _q.size:
-                _parts.append("q " + _fmt(_q, sign="+"))
-            if _lt.size:
-                _parts.append("lat_us " + _fmt(_lt))
-            if _ac.size:
-                # `req` is EXACT per plan; `applied~` is req x the batch-wide
-                # per-kind applied fraction -- an estimate, marked as one.
-                _parts.append("req " + _fmt(_ac))
-                _rk = "/".join(
-                    str(int(np.sum(_pr.get(f"req_{k}", 0))))
-                    for k in ("diag", "compress", "quant"))
-                _parts.append(f"req d/c/q={_rk}")
-            if _ae.size:
-                _parts.append("applied~ " + _fmt(_ae))
-            if _sk.size:
-                _parts.append(f"skips={int(_sk.sum())}")
-            # THE WIN TEST (sec 14.7): <= 20 approximations REQUESTED (an
-            # upper bound on applied, so this cannot miss a real win), q >=
-            # 0.8, and a latency at or below 0.9x this episode's own live
-            # median.
-            if _q.size and _lt.size and _ac.size:
-                _base = float(np.median(_lt[_live_env])) if _live_env.any() \
-                    else float(np.median(_lt))
-                _hit = np.where((_ac <= 20) & (_q >= 0.8)
-                                & (_lt <= 0.9 * _base) & _live_env)[0]
-                if _hit.size:
-                    _b = int(_hit[np.argmin(_lt[_hit])])
-                    _parts.append(f"WIN env={_b} lat={_lt[_b]:.4g}us "
-                                  f"q={_q[_b]:+.3f} ops={int(_ac[_b])}")
-                else:
-                    _parts.append("WIN none")
-            tqdm.write(" | ".join(_parts))
+            tqdm.write(_plan_census_line(ep, _pr, _live_env, _paired_costs))
         # ALPHAGRAD_DEBUG_APPROX_PROB=1: mirror the approximation telemetry to
         # stdout, so a --wandb disabled probe (or a crashed run's log) still
         # answers "is skip/none ever chosen, or is it masked?".
