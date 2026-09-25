@@ -65,6 +65,10 @@ def stub(monkeypatch):
     monkeypatch.setattr(E, "_toolchain_probe_compile", lambda: None)
     monkeypatch.setattr(CC, "_LOCAL_CACHE", {})
     monkeypatch.setattr(E, "_COMPILE_NOTES", {})
+    # compile_fallbacks is a delta since the previous record of this process.
+    monkeypatch.setattr(E, "_MEASURE_FALLBACKS_AT_LAST_RECORD",
+                        [int(E._MEASURE_COMPILE_FALLBACKS["n"])])
+    E.set_measure_timeout_s(120.0)
     real = jax.stages.Lowered.compile
     st = {"fail": 0, "seen": []}
 
@@ -78,6 +82,7 @@ def stub(monkeypatch):
     monkeypatch.setattr(jax.stages.Lowered, "compile", compile)
     E.consume_plan_records()
     yield st
+    E.set_measure_timeout_s(None)
     E.consume_plan_records()
 
 
