@@ -2289,9 +2289,14 @@ def test_every_container_reads_back_from_the_projection():
     states = tuple(xs[2:7])
     weights = tuple(xs[7:10])
     for name in RSNN_CARRY_CONTAINERS:
-        dense = project_rsnn_carry(rows[1:], name, weights)
-        stored = project_rsnn_carry(rows_s[1:], name, weights)
-        for given in (dense, stored, rsnn_zero_carry(name, weights)):
+        # the diag container's readout trace against a hidden weight is the
+        # filter of the given trace and the plan's S row
+        zero = rsnn_zero_carry(name, weights)
+        dense = project_rsnn_carry(rows[1:], name, weights, given=zero,
+                                   a_out=xs[12])
+        stored = project_rsnn_carry(rows_s[1:], name, weights, given=zero,
+                                    a_out=xs[12])
+        for given in (dense, stored, zero):
             assert len(given) == len(RSNN_CARRY_STACKS)
             for (ss, w), J in zip(RSNN_CARRY_STACKS, given):
                 c = rsnn_carry_container((ss[0], w), states[ss[0]].shape,
