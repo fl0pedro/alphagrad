@@ -5736,8 +5736,12 @@ def _grad_oracle_exact(config, order, args, device=None):
     exe = (lowered.compile() if _is_cpu_device(device)
            else _compile_measure(lowered))
     out = exe(*args)
-    return _gradient_leaves(_loss_rows(config, out[1] if config.has_aux
-                                       else out))
+    rows = out[1] if config.has_aux else out
+    # The oracle checks the step, not the full rollout: a carried target's
+    # loss row leads its rows.
+    if int(getattr(config, "carried_outputs", 0) or 0) > 0:
+        rows = rows[0]
+    return _gradient_leaves(rows)
 
 
 def _grad_oracle_reference(config, args, device, probe_seed):

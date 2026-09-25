@@ -157,6 +157,12 @@ for example in ("RSNN_SHD", "VmappedRSNN_SHD"):
             out[f"{example}/{rule}/reference"] = worst_ref
         out[f"{example}/{rule}/argnums"] = list(env.config.argnums)
         out[f"{example}/{rule}/reference_kind"] = E.reference_kind(env.config)
+        # the asynchronous oracle checks the STEP on its own tuple
+        seed, a_np = E.grad_oracle_submission(env.config, env.args, 0)
+        status, rel_l2 = E.grad_oracle_cpu_check(
+            env.config, a_np, [int(v) for v in O.reverse_order(
+                env.valid_vertices)], seed)
+        out[f"{example}/{rule}/oracle"] = [status, rel_l2]
 print("RESULT " + json.dumps(out))
 '''
 
@@ -192,6 +198,13 @@ def test_the_empty_tbptt_plans_rollout_sums_the_spatial_gradients(
 def test_the_reference_is_jax_grad_of_the_sequence_loss(exact, example, rule):
     assert exact[f"{example}/{rule}/reference"] < 1e-12, exact
     assert exact[f"{example}/{rule}/reference_kind"] == "jax.grad"
+
+
+@pytest.mark.parametrize("example", ["RSNN_SHD", "VmappedRSNN_SHD"])
+@pytest.mark.parametrize("rule", ["tbptt", "bptt", "rtrl"])
+def test_the_gradient_oracle_checks_the_step_and_passes(exact, example, rule):
+    status, rel_l2 = exact[f"{example}/{rule}/oracle"]
+    assert status == "pass" and rel_l2 < 1e-10, exact
 
 
 @pytest.mark.parametrize("example", ["RSNN_SHD", "VmappedRSNN_SHD"])
