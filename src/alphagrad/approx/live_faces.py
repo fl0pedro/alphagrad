@@ -397,6 +397,8 @@ class LiveFaceStream:
                       # tokenizer by ONE vertex instead of replaying the
                       # whole prefix (see `_tokenizer_at`).
                       "prefix_ext": 0,
+                      # Misses served by the step callback's tokenizer.
+                      "prefix_shared": 0,
                       # The face-wire key chain (see `hist_key`): `ext` is a
                       # key built by adding one row to the previous step's,
                       # `cold` a key rebuilt from the whole history. A steady
@@ -575,7 +577,9 @@ class LiveFaceStream:
     def _tokenizer_at(self, order, specs, n, face_rows_hist=None,
                       face_skips_hist=None, *, hist_key=None):
         from graphax import IncrementalPathTokenizer
-        from alphagrad.approx.env import decode_vertex_rule_specs
+        from alphagrad.approx.env import (
+            decode_vertex_rule_specs, prefix_tokenizer_live,
+            shared_prefix_tokenizer)
         from alphagrad.approx.common.masks import make_live_masked_hook
 
         order = np.asarray(order).reshape(-1)
@@ -597,7 +601,7 @@ class LiveFaceStream:
                else (hist_key,))
         key = (order[:n].tobytes(), specs[:n].tobytes()) + _hk
         hit = self._prefix.get(key)
-        if hit is not None:
+        if hit is not None and prefix_tokenizer_live(hit, n):
             self.stats["prefix_hit"] += 1
             return hit
         self.stats["prefix_miss"] += 1
@@ -635,6 +639,15 @@ class LiveFaceStream:
                     ft = None
             tk.eliminate(v, hooks, ft or None)
 
+        tk = None
+        if frh is not None and fsh is not None:
+            tk = shared_prefix_tokenizer(
+                self.jaxpr, self.argnums, self.vocab, order[:n], specs[:n],
+                hist_key if hist_key is not None else tuple(
+                    _face_row_key(frh[j], fsh[j]) for j in range(n)),
+                int(frh.shape[1]))
+            if tk is not None:
+                self.stats["prefix_shared"] += 1
         # POP-EXTEND. A rollout asks for prefixes 1, 2, 3, ... in order, and
         # the key grows by one vertex each time, so EVERY step missed and
         # rebuilt the tokenizer from `base_tokens()` by replaying all n
@@ -655,13 +668,14 @@ class LiveFaceStream:
         # `order[:n-1]` / `specs[:n-1]` / the face wires below index n-1 are
         # bitwise stable across the step: `env.step` only shift-and-inserts
         # at `idx = step_count`, so rows below it never move.
-        tk = None
-        if _PREFIX_EXTEND and n > 0:
+        if tk is None and _PREFIX_EXTEND and n > 0:
             _phk = (_hist_key_parts(frh, fsh, n - 1) if hist_key is None
                     else (hist_key[:n - 1],))
             pkey = (order[:n - 1].tobytes(),
                     specs[:n - 1].tobytes()) + _phk
             tk = self._prefix.pop(pkey, None)
+            if tk is not None and not prefix_tokenizer_live(tk, n - 1):
+                tk = None
             if tk is not None:
                 try:
                     _apply(tk, n - 1)

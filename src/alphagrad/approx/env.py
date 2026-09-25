@@ -829,8 +829,6 @@ def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
     before extension — a sibling chain that misses takes the honest cold
     replay (same policy as ``incremental_token_delta``).
     """
-    from graphax import IncrementalPathTokenizer
-
     # `vocab_size` is the TOTAL id space, resolved through THE one resolver
     # (`common.token_vocab.incr_token_vocab`): 223 reserved structural tokens
     # plus 10 digits, leaving 23 symbols for the NAME alphabet at the 256 the
@@ -897,20 +895,8 @@ def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
             break
     if tk is None:
         _INCR_STREAM_STATS["cold"] += 1
-        tk = IncrementalPathTokenizer(
-            config.jaxpr, tuple(config.argnums), list(consts), list(args),
-            vocab_size=vocab,
-        )
-        stream = [int(t) for t in tk.base_tokens()]
-        seg_ids = [int(g) for g in tk.last_eqn_ids()]
-        guard = os.environ.get("ALPHAGRAD_VOCAB_SIZE")
-        if guard is not None and tk.max_token_id() >= int(guard):
-            raise ValueError(
-                f"incremental token ids reach {tk.max_token_id()} but the "
-                f"policy embedding has only {guard} rows — raise --vocab-size "
-                f"or lower ALPHAGRAD_INCR_TOKEN_VOCAB. (JAX CLAMPS an "
-                f"out-of-range gather, silently reading the wrong row.)"
-            )
+        tk, stream, seg_ids = _cold_stream_tokenizer(config, consts, args,
+                                                     vocab)
     for _ki in range(done, len(steps)):
         v, _rows = steps[_ki]
         if _unified:
@@ -934,6 +920,148 @@ def _incremental_stream_tokens(config, consts, args, o_list, specs_list,
     _INCR_STREAM_CACHE[key] = (tk, stream, seg_ids,
                                ft_out if _unified else None, last_start)
     return stream, seg_ids, _ft_ret, last_start
+
+
+def _cold_stream_tokenizer(config, consts, args, vocab):
+    from graphax import IncrementalPathTokenizer
+
+    tk = IncrementalPathTokenizer(
+        config.jaxpr, tuple(config.argnums), list(consts), list(args),
+        vocab_size=vocab,
+    )
+    stream = [int(t) for t in tk.base_tokens()]
+    seg_ids = [int(g) for g in tk.last_eqn_ids()]
+    guard = os.environ.get("ALPHAGRAD_VOCAB_SIZE")
+    if guard is not None and tk.max_token_id() >= int(guard):
+        raise ValueError(
+            f"incremental token ids reach {tk.max_token_id()} but the "
+            f"policy embedding has only {guard} rows — raise --vocab-size "
+            f"or lower ALPHAGRAD_INCR_TOKEN_VOCAB. (JAX CLAMPS an "
+            f"out-of-range gather, silently reading the wrong row.)"
+        )
+    return tk, stream, seg_ids
+
+
+# One prefix graph per environment for the step and face callbacks.
+_SHARED_PREFIX = True
+_PREFIX_GRAPHS: dict = {}
+_PREFIX_GRAPH_STATS = {"shared": 0, "stale": 0, "poison": 0}
+
+
+class _PrefixGraph:
+    __slots__ = ("tk", "n", "stream", "seg_ids", "ft", "last_start", "w",
+                 "err")
+
+
+def prefix_tokenizer_live(tk, n):
+    return len(tk.ij.steps) == n and not getattr(tk, "_poisoned", False)
+
+
+def _prefix_graph_live(rec, jaxpr, n):
+    return (rec.n == n and rec.tk.jaxpr is jaxpr
+            and prefix_tokenizer_live(rec.tk, n))
+
+
+def _prefix_graph_key(jaxpr, argnums, vocab, order, specs, fsig):
+    return (id(jaxpr), tuple(int(a) for a in argnums), int(vocab),
+            np.ascontiguousarray(np.asarray(order), np.int64).tobytes(),
+            np.ascontiguousarray(np.asarray(specs), np.int64).tobytes(),
+            tuple(fsig))
+
+
+def _shared_prefix_stream(config, consts, args, o_list, specs_list, specs,
+                          faces_np, skips_np, fsig, have_faces, unified):
+    from alphagrad.approx.common.masks import make_live_masked_hook
+
+    vocab = incr_token_vocab()
+    n = len(o_list)
+    order = np.asarray(o_list, np.int64).reshape(-1)
+    specs = np.asarray(specs)
+    key = _prefix_graph_key(config.jaxpr, config.argnums, vocab, order,
+                            specs, fsig)
+    rec = _PREFIX_GRAPHS.get(key)
+    if rec is not None and _prefix_graph_live(rec, config.jaxpr, n):
+        _INCR_STREAM_STATS["hit"] += 1
+    else:
+        if rec is not None:
+            del _PREFIX_GRAPHS[key]
+            _PREFIX_GRAPH_STATS["stale"] += 1
+        rec = None
+        if n:
+            parent = _PREFIX_GRAPHS.pop(_prefix_graph_key(
+                config.jaxpr, config.argnums, vocab, order[:-1], specs[:-1],
+                fsig[:-1]), None)
+            if parent is not None and _prefix_graph_live(
+                    parent, config.jaxpr, n - 1):
+                rec = parent
+                _INCR_STREAM_STATS["ext"] += 1
+            elif parent is not None:
+                _PREFIX_GRAPH_STATS["stale"] += 1
+        if rec is None:
+            _INCR_STREAM_STATS["cold"] += 1
+            rec = _PrefixGraph()
+            rec.tk, rec.stream, rec.seg_ids = _cold_stream_tokenizer(
+                config, consts, args, vocab)
+            rec.n, rec.ft, rec.last_start, rec.w, rec.err = 0, {}, 0, 0, None
+        if have_faces and rec.err is not None:
+            raise rec.err
+        if rec.n < n:
+            stream, seg_ids = list(rec.stream), list(rec.seg_ids)
+            try:
+                while rec.n < n:
+                    k = rec.n
+                    v = int(o_list[k])
+                    try:
+                        pf = _face_dict_for_vertex(config, rec.tk.ij, v,
+                                                   faces_np[k], skips_np[k])
+                    except Exception as exc:
+                        if have_faces:
+                            raise
+                        # Kept: the separate face path raises it later.
+                        if rec.err is None:
+                            rec.err = exc
+                        pf = None
+                    rules = decode_vertex_rule_specs(config.jaxpr, v,
+                                                     specs_list[k])
+                    hooks = (make_live_masked_hook(rules),) if rules else ()
+                    rec.last_start = len(stream)
+                    stream += [int(t) for t in rec.tk.eliminate(
+                        v, hooks, pf or None)]
+                    seg_ids += [int(g) for g in rec.tk.last_eqn_ids()]
+                    if pf:
+                        rec.ft[v] = pf
+                    rec.w = max(rec.w, int(np.shape(faces_np)[1]))
+                    rec.n += 1
+            except BaseException:
+                rec.tk._poisoned = True
+                _PREFIX_GRAPH_STATS["poison"] += 1
+                raise
+            rec.stream, rec.seg_ids = stream, seg_ids
+        while len(_PREFIX_GRAPHS) >= max(_INCR_STREAM_CACHE_CAP,
+                                         _LIVE_CHAIN_CAP):
+            _PREFIX_GRAPHS.pop(next(iter(_PREFIX_GRAPHS)))
+        _PREFIX_GRAPHS[key] = rec
+    if not have_faces:
+        ft = None
+    elif unified:
+        ft = dict(rec.ft) or None
+    else:
+        ft = dict(rec.ft)
+    return rec.stream, rec.seg_ids, ft, rec.last_start
+
+
+def shared_prefix_tokenizer(jaxpr, argnums, vocab, order, specs, fsig,
+                            width):
+    if not _SHARED_PREFIX:
+        return None
+    n = len(fsig)
+    rec = _PREFIX_GRAPHS.get(_prefix_graph_key(jaxpr, argnums, vocab, order,
+                                               specs, fsig))
+    if (rec is None or not _prefix_graph_live(rec, jaxpr, n)
+            or rec.w > int(width)):
+        return None
+    _PREFIX_GRAPH_STATS["shared"] += 1
+    return rec.tk
 
 
 # ---------------------------------------------------------------------------
@@ -9218,7 +9346,17 @@ def _callback_measured(
         _wire_sig = _face_wire_keys(_faces_np, _skips_np, len(o_list),
                                     _joins_np)
     _pf("cb.face_wire_sig")
-    if _have_face_actions and not _unified_fe:
+    _share = (_SHARED_PREFIX and bool(getattr(config, "per_face", False))
+              and _joins_np is None
+              and os.environ.get("ALPHAGRAD_INCREMENTAL_TOKENS", "1") == "1")
+    if _share:
+        stream, seg_ids, ft_by_vertex, _last_start = _shared_prefix_stream(
+            config, consts, args, o_list, specs_list, partial_specs,
+            _faces_np, _skips_np,
+            _wire_sig if _wire_sig is not None
+            else _face_wire_keys(_faces_np, _skips_np, len(o_list)),
+            _have_face_actions, _unified_fe)
+    elif _have_face_actions and not _unified_fe:
         # NUMPY, not `.tolist()`: `_face_dict_for_vertex` pulls the three
         # wire ints out of `face_row[f][s]` explicitly and reads
         # `face_skip[f]` scalar-wise, so it never needed Python lists --
@@ -9259,23 +9397,24 @@ def _callback_measured(
         # one stream-global id per contraction/approx group, -1 elsewhere —
         # which is exactly the relational-gate contract (same/earlier/later
         # comparisons, no embedding-table bound).
-        _fe_inline = _unified_fe and _have_face_actions
-        stream, seg_ids, _ft_ret, _last_start = _incremental_stream_tokens(
-            config, consts, args, o_list, specs_list, tok_rules_by_v,
-            ft_by_vertex=ft_by_vertex,
-            # NUMPY, not `.tolist()`: only the ~1.24 LIVE faces of the
-            # CURRENT vertex are ever indexed out of these, so materialising
-            # T x MAX_FACES x FACE_SLOTS x 3 Python ints per step was pure
-            # padding cost (O(T^2) per episode).
-            face_rows_list=_faces_np if _fe_inline else None,
-            face_skips_list=_skips_np if _fe_inline else None,
-            face_joins_list=_joins_np if _fe_inline else None,
-            # PER-STEP signatures (not one whole-prefix blob) so the stream
-            # cache can find the parent at every ancestor cut under face
-            # actions instead of replaying the whole prefix cold each step.
-            face_key=_wire_sig
-            if (ft_by_vertex is not None or _fe_inline) else None,
-        )
+        _fe_inline = _unified_fe and _have_face_actions and not _share
+        if not _share:
+            stream, seg_ids, _ft_ret, _last_start = _incremental_stream_tokens(
+                config, consts, args, o_list, specs_list, tok_rules_by_v,
+                ft_by_vertex=ft_by_vertex,
+                # NUMPY, not `.tolist()`: only the ~1.24 LIVE faces of the
+                # CURRENT vertex are ever indexed out of these, so materialising
+                # T x MAX_FACES x FACE_SLOTS x 3 Python ints per step was pure
+                # padding cost (O(T^2) per episode).
+                face_rows_list=_faces_np if _fe_inline else None,
+                face_skips_list=_skips_np if _fe_inline else None,
+                face_joins_list=_joins_np if _fe_inline else None,
+                # PER-STEP signatures (not one whole-prefix blob) so the stream
+                # cache can find the parent at every ancestor cut under face
+                # actions instead of replaying the whole prefix cold each step.
+                face_key=_wire_sig
+                if (ft_by_vertex is not None or _fe_inline) else None,
+            )
         if _fe_inline:
             # measurement sites below read the same dict the eliminations
             # actually applied
