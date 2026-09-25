@@ -88,7 +88,7 @@ RSNN_DATASET = "shd"
 #: One entry per rule, the value on its own line, one commit per rule.
 RSNN_FORM = {
     "tbptt":
-        (RSNN_EXAMPLE, None),
+        (RSNN_VMAP_EXAMPLE, "256"),
     "bptt":
         (RSNN_EXAMPLE, None),
     "rtrl":

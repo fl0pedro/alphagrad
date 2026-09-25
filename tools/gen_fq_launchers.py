@@ -2632,7 +2632,7 @@ THESIS_TARGET_CLI = {
     # the only flag the recurrent rows carry that the NN256 and TLM rows do
     # not.  Everything else comes from `thesis_cli`, unchanged.
     # dsnn-dfw.191: a batched rule names THESIS_RSNN_VMAP_EXAMPLE instead.
-    "rsnn_tbptt": {"--example": THESIS_RSNN_EXAMPLE,
+    "rsnn_tbptt": {"--example": THESIS_RSNN_VMAP_EXAMPLE,
                    "--dataset": THESIS_RSNN_DATASET,
                    "--temporal-rule": "tbptt"},
     "rsnn_bptt": {"--example": THESIS_RSNN_EXAMPLE,
@@ -2660,7 +2660,7 @@ THESIS_TARGET_ENV = {
     # dsnn-dfw.191: a batched rule exports its batch.  One entry per rule, the
     # value on its own line, so that each rule's batch is its own commit.
     "rsnn_tbptt":
-        {},
+        {NN_BATCH_VAR: "256"},  # owner ruling Q21, dsnn-dfw.193
     "rsnn_bptt":
         {},
     "rsnn_rtrl":
