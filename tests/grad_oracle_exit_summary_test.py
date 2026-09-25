@@ -19,6 +19,7 @@ class _Ref:
 _RAY = types.SimpleNamespace(
     wait=lambda refs, num_returns=None, timeout=None: (list(refs), []),
     get=lambda ref: ref.value,
+    put=lambda value: value,
     kill=lambda actor, no_restart=False: None)
 
 
