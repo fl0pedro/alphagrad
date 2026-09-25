@@ -45,6 +45,8 @@ def env_of(monkeypatch):
     from alphagrad.approx.common import examples
     keep = E.MAX_FACES
     monkeypatch.delenv("ALPHAGRAD_MAX_FACES", raising=False)
+    # The carried key is the key of the separate stream path.
+    monkeypatch.setattr(E, "_SHARED_PREFIX", False)
     _clear()
 
     def build(target):
