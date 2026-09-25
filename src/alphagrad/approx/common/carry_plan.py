@@ -379,6 +379,7 @@ def _build_variant(container: str, entry: dict) -> dict:
     consts = tuple(cj.literals)
     args = tuple(xs)
     vmap, alt_carry = _alignment(base_cfg.jaxpr, cj.jaxpr)
+    valid = set(valid_vertices(cj.jaxpr, args, consts, tuple(argnums)))
     return {
         "container": container,
         "config": cfg,
@@ -386,7 +387,9 @@ def _build_variant(container: str, entry: dict) -> dict:
         "consts": consts,
         "vertex_map": vmap,
         "alt_carry": alt_carry,
-        "valid": set(valid_vertices(cj.jaxpr, args, consts, tuple(argnums))),
+        "valid": valid,
+        "chain": contraction_chains(cj.jaxpr,
+                                    [v for v in alt_carry if v in valid]),
     }
 
 
@@ -510,6 +513,7 @@ def contraction_chains(jaxpr, carry) -> set:
     chain up to the attached readout membrane; the weight's shared
     difference vertex, which the hidden chains read too, stays outside.
     """
+    from jax._src.core import Literal
     scope = set(int(v) for v in carry)
     producer = {}
     for i, e in enumerate(jaxpr.eqns, 1):
@@ -519,6 +523,8 @@ def contraction_chains(jaxpr, carry) -> set:
     parents: dict = {v: set() for v in scope}
     for i, e in enumerate(jaxpr.eqns, 1):
         for iv in e.invars:
+            if isinstance(iv, Literal):
+                continue
             p = producer.get(iv)
             if p in scope:
                 consumers[p].add(i)
@@ -565,7 +571,10 @@ def transport_order(o_list, variant) -> list:
     # to the states: the readout factor meets the loss before the trace,
     # and a hidden trace meets the step's coefficients once, at the state.
     carry = [v for v in variant["alt_carry"] if v in valid]
-    chain = contraction_chains(variant["config"].jaxpr, carry)
+    chain = variant.get("chain")
+    if chain is None:
+        chain = (contraction_chains(variant["config"].jaxpr, carry)
+                 if carry else set())
     alt_carry = (sorted((v for v in carry if v in chain), reverse=True)
                  + sorted(v for v in carry if v not in chain))
     base_carry = [int(v) for v in o_list if int(v) not in vmap]
