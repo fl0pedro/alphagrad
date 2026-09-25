@@ -13,31 +13,31 @@ import numpy as np                                              # noqa: E402
 import pytest                                                   # noqa: E402
 
 from alphagrad.approx.env import (                              # noqa: E402
-    MEASURE_INNER_MIN, probe_counts_fixed, resolve_measure_inner,
+    MEASURE_INNER_MIN, probe_at_floor, resolve_measure_inner,
     resolve_measure_windows)
 
 WINDOW, BUDGET, HI, CAP = 0.05, 1.0, 50, 20
 
 
-def test_the_campaign_rule_is_fixed_past_ten_times_its_threshold():
+def test_the_campaign_rule_is_at_its_floor_past_ten_times_the_threshold():
     # windows(t) reads 1 for t > BUDGET / (MEASURE_INNER_MIN * 1.5); a tenth of 1.4 s is past it.
     assert resolve_measure_windows(0.14, MEASURE_INNER_MIN, BUDGET, CAP) == 1
     assert resolve_measure_windows(0.12, MEASURE_INNER_MIN, BUDGET, CAP) == 2
-    assert probe_counts_fixed(10.0, WINDOW, BUDGET, HI, CAP)
-    assert probe_counts_fixed(1.4, WINDOW, BUDGET, HI, CAP)
-    assert not probe_counts_fixed(1.2, WINDOW, BUDGET, HI, CAP)
-    assert not probe_counts_fixed(0.5, WINDOW, BUDGET, HI, CAP)
-    assert not probe_counts_fixed(1e-3, WINDOW, BUDGET, HI, CAP)
-    assert not probe_counts_fixed(0.0, WINDOW, BUDGET, HI, CAP)
-    assert not probe_counts_fixed(float("nan"), WINDOW, BUDGET, HI, CAP)
+    assert probe_at_floor(10.0, WINDOW, BUDGET, HI, CAP)
+    assert probe_at_floor(1.4, WINDOW, BUDGET, HI, CAP)
+    assert not probe_at_floor(1.2, WINDOW, BUDGET, HI, CAP)
+    assert not probe_at_floor(0.5, WINDOW, BUDGET, HI, CAP)
+    assert not probe_at_floor(1e-3, WINDOW, BUDGET, HI, CAP)  # the ceiling, not the floor
+    assert not probe_at_floor(0.0, WINDOW, BUDGET, HI, CAP)
+    assert not probe_at_floor(float("nan"), WINDOW, BUDGET, HI, CAP)
 
 
-def test_fixed_means_equal_counts_at_both_ends():
-    for t in (0.2, 1.0, 3.0, 40.0):
-        assert probe_counts_fixed(t, WINDOW, BUDGET, HI, CAP) == (
-            resolve_measure_inner(t, WINDOW, HI) == resolve_measure_inner(t / 10, WINDOW, HI)
-            and resolve_measure_windows(t, resolve_measure_inner(t, WINDOW, HI), BUDGET, CAP)
-            == resolve_measure_windows(t / 10, resolve_measure_inner(t, WINDOW, HI), BUDGET, CAP))
+def test_the_floor_is_the_counts_at_a_tenth_of_the_reading():
+    for t in (0.2, 1.0, 1.4, 3.0, 40.0):
+        inner = resolve_measure_inner(t / 10, WINDOW, HI)
+        assert probe_at_floor(t, WINDOW, BUDGET, HI, CAP) == (
+            inner == MEASURE_INNER_MIN
+            and resolve_measure_windows(t / 10, inner, BUDGET, CAP) == 1)
 
 
 class _Slow:
