@@ -2635,7 +2635,7 @@ THESIS_TARGET_CLI = {
     "rsnn_tbptt": {"--example": THESIS_RSNN_VMAP_EXAMPLE,
                    "--dataset": THESIS_RSNN_DATASET,
                    "--temporal-rule": "tbptt"},
-    "rsnn_bptt": {"--example": THESIS_RSNN_EXAMPLE,
+    "rsnn_bptt": {"--example": THESIS_RSNN_VMAP_EXAMPLE,
                   "--dataset": THESIS_RSNN_DATASET,
                   "--temporal-rule": "bptt"},
     "rsnn_rtrl": {"--example": THESIS_RSNN_EXAMPLE,
@@ -2662,7 +2662,7 @@ THESIS_TARGET_ENV = {
     "rsnn_tbptt":
         {NN_BATCH_VAR: "256"},  # owner ruling Q21, dsnn-dfw.193
     "rsnn_bptt":
-        {},
+        {NN_BATCH_VAR: "256"},  # owner ruling Q21, dsnn-dfw.193
     "rsnn_rtrl":
         {},
     "rsnn_window2":
