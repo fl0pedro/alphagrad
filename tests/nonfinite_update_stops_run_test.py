@@ -11,7 +11,7 @@ from pathlib import Path
 _PKG = Path(importlib.util.find_spec("alphagrad").submodule_search_locations[0])
 _PPO = _PKG / "approx" / "ppo.py"
 
-# The environment and the flags of the canonical smoke, tools/smoke.sh, for one episode.
+# The environment and the flags of tools/smoke.sh for one episode, plus --grad-oracle off: without a plan log the oracle refuses to start.
 _ENV = {
     "JAX_PLATFORMS": "cpu",
     "ALPHAGRAD_EXTEND_CHUNK": "256",
@@ -32,7 +32,7 @@ _ARGV = (
     "--rewards cmp mem --lambda-cmp 1 --lambda-mem 1 --lambda-frob 1 "
     "--advantage-norm popart --episodes 1 --seed 42 --num-envs 2 "
     "--minibatches 1 --vocab-size 512 --wandb disabled "
-    "--example Helmholtz --name nan_update").split()
+    "--example Helmholtz --name nan_update --grad-oracle off").split()
 
 
 def test_a_nan_parameter_after_the_update_stops_the_run(tmp_path):
