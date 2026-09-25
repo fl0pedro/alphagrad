@@ -719,13 +719,14 @@ def _resolve_plan_log_path(args) -> str | None:
 #
 # The oracle is a SANITY CHECK and not part of the scoring. The scheduling
 # lives in `common/grad_oracle_async.py` and the check itself in
-# `env.grad_oracle_cpu_check`; these three functions are the trainer's own
+# `env.grad_oracle_cpu_check`; these four functions are the trainer's own
 # half, at module level so they can be tested without running a campaign.
 #
 #   `_grad_oracle_jobs`     what to check, read off the episode's plan records
 #   `_grad_oracle_write`    the late records, appended to the plan log
 #   `_grad_oracle_boundary` the episode boundary: take the answers, write them,
 #                           and RAISE on a fail
+#   `_grad_oracle_exit_summary` the line printed at the drain at exit
 #
 # THE BOUNDARY IS CALLED AFTER `_ckpt_write`. That order is the whole reason a
 # fail is allowed to stop the run: the checkpoint at that episode exists before
@@ -826,6 +827,17 @@ def _grad_oracle_boundary(oracle, path, episode, tol, log=print):
         f"this is a graphax defect and not noise. {len(fails)} order(s) failed "
         f"at this boundary. The checkpoint at episode {int(episode)} is "
         f"written: fix the defect and resume from it.")
+
+
+def _grad_oracle_exit_summary(oracle, seconds):
+    # Max from the results taken: the check can run in another process.
+    c = oracle.counts()
+    rel = oracle.rel_l2_max
+    shown = "none" if rel is None else f"{rel:.3e}"
+    return (f"[grad-oracle] drained at exit in {float(seconds):.1f}s: "
+            f"{c['pass']} pass, {c['fail']} fail, {c['timeout']} timeout, "
+            f"{c['pending']} pending of {c['submitted']} submitted "
+            f"(max rel_l2 seen {shown})")
 
 
 # Slot 2 was named "cos" until 2026-08-07; it is the value head for reward
@@ -18859,15 +18871,8 @@ def main(args=None):
         _or_left = _GRAD_ORACLE.drain(float(args.grad_oracle_timeout))
         _grad_oracle_write(_resolve_plan_log_path(args), _or_left,
                            _EPISODES_DONE[0], _GRAD_ORACLE_TOL)
-        _or_c = _GRAD_ORACLE.counts()
-        print(f"[grad-oracle] drained at exit in "
-              f"{_prof_time.perf_counter() - _or_t0:.1f}s: "
-              f"{_or_c['pass']} pass, {_or_c['fail']} fail, "
-              f"{_or_c['timeout']} timeout, {_or_c['pending']} pending of "
-              f"{_or_c['submitted']} submitted "
-              f"(max rel_l2 seen "
-              f"{_ep_env_mod._GRAD_ORACLE_STATS['rel_l2_max']:.3e})",
-              flush=True)
+        print(_grad_oracle_exit_summary(
+            _GRAD_ORACLE, _prof_time.perf_counter() - _or_t0), flush=True)
         _GRAD_ORACLE.close()
         _or_fails = [r for r in _or_left if r["status"] == "fail"]
         if _or_fails:
