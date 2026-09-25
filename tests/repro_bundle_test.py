@@ -148,7 +148,7 @@ def test_b_a_raise_in_a_pure_callback_inside_jit_writes_a_bundle_and_raises(
                            "expected shape (32, 128)!")
 
     monkeypatch.setattr(E, "_incremental_stream_tokens", _edge_shape)
-    # The patched raise site is on the separate tokenizer path; the shared prefix (dsnn-dfw.189) bypasses it.
+    # The shared prefix (dsnn-dfw.189) bypasses the patched raise site, which is on the separate tokenizer path.
     monkeypatch.setattr(E, "_SHARED_PREFIX", False)
 
     def _host(x):
