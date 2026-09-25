@@ -66,6 +66,37 @@ def test_fallback_on_fusion_cycle():
     assert len(lo.calls) == 2
 
 
+# The error text of job 67947: VmappedTransformerLM at B=64 under the Markowitz order.
+_SOFTMAX_TRITON = (
+    "INTERNAL: Failed to compile Triton kernel. Context: [Fusion: fusion.260 = "
+    "f32[64,32,128]{2,1,0} fusion(a_7_.1, constant_285_0, get-tuple-element.2.0, "
+    "constant_471_0, fusion.499, input_reduce_fusion.39, fusion.517), kind=kCustom, "
+    "calls=fused_computation.238, backend_config={\"operation_queue_id\":\"0\","
+    "\"fusion_backend_config\":{\"kind\":\"__triton\",\"block_level_fusion_config\":"
+    "{\"num_warps\":\"8\"}}}]")
+
+
+class _SoftmaxLowered:
+    def __init__(self):
+        self.calls = []
+
+    def compile(self, compiler_options=None):
+        self.calls.append(compiler_options)
+        off = str((compiler_options or {}).get("xla_disable_hlo_passes", ""))
+        if "triton-softmax-rewriter" not in off.split(","):
+            raise RuntimeError(_SOFTMAX_TRITON)
+        return "EXE"
+
+
+def test_fallback_turns_off_the_triton_softmax_rewriter():
+    lo = _SoftmaxLowered()
+    assert env_mod._compile_measure(lo) == "EXE"
+    assert len(lo.calls) == 2
+    assert "xla_disable_hlo_passes" not in (lo.calls[0] or {})
+    assert lo.calls[1][
+        "xla_gpu_experimental_enable_fusion_block_level_rewriter"] is False
+
+
 # ---------------------------------------------------------------------------
 # MEASURE TOOLCHAIN GATE (finding 03, ticket dsnn-3qm.21).
 #
