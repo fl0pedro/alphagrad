@@ -4568,7 +4568,8 @@ def _gradient_similarity(jac_exact, jac_approx, site: str):
 # the base program's inputs, compiled with the measurement's compiler options
 # (owner rulings 2026-09-24 Q39-Q41; until then the graphax rev-exact
 # elimination, which `rev_exact_telemetry_enabled` keeps as telemetry) -- in
-# the same callback, INTERLEAVED with the candidate window by window since
+# the same process -- timed once per process and program by the first plan of a
+# graph (Q17 b, 2026-09-25), INTERLEAVED with that plan's windows since
 # 2026-09-14 (it used to run as a second block right after it), through the
 # same executable path and the same instrument (`_time_one_rep`, same eval
 # args, same warmup, same median). Its POINTS x REPS are its own
@@ -9865,8 +9866,8 @@ def _callback_measured(
     # vertex set; that program is now `_do_compile_rev_exact`, telemetry only
     # (`rev_exact_telemetry_enabled`), and no longer scores 0. The COMPILE is
     # cached like every other executable (graph, arg shapes, device); the
-    # MEASUREMENT is taken anew in every terminal callback, interleaved with
-    # the candidate's -- that is what makes it paired.
+    # MEASUREMENT is taken once per process and program (Q17 b, 2026-09-25),
+    # interleaved with the first plan's windows, and later plans reuse them.
     # ON THE BASE PROGRAM: the base target, its arguments and, for the
     # telemetry, the policy's own vertex set, the base jaxpr and its consts
     # (see `_ref_cfg` above). With no carry variant these are the
@@ -10613,6 +10614,7 @@ def _callback_measured(
             _ref_windows = int(_ref_once["windows"])
 
         # ---- THE INTERLEAVED TIMING LOOP --------------------------------
+        # Only the plan that times the reference (Q17 b) runs both halves.
         # A B A B ... (see `interleave_windows`), not two blocks: the paired
         # ratio can only cancel drift that both halves saw, so the two halves
         # have to occupy the same seconds. The windows of each half are
