@@ -981,187 +981,217 @@ class CpuApproxPool:
                     )
                     held[j] = fresh  # may be None (respawn failed)
 
-        # held[j] is reused across waves; set to None when poisoned (dead).
-        for wave_start in range(0, N, M):
-            wave = list(range(wave_start, min(wave_start + M, N)))
-            futures: dict[int, Any] = {}
-            flags: dict[int, Any] = {}
-            f_timeouts: dict[int, float] = {}
-            # Actor index j -> the slots of this wave that ran out of memory.
-            oom_by_actor: dict[int, list] = {}
-            for j, i in enumerate(wave):
-                actor = held[j]
-                if actor is None:
+        # A WORK QUEUE, NOT WAVES. A slot goes to the first actor that is
+        # free, so a fast plan does not hold its actor idle until the slowest
+        # plan of its wave is back: waves of M idled 30 and 49 percent of the
+        # actor time in the two full episodes of the B=64 rtrl row (job
+        # 68069, dsnn-dfw.223). Each slot keeps the one deadline, from its
+        # own dispatch. held[j] is None once actor j is poisoned (dead).
+        free: collections.deque = collections.deque(
+            j for j in range(M) if held[j] is not None)
+        pending: dict[Any, tuple[int, int, float]] = {}
+        flags: dict[int, Any] = {}
+        f_timeouts: dict[int, float] = {}
+        nxt = 0
+
+        def _adopt() -> bool:
+            # An actor respawned after a kill lands in ``self._alive``; it
+            # serves the rest of this batch instead of idling until the next.
+            a = self._pick()
+            if a is None:
+                return False
+            held.append(a)
+            free.append(len(held) - 1)
+            return True
+
+        def _dispatch(j: int, i: int) -> None:
+            actor = held[j]
+            self._n_calls += 1
+            try:
+                # THE SAME NUMBER travels with the request: the actor
+                # scores a refused plan at the deadline of this slot.
+                _to = self._deadline()
+                fut = actor.evaluate.remote(
+                    np.asarray(order_batch[i]),
+                    np.asarray(specs_batch[i]),
+                    int(step_batch[i]),
+                    eval_samples=samples_arg,
+                    init=bool(init),
+                    face_specs=(
+                        None if face_specs_batch is None else
+                        np.asarray(face_specs_batch[i], dtype=np.int32)),
+                    face_skips=(
+                        None if face_skips_batch is None else
+                        np.asarray(face_skips_batch[i], dtype=np.int32)),
+                    episode=(None if episode is None else int(episode)),
+                    env_row=(None if env_rows is None
+                             else int(env_rows[i])),
+                    rule=(None if rule is None else str(rule)),
+                    timeout_s=(float(_to) if _to > 0 else None),
+                )
+                # An actor runs calls in send order: the flag of this call.
+                flags[i] = actor.pop_oom_flag.remote()
+                f_timeouts[i] = _to
+                pending[fut] = (i, j, time.time() + _to if _to > 0 else 0.0)
+            except Exception as _exc:
+                self._n_other_errors += 1
+                print(
+                    f"[SENTINEL] batch dispatch-error slot={i} "
+                    f"step={int(step_batch[i])}: {type(_exc).__name__}: "
+                    f"{str(_exc)[:120]} (n_other_errors={self._n_other_errors})",
+                    flush=True,
+                )
+                self._poison(actor, future=None)
+                held[j] = None
+                _sentinel_slot(i)
+
+        def _collect(fut) -> None:
+            i, j, _dl = pending.pop(fut)
+            actor = held[j]
+            try:
+                _res = ray.get(fut, timeout=0) if _dl > 0 else ray.get(fut)
+                self._check_arity(_res)
+                reward = _res[-1]
+                tokens_out[i] = self._wire(_res[0], self._token_dtype,
+                                           "tokens")
+                if self._emit_eqn_ids:
+                    eqn_ids_out[i] = self._wire(
+                        _res[1], self._eqn_dtype, "eqn_ids")
+                rewards_out[i] = np.asarray(reward, dtype=np.float32)
+                with self._lock:
+                    self._measures_since_recycle[id(actor)] = (
+                        self._measures_since_recycle.get(id(actor), 0) + 1
+                    )
+                # Every row (Q52): an in-callback OOM is a scored, finite row.
+                try:
+                    _was_oom = bool(ray.get(flags[i], timeout=10.0))
+                except Exception as _flag_exc:
+                    self._n_actor_errors += 1
+                    print(
+                        f"[POOL] oom-flag read failed actor#{j} slot={i} "
+                        f"step={int(step_batch[i])}: "
+                        f"{type(_flag_exc).__name__}: "
+                        f"{str(_flag_exc)[:120]}; the row stands, the "
+                        f"actor is replaced "
+                        f"(n_actor_errors={self._n_actor_errors})",
+                        flush=True,
+                    )
+                    self._poison(actor, future=None)
+                    held[j] = None
+                    return
+                if _was_oom:
+                    # The server's -1e10 row stays masked, a scored row scored.
+                    if self._reward_is_sentinel(reward):
+                        sentinel_mask[i] = True
+                    # Recycle NOW, before this actor gets another slot: only
+                    # process teardown frees the leaked XLA memory.
+                    fresh = self._recycle_actor(actor)
+                    self._n_oom_recycles += 1
+                    held[j] = fresh  # may be None on failure
+                    print(
+                        f"[POOL] oom-recycle actor#{j} slots=[{i}]: "
+                        f"{'fresh actor' if fresh is not None else 'respawn failed'}, "
+                        f"rows not measured again "
+                        f"(n_oom_recycles={self._n_oom_recycles})",
+                        flush=True,
+                    )
+                    if fresh is None:
+                        return
+                free.append(j)
+            except GetTimeoutError:
+                self._n_timeouts += 1
+                print(
+                    f"[SENTINEL] batch timeout slot={i} step={int(step_batch[i])} "
+                    f"after {f_timeouts.get(i, 0.0):.0f}s (n_timeouts={self._n_timeouts})",
+                    flush=True,
+                )
+                self._poison(actor, future=fut)
+                held[j] = None
+                _sentinel_slot(i)
+                # A non-terminal slot (a tokenization stall) is no plan.
+                if self._is_terminal(order_batch[i], step_batch[i]):
+                    self._record_timeout(
+                        f_timeouts.get(i, 0.0), order=order_batch[i],
+                        specs=specs_batch[i], step=step_batch[i],
+                        face_specs=(None if face_specs_batch is None
+                                    else face_specs_batch[i]),
+                        face_skips=(None if face_skips_batch is None
+                                    else face_skips_batch[i]),
+                        reward=rewards_out[i])
+            except RayActorError:
+                self._n_actor_errors += 1
+                print(
+                    f"[SENTINEL] batch actor-error slot={i} "
+                    f"step={int(step_batch[i])} (n_actor_errors={self._n_actor_errors})",
+                    flush=True,
+                )
+                self._poison(actor, future=fut)
+                held[j] = None
+                _sentinel_slot(i)
+            except Exception as _exc:
+                # The actor's measure toolchain gate fired (finding 03).
+                # Ray re-raises the actor's exception as a RayTaskError
+                # that is ALSO an instance of the original class; the
+                # text match covers a pickling failure. This must stop
+                # the run, not become one more [SENTINEL] line.
+                if _is_toolchain_fault(_exc):
+                    raise
+                self._n_other_errors += 1
+                # THE FIRST ONE IN FULL. 120 characters of a RayTaskError
+                # is the actor id and nothing else, so the one line that
+                # says WHY an actor died was the one line the log did not
+                # carry; every later error keeps the short form so a
+                # storm of them does not bury the run.
+                _first = self._n_other_errors == 1
+                print(
+                    f"[SENTINEL] batch other-error slot={i} "
+                    f"step={int(step_batch[i])}: {type(_exc).__name__}: "
+                    f"{str(_exc) if _first else str(_exc)[:120]} "
+                    f"(n_other_errors={self._n_other_errors})",
+                    flush=True,
+                )
+                self._poison(actor, future=fut)
+                held[j] = None
+                _sentinel_slot(i)
+
+        while nxt < N or pending:
+            while nxt < N and (free or _adopt()):
+                j = free.popleft()
+                _dispatch(j, nxt)
+                nxt += 1
+            if not pending:
+                # Every actor of the batch is dead and nothing is in flight.
+                for i in range(nxt, N):
                     print(
                         f"[SENTINEL] batch pool-drained slot={i} "
                         f"step={int(step_batch[i])} (actor died)",
                         flush=True,
                     )
                     _sentinel_slot(i)
-                    continue
-                self._n_calls += 1
-                try:
-                    # THE SAME NUMBER travels with the request: the actor
-                    # scores a refused plan at the deadline of this slot.
-                    _to = self._deadline()
-                    futures[i] = actor.evaluate.remote(
-                        np.asarray(order_batch[i]),
-                        np.asarray(specs_batch[i]),
-                        int(step_batch[i]),
-                        eval_samples=samples_arg,
-                        init=bool(init),
-                        face_specs=(
-                            None if face_specs_batch is None else
-                            np.asarray(face_specs_batch[i], dtype=np.int32)),
-                        face_skips=(
-                            None if face_skips_batch is None else
-                            np.asarray(face_skips_batch[i], dtype=np.int32)),
-                        episode=(None if episode is None else int(episode)),
-                        env_row=(None if env_rows is None
-                                 else int(env_rows[i])),
-                        rule=(None if rule is None else str(rule)),
-                        timeout_s=(float(_to) if _to > 0 else None),
-                    )
-                    # An actor runs calls in send order: the flag of this call.
-                    flags[i] = actor.pop_oom_flag.remote()
-                    f_timeouts[i] = _to
-                except Exception as _exc:
-                    self._n_other_errors += 1
-                    print(
-                        f"[SENTINEL] batch dispatch-error slot={i} "
-                        f"step={int(step_batch[i])}: {type(_exc).__name__}: "
-                        f"{str(_exc)[:120]} (n_other_errors={self._n_other_errors})",
-                        flush=True,
-                    )
-                    self._poison(actor, future=None)
-                    held[j] = None
-                    _sentinel_slot(i)
-
-            # Per-wave wall clock = the deadline of this wave's slots.
-            wave_to = max((t for t in f_timeouts.values() if t > 0.0), default=0.0)
-            wave_no_timeout = wave_to <= 0.0
-            live = list(futures.values())
-            if live and not wave_no_timeout:
-                try:
-                    ray.wait(live, num_returns=len(live), timeout=wave_to)
-                except Exception:
-                    pass
-
-            for j, i in enumerate(wave):
-                if sentinel_mask[i] or i not in futures:
-                    continue
-                actor = held[j]
-                future = futures[i]
-                try:
-                    if wave_no_timeout:
-                        _res = ray.get(future)
-                    else:
-                        _res = ray.get(future, timeout=0)
-                    self._check_arity(_res)
-                    reward = _res[-1]
-                    tokens_out[i] = self._wire(_res[0], self._token_dtype,
-                                               "tokens")
-                    if self._emit_eqn_ids:
-                        eqn_ids_out[i] = self._wire(
-                            _res[1], self._eqn_dtype, "eqn_ids")
-                    rewards_out[i] = np.asarray(reward, dtype=np.float32)
-                    with self._lock:
-                        self._measures_since_recycle[id(actor)] = (
-                            self._measures_since_recycle.get(id(actor), 0) + 1
-                        )
-                    # Every row (Q52): an in-callback OOM is a scored, finite row.
-                    try:
-                        _was_oom = bool(ray.get(flags[i], timeout=10.0))
-                    except Exception as _flag_exc:
-                        self._n_actor_errors += 1
-                        print(
-                            f"[POOL] oom-flag read failed actor#{j} slot={i} "
-                            f"step={int(step_batch[i])}: "
-                            f"{type(_flag_exc).__name__}: "
-                            f"{str(_flag_exc)[:120]}; the row stands, the "
-                            f"actor is replaced "
-                            f"(n_actor_errors={self._n_actor_errors})",
-                            flush=True,
-                        )
-                        self._poison(actor, future=None)
-                        held[j] = None
-                        continue
-                    if _was_oom:
-                        oom_by_actor.setdefault(j, []).append(i)
-                        # The server's -1e10 row stays masked, a scored row scored.
-                        if self._reward_is_sentinel(reward):
-                            sentinel_mask[i] = True
-                except GetTimeoutError:
-                    self._n_timeouts += 1
-                    print(
-                        f"[SENTINEL] batch timeout slot={i} step={int(step_batch[i])} "
-                        f"after {f_timeouts.get(i, 0.0):.0f}s (n_timeouts={self._n_timeouts})",
-                        flush=True,
-                    )
-                    self._poison(actor, future=future)
-                    held[j] = None
-                    _sentinel_slot(i)
-                    # A non-terminal slot (a tokenization stall) is no plan.
-                    if self._is_terminal(order_batch[i], step_batch[i]):
-                        self._record_timeout(
-                            f_timeouts.get(i, 0.0), order=order_batch[i],
-                            specs=specs_batch[i], step=step_batch[i],
-                            face_specs=(None if face_specs_batch is None
-                                        else face_specs_batch[i]),
-                            face_skips=(None if face_skips_batch is None
-                                        else face_skips_batch[i]),
-                            reward=rewards_out[i])
-                except RayActorError:
-                    self._n_actor_errors += 1
-                    print(
-                        f"[SENTINEL] batch actor-error slot={i} "
-                        f"step={int(step_batch[i])} (n_actor_errors={self._n_actor_errors})",
-                        flush=True,
-                    )
-                    self._poison(actor, future=future)
-                    held[j] = None
-                    _sentinel_slot(i)
-                except Exception as _exc:
-                    # The actor's measure toolchain gate fired (finding 03).
-                    # Ray re-raises the actor's exception as a RayTaskError
-                    # that is ALSO an instance of the original class; the
-                    # text match covers a pickling failure. This must stop
-                    # the run, not become one more [SENTINEL] line.
-                    if _is_toolchain_fault(_exc):
-                        raise
-                    self._n_other_errors += 1
-                    # THE FIRST ONE IN FULL. 120 characters of a RayTaskError
-                    # is the actor id and nothing else, so the one line that
-                    # says WHY an actor died was the one line the log did not
-                    # carry; every later error keeps the short form so a
-                    # storm of them does not bury the run.
-                    _first = self._n_other_errors == 1
-                    print(
-                        f"[SENTINEL] batch other-error slot={i} "
-                        f"step={int(step_batch[i])}: {type(_exc).__name__}: "
-                        f"{str(_exc) if _first else str(_exc)[:120]} "
-                        f"(n_other_errors={self._n_other_errors})",
-                        flush=True,
-                    )
-                    self._poison(actor, future=future)
-                    held[j] = None
-                    _sentinel_slot(i)
-
-            # Recycle after the wave: only process teardown frees the leaked XLA memory.
-            for j, slots in oom_by_actor.items():
-                old_actor = held[j]
-                if old_actor is None:
-                    continue
-                fresh = self._recycle_actor(old_actor)
-                self._n_oom_recycles += 1
-                held[j] = fresh  # replace in-place; may be None on failure
-                print(
-                    f"[POOL] oom-recycle actor#{j} slots={slots}: "
-                    f"{'fresh actor' if fresh is not None else 'respawn failed'}, "
-                    f"rows not measured again "
-                    f"(n_oom_recycles={self._n_oom_recycles})",
-                    flush=True,
-                )
+                nxt = N
+                break
+            now = time.time()
+            _dls = [dl for (_i, _j, dl) in pending.values() if dl > 0]
+            if _dls:
+                t_left = max(0.0, min(_dls) - now)
+                ready, _ = ray.wait(list(pending), num_returns=1,
+                                    timeout=t_left)
+            else:
+                ready, _ = ray.wait(list(pending), num_returns=1)
+            for fut in ready:
+                if fut in pending:
+                    _collect(fut)
+            if ready:
+                continue
+            now = time.time()
+            expired = [fut for fut, (_i, _j, dl) in pending.items()
+                       if 0 < dl <= now]
+            for fut in expired:
+                _collect(fut)
+            if not expired:
+                # ``ray.wait`` came back early with nothing ready.
+                time.sleep(0.005 if not _dls else
+                           min(0.005, max(0.0, min(_dls) - now)))
 
         # Return still-alive actors to the pool.
         for a in held:
