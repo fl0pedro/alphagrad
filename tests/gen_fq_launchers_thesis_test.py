@@ -82,7 +82,20 @@ TEMPORAL_RULES = ("tbptt", "bptt", "rtrl", "window2")
 RSNN_TARGETS = tuple(f"rsnn_{r}" for r in TEMPORAL_RULES)
 ALL_TARGETS = TARGETS + RSNN_TARGETS
 RSNN_EXAMPLE = "RSNN_SHD"
+RSNN_VMAP_EXAMPLE = "VmappedRSNN_SHD"
 RSNN_DATASET = "shd"
+#: dsnn-dfw.191: the --example and the batch of each rule (None: unbatched).
+#: One entry per rule, the value on its own line, one commit per rule.
+RSNN_FORM = {
+    "tbptt":
+        (RSNN_VMAP_EXAMPLE, "256"),
+    "bptt":
+        (RSNN_VMAP_EXAMPLE, "256"),
+    "rtrl":
+        (RSNN_VMAP_EXAMPLE, "64"),
+    "window2":
+        (RSNN_EXAMPLE, None),
+}
 EPISODES = "1000"
 #: THE LONG CONDITIONED ROWS (owner ruling 2026-09-20): condC on NN256, five
 #: seeds, runs twice the episodes.  No other coordinate moves.
@@ -240,6 +253,11 @@ def _cli(gen, a) -> dict:
 
 def _by_name(arms, name):
     return next(a for a in arms if a["name"] == name)
+
+
+def _rsnn_env(rule: str) -> dict:
+    batch = RSNN_FORM[rule][1]
+    return {**({"ALPHAGRAD_NN_BATCH": batch} if batch else {}), **MATRIX_ENV}
 
 
 def _bash_n(text: str) -> str | None:
@@ -428,9 +446,11 @@ def test_every_arm_carries_the_shared_thesis_flags(gen, matrix):
         assert gen.THESIS_TLM_FACE_WIRE_FACES == TLM_FACE_WIRE_FACES
         assert cli["--ray-measure-timeout"] == "300", a["name"]
         assert cli["--rollout-shards"] == "1", a["name"]
-        # the gate inputs, resolved from THIS arm's order
-        assert (cli["--gate-winners-table"]
-                == gen.CAMPAIGN_GATE_WINNERS_TABLES[ORDER]), a["name"]
+        # the gate inputs, resolved from THIS arm's order; a batched row
+        # passes no winners table (dsnn-qaht)
+        assert (cli.get("--gate-winners-table")
+                == (None if cli["--example"].startswith("Vmapped")
+                    else gen.CAMPAIGN_GATE_WINNERS_TABLES[ORDER])), a["name"]
         assert (cli["--gate-offline-contrast"]
                 == gen.GATE_OFFLINE_CONTRAST[ORDER]), a["name"]
 
@@ -508,30 +528,37 @@ def test_the_targets_are_the_ones_the_owner_named(gen, matrix):
     for a in matrix:
         cli = _cli(gen, a)
         if a["thesis_target"] == "nn256":
-            assert cli["--example"] == "NeuralNetwork", a["name"]
+            assert cli["--example"] == "VmappedNeuralNetwork", a["name"]
             assert cli["--dataset"] == "mnist", a["name"]
             assert a["env"] == {"ALPHAGRAD_NN_HIDDEN": "256",
+                                "ALPHAGRAD_NN_BATCH": "4096",
                                 **MATRIX_ENV}, a["name"]
             assert cli["--face-wire-faces"] == FACE_WIRE_FACES, a["name"]
             text = gen.render(a)
             assert "export ALPHAGRAD_NN_HIDDEN=256\n" in text, a["name"]
+            assert "export ALPHAGRAD_NN_BATCH=4096\n" in text, a["name"]
         elif a["thesis_target"] == "tlm":
-            assert cli["--example"] == "TransformerLM", a["name"]
+            assert cli["--example"] == "VmappedTransformerLM", a["name"]
             assert cli["--dataset"] == "wikitext2", a["name"]
-            assert a["env"] == MATRIX_ENV, a["name"]
+            assert a["env"] == {"ALPHAGRAD_NN_BATCH": "64",
+                                **MATRIX_ENV}, a["name"]
             assert cli["--face-wire-faces"] == TLM_FACE_WIRE_FACES, a["name"]
             text = gen.render(a)
             assert "ALPHAGRAD_NN_HIDDEN" not in text, a["name"]
+            assert "export ALPHAGRAD_NN_BATCH=64\n" in text, a["name"]
         else:
             assert a["thesis_target"] in RSNN_TARGETS, a["name"]
-            assert cli["--example"] == RSNN_EXAMPLE, a["name"]
+            example, batch = RSNN_FORM[a["thesis_rule"]]
+            assert cli["--example"] == example, a["name"]
             assert cli["--dataset"] == RSNN_DATASET, a["name"]
             # the recurrent target's shape is module constants of
             # common/rsnn_shd.py, not an environment variable
-            assert a["env"] == MATRIX_ENV, a["name"]
+            assert a["env"] == _rsnn_env(a["thesis_rule"]), a["name"]
             assert cli["--face-wire-faces"] == FACE_WIRE_FACES, a["name"]
             text = gen.render(a)
             assert "ALPHAGRAD_NN_HIDDEN" not in text, a["name"]
+            assert (f"export ALPHAGRAD_NN_BATCH={batch}\n" in text if batch
+                    else "ALPHAGRAD_NN_BATCH" not in text), a["name"]
     # the hidden width really is read from that variable and has no flag
     ex = open(os.path.join(_ALPHAGRAD, "src", "alphagrad", "approx", "common",
                            "examples.py")).read()
@@ -539,6 +566,43 @@ def test_the_targets_are_the_ones_the_owner_named(gen, matrix):
     ppo = open(os.path.join(_ALPHAGRAD, "src", "alphagrad", "approx",
                             "ppo.py")).read()
     assert '"--nn-hidden"' not in ppo
+
+
+def test_a_vmapped_row_carries_its_batch_and_no_frozen_round_moves(
+        gen, matrix, smoke):
+    var = gen.NN_BATCH_VAR
+    assert var == "ALPHAGRAD_NN_BATCH"
+    for a in matrix + smoke:
+        vmapped = _cli(gen, a)["--example"].startswith("Vmapped")
+        assert (var in a["env"]) == vmapped, a["name"]
+    for a in _frozen_rounds(gen):
+        assert not _cli(gen, a)["--example"].startswith("Vmapped"), a["name"]
+        assert var not in (a.get("env") or {}), a["name"]
+        assert var not in gen.render(a), a["name"]
+    assert var in gen.THESIS_ENV_ALLOWED
+    assert var not in gen.CAMPAIGN_ENV_ALLOWED
+    ds = open(os.path.join(_ALPHAGRAD, "src", "alphagrad", "approx", "common",
+                           "datasets.py")).read()
+    assert 'environ.get("ALPHAGRAD_NN_BATCH"' in ds
+
+
+def test_a_batched_row_passes_no_gate_winners_table(gen, matrix, smoke,
+                                                     pairs):
+    table = gen.CAMPAIGN_GATE_WINNERS_TABLES[ORDER]
+    assert table == "/Scratch/assmuth/sweep64/runs/markowitz/winners.csv"
+    for a in matrix + smoke + pairs:
+        cli = _cli(gen, a)
+        text = gen.render(a)
+        batched = cli["--example"].startswith("Vmapped")
+        passed = f"  --gate-winners-table {table}\n" in text
+        assert passed is not batched, a["name"]
+        assert ("--gate-winners-table" in cli) is not batched, a["name"]
+        assert ("gate G1 winners table" in text) is not batched, a["name"]
+    for a in _frozen_rounds(gen):
+        cli = _cli(gen, a)
+        assert (cli["--gate-winners-table"]
+                == gen.CAMPAIGN_GATE_WINNERS_TABLES[cli["--fixed-order"]]), \
+            a["name"]
 
 
 def test_arms_a_and_b_are_the_fixed_form_with_no_quality_floor(gen, matrix):
@@ -997,7 +1061,8 @@ def test_no_thesis_launcher_exports_an_xla_flag_or_a_promoted_var(gen,
 def test_every_export_in_a_thesis_launcher_is_allowed(gen, matrix, smoke):
     allowed = set(gen.THESIS_ENV_ALLOWED)
     assert allowed == (set(gen.CAMPAIGN_ENV_ALLOWED)
-                       | {"ALPHAGRAD_NN_HIDDEN"} | set(MATRIX_ENV))
+                       | {"ALPHAGRAD_NN_HIDDEN", "ALPHAGRAD_NN_BATCH"}
+                       | set(MATRIX_ENV))
     for a in matrix + smoke:
         exported = set(_EXPORT.findall(gen.render(a)))
         assert exported <= allowed, (a["name"], sorted(exported - allowed))
@@ -1154,7 +1219,8 @@ def test_the_smoke_is_the_three_runs_the_owner_asked_for(gen, smoke):
 
     first, resume, cond = smoke
     assert _cli(gen, first)["--episodes"] == "20"
-    assert _cli(gen, first)["--example"] == "TransformerLM"
+    assert _cli(gen, first)["--example"] == "VmappedTransformerLM"
+    assert first["env"]["ALPHAGRAD_NN_BATCH"] == "64"
     assert _cli(gen, first)["--reward-mode"] == "lagrangian"
     assert _cli(gen, first)["--grad-oracle-cadence"] == "10"
     assert "--preference-conditioned" not in _cli(gen, first)
@@ -1164,12 +1230,13 @@ def test_the_smoke_is_the_three_runs_the_owner_asked_for(gen, smoke):
     assert _cli(gen, resume)["--face-wire-faces"] == TLM_FACE_WIRE_FACES
 
     assert _cli(gen, cond)["--episodes"] == "5"
-    assert _cli(gen, cond)["--example"] == "NeuralNetwork"
+    assert _cli(gen, cond)["--example"] == "VmappedNeuralNetwork"
     assert _cli(gen, cond)["--dataset"] == "mnist"
     assert "--preference-conditioned" in _cli(gen, cond)
     assert _cli(gen, cond)["--reward-mode"] == "lagrangian"
     assert _cli(gen, cond)["--face-wire-faces"] == FACE_WIRE_FACES
-    assert cond["env"] == {"ALPHAGRAD_NN_HIDDEN": "256", **MATRIX_ENV}
+    assert cond["env"] == {"ALPHAGRAD_NN_HIDDEN": "256",
+                           "ALPHAGRAD_NN_BATCH": "4096", **MATRIX_ENV}
 
 
 def test_the_resume_leg_differs_in_resume_alone(gen, smoke):
@@ -1352,14 +1419,16 @@ def test_the_recurrent_block_is_four_rules_five_arms_five_seeds(gen, snn):
 def test_every_recurrent_row_is_the_rsnn_shd_target(gen, snn):
     for a in snn:
         cli = _cli(gen, a)
-        assert cli["--example"] == RSNN_EXAMPLE == "RSNN_SHD", a["name"]
+        assert RSNN_EXAMPLE == "RSNN_SHD", a["name"]
+        assert cli["--example"] == RSNN_FORM[a["thesis_rule"]][0], a["name"]
         assert cli["--dataset"] == RSNN_DATASET == "shd", a["name"]
         assert cli["--temporal-rule"] == a["thesis_rule"], a["name"]
         assert a["thesis_rule"] in TEMPORAL_RULES, a["name"]
         # and the flag really is spelled that way on the rendered command line
         text = gen.render(a)
         assert f"\n  --temporal-rule {a['thesis_rule']}\n" in text, a["name"]
-        assert "\n  --example RSNN_SHD\n" in text, a["name"]
+        assert (f"\n  --example {RSNN_FORM[a['thesis_rule']][0]}\n"
+                in text), a["name"]
         assert "\n  --dataset shd\n" in text, a["name"]
     # all four rules are present, each on 25 rows
     assert {a["thesis_rule"] for a in snn} == set(TEMPORAL_RULES)
@@ -1450,6 +1519,9 @@ def test_every_recurrent_row_carries_the_nn256_and_tlm_flags_unchanged(
             diff -= node_derived
             diff -= face_init
             diff -= popart_flags
+            # dsnn-qaht: a batched row drops the G1 winners table; which rows
+            # do is pinned by test_a_batched_row_passes_no_gate_winners_table.
+            diff -= {"--gate-winners-table"}
             if t == "nn256":
                 # the recurrent row renders 0.005 (dsnn-dfw.84 and
                 # dsnn-dfw.78) against NN256's 0.05: always a real diff.
@@ -1484,7 +1556,7 @@ def test_no_recurrent_row_carries_an_xla_flag(gen, snn):
     jax_cache_exports = {f"export {k}={v}" for k, v in gen.JAX_CACHE_ENV}
     jax_cache_mkdir = f"mkdir -p {gen.JAX_CACHE_DIR_EXPR}"
     for a in snn:
-        assert a["env"] == MATRIX_ENV, a["name"]
+        assert a["env"] == _rsnn_env(a["thesis_rule"]), a["name"]
         text = gen.render(a)
         assert "XLA_FLAGS" not in text, a["name"]
         for line in text.splitlines():
@@ -1609,10 +1681,13 @@ def test_the_four_rules_are_the_four_the_tree_defines(gen, snn):
     assert rsnn_shd.target_example(RSNN_EXAMPLE, "window2") == \
         rsnn_shd.RSNN_W2_TARGET
     assert rsnn_shd.target_example(RSNN_EXAMPLE, "tbptt") == RSNN_EXAMPLE
+    assert gen.THESIS_RSNN_VMAP_EXAMPLE == RSNN_VMAP_EXAMPLE
+    assert rsnn_shd.RSNN_VMAP_TARGET == RSNN_VMAP_EXAMPLE
     for a in snn:
-        assert _cli(gen, a)["--example"] == RSNN_EXAMPLE, a["name"]
+        example = RSNN_FORM[a["thesis_rule"]][0]
+        assert _cli(gen, a)["--example"] == example, a["name"]
         assert rsnn_shd.resolve_temporal_rule(
-            RSNN_EXAMPLE, a["thesis_rule"]) == a["thesis_rule"], a["name"]
+            example, a["thesis_rule"]) == a["thesis_rule"], a["name"]
 
 
 def test_the_retention_bound_reaches_every_row_thesis_arm_emits(

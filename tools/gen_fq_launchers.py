@@ -2613,42 +2613,79 @@ def thesis_job_name(node: str) -> str:
 #: tuple ppo.py builds `--temporal-rule`'s choices from.
 THESIS_TEMPORAL_RULES = ("tbptt", "bptt", "rtrl", "window2")
 THESIS_RSNN_EXAMPLE = "RSNN_SHD"
+#: The batched one-step body, rsnn_shd.RSNN_VMAP_TARGET; window2 has none.
+THESIS_RSNN_VMAP_EXAMPLE = "VmappedRSNN_SHD"
 THESIS_RSNN_DATASET = "shd"
 #: The target key of a temporal rule.  `rsnn_bptt`, so `thesis_run_name`
 #: spells the run `<arm>_rsnn_bptt_s<seed>`.
 THESIS_RSNN_TARGETS = tuple(f"rsnn_{r}" for r in THESIS_TEMPORAL_RULES)
 THESIS_TARGETS = ("nn256", "tlm") + THESIS_RSNN_TARGETS
+#: The batch of a Vmapped target; common/datasets.py reads it at import time.
+NN_BATCH_VAR = "ALPHAGRAD_NN_BATCH"
 THESIS_TARGET_CLI = {
-    "nn256": {"--example": "NeuralNetwork", "--dataset": "mnist"},
-    "tlm": {"--example": "TransformerLM", "--dataset": "wikitext2"},
+    "nn256": {"--example": "VmappedNeuralNetwork",
+              "--dataset": "mnist"},
+    "tlm": {"--example": "VmappedTransformerLM",
+            "--dataset": "wikitext2"},
     # THE RECURRENT TARGET.  --example and --dataset are the same in all four
     # rows; --temporal-rule is the only difference between them, and it is
     # the only flag the recurrent rows carry that the NN256 and TLM rows do
     # not.  Everything else comes from `thesis_cli`, unchanged.
-    **{f"rsnn_{r}": {"--example": THESIS_RSNN_EXAMPLE,
+    # dsnn-dfw.191: a batched rule names THESIS_RSNN_VMAP_EXAMPLE instead.
+    "rsnn_tbptt": {"--example": THESIS_RSNN_VMAP_EXAMPLE,
+                   "--dataset": THESIS_RSNN_DATASET,
+                   "--temporal-rule": "tbptt"},
+    "rsnn_bptt": {"--example": THESIS_RSNN_VMAP_EXAMPLE,
+                  "--dataset": THESIS_RSNN_DATASET,
+                  "--temporal-rule": "bptt"},
+    "rsnn_rtrl": {"--example": THESIS_RSNN_VMAP_EXAMPLE,
+                  "--dataset": THESIS_RSNN_DATASET,
+                  "--temporal-rule": "rtrl"},
+    "rsnn_window2": {"--example": THESIS_RSNN_EXAMPLE,
                      "--dataset": THESIS_RSNN_DATASET,
-                     "--temporal-rule": r}
-       for r in THESIS_TEMPORAL_RULES},
+                     "--temporal-rule": "window2"},
 }
 THESIS_TARGET_ENV = {
-    "nn256": {"ALPHAGRAD_NN_HIDDEN": "256"},
-    "tlm": {},          # the ALPHAGRAD_TLM_* triple is in CAMPAIGN_ENV
+    # Decision D1 (dsnn-dfw.152): 43 percent of the card under Markowitz.
+    "nn256": {"ALPHAGRAD_NN_HIDDEN": "256", NN_BATCH_VAR: "4096"},
+    # the ALPHAGRAD_TLM_* triple is in CAMPAIGN_ENV
+    # Owner ruling Q21 (2026-09-25): 62 percent of the card under Markowitz.
+    "tlm": {NN_BATCH_VAR: "64"},
     # The recurrent target's shape is NOT an environment variable: the hidden
     # width, the time constants and the init scale are module constants of
     # common/rsnn_shd.py (RSNN_HIDDEN = 128, the seven measured constants and
     # WEIGHT_SCALE), chosen by the learning gate, and nothing reads an env
     # var for them.  So these rows export nothing of their own and
     # THESIS_TARGET_ENV_ALLOWED below does not grow.
-    **{t: {} for t in THESIS_RSNN_TARGETS},
+    # dsnn-dfw.191: a batched rule exports its batch.  One entry per rule, the
+    # value on its own line, so that each rule's batch is its own commit.
+    "rsnn_tbptt":
+        {NN_BATCH_VAR: "256"},  # owner ruling Q21, dsnn-dfw.193
+    "rsnn_bptt":
+        {NN_BATCH_VAR: "256"},  # owner ruling Q21, dsnn-dfw.193
+    "rsnn_rtrl":
+        {NN_BATCH_VAR: "64"},  # owner ruling Q22 a, dsnn-dfw.193
+    "rsnn_window2":
+        {},
 }
 #: The ONLY per-arm exports a thesis launcher may carry.  `render` refuses
 #: any other key, exactly as it refuses every per-arm export on a campaign arm.
 THESIS_TARGET_ENV_ALLOWED = frozenset(
     k for env in THESIS_TARGET_ENV.values() for k in env
-) | {MEASURE_CACHE_CLEAR_EVERY_VAR, PROACTIVE_RECYCLE_EVERY_VAR}
+) | {MEASURE_CACHE_CLEAR_EVERY_VAR, PROACTIVE_RECYCLE_EVERY_VAR, NN_BATCH_VAR}
 #: Every `export NAME=` a THESIS launcher may contain: the campaign's allowed
 #: set plus the target-shape variables above.
 THESIS_ENV_ALLOWED = frozenset(CAMPAIGN_ENV_ALLOWED) | THESIS_TARGET_ENV_ALLOWED
+
+
+def thesis_target_form(target: str, batched: bool) -> tuple[dict, dict]:
+    cli = dict(THESIS_TARGET_CLI[target])
+    env = dict(THESIS_TARGET_ENV[target])
+    if not batched:
+        # A frozen round keeps the unbatched target it ran on (dsnn-dfw.191).
+        cli["--example"] = cli["--example"].removeprefix("Vmapped")
+        env.pop(NN_BATCH_VAR, None)
+    return cli, env
 
 
 def thesis_temporal_rule(target: str) -> str | None:
@@ -2997,6 +3034,7 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
                episodes: str, checkpoint_every: str,
                auto_stop: bool, grad_oracle_cadence: str = "50",
                matrix_row: bool = False,
+               batched: bool = False,
                face_entropy_floor: str = "0.3",
                face_entropy_weight: str | None = None,
                ppo_epochs: str = "1", minibatches: str = "4",
@@ -3046,7 +3084,7 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
         "--name": name,
         "--seed": seed,
         # --- the target
-        **THESIS_TARGET_CLI[target],
+        **thesis_target_form(target, batched)[0],
         # --- the search space
         "--approx-profile": THESIS_PROFILE,
         "--fixed-order": THESIS_ORDER,
@@ -3143,6 +3181,10 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
         # --no-symlog; both are passed and ppo.py checks they agree.
         cli["--no-symlog"] = None
         cli["--symlog-channels"] = "none"
+    if cli["--example"].startswith("Vmapped"):
+        # dsnn-qaht: every G1 winners table was recorded on the unbatched
+        # TransformerLM graph, so its vertex ids do not name a batched graph.
+        cli["--gate-winners-table"] = _DELETE
     return cli
 
 
@@ -3166,7 +3208,8 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
                THESIS_PROACTIVE_RECYCLE_EVERY,
                ray_measure_timeout: str = THESIS_RAY_MEASURE_TIMEOUT,
                cores_per_actor: str | None = THESIS_CORES_PER_ACTOR,
-               jax_cache_fixed_order_only: bool = True) -> dict:
+               jax_cache_fixed_order_only: bool = True,
+               batched: bool = True) -> dict:
     """One thesis run -> one `arm(...)`.  Returns the arm."""
     _require(node in THESIS_NODES,
              f"node {node!r} is not one of the permitted thesis nodes "
@@ -3191,7 +3234,7 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
                      episodes=episodes, checkpoint_every=checkpoint_every,
                      auto_stop=auto_stop,
                      grad_oracle_cadence=grad_oracle_cadence,
-                     matrix_row=True,
+                     matrix_row=True, batched=batched,
                      face_entropy_floor=face_entropy_floor,
                      face_entropy_weight=face_entropy_weight,
                      ppo_epochs=ppo_epochs, minibatches=minibatches,
@@ -3217,7 +3260,7 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
         # dsnn-dfw.99: the retention bound and the process recycle ride
         # with the target shape, and a row that renders `None` for either of
         # the two drops that one export again.
-        env=dict(THESIS_TARGET_ENV[target],
+        env=dict(thesis_target_form(target, batched)[1],
                  **({MEASURE_CACHE_CLEAR_EVERY_VAR: cache_clear_every}
                     if cache_clear_every is not None else {}),
                  **({PROACTIVE_RECYCLE_EVERY_VAR: proactive_recycle_every}
@@ -3917,6 +3960,8 @@ for _sweepl_tag, _sweepl_overrides in sweepl_configs():
             ray_measure_timeout=CAMPAIGN_RAY_MEASURE_TIMEOUT,
             cores_per_actor=None,
             jax_cache_fixed_order_only=False,
+            # dsnn-dfw.191: same reason, keeps the unbatched target too.
+            batched=False,
         )
         ARMS[-1]["sweepl"] = True
         ARMS[-1]["sweepl_tag"] = _sweepl_tag
@@ -4089,6 +4134,8 @@ for _sweepl2_tag, _sweepl2_overrides in sweepl2_configs():
             ray_measure_timeout=CAMPAIGN_RAY_MEASURE_TIMEOUT,
             cores_per_actor=None,
             jax_cache_fixed_order_only=False,
+            # dsnn-dfw.191: same reason, keeps the unbatched target too.
+            batched=False,
         )
         ARMS[-1]["sweepl2"] = True
         ARMS[-1]["sweepl2_tag"] = _sweepl2_tag
@@ -4248,6 +4295,8 @@ for _sweepl3_tag, _sweepl3_overrides in sweepl3_configs():
             ray_measure_timeout=CAMPAIGN_RAY_MEASURE_TIMEOUT,
             cores_per_actor=None,
             jax_cache_fixed_order_only=False,
+            # dsnn-dfw.191: same reason, keeps the unbatched target too.
+            batched=False,
         )
         ARMS[-1]["sweepl3"] = True
         ARMS[-1]["sweepl3_tag"] = _sweepl3_tag
@@ -4465,7 +4514,7 @@ def orderonly_arm(*, seed: str, lam_cmp: str | None = None,
         orderonly=True, thesis_arm=arm_name, thesis_target=ORDERONLY_TARGET,
         thesis_seed=seed, orderonly_weights=(None if pref
                                              else (lam_cmp, lam_mem)),
-        env=dict(THESIS_TARGET_ENV[ORDERONLY_TARGET]),
+        env=thesis_target_form(ORDERONLY_TARGET, batched=False)[1],
         required_flags=ORDERONLY_REQUIRED_FLAGS,
         required_flags_file=" ".join(THESIS_FLAGS_FILES),
         cli=cli,
@@ -4614,7 +4663,7 @@ def orderonly_final_arm(*, seed: str) -> dict:
         orderonly_final=True, thesis_arm=ORDERONLY_ARM,
         thesis_target=ORDERONLY_TARGET, thesis_seed=seed,
         orderonly_weights=(lam_cmp, lam_mem),
-        env=dict(THESIS_TARGET_ENV[ORDERONLY_TARGET]),
+        env=thesis_target_form(ORDERONLY_TARGET, batched=False)[1],
         required_flags=ORDERONLY_REQUIRED_FLAGS,
         required_flags_file=" ".join(THESIS_FLAGS_FILES),
         cli=cli,
@@ -4725,7 +4774,7 @@ def orderonly_tlm_final_arm() -> dict:
         orderonly_tlm_final=True, thesis_arm=ORDERONLY_ARM,
         thesis_target="tlm", thesis_seed=ORDERONLY_TLM_FINAL_SEED,
         orderonly_weights=(lam_cmp, lam_mem),
-        env=dict(THESIS_TARGET_ENV["tlm"]),
+        env=thesis_target_form("tlm", batched=False)[1],
         required_flags=ORDERONLY_REQUIRED_FLAGS,
         required_flags_file=" ".join(THESIS_FLAGS_FILES),
         cli=cli,
@@ -4913,7 +4962,7 @@ def orderonly_rsnn_arm(*, rule: str, seed: str, lam_cmp: str | None = None,
         thesis_rule=thesis_temporal_rule(target),
         thesis_seed=seed, orderonly_weights=(None if pref
                                              else (lam_cmp, lam_mem)),
-        env=dict(THESIS_TARGET_ENV[target]),
+        env=thesis_target_form(target, batched=False)[1],
         required_flags=ORDERONLY_REQUIRED_FLAGS,
         required_flags_file=" ".join(THESIS_FLAGS_FILES),
         cli=cli,
@@ -4988,7 +5037,7 @@ def orderonly_rsnn_tbptt_arm(*, seed: str) -> dict:
         orderonly_rsnn=True, thesis_arm=ORDERONLY_ARM, thesis_target=target,
         thesis_rule=thesis_temporal_rule(target),
         thesis_seed=seed, orderonly_weights=(lam_cmp, lam_mem),
-        env=dict(THESIS_TARGET_ENV[target]),
+        env=thesis_target_form(target, batched=False)[1],
         required_flags=ORDERONLY_REQUIRED_FLAGS,
         required_flags_file=" ".join(THESIS_FLAGS_FILES),
         cli=cli,
@@ -5417,6 +5466,7 @@ def _scratch_stack_block(target_env: dict | None = None,
         L.append("# device memory to the pool; only recycling the actor PROCESS")
         L.append("# does.  ppo.py has no flag for it.")
         L.append(f"export {PROACTIVE_RECYCLE_EVERY_VAR}={_proactive_recycle}")
+    _batch = target_env.pop(NN_BATCH_VAR, None)
     if target_env:
         L.append("")
         L.append("# THE TARGET SHAPE (thesis matrix, ticket dsnn-dfw.4).  The")
@@ -5425,6 +5475,11 @@ def _scratch_stack_block(target_env: dict | None = None,
         L.append("# ALPHAGRAD_TLM_* triple above is, and ppo.py has no flag for it.")
         for k in sorted(target_env):
             L.append(f"export {k}={target_env[k]}")
+    if _batch is not None:
+        L.append("")
+        L.append("# THE BATCH (dsnn-4ay).  common/datasets.py reads it at")
+        L.append("# IMPORT time, and ppo.py has no flag for it.")
+        L.append(f"export {NN_BATCH_VAR}={_batch}")
     L.append("")
     if jax_cache:
         L.extend(_jax_cache_lines())

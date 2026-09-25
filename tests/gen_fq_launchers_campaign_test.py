@@ -790,6 +790,10 @@ def test_every_arm_including_the_wave_arms_gets_a_real_winners_table(gen):
         if a.get("kind") != "train":
             continue
         cli = _cli(gen, a)
+        if cli["--example"].startswith("Vmapped"):
+            # dsnn-qaht: a batched thesis row passes no table.
+            assert "--gate-winners-table" not in cli, a["name"]
+            continue
         tbl = cli["--gate-winners-table"]
         assert isinstance(tbl, str), (a["name"], tbl)
         assert tbl == gen.CAMPAIGN_GATE_WINNERS_TABLES[cli["--fixed-order"]]
