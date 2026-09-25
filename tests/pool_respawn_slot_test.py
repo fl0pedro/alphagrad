@@ -228,3 +228,24 @@ def test_the_trainer_factory_refuses_a_missing_slot_and_checks_the_device():
     assert "_wait_device_free(" in spawn
     assert "slot=_slot, gpu_uuid=_uuid" in spawn
     assert "% max(_n_actors, 1)" not in spawn, "the counter's wrap-around is gone"
+
+
+def test_the_trainer_pins_each_slot_to_the_device_the_row_names():
+    # dsnn-dfw.245: the pin, the guard and the uuid read one list, made from the trainer's own mask.
+    import inspect
+    import alphagrad.approx.ppo as ppo
+
+    src = inspect.getsource(ppo.main)
+    i_map = src.index("_measure_dev = _measure_devices(")
+    i_cvd = src.index('os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpus)')
+    assert i_map < i_cvd
+    assert 'visible=os.environ.get("CUDA_VISIBLE_DEVICES")' in src[i_map:i_cvd]
+    assert '"CUDA_VISIBLE_DEVICES": str(_measure_dev[idx])' in src
+    spawn = src[src.index("def _spawn(slot: int | None = None):"):]
+    spawn = spawn[:spawn.index("_actors = [_spawn(i) for i in range(_n_actors)]")]
+    assert "_dev = _measure_dev[_slot]" in spawn
+    assert "_uuid = _gpu_uuid_of.get(_dev)" in spawn
+    assert "_first_gpu" not in src and "idx + _first" not in src
+    ns = ppo.make_argparser().parse_args(["--gpus", "4", "--measure-gpus", "5,6,7"])
+    assert (ns.gpus, ns.measure_gpus) == ("4", "5,6,7")
+    assert ppo.make_argparser().parse_args([]).measure_gpus is None

@@ -46,8 +46,7 @@ NN256_ACTORS = "3"
 
 def _load(pairs: bool):
     old = os.environ.pop("THESIS_PAIRS", None)
-    if pairs:
-        os.environ["THESIS_PAIRS"] = "1"
+    os.environ["THESIS_PAIRS"] = "1" if pairs else "0"
     try:
         spec = importlib.util.spec_from_file_location("gen_fq_launchers", _GEN)
         mod = importlib.util.module_from_spec(spec)
@@ -61,7 +60,6 @@ def _load(pairs: bool):
 
 @pytest.fixture(scope="module")
 def gen():
-    # The pair path, switched on: the default keeps it off (dsnn-dfw.245).
     return _load(pairs=True)
 
 
@@ -401,3 +399,66 @@ def test_with_the_pairs_off_every_nn256_seed_is_a_single_row(gen, gen_off):
     for s in ("250197", "250198"):
         a = off[f"C_popart_nn256_s{s}"]
         assert a["node"] in EIGHT_GPU and not a.get("paired_into"), a["name"]
+
+
+# -------------------------------------- 5. the devices a row names (dsnn-dfw.245)
+
+_FROZEN = ("orderonly", "orderonly_rsnn", "orderonly_final",
+           "orderonly_tlm_final", "sweepl", "sweepl2", "sweepl3")
+
+
+def _array(text: str, tag: str) -> str:
+    i = text.index(f"\nARGS_{tag}=(\n")
+    return text[i:text.index("\n)\n", i)]
+
+
+def test_each_half_names_its_own_trainer_gpu_and_measure_gpus(gen):
+    from alphagrad.approx.common.device_guard import measure_devices
+
+    want = {"A": ("0", "1,2,3"), "B": ("4", "5,6,7")}
+    pairs = gen.thesis_pair_arms()
+    assert pairs
+    for p in pairs:
+        text = gen.render(p)
+        for tag, h in zip(("A", "B"), p["halves"]):
+            cli = dict(gen._merge_cli(h["cli"]))
+            assert (cli["--gpus"], cli["--measure-gpus"]) == want[tag], \
+                (p["name"], tag)
+            dev = h["devices"].split(",")
+            assert [cli["--gpus"]] + cli["--measure-gpus"].split(",") == dev, \
+                (p["name"], tag)
+            arr = _array(text, tag)
+            assert f"\n  --gpus {want[tag][0]}\n" in arr, (p["name"], tag)
+            assert f"\n  --measure-gpus {want[tag][1]}\n" in arr, \
+                (p["name"], tag)
+            # ppo.py's own check takes the half's line under the half's mask
+            assert measure_devices(
+                int(cli["--ray-measure"]), cli["--measure-gpus"],
+                trainer_gpus=cli["--gpus"], visible=h["devices"]) == \
+                [int(d) for d in dev[1:]], (p["name"], tag)
+        for flag in ("--gpus", "--measure-gpus"):
+            assert flag in p["required_flags"], (p["name"], flag)
+
+
+def test_every_single_row_names_gpu_0_and_the_measure_gpus_after_it(gen):
+    rows = [a for a in gen.thesis_arms() if not a.get("paired")]
+    frozen = [a for a in rows if any(a.get(k) for k in _FROZEN)]
+    single = [a for a in rows if not any(a.get(k) for k in _FROZEN)]
+    assert single and frozen
+    for a in single:
+        cli = dict(gen._merge_cli(a["cli"]))
+        n = int(cli["--ray-measure"])
+        assert n == a["gpus"] - 1, a["name"]
+        assert cli["--gpus"] == "0", a["name"]
+        assert cli["--measure-gpus"] == ",".join(
+            str(k) for k in range(1, n + 1)), a["name"]
+        for flag in ("--gpus", "--measure-gpus"):
+            assert flag in a["required_flags"], (a["name"], flag)
+        text = gen.render(a)
+        assert f"\n  --measure-gpus {cli['--measure-gpus']}\n" in _args(text), \
+            a["name"]
+    for a in frozen:
+        cli = dict(gen._merge_cli(a["cli"]))
+        assert "--measure-gpus" not in cli and "--gpus" not in cli, a["name"]
+        assert "--measure-gpus" not in a["required_flags"], a["name"]
+        assert "--measure-gpus" not in gen.render(a), a["name"]

@@ -892,10 +892,12 @@ def test_the_arms_differ_only_where_the_matrix_says_they_do(gen, matrix):
     GPU, and the runs are spread round-robin over nodes of two sizes.
     `test_the_nodes_and_the_actors_per_node_size` is what pins it, per arm,
     against that node's own size.  The oracle's host budget follows the
-    node's size the same way (owner rulings 2026-09-25).
+    node's size the same way (owner rulings 2026-09-25), and so do the
+    measure GPUs (dsnn-dfw.245).
     """
     node_derived = {"--ray-measure", "--cpu-cores-per-actor",
-                    "--reserved-driver-cores", "--grad-oracle-host-budget-gb"}
+                    "--reserved-driver-cores", "--grad-oracle-host-budget-gb",
+                    "--measure-gpus"}
     allowed_between_arms = {
         "--name", "--face-none-bias", "--reward-mode", "--quality-floor",
         "--advantage-norm", "--no-symlog", "--symlog-channels",
@@ -1395,7 +1397,8 @@ def test_every_recurrent_row_carries_the_nn256_and_tlm_flags_unchanged(
     stays on the campaign's 64, same as its NN256 twin (never a diff), but
     its TLM twin renders 128 (always a diff).
     """
-    node_derived = {"--ray-measure", "--grad-oracle-host-budget-gb"}
+    node_derived = {"--ray-measure", "--grad-oracle-host-budget-gb",
+                    "--measure-gpus"}
     face_init = {"--face-none-bias", "--face-init-approx-per-plan",
                  "--face-init-skips-per-plan"}
     popart_flags = {"--advantage-norm", "--no-symlog", "--symlog-channels"}

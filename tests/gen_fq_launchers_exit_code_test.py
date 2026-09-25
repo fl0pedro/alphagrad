@@ -24,10 +24,9 @@ _TRAINER_LINE = re.compile(
     r'^\s*src/alphagrad/approx/ppo\.py "\$\{ARGS\[@\]\}"\s*$', re.M)
 
 
-def _gen(pairs: bool = False):
+def _gen(pairs: bool = True):
     old = os.environ.pop("THESIS_PAIRS", None)
-    if pairs:
-        os.environ["THESIS_PAIRS"] = "1"
+    os.environ["THESIS_PAIRS"] = "1" if pairs else "0"
     try:
         spec = importlib.util.spec_from_file_location("gen_fq_launchers", _GEN)
         mod = importlib.util.module_from_spec(spec)

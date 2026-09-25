@@ -70,3 +70,52 @@ def test_gpu_uuids_map_the_index_to_the_uuid():
 
 def test_a_refusal_is_an_actor_start_refusal():
     assert issubclass(DG.DeviceInUse, DG.ActorStartRefused)
+
+
+# dsnn-dfw.245: each measure slot takes the device the row names, and half B stays off half A's GPUs.
+
+def test_each_half_of_a_pair_maps_its_slots_to_its_own_devices():
+    assert DG.measure_devices(3, "1,2,3", trainer_gpus="0", visible="0,1,2,3") == [1, 2, 3]
+    assert DG.measure_devices(3, "5,6,7", trainer_gpus="4", visible="4,5,6,7") == [5, 6, 7]
+    assert DG.measure_devices(3, "1,2,3", trainer_gpus="0") == [1, 2, 3]
+    assert DG.measure_devices(7, "1,2,3,4,5,6,7", trainer_gpus="0",
+                              visible="0,1,2,3,4,5,6,7") == [1, 2, 3, 4, 5, 6, 7]
+
+
+def test_a_device_count_that_is_not_the_actor_count_raises():
+    with pytest.raises(ValueError, match="names 2 devices for 3 measure actors"):
+        DG.measure_devices(3, "5,6", trainer_gpus="4", visible="4,5,6,7")
+    with pytest.raises(ValueError, match="names 3 devices for 7 measure actors"):
+        DG.measure_devices(7, "1,2,3", trainer_gpus="0")
+
+
+def test_a_measure_device_that_is_the_trainer_s_raises():
+    with pytest.raises(ValueError, match=r"the trainer's device \[4\]"):
+        DG.measure_devices(3, "4,5,6", trainer_gpus="4", visible="4,5,6,7")
+    with pytest.raises(ValueError, match=r"the trainer's device \[0\]"):
+        DG.measure_devices(3, "0,1,2", trainer_gpus="0", visible="0,1,2,3")
+
+
+def test_half_b_on_half_a_s_gpus_raises():
+    with pytest.raises(ValueError, match="does not hold"):
+        DG.measure_devices(3, "1,2,3", trainer_gpus="4", visible="4,5,6,7")
+    with pytest.raises(ValueError, match="is not the trainer's device"):
+        DG.measure_devices(3, "5,6,7", trainer_gpus="0", visible="4,5,6,7")
+    with pytest.raises(ValueError, match="is not the trainer's device"):
+        DG.measure_devices(3, "5,6,7", trainer_gpus="4")
+
+
+def test_a_repeated_or_malformed_device_raises():
+    with pytest.raises(ValueError, match="twice"):
+        DG.measure_devices(3, "1,1,2", trainer_gpus="0")
+    with pytest.raises(ValueError, match="not a comma-separated list"):
+        DG.measure_devices(3, "1,2,x", trainer_gpus="0")
+    with pytest.raises(ValueError, match="not a comma-separated list"):
+        DG.measure_devices(3, "1,2,3", trainer_gpus="0", visible="GPU-aaa")
+
+
+def test_without_the_flag_the_slots_keep_the_first_gpu_rule():
+    assert DG.measure_devices(3, None, trainer_gpus="0") == [1, 2, 3]
+    assert DG.measure_devices(3, None, trainer_gpus="0", first_gpu="0") == [0, 1, 2]
+    with pytest.raises(ValueError, match="both name the measure devices"):
+        DG.measure_devices(3, "1,2,3", trainer_gpus="0", first_gpu="1")
