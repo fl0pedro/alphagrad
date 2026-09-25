@@ -203,15 +203,12 @@ def make_argparser() -> argparse.ArgumentParser:
                         "(owner rulings 2026-09-24 Q46, Q48): the latency "
                         "sentinel of a refused plan. Nothing kills a call "
                         "in this process; a hang stays a hang.")
-    # 2, as the launchers pass (--latency-warmup 2). Warmup is a BIAS
-    # knob, not a precision knob: one untimed execution leaves first-touch
-    # cost in the first timed one.
-    p.add_argument("--latency-warmup", type=int, default=2,
-                   help="UNTIMED executions before the first timed rep, "
-                        "inside env._callback. The smoke run showed the very "
-                        "first execution of a plan reading 5-10x the settled "
-                        "value; without this the whole trial-0 column is "
-                        "first-touch, not latency.")
+    # Accepted for the wave launchers' command lines; the measurement has
+    # no warm-ups since 2026-09-25 (owner ruling), so nothing reads it.
+    p.add_argument("--latency-warmup", type=int, default=0,
+                   help="No reader since 2026-09-25: the measurement runs no "
+                        "untimed execution (owner ruling). Accepted so the "
+                        "rendered wave launchers still parse.")
     p.add_argument("--grad-oracle", choices=["reference", "off"],
                    default="reference",
                    help="Oracle A (ticket .62). INERT IN THIS TOOL since the "
@@ -573,7 +570,6 @@ def build_env(args):
         latency_inner_reps=int(args.latency_inner_reps),
         measure_budget_secs=float(args.measure_budget_secs),
         measure_window_secs=float(args.measure_window_secs),
-        latency_warmup=int(args.latency_warmup),
         # --face-actions implies per-face legality masking (a per-vertex rule
         # that does not fit ONE face's operand would otherwise hit graphax's
         # strict TRANSFORM-DID-NOT-FIT guard and kill the measurement).
@@ -1625,14 +1621,9 @@ def config_stamp(args):
         "inner_reps": int(args.latency_inner_reps),
         "measure_budget_secs": float(args.measure_budget_secs),
         "measure_window_secs": float(args.measure_window_secs),
-        # BOTH warmups, named. `script` = this tool's whole-plan pass, which
-        # pays the COMPILE. `env` = agent B's _resolve_warmup, untimed
-        # executions inside the measure loop, which pays first-touch on an
-        # already-compiled executable. They are not the same thing and both
-        # are on.
-        "warmup_src": (f"script:{int(args.warmup_trials)}+"
-                       f"env:{os.environ.get('ALPHAGRAD_MEASURE_WARMUP', '1')}"
-                       f"/cfg:{int(args.latency_warmup)}"),
+        # `script` = this tool's whole-plan pass, which pays the COMPILE. The
+        # measure loop itself runs no untimed execution since 2026-09-25.
+        "warmup_src": f"script:{int(args.warmup_trials)}+env:none",
         "config_note": args.config_note,
         "quality_metric": str(args.quality_metric),
         "approx_add": str(args.approx_add),

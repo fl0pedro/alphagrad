@@ -2933,6 +2933,11 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
             "ref_measure_windows": (measure_counts or {}).get("ref_windows"),
             "ref_measure_secs": (measure_counts or {}).get("ref_secs"),
             "ref_timing": (measure_counts or {}).get("ref_timing"),
+            # THE FIRST EXECUTION'S SECONDS, per half (owner ruling
+            # 2026-09-25): it set the counts above, and with inner 1 and
+            # windows 1 it is the whole sample.
+            "measure_first_s": (measure_counts or {}).get("first_s"),
+            "ref_measure_first_s": (measure_counts or {}).get("ref_first_s"),
             # THE PLAN THIS ONE'S NUMBERS CAME FROM (owner ruling
             # 2026-09-14). None on every measured plan. An integer names the
             # index, within this episode and this measure actor, of the
@@ -3916,8 +3921,9 @@ class EnvConfig(NamedTuple):
     # variation is 0.56 percent. The fixed counts were a specification
     # (commit 61e7027e, "the spec's 20"), never a noise measurement.
     #
-    # The counts are now derived from ONE warm-up execution's measured time
-    # `t`:
+    # The counts are derived from the FIRST TIMED execution's measured time
+    # `t` (owner rulings 2026-09-25: no warm-ups, and a first execution past
+    # the budget is the whole sample; see `first_execution_counts`):
     #     inner   = clamp(ceil(measure_window_secs / t), 5, 50)
     #     windows = clamp(round(measure_budget_secs / (inner * t)),
     #                     1, num_data_points * reps_per_point)
@@ -3982,15 +3988,6 @@ class EnvConfig(NamedTuple):
     # (``common.examples.get_fn`` = model + loss), so this field selects
     # nothing; it is kept accepted because callers still forward it.
     measure_grad: bool = False
-    # WARMUP executions before the timed window. Passed by every caller
-    # (cpu_approx_worker, az_gumbel) since the actor-args dict was written, but
-    # until now it had NO READER in this module -- it was swallowed by
-    # ``from_jaxpr(**_compat)``. The elimrl/POMO worker always runs exactly one
-    # untimed warmup call before its timing loop; this stack ran none, so its
-    # FIRST timed rep paid first-touch/allocator cost that the reference
-    # protocol does not. Default 0 keeps every existing campaign bit-identical;
-    # set it to 1 to match the reference protocol.
-    latency_warmup: int = 0
     # THE PER-STEP DELTA WINDOW BIN (owner ruling 2026-09-14). A power of
     # two at or below MAX_DELTA_TOKENS, or 0 meaning "the cap".
     #
@@ -5031,7 +5028,7 @@ def _gradient_similarity(jac_exact, jac_approx, site: str):
 # graph (Q17 b, 2026-09-25), INTERLEAVED with that plan's windows since
 # 2026-09-14 (it used to run as a second block right after it), through the
 # same executable path and the same instrument (`_time_one_rep`, same eval
-# args, same warmup, same median). Its POINTS x REPS are its own
+# args, same median). Its POINTS x REPS are its own
 # (`EnvConfig.ref_num_data_points`) and so is its INNER, which the window
 # rule derives from its own execution time (`EnvConfig.measure_budget_secs`).
 # The cost channels then carry the LOG-DIFFERENCE ``Delta_c = log
@@ -5358,12 +5355,11 @@ def _time_one_rep(ex, eval_args, unique_devices, inner):
 
 
 def _campaign_measure_cost(ex, eval_args_list, unique_devices,
-                           inner, warmup, n_reps):
+                           inner, n_reps):
     """(latency_ns, peak_bytes) of `ex` under the FULL campaign
     instrument: ``len(eval_args_list)`` data points x `n_reps` timing
-    repetitions of `inner` back-to-back executions each, `warmup`
-    untimed executions per point, reduced by ``_aggregate_samples``
-    (the same median the plan's own channels get).
+    repetitions of `inner` back-to-back executions each, reduced by
+    ``_aggregate_samples`` (the same median the plan's own channels get).
 
     NOT ON THE MEASUREMENT PATH SINCE 2026-09-14, and say so plainly: the
     terminal callback measures the candidate and the paired rev-exact
@@ -5382,8 +5378,6 @@ def _campaign_measure_cost(ex, eval_args_list, unique_devices,
     _lat: list[float] = []
     _peak: list[float] = []
     for _eval_args in eval_args_list:
-        for _w in range(max(0, int(warmup))):
-            jax.block_until_ready(ex(*_eval_args))
         for _r in range(max(1, int(n_reps))):
             _l, _p, _s, _o = _time_one_rep(
                 ex, _eval_args, unique_devices, inner)
@@ -5394,20 +5388,6 @@ def _campaign_measure_cost(ex, eval_args_list, unique_devices,
         float(_aggregate_samples(_lat, want_top_quartile=True)) if _lat else 0.0,
         float(_aggregate_samples(_peak, want_top_quartile=True)) if _peak else 0.0,
     )
-
-
-def _resolve_warmup(config) -> int:
-    """Untimed executions to run before the first TIMED one.
-
-    ``config.latency_warmup`` when set; otherwise 1 unless
-    ``ALPHAGRAD_MEASURE_WARMUP=0``. See the call site in the measurement
-    loop for why the default is 1: without it the first timed sample of
-    a plan is the first execution of a freshly compiled executable.
-    """
-    _w = max(0, int(getattr(config, "latency_warmup", 0) or 0))
-    if _w == 0 and os.environ.get("ALPHAGRAD_MEASURE_WARMUP", "1") != "0":
-        return 1
-    return _w
 
 
 # ---------------------------------------------------------------------------
@@ -5471,17 +5451,14 @@ def resolve_measure_windows(t_exec_s: float, inner: int, budget_s: float,
     return int(min(cap, max(1, want)))
 
 
-def probe_at_floor(t_s: float, window_s: float, budget_s: float, hi: int,
-                       cap: int, cold_factor: float = 10.0) -> bool:
-    # Both counts fall as the time grows, so the floor counts at t_s / cold_factor
-    # are the counts everywhere between there and t_s.
-    if not math.isfinite(t_s) or t_s <= 0.0:
-        return False
-    warm = float(t_s) / float(cold_factor)
-    lo = min(MEASURE_INNER_MIN, max(1, int(hi)))
-    if resolve_measure_inner(warm, window_s, hi) != lo:
-        return False
-    return resolve_measure_windows(warm, lo, budget_s, cap) == 1
+def first_execution_counts(t_first_s: float, window_s: float, budget_s: float,
+                           hi: int, cap: int) -> tuple[int, int, bool]:
+    # (inner, windows, whole): a first execution past the budget is the whole
+    # sample (owner ruling 2026-09-25); otherwise it sets the counts and leaves.
+    if math.isfinite(t_first_s) and float(t_first_s) > float(budget_s):
+        return 1, 1, True
+    inner = resolve_measure_inner(t_first_s, window_s, hi)
+    return inner, resolve_measure_windows(t_first_s, inner, budget_s, cap), False
 
 
 def interleave_windows(n_a: int, n_b: int) -> list:
@@ -5838,13 +5815,9 @@ def _grad_cosine_k(config=None) -> int:
     cosine paid -- and the bake-off found K>1 buys essentially no extra
     correlation on the dense targets.
 
-    A GENERATOR MAY ASK FOR MORE, AND ONE HAS TO. On a sparse spiking target a
-    probe batch IS a step position, and at a step where nothing fired the exact
-    gradient is identically zero, the cosine is undefined and the measurement
-    is refused. 43 of the 99 legal step positions of the recording the RSNN_SHD
-    campaign drew are silent (probe 66655), so K=1 refuses 43 percent of every
-    measurement on that target. Such a generator declares `probe_batches` and
-    that number is the default here. ALPHAGRAD_GRAD_COSINE_K overrides both.
+    A generator's `probe_batches` and ALPHAGRAD_GRAD_COSINE_K can raise it;
+    since the owner's ruling of 2026-09-25 (dsnn-dfw.221, K = 1) no generator
+    does.
     """
     _default = 1
     if config is not None:
@@ -5971,13 +5944,9 @@ def _grad_cosine_k(config=None) -> int:
     cosine paid -- and the bake-off found K>1 buys essentially no extra
     correlation on the dense targets.
 
-    A GENERATOR MAY ASK FOR MORE, AND ONE HAS TO. On a sparse spiking target a
-    probe batch IS a step position, and at a step where nothing fired the exact
-    gradient is identically zero, the cosine is undefined and the measurement
-    is refused. 43 of the 99 legal step positions of the recording the RSNN_SHD
-    campaign drew are silent (probe 66655), so K=1 refuses 43 percent of every
-    measurement on that target. Such a generator declares `probe_batches` and
-    that number is the default here. ALPHAGRAD_GRAD_COSINE_K overrides both.
+    A generator's `probe_batches` and ALPHAGRAD_GRAD_COSINE_K can raise it;
+    since the owner's ruling of 2026-09-25 (dsnn-dfw.221, K = 1) no generator
+    does.
     """
     _default = 1
     if config is not None:
@@ -10729,18 +10698,19 @@ def _callback_measured(
                           "bytes_limit_source": _limit_src,
                           "measure_latency": bool(config.measure_latency)}
         _ref_rec = None
-        _counts_r = {"inner": 0, "windows": 0, "secs": 0.0,
+        _counts_r = {"inner": 0, "windows": 0, "secs": 0.0, "first_s": 0.0,
                      "ref_inner": 0, "ref_windows": 0, "ref_secs": 0.0,
-                     "ref_timing": None}
+                     "ref_first_s": 0.0, "ref_timing": None}
         _r_static = None
         if _paired:
             _r_ex = _compile_reference()
             try:
-                _r_warmup = _resolve_warmup(config)
                 _r_cfg_inner = max(
                     1, int(getattr(config, "latency_inner_reps", 1)))
                 _r_window_s = float(
                     getattr(config, "measure_window_secs", 0.05) or 0.0)
+                _r_budget_s = float(
+                    getattr(config, "measure_budget_secs", 1.0) or 0.0)
                 _r_points = max(
                     1, int(getattr(config, "ref_num_data_points", 5)))
                 if _ref_eval:
@@ -10766,34 +10736,35 @@ def _callback_measured(
                 _r_key = _ref_once_key(
                     paired_ref_key, _r_devs, _r_args_all,
                     (_r_points, _r_reps, bool(config.measure_latency),
-                     _r_cfg_inner, _r_window_s, _r_warmup))
+                     _r_cfg_inner, _r_window_s))
                 _r_once = _REF_ONCE.get(_r_key)
                 _r_timing = ("timed" if _r_once is None or _st["ref_timed"]
                              else "reused")
                 if _r_once is None:
-                    if config.measure_latency:
-                        _t_ref = 0.0
-                        for _w in range(max(2, _r_warmup)):
-                            _p0 = time.perf_counter()
-                            jax.block_until_ready(_r_ex(*_r_args_all[0]))
-                            _t_ref = time.perf_counter() - _p0
-                        _r_inner = resolve_measure_inner(
-                            _t_ref, _r_window_s, _r_cfg_inner)
-                    else:
-                        _r_inner = _r_cfg_inner
-                        for _w in range(_r_warmup):
-                            jax.block_until_ready(_r_ex(*_r_args_all[0]))
+                    # The same rule as the measured plan's reference below:
+                    # the first execution is timed and sets the counts.
+                    _r_first = 0.0
                     _r_windows = _r_points * _r_reps
-                    _r_warmed = {0}
+                    _r_loop = _r_windows
                     _r_lat_s: list = []
                     _r_pk_s: list = []
-                    for _ib in range(_r_windows):
+                    if config.measure_latency:
+                        _rl0, _rp0, _rs0, _ro0 = _time_one_rep(
+                            _r_ex, _r_args_all[0], _r_devs, 1)
+                        del _ro0, _rs0
+                        _r_first = float(_rl0) / 1e9
+                        _r_inner, _rw, _r_whole = first_execution_counts(
+                            _r_first, _r_window_s, _r_budget_s, _r_cfg_inner,
+                            _r_windows)
+                        if _r_whole:
+                            _r_windows = 1
+                            _r_loop = 0
+                            _r_lat_s.append(_rl0)
+                            _r_pk_s.append(_rp0)
+                    else:
+                        _r_inner = _r_cfg_inner
+                    for _ib in range(_r_loop):
                         _p = _ib % _r_points
-                        if _p not in _r_warmed:
-                            for _w in range(_r_warmup):
-                                jax.block_until_ready(
-                                    _r_ex(*_r_args_all[_p]))
-                            _r_warmed.add(_p)
                         _l, _pk, _s, _o = _time_one_rep(
                             _r_ex, _r_args_all[_p], _r_devs, _r_inner)
                         del _o, _s
@@ -10802,7 +10773,9 @@ def _callback_measured(
                     _r_once = {
                         "lat": tuple(_r_lat_s), "peak": tuple(_r_pk_s),
                         "inner": int(_r_inner), "windows": int(_r_windows),
-                        "secs": float(sum(_r_lat_s)) * _r_inner / 1e9,
+                        "first": float(_r_first),
+                        "secs": (float(sum(_r_lat_s)) * _r_inner / 1e9
+                                 + (_r_first if _r_loop else 0.0)),
                         "static": _static_memory_bytes(_r_ex)}
                     _REF_ONCE[_r_key] = _r_once
             except MeasureToolchainFault:
@@ -10839,7 +10812,8 @@ def _callback_measured(
                                   static=_r_static)
             _counts_r.update(
                 ref_inner=int(_r_inner), ref_windows=int(_r_windows),
-                ref_secs=float(_r_once["secs"]), ref_timing=_r_timing)
+                ref_secs=float(_r_once["secs"]),
+                ref_first_s=float(_r_once["first"]), ref_timing=_r_timing)
             _ref_rec = {
                 "latency_ns": float(_r_lat),
                 "temp_bytes": float(_r_static[0]),
@@ -11069,7 +11043,7 @@ def _callback_measured(
     # `reps_per_point` timing repetitions is now the CAP on the number of
     # timed windows, not the number itself (owner ruling 2026-09-14; see
     # `EnvConfig.measure_budget_secs`). The windows a plan actually gets are
-    # derived from one warm-up execution's measured time so that the plan
+    # derived from its first timed execution's measured time so that the plan
     # costs about `measure_budget_secs` of executions however fast or slow it
     # is, and they are spread ROUND-ROBIN over the data points. Reps exist
     # only to average timer noise, so without --measure-latency we take 1 rep
@@ -11092,8 +11066,8 @@ def _callback_measured(
     # measurement that motivates it). The reference is 150x cheaper per
     # execution than the candidate on the Markowitz order, so the candidate's
     # counts leave it with a tenth of a second of integration and it carries
-    # essentially all of the paired ratio's noise. The inner reps and the
-    # warmup stay SHARED; only the points and the reps fork here.
+    # essentially all of the paired ratio's noise. The inner rule stays
+    # SHARED; only the points and the reps fork here.
     n_ref_points = max(1, int(getattr(config, "ref_num_data_points", 5)))
     if _ref_eval:
         n_ref_points = min(n_ref_points, len(_ref_eval[0]))
@@ -11196,23 +11170,6 @@ def _callback_measured(
                 if callback_device is not None:
                     _ea = [jax.device_put(d, callback_device) for d in _ea]
                 ref_eval_args_all.append(_ea)
-        # WARMUP (config.latency_warmup): untimed executions before the
-        # first timed rep, matching the elimrl/POMO worker's single warmup
-        # call. Runs OUTSIDE every timing and memory window, so it can only
-        # remove first-touch bias, never add to it.
-        #
-        # DEFAULT ON (2026-08-26, ALPHAGRAD_MEASURE_WARMUP=0 to restore the
-        # old behaviour). Without it the FIRST timed sample of a plan is the
-        # FIRST EXECUTION of a freshly compiled executable, so first-touch
-        # (buffer setup, lazy scratch allocation, cold caches/clocks) lands
-        # inside a timed window. The 5x4 median absorbs one cold sample out
-        # of twenty almost completely -- so this is not the source of the
-        # campaign's latency numbers -- but a paired harness with few
-        # samples is fully exposed to it (identity-vs-itself measured
-        # 0.51 +/- 0.59 without a warmup, 1.00 +/- 0.14 with one), and the
-        # gate floor is a FRESH compile every time it is measured. One
-        # untimed execution costs one execution and removes the whole class.
-        _warmup = _resolve_warmup(config)
         # THE CONFIGURED INNER-REP CEILING. Since the owner's ruling of
         # 2026-09-14 `--latency-inner-reps` is the CEILING of the window
         # rule, not the inner itself (see `resolve_measure_inner`): the
@@ -11225,68 +11182,33 @@ def _callback_measured(
         # timing loop, because since 2026-09-14 its windows are INTERLEAVED
         # with the candidate's instead of forming a second block after them.
 
-        def _probe_one(ex, eval_args) -> float:
-            """Seconds of ONE execution of `ex`, measured on the WARM-UP.
-
-            THE LAST warm-up execution, and there are at least TWO. A single
-            warm-up is a COLD reading, and a cold reading here does not just
-            add noise to the counts, it can change the SCALE of the result:
-            the inner-rep count is ``ceil(window / t)``, so a `t` that reads
-            HIGH gives a SMALLER inner, and a small inner on a microsecond
-            program reads high against the dispatch floor (section 1.3 of
-            docs/UNBIASED_PARETO_AND_MEASUREMENT.md).
-
-            MEASURED, on the transformer arm (job 65666, one measure actor,
-            two episodes, one warm-up): the rev-exact reference settled at
-            138 us, but some plans' cold probe read about 2.5 ms and took
-            inner 20 instead of 50. Those plans then read up to 220 us, and
-            the reference's coefficient of variation over 112 plans was 9.6
-            percent against 2.1 percent under the fixed protocol. The second
-            warm-up costs one execution of the reference, 0.14 ms, and the
-            docs size the cold read as gone by the second reading (the
-            identity plan's first cold reading is 7.2 percent off and is
-            back inside 2 percent by reading two).
-
-            With ``ALPHAGRAD_MEASURE_WARMUP=0`` the budget still has to size
-            itself from something, so that configuration now pays exactly
-            TWO untimed executions per half per plan where it used to pay
-            none. They buy the counts.
-            """
-            _t = 0.0
-            for _w in range(max(2, _warmup)):
-                _p0 = time.perf_counter()
-                jax.block_until_ready(ex(*eval_args))
-                _t = time.perf_counter() - _p0
-                # The extra execution buys the counts; a first reading that
-                # fixes them already has bought them (dsnn-dfw.223).
-                if _w + 1 >= _warmup and probe_at_floor(
-                        _t, _window_s, _budget_s, _cfg_inner,
-                        n_points * n_reps):
-                    break
-            return _t
-
-        # ---- THE CANDIDATE'S BUDGET (owner ruling 2026-09-14) -----------
-        # One second of executions per plan, whatever the plan costs, instead
-        # of a fixed 5 x 4 x 50 = 1005 executions that cost 18.3 s on the
-        # transformer arm and 0.12 s on the reference. See
-        # `EnvConfig.measure_budget_secs`.
-        _warmed_cand: set = set()
-        _warmed_ref: set = set()
+        # ---- THE CANDIDATE'S BUDGET (owner rulings 2026-09-14 and
+        # 2026-09-25). One second of executions per plan, whatever the plan
+        # costs (see `EnvConfig.measure_budget_secs`). Every execution is
+        # timed, by the one instrument, and none runs untimed first: the
+        # first execution sets the counts. Past the budget it is the whole
+        # sample; otherwise it leaves the sample and the windows follow.
+        _t_cand = 0.0
+        _n_loop = 0
         if config.measure_latency:
-            _t_cand = _probe_one(compiled_cost, eval_args_all[0])
-            _inner = resolve_measure_inner(_t_cand, _window_s, _cfg_inner)
-            _n_windows = resolve_measure_windows(
-                _t_cand, _inner, _budget_s, n_points * n_reps)
+            _lat0, _peak0, _peak_src, _out0 = _time_one_rep(
+                compiled_cost, eval_args_all[0], unique_devices, 1)
+            del _out0
+            _t_cand = float(_lat0) / 1e9
+            _inner, _n_windows, _whole = first_execution_counts(
+                _t_cand, _window_s, _budget_s, _cfg_inner, n_points * n_reps)
+            if _whole:
+                latency_samples.append(_lat0)
+                peak_mem_samples.append(_peak0)
+            else:
+                _n_loop = _n_windows
         else:
             # THE BUDGET IS A TIMING INSTRUMENT. With --measure-latency off
             # there is no timer noise to integrate, `n_reps` is already 1,
             # and this path stays exactly what it was before the ruling.
-            _t_cand = 0.0
             _inner = _cfg_inner
             _n_windows = n_points * n_reps
-            for _w in range(_warmup):
-                jax.block_until_ready(compiled_cost(*eval_args_all[0]))
-        _warmed_cand.add(0)
+            _n_loop = _n_windows
 
         # ---- THE REFERENCE'S BUDGET -------------------------------------
         # It KEEPS ITS OWN WINDOW COUNT, `ref_num_data_points` x
@@ -11297,36 +11219,50 @@ def _callback_measured(
         # from the window rule, applied to ITS OWN execution time -- a 121 us
         # program fills a 50 ms window 413 times over and takes the ceiling
         # of 50, where the candidate takes the floor of 5.
+        # Its first execution counts too (owner ruling 2026-09-25): timed by
+        # the instrument, it sets the inner, and past the budget it is the
+        # reference's whole sample.
         _ref_inner = 0
         _ref_windows = 0
+        _ref_loop = 0
+        _t_ref = 0.0
         _ref_once = None
         _ref_timed_now = False
+        _ref_lat_samples: list[float] = []
+        _ref_peak_samples: list[float] = []
         if _paired:
             _ref_once_k = _ref_once_key(
                 paired_ref_key, unique_devices,
                 ref_eval_args_all[:n_ref_points],
                 (n_ref_points, n_ref_reps, bool(config.measure_latency),
-                 _cfg_inner, _window_s, _warmup))
+                 _cfg_inner, _window_s))
             _ref_once = _REF_ONCE.get(_ref_once_k)
         if _paired and _ref_once is None:
-            with _reference_errors(
-                    f"the reference ({_ref_kind}) failed in its probe or "
-                    f"warm-up"):
-                if config.measure_latency:
-                    _t_ref = _probe_one(_ref_ex, ref_eval_args_all[0])
-                    _ref_inner = resolve_measure_inner(
-                        _t_ref, _window_s, _cfg_inner)
-                else:
-                    _t_ref = 0.0
-                    _ref_inner = _cfg_inner
-                    for _w in range(_warmup):
-                        jax.block_until_ready(_ref_ex(*ref_eval_args_all[0]))
             _ref_windows = n_ref_points * n_ref_reps
+            _ref_loop = _ref_windows
+            with _reference_errors(
+                    f"the reference ({_ref_kind}) failed in its first "
+                    f"execution"):
+                if config.measure_latency:
+                    _rl0, _rp0, _rs0, _ro0 = _time_one_rep(
+                        _ref_ex, ref_eval_args_all[0], unique_devices, 1)
+                    del _ro0, _rs0
+                    _t_ref = float(_rl0) / 1e9
+                    _ref_inner, _rw, _r_whole = first_execution_counts(
+                        _t_ref, _window_s, _budget_s, _cfg_inner,
+                        _ref_windows)
+                    if _r_whole:
+                        _ref_windows = 1
+                        _ref_loop = 0
+                        _ref_lat_samples.append(_rl0)
+                        _ref_peak_samples.append(_rp0)
+                else:
+                    _ref_inner = _cfg_inner
             _ref_timed_now = True
-            _warmed_ref.add(0)
         elif _paired:
             _ref_inner = int(_ref_once["inner"])
             _ref_windows = int(_ref_once["windows"])
+            _t_ref = float(_ref_once["first"])
 
         # ---- THE INTERLEAVED TIMING LOOP --------------------------------
         # Only the plan that times the reference (Q17 b) runs both halves.
@@ -11349,22 +11285,15 @@ def _callback_measured(
         # class to a no-op). peak_memory + latency_ns are zero for the run.
         #
         # ONE instrument (see `_time_one_rep`): both halves call the same
-        # function, with the same warmup and the same window rule, so the
-        # reference is exactly what the campaign path would have printed for
-        # the rev-exact plan -- not a throughput timing that reads 13% low.
-        _ref_lat_samples: list[float] = []
-        _ref_peak_samples: list[float] = []
+        # function, with the same window rule, so the reference is exactly
+        # what the campaign path would have printed for the rev-exact plan
+        # -- not a throughput timing that reads 13% low.
         _ia = 0
         _ib = 0
         for _who in interleave_windows(
-                _n_windows, _ref_windows if _ref_timed_now else 0):
+                _n_loop, _ref_loop if _ref_timed_now else 0):
             if _who == 0:
                 _p = _ia % n_points
-                if _p not in _warmed_cand:
-                    for _w in range(_warmup):
-                        jax.block_until_ready(
-                            compiled_cost(*eval_args_all[_p]))
-                    _warmed_cand.add(_p)
                 _lat_ns, _peak_b, _peak_src, _out = _time_one_rep(
                     compiled_cost, eval_args_all[_p], unique_devices, _inner)
                 # DROPPED IMMEDIATELY. The old loop kept the last timed
@@ -11381,11 +11310,6 @@ def _callback_measured(
                 with _reference_errors(
                         f"the reference ({_ref_kind}) failed in its "
                         f"interleaved windows"):
-                    if _p not in _warmed_ref:
-                        for _w in range(_warmup):
-                            jax.block_until_ready(
-                                _ref_ex(*ref_eval_args_all[_p]))
-                        _warmed_ref.add(_p)
                     _l, _pk, _s, _o = _time_one_rep(
                         _ref_ex, ref_eval_args_all[_p], unique_devices,
                         _ref_inner)
@@ -11398,7 +11322,9 @@ def _callback_measured(
                 "lat": tuple(_ref_lat_samples),
                 "peak": tuple(_ref_peak_samples),
                 "inner": int(_ref_inner), "windows": int(_ref_windows),
-                "secs": float(sum(_ref_lat_samples)) * _ref_inner / 1e9,
+                "first": float(_t_ref),
+                "secs": (float(sum(_ref_lat_samples)) * _ref_inner / 1e9
+                         + (_t_ref if _ref_loop else 0.0)),
                 "static": _static_memory_bytes(_ref_ex)}
             _REF_ONCE[_ref_once_k] = _ref_once
             _st["ref_timed"] = True
@@ -11419,17 +11345,23 @@ def _callback_measured(
                 _rev_ex = cached_compile(
                     b"rev-exact:" + paired_ref_key, _do_compile_rev_exact)
                 if config.measure_latency:
-                    if not _ref_timed_now:
-                        _probe_one(_ref_ex, ref_eval_args_all[0])
-                    _rv_inner = resolve_measure_inner(
-                        _probe_one(_rev_ex, ref_eval_args_all[0]), _window_s,
-                        _cfg_inner)
-                    for _w in range(_ref_windows):
-                        _l, _pk, _s, _o = _time_one_rep(
-                            _rev_ex, ref_eval_args_all[0], unique_devices,
-                            _rv_inner)
-                        del _o, _s
-                        _rv_lat.append(_l)
+                    # The rev-exact's first execution counts, like every
+                    # other half's (owner ruling 2026-09-25).
+                    _rl0, _rp0, _rs0, _ro0 = _time_one_rep(
+                        _rev_ex, ref_eval_args_all[0], unique_devices, 1)
+                    del _ro0, _rs0, _rp0
+                    _rv_inner, _rv_w, _rv_whole = first_execution_counts(
+                        float(_rl0) / 1e9, _window_s, _budget_s, _cfg_inner,
+                        _ref_windows)
+                    if _rv_whole:
+                        _rv_lat.append(_rl0)
+                    for _w in range(1 if _rv_whole else _ref_windows):
+                        if not _rv_whole:
+                            _l, _pk, _s, _o = _time_one_rep(
+                                _rev_ex, ref_eval_args_all[0],
+                                unique_devices, _rv_inner)
+                            del _o, _s
+                            _rv_lat.append(_l)
                         _l, _pk, _s, _o = _time_one_rep(
                             _ref_ex, ref_eval_args_all[0], unique_devices,
                             _ref_inner)
@@ -11442,13 +11374,13 @@ def _callback_measured(
                 float(_aggregate_samples(_tl_lat, want_top_quartile=True))
                 if _tl_lat else 0.0,
                 len(_rv_lat))
-        # SECONDS OF EXECUTION actually spent inside timed windows, per half.
-        # Window w of a half took ``latency_ns[w] * inner`` nanoseconds, which
-        # is the quantity the budget is a target for. Warm-ups, probes and the
-        # quality walk are outside it, by the same rule that keeps them
-        # outside the timing windows themselves.
-        _meas_secs = float(sum(latency_samples)) * _inner / 1e9
-        _ref_secs = float(sum(_ref_lat_samples)) * _ref_inner / 1e9
+        # SECONDS OF EXECUTION actually spent inside timed windows, per half:
+        # the first execution and the windows that followed it. Window w of a
+        # half took ``latency_ns[w] * inner`` nanoseconds, which is the
+        # quantity the budget is a target for. The quality run is outside it.
+        _meas_secs = (float(sum(latency_samples)) * _inner / 1e9
+                      + (_t_cand if _n_loop else 0.0))
+        _ref_secs = float(_ref_once["secs"]) if _paired else 0.0
         _ref_secs_now = _ref_secs if _ref_timed_now else 0.0
         _pf("cb.exec_measure")
 
@@ -12038,9 +11970,11 @@ def _callback_measured(
         "inner": int(_inner),
         "windows": int(_n_windows),
         "secs": float(_meas_secs),
+        "first_s": float(_t_cand),
         "ref_inner": int(_ref_inner),
         "ref_windows": int(_ref_windows),
         "ref_secs": float(_ref_secs),
+        "ref_first_s": float(_ref_once["first"]) if _paired else 0.0,
         "ref_timing": (None if not _paired
                        else "timed" if _ref_timed_now else "reused"),
     }
@@ -12262,7 +12196,6 @@ class VertexEliminationEnv:
         measure_budget_secs: float = 1.0,
         measure_window_secs: float = 0.05,
         latency_inner_reps: int = 1,
-        latency_warmup: int = 0,
         per_face: bool = False,
         measure_grad: bool = False,
         scalar_target: bool = False,
@@ -12347,7 +12280,6 @@ class VertexEliminationEnv:
             measure_budget_secs=float(measure_budget_secs),
             measure_window_secs=float(measure_window_secs),
             latency_inner_reps=int(latency_inner_reps),
-            latency_warmup=int(latency_warmup),
             per_face=bool(per_face),
             target_fun=target_fun,
             data_gen=data_gen,

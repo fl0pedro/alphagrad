@@ -361,7 +361,9 @@ def test_reference_is_measured_once_per_process(monkeypatch):
     env = _make_env()
     # FORWARD, so the candidate's executable is never the rev-exact one.
     fwd = sorted(int(x) for x in np.asarray(env.valid_vertices))
-    per_cb = int(env.config.ref_num_data_points) * int(
+    # The reference's timed calls: its one first execution (owner ruling
+    # 2026-09-25) and then its own points x reps windows.
+    per_cb = 1 + int(env.config.ref_num_data_points) * int(
         env.config.ref_reps_per_point)
 
     def _ref_windows():
