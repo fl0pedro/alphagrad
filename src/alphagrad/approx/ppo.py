@@ -1849,18 +1849,9 @@ def _popart_live_moments(flat, live):
     # Mean and mean square of the live rows of (B, K), and their count.
     keep = jnp.reshape(live, (-1, 1)) > 0.5
     n = jnp.sum(keep.astype(flat.dtype))
-
-    def plain(f):
-        return jnp.mean(f, axis=0), jnp.mean(jnp.square(f), axis=0)
-
-    def masked(f):
-        x = jnp.where(keep, f, 0.0)
-        d = jnp.maximum(n, 1.0)
-        return jnp.sum(x, axis=0) / d, jnp.sum(jnp.square(x), axis=0) / d
-
-    # All rows live: the plain means, so such a run keeps its old bits.
-    m1, m2 = lax.cond(jnp.all(keep), plain, masked, flat)
-    return m1, m2, n
+    x = jnp.where(keep, flat, 0.0)
+    d = jnp.maximum(n, 1.0)
+    return jnp.sum(x, axis=0) / d, jnp.sum(jnp.square(x), axis=0) / d, n
 
 
 def _popart_seed_stats(returns, live, sigma_min):

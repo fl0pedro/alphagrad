@@ -3,7 +3,6 @@ from __future__ import annotations
 import ast
 import inspect
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -86,39 +85,3 @@ def test_the_episode_update_gives_popart_only_the_live_environments():
     for c in updates:
         assert "live" in {k.arg for k in c.keywords}, ast.unparse(c)
     assert any(c.func.id == "_popart_seed_stats" for c in calls)
-
-
-def _old_seed(ret):
-    flat = ret.reshape(-1, ret.shape[-1])
-    mu = jnp.mean(flat, axis=0)
-    var = jnp.mean(jnp.square(flat), axis=0) - jnp.square(mu)
-    return mu, jnp.clip(jnp.sqrt(jnp.maximum(var, 1e-12)), SIGMA_MIN, 1e12)
-
-
-@pytest.mark.parametrize("jit", [False, True])
-def test_with_every_environment_live_the_statistics_keep_their_bits(jit):
-    ret = jnp.asarray(np.random.default_rng(3).normal(size=(E, T, K))
-                      .astype(np.float32) * 3.0 + 1.0)
-    live = jnp.ones((E, T), jnp.float32)
-    z = jnp.zeros((K,), jnp.float32)
-    warm = ppo._popart_update(z, z, z, ret * 0.5, BETA, SIGMA_MIN, 1e12, WINSOR)
-
-    def old(s, r):
-        return ppo._popart_update(*s, r, BETA, SIGMA_MIN, 1e12, WINSOR)
-
-    def new(s, r, lv):
-        return ppo._popart_update(*s, r, BETA, SIGMA_MIN, 1e12, WINSOR,
-                                  live=lv)
-
-    def seed(r, lv):
-        return ppo._popart_seed_stats(r, lv, SIGMA_MIN)[:2]
-
-    old_seed = _old_seed
-    if jit:
-        old, new = jax.jit(old), jax.jit(new)
-        seed, old_seed = jax.jit(seed), jax.jit(_old_seed)
-    for state in ((z, z, z), warm):
-        for a, b in zip(old(state, ret), new(state, ret, live)):
-            np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
-    for a, b in zip(old_seed(ret), seed(ret, live)):
-        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
