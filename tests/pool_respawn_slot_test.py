@@ -239,8 +239,10 @@ def test_the_trainer_pins_each_slot_to_the_device_the_row_names():
     i_map = src.index("_measure_dev = _measure_devices(")
     i_cvd = src.index('os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpus)')
     assert i_map < i_cvd
-    assert 'visible=os.environ.get("CUDA_VISIBLE_DEVICES")' in src[i_map:i_cvd]
-    assert '"CUDA_VISIBLE_DEVICES": str(_measure_dev[idx])' in src
+    # dsnn-dfw.288: the job's mask, kept before the trainer narrows its own view to --gpus.
+    assert "visible=_job_visible_devices()" in src[i_map:i_cvd]
+    assert src.index("_own_gpus_only(str(args.gpus))") > i_map
+    assert "_measure_actor_env(\n                _measure_dev[idx] if _gpu else None)" in src
     spawn = src[src.index("def _spawn(slot: int | None = None):"):]
     spawn = spawn[:spawn.index("_actors = [_spawn(i) for i in range(_n_actors)]")]
     assert "_dev = _measure_dev[_slot]" in spawn

@@ -89,9 +89,10 @@ def _import_ppo(argv, visible):
             return orig(*a, **k)
         xb.backends = hooked
         import alphagrad.approx.ppo
-        from alphagrad.approx.common.device_guard import job_visible_devices
+        from alphagrad.approx.common import device_guard
+        job = getattr(device_guard, "job_visible_devices", lambda: None)()
         print("RESULT", repr((seen[0] if seen else None, os.environ.get("CUDA_VISIBLE_DEVICES"),
-                              job_visible_devices())))
+                              job)))
     """)
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=visible)
     env.pop("ALPHAGRAD_POOL_TERMINAL_LOCAL", None)
