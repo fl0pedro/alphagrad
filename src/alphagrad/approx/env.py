@@ -2952,6 +2952,11 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
                 "ref_inner_p"),
             "ref_measure_windows_provisional": (measure_counts or {}).get(
                 "ref_windows_p"),
+            # The quantiles of the per-execution latency over each half's timed windows (owner ruling 2026-09-26, Q12).
+            **latency_quantile_fields(
+                "candidate", (measure_counts or {}).get("lat_q")),
+            **latency_quantile_fields(
+                "ref", (measure_counts or {}).get("ref_lat_q")),
             # THE PLAN THIS ONE'S NUMBERS CAME FROM (owner ruling
             # 2026-09-14). None on every measured plan. An integer names the
             # index, within this episode and this measure actor, of the
@@ -5223,6 +5228,24 @@ def paired_cost_floor() -> str:
             f"{PAIRED_COST_FLOOR_CHOICES} (set by ppo.py from "
             f"--paired-cost-floor), got {want!r}")
     return want
+
+
+LATENCY_QUANTILES = (10, 25, 50, 75, 90)
+
+
+def latency_quantiles(samples) -> dict | None:
+    # p10 to p90 of the per-execution latency over the timed windows, in ns (owner ruling 2026-09-26, Q12). One reading fills every field.
+    s = np.asarray([float(x) for x in samples], dtype=np.float64)
+    if s.size == 0:
+        return None
+    return {f"p{q}": float(v)
+            for q, v in zip(LATENCY_QUANTILES, np.percentile(s, LATENCY_QUANTILES))}
+
+
+def latency_quantile_fields(half: str, q: dict | None) -> dict:
+    # candidate_latency_p10_ns ... ref_latency_p90_ns, the record fields of latency_quantiles.
+    return {f"{half}_latency_p{p}_ns": (None if q is None else q[f"p{p}"])
+            for p in LATENCY_QUANTILES}
 
 
 def _time_one_rep(ex, eval_args, unique_devices, inner):
@@ -10790,7 +10813,7 @@ def _callback_measured(
                      "ref_inner": 0, "ref_windows": 0, "ref_secs": 0.0,
                      "ref_first_s": 0.0, "ref_warm_s": 0.0,
                      "ref_inner_p": 0, "ref_windows_p": 0,
-                     "ref_timing": None}
+                     "ref_timing": None, "lat_q": None, "ref_lat_q": None}
         _r_static = None
         if _paired:
             _r_ex = _compile_reference()
@@ -10916,6 +10939,8 @@ def _callback_measured(
                       else float(_r_peak))
             _ref_for_score.update(latency_ns=_r_lat, memory_bytes=_r_mem,
                                   static=_r_static)
+            _r_q = (latency_quantiles(_r_lat_s) if config.measure_latency
+                    else None)
             _counts_r.update(
                 ref_inner=int(_r_inner), ref_windows=int(_r_windows),
                 ref_secs=float(_r_once["secs"]),
@@ -10923,8 +10948,10 @@ def _callback_measured(
                 ref_warm_s=float(_r_once["warm"]),
                 ref_inner_p=int(_r_once["inner_p"]),
                 ref_windows_p=int(_r_once["windows_p"]),
-                ref_timing=_r_timing)
+                ref_timing=_r_timing, ref_lat_q=_r_q)
             _ref_rec = {
+                **latency_quantile_fields("ref", _r_q),
+                **latency_quantile_fields("candidate", None),
                 "latency_ns": float(_r_lat),
                 "temp_bytes": float(_r_static[0]),
                 "output_bytes": float(_r_static[1]),
@@ -11741,6 +11768,10 @@ def _callback_measured(
         if config.measure_latency
         else 0.0
     )
+    _lat_q = (latency_quantiles(latency_samples) if config.measure_latency
+              else None)
+    _ref_lat_q = (latency_quantiles(_ref_lat_samples)
+                  if _paired and config.measure_latency else None)
     # Fake-fast guard: a positive-but-implausibly-small reading is clamped UP
     # to the floor rather than trusted — a degenerate (zero-work) plan must
     # not report an unbeatable latency. 0.0 stays 0.0 (= "not measured").
@@ -11889,6 +11920,8 @@ def _callback_measured(
                       f"(rev-exact {_rv_med/1e3:.1f}us, reference "
                       f"{_tl_med/1e3:.1f}us)", flush=True)
             _paired_ref_rec = {
+                **latency_quantile_fields("candidate", _lat_q),
+                **latency_quantile_fields("ref", _ref_lat_q),
                 "ratio_log": _ratio_log,
                 # POSITIVE units (ticket .45 logs these as ref/*).
                 "latency_ns": float(_ref_lat_ns),
@@ -12142,6 +12175,8 @@ def _callback_measured(
         "ref_windows_p": int(_ref_once["windows_p"]) if _paired else 0,
         "ref_timing": (None if not _paired
                        else "timed" if _ref_timed_now else "reused"),
+        "lat_q": _lat_q,
+        "ref_lat_q": _ref_lat_q,
     }
     _LAST_MEASURE_COUNTS.clear()
     _LAST_MEASURE_COUNTS.update(_measure_counts)
