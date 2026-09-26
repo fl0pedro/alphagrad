@@ -1429,7 +1429,8 @@ def test_every_recurrent_row_carries_the_nn256_and_tlm_flags_unchanged(
     The face-wire budget (dsnn-dfw.104, owner ruling 2026-09-22) is
     excluded the same way, in the OPPOSITE direction: the recurrent row
     stays on the campaign's 64, same as its NN256 twin (never a diff), but
-    its TLM twin renders 128 (always a diff).
+    its TLM twin renders 128 (always a diff). --episodes differs from the NN256
+    twin alone: 2000 there against 1000 here and on TLM (owner, 2026-09-26).
     """
     node_derived = {"--ray-measure", "--grad-oracle-host-budget-gb",
                     "--measure-gpus"}
@@ -1474,6 +1475,9 @@ def test_every_recurrent_row_carries_the_nn256_and_tlm_flags_unchanged(
             assert ("--grad-oracle-batch" in diff) == (t == "tlm"), \
                 (a["name"], t)
             diff -= {"--grad-oracle-batch"}
+            # The NN256 twin runs 2000 episodes (owner, 2026-09-26), the recurrent row 1000 like TLM.
+            assert ("--episodes" in diff) == (t == "nn256"), (a["name"], t)
+            diff -= {"--episodes"}
             assert diff == target_keys, (a["name"], t, sorted(diff))
 
 
