@@ -2928,8 +2928,10 @@ rev-exact measured back to back in the same actor; --cost-form paired-log,
 
 _THESIS_SHARED_MEM_OBJECTIVE = f"""WHAT IS SHARED BY EVERY ARM.  Three trained channels -- paired log-difference
 latency (against rev-exact measured back to back in the same actor;
---cost-form paired-log), the static memory objective (reward slot 11: the
-three memory_analysis() log ratios against the same rev-exact,
+--cost-form paired-log), the static memory objective (reward slot 11: minus
+the log ratio of the total static bytes, temp + args + out, against the same
+rev-exact's total, the three ratios logged only (owner ruling 2026-09-26 Q1 a,
+dsnn-dfw.285),
 --mem-objective-weight {THESIS_MEM_OBJECTIVE_WEIGHT}) and grad-cosine quality
 -- with --rewards cmp acc and --lambda-cmp 1.  The runtime watermark stays in
 slot 5 (--mem-channel {THESIS_MEM_CHANNEL}), logged and not trained (dsnn-mep,
