@@ -6940,6 +6940,33 @@ def make_argparser() -> argparse.ArgumentParser:
         help="Directory for the swept front and the per-rollout plan "
         "records. Defaults to the run directory.",
     )
+    # ---- THE READOUT (ticket dsnn-dfw.291, owner ruling 2026-09-26 Q2 c) ----
+    p.add_argument(
+        "--readout-plans",
+        type=int,
+        default=0,
+        help="After the last episode and the last checkpoint, sample this "
+        "many plans from the final policy with no update, and the most "
+        "likely plan (greedy: the argmax at every step), measure them as "
+        "training measures a plan and write readout.json next to "
+        "pareto_front.json. The thesis rows run 64. 0 runs no readout.",
+    )
+    p.add_argument(
+        "--readout-checkpoint",
+        type=str,
+        default="",
+        help="Read out this ppo_ckpt_* directory and train nothing "
+        "(tools/readout.py rebuilds the run's namespace from it). Refuses "
+        "--resume and a positive --checkpoint-every: a readout never writes "
+        "a checkpoint and never updates the policy.",
+    )
+    p.add_argument(
+        "--readout-out",
+        type=str,
+        default="",
+        help="Directory for the readout file. Defaults to the run directory, "
+        "where pareto_front.json is.",
+    )
     p.add_argument(
         "--dirichlet-alpha",
         type=float,
@@ -7847,6 +7874,151 @@ def _ratio_dists(records, args, episode, n_envs, plan_states=None):
     return out, counts
 
 
+# ---------------------------------------------------------------------------
+# THE READOUT (ticket dsnn-dfw.291, owner ruling 2026-09-26 Q2 c): plans
+# sampled from a trained policy with no further update, measured by the
+# training measurement (CONTEXT.md, Readout). The functions here are the
+# host arithmetic; `main` runs the rollouts.
+# ---------------------------------------------------------------------------
+_GREEDY_PRNG: list = [None]
+READOUT_FILE = "readout.json"
+
+
+def _greedy_bits(key_data, bit_width, shape):
+    # The middle of the range on every draw: a uniform reads 0.5 and a Gumbel one constant.
+    dtype = {8: jnp.uint8, 16: jnp.uint16, 32: jnp.uint32,
+             64: jnp.uint64}[int(bit_width)]
+    return jnp.full(tuple(shape), 1 << (int(bit_width) - 1), dtype=dtype)
+
+
+def greedy_keys(n: int):
+    # Under these keys a categorical draw is its argmax and a Bernoulli draw its likelier value: the most likely plan.
+    import jax.extend.random as _jxr
+    if _GREEDY_PRNG[0] is None:
+        _GREEDY_PRNG[0] = _jxr.define_prng_impl(
+            key_shape=(2,),
+            seed=lambda s: jnp.zeros((2,), jnp.uint32),
+            split=lambda k, shape: jnp.zeros((*shape, 2), jnp.uint32),
+            random_bits=_greedy_bits,
+            fold_in=lambda k, d: k,
+            name="greedy", tag="greedy")
+    return jrand.wrap_key_data(jnp.zeros((int(n), 2), jnp.uint32),
+                               impl=_GREEDY_PRNG[0])
+
+
+def readout_digest(tree) -> str:
+    # sha256 over every array leaf of a pytree, its dtype and shape included.
+    import hashlib
+    h = hashlib.sha256()
+    for leaf in jax.tree_util.tree_leaves(eqx.filter(tree, eqx.is_array)):
+        a = np.ascontiguousarray(np.asarray(leaf))
+        h.update(f"{a.dtype}{a.shape}".encode())
+        h.update(a.tobytes())
+    return h.hexdigest()
+
+
+def readout_check_args(args) -> int:
+    # The readout's refusals, taken at startup so a run never trains to an end it cannot read out.
+    n = int(getattr(args, "readout_plans", 0) or 0)
+    ckpt = str(getattr(args, "readout_checkpoint", "") or "")
+    if n < 0:
+        raise ValueError(f"--readout-plans must be 0 (off) or positive, got {n}")
+    if ckpt:
+        if n <= 0:
+            raise ValueError(
+                "--readout-checkpoint reads out a policy, so it needs "
+                "--readout-plans N > 0 (the thesis rows run 64).")
+        if str(getattr(args, "resume", "") or ""):
+            raise ValueError(
+                "--readout-checkpoint and --resume are two readings of a "
+                "checkpoint: one samples the policy, the other trains it on. "
+                "Pass one.")
+        if int(getattr(args, "checkpoint_every", 0) or 0):
+            raise ValueError(
+                "a readout never writes a checkpoint: pass "
+                "--checkpoint-every 0 with --readout-checkpoint.")
+    if n and str(getattr(args, "preference_sweep_checkpoint", "") or ""):
+        raise ValueError(
+            "a preference sweep is the readout of a preference-conditioned "
+            "policy: pass --preference-sweep-checkpoint or --readout-plans, "
+            "not both.")
+    if n and bool(getattr(args, "preference_conditioned", False)):
+        raise ValueError(
+            "a preference-conditioned policy is read out by the preference "
+            "sweep (tools/preference_sweep.py), which sweeps the preference; "
+            "--readout-plans reads out an unconditioned policy.")
+    if n and not (getattr(args, "plan_log", None)
+                  or bool(getattr(args, "record_all_plans", False))):
+        raise ValueError(
+            "the readout reads the latency quantiles, the static memory and "
+            "the watermark off the plan records: pass --plan-log.")
+    return n
+
+
+def _readout_spread(values) -> dict | None:
+    v = np.asarray([float(x) for x in values if x is not None], np.float64)
+    if v.size == 0:
+        return None
+    q = np.percentile(v, (10, 50, 90))
+    return {"n": int(v.size), "p10": float(q[0]), "median": float(q[1]),
+            "p90": float(q[2]), "min": float(v.min()), "max": float(v.max())}
+
+
+def readout_entries(kind, rollout, actions, end_states, rewards, rows,
+                    args) -> list:
+    # One entry per environment row: its plan, its reward row, its own plan record and the numbers read off it.
+    v_idx, op, i_, j_, fac, knd, qdt = (np.asarray(a) for a in actions)
+    faces = np.asarray(end_states.face_specs)
+    skips = np.asarray(end_states.face_skips)
+    rw = np.asarray(rewards, np.float64)
+    hashes = _plan_hashes(end_states, rw.shape[0]) or [None] * rw.shape[0]
+    q_idx = int(REWARD_INDEX["quality"])
+    out = []
+    for e in range(rw.shape[0]):
+        seq = _action_to_pylist_dynamic(v_idx[e], op[e], i_[e], j_[e], fac[e],
+                                        knd[e], qdt[e], args.max_substeps)
+        rec = rows.get(e)
+        smp, src = (None, None) if rec is None else _band_sample(rec, args)
+        qs = None if rec is None else _latency_quantiles(rec, args)[0]
+        out.append({
+            "kind": str(kind), "rollout": int(rollout), "env": int(e),
+            "plan_hash": hashes[e],
+            "order": [int(v) for v, _calls in seq],
+            "plan": _arch_plan_from_seq(seq, faces, skips, e),
+            "reward": [float(x) for x in rw[e]],
+            "quality": float(rw[e][q_idx]),
+            "refused": ("no plan record" if rec is None
+                        else rec.get("refused")),
+            "latency_log_ratio": (None if smp is None else
+                                  float(np.median(smp[args.cmp_type]))),
+            "latency_quantiles": None if qs is None else qs[args.cmp_type],
+            "memory_log_ratio": (None if smp is None else
+                                 float(np.median(smp[args.mem_type]))),
+            "memory_source": src,
+            "record": rec,
+        })
+    return out
+
+
+def readout_summary(sampled, greedy) -> dict:
+    # What the sampled plans and the greedy plan say, over the plans that were measured.
+    ok = [p for p in sampled if p["record"] is not None and not p["refused"]]
+    refused = {}
+    for p in sampled:
+        if p["refused"]:
+            k = str(p["refused"]).split(":", 1)[0]
+            refused[k] = refused.get(k, 0) + 1
+    hashes = [p["plan_hash"] for p in sampled]
+    return {
+        "sampled": len(sampled), "measured": len(ok), "refused": refused,
+        "distinct_plans": len(set(hashes)),
+        "greedy_in_sample": greedy is not None and greedy["plan_hash"] in hashes,
+        "quality": _readout_spread(p["quality"] for p in ok),
+        "latency_log_ratio": _readout_spread(p["latency_log_ratio"] for p in ok),
+        "memory_log_ratio": _readout_spread(p["memory_log_ratio"] for p in ok),
+    }
+
+
 def _dump_pareto(archive, args, ep, *, final=False, rule=None):
     """Persist the front + a replayable best_sequences.json. Never raises.
 
@@ -8325,6 +8497,11 @@ def main(args=None):
               f"points, {int(args.preference_sweep_plans)} plans each, "
               f"{len(_PSWEEP_PLAN)} episodes of {int(args.num_envs)} "
               f"environments", flush=True)
+    # ---- THE READOUT (ticket dsnn-dfw.291), REFUSED HERE when it cannot run --
+    _READOUT_N = readout_check_args(args)
+    _READOUT_PATH = str(getattr(args, "readout_checkpoint", "") or "")
+    _READOUT_META = (_ckpt.read_ppo_meta(_READOUT_PATH) if _READOUT_PATH
+                     else None)
     # AUTO-STOP (3 of 8). THE REFUSAL, AND THE MONITOR. The refusal is made
     # here, beside the checkpoint's own, so a command line that cannot stop
     # correctly never builds an array. The monitor holds one row per episode
@@ -8379,6 +8556,10 @@ def main(args=None):
     _RULES = _rule_list(args.temporal_rule)
     _GRAPH_KEYS = list(_RULES) or [None]
     _TWO_GRAPH = len(_GRAPH_KEYS) > 1
+    if _READOUT_N and _TWO_GRAPH:
+        raise ValueError(
+            "the readout samples the policy on one graph; a run that "
+            "alternates between two graphs has no readout (dsnn-dfw.291).")
     #: rule -> everything about that graph. Filled as the build reaches each
     #: piece, read by the swap at the top of the episode loop.
     _GRAPHS: dict = {_k: {"rule": _k} for _k in _GRAPH_KEYS}
@@ -18189,6 +18370,164 @@ def main(args=None):
               f"{len(pareto_archive.pts)} Pareto points, "
               f"lambda={lag_lambda:g}, kl_ref_coef={_kl_ref_coef:g}",
               flush=True)
+
+    # ---- THE READOUT (ticket dsnn-dfw.291, owner ruling 2026-09-26 Q2 c) ----
+    # Plans sampled from the policy with no update and measured as a training
+    # episode measures its plans: the same rollout_fn, the same pool, the
+    # same bins. The archive front says what the search found, the readout
+    # what the policy learned. It writes no checkpoint and updates nothing.
+    def _readout_rollout(pol, keys, base_m, prefs, pin, label, index):
+        def _attempt(_n, _w):
+            _ep_begin_attempt()
+
+            def _one(_sh, _env_s):
+                _dev = _SHARD_DEVS[_sh]
+                _lo, _hi = _shards.shard_env_range(_sh, _SHARDS,
+                                                   envs_per_shard)
+                _pf = jax.tree_util.tree_map(lambda _x: _x[_lo:_hi], prefs)
+                _t0, _f0 = _episode_streams(_n, _w)
+                return _repro_guard(rollout_fn, label, index)(
+                    _to_device(pol, _dev), _env_s, num_valid,
+                    _to_device(reset_envs(_env_s), _dev),
+                    _to_device(keys[_lo:_hi], _dev),
+                    _to_device(base_m, _dev), _to_device(_pf, _dev),
+                    _to_device(op_legality_override, _dev),
+                    _to_device(pin, _dev),
+                    # positional: vmap in_axes is a positional tuple
+                    None,
+                    _to_device(_t0, _dev), _to_device(_f0, _dev),
+                    _to_device(_ep_env_idx(_sh), _dev))
+            with _read_path("rollout"):
+                _out = _shard_rollout(_one, int(_w))
+            _wov = _epstream.window_overflow_from(_out[8], _out[9], _w,
+                                                  _out[10])
+            if _wov is not None:
+                return _out, _wov
+            return _out, _epstream.overflow_from(_out[6], _out[7], _n)
+
+        _ep_new_episode()
+        _out = _epstream.run_episode(
+            _EP_BIN, label, _attempt, log=lambda line: print(line, flush=True),
+            on_discard=_ep_discard, window_policy=_WIN_BIN)
+        _EP_BIN.record(int(np.max(np.asarray(_out[5]))))
+        _WIN_BIN.record(int(max(int(np.max(np.asarray(_out[11]))),
+                                int(np.max(np.asarray(_out[12]))))))
+        return _out
+
+    def _readout(pol, pol_opt, pol_key, lag, *, source, episode,
+                 checkpoint=None):
+        nonlocal env_episode
+        import json as _json
+        before = (readout_digest(pol), readout_digest(pol_opt))
+        n_plans = int(_READOUT_N)
+        n_roll = -(-n_plans // int(num_envs))
+        # The readout's own key stream, from the policy's key: a readout of the final checkpoint draws the end-of-run readout's plans.
+        rkey = jrand.fold_in(pol_key, 291)
+        prefs = static_pref
+        if args.reward_mode == "lagrangian":
+            prefs = _lag_preferences(prefs, head_reward_weights_np, lag, False)
+        pin = jnp.asarray(args.pin_rules_to_exact, dtype=jnp.bool_)
+        base_m = _carry_stream.base_memory(
+            pol, _BASE_TOK, _BASE_N, window=_BASE_W, total_v=total_v,
+            embd_dim=args.embd_dim, base_owners=_BASE_OWN, path="rollout")
+        pool = getattr(env, "_remote_pool", None)
+        print(f"[readout] {source} at episode {int(episode)}: {n_plans} "
+              f"sampled plans in {n_roll} rollouts of {int(num_envs)} "
+              f"environments, then the greedy plan", flush=True)
+        sampled, greedy_rows = [], []
+        for r in range(n_roll + 1):
+            kind = "greedy" if r == n_roll else "sampled"
+            rkey, k_eval, k_roll = jrand.split(rkey, 3)
+            eval_samples = generate_eval_samples(env, k_eval,
+                                                 args.num_eval_samples)
+            env_episode = eqx.tree_at(lambda e: e.eval_args_samples, env,
+                                      eval_samples)
+            _SHARD_ENV_CACHE.clear()
+            _tok_env_mod.set_local_bound_operands(
+                env.args, env.consts, eval_samples)
+            if pool is not None:
+                pool.set_eval_samples(eval_samples)
+            _ep_env_mod.set_walk_episode(int(episode) + r)
+            keys = (greedy_keys(num_envs) if kind == "greedy"
+                    else jrand.split(k_roll, num_envs))
+            out = _readout_rollout(pol, keys, base_m, prefs, pin,
+                                   f"readout {kind} rollout {r}", r)
+            end, traj, tot = out[0], out[1], out[2]
+            drain = _drain_measure_telemetry(pool=True, trainer=True)
+            recs = list((drain.get("local_plan") or {}).get("records", ()))
+            recs += list((drain.get("pool_plan") or {}).get("records", ()))
+            _ep_env_mod.consume_refused_counts()
+            rows, join = _join_plan_records(recs, r, num_envs, end)
+            ents = readout_entries(
+                kind, r,
+                (traj.vertex_idx, traj.micro_op_seq, traj.micro_i_seq,
+                 traj.micro_j_seq, traj.micro_factor_seq,
+                 traj.micro_compress_kind_seq, traj.micro_quant_dtype_seq),
+                end, tot, rows, args)
+            (greedy_rows if kind == "greedy" else sampled).extend(ents)
+            print(f"[readout] {kind} rollout {r}: {len(rows)} of "
+                  f"{int(num_envs)} plan records joined {join}", flush=True)
+        sampled = sampled[:n_plans]
+        after = (readout_digest(pol), readout_digest(pol_opt))
+        if after != before:
+            raise RuntimeError(
+                f"the readout changed the policy or its optimiser state "
+                f"(sha256 {before} before, {after} after); a readout never "
+                f"updates the policy.")
+        greedy = dict(greedy_rows[0])
+        greedy["name"] = "greedy: the argmax at every step"
+        greedy["one_plan_in_every_environment"] = (
+            len({p["plan_hash"] for p in greedy_rows}) == 1)
+        greedy["repeats"] = [
+            {k: p[k] for k in ("env", "plan_hash", "quality", "refused",
+                               "latency_log_ratio", "memory_log_ratio")}
+            for p in greedy_rows]
+        summary = readout_summary(sampled, greedy)
+        doc = {
+            "source": "readout, ticket dsnn-dfw.291 (owner ruling 2026-09-26, "
+                      "Q2 c)",
+            "claim": "what the policy learned: plans sampled from it with no "
+                     "update, measured by the training measurement. The "
+                     "archive front in pareto_front.json says what the "
+                     "search found.",
+            "mode": str(source), "episode": int(episode),
+            "checkpoint": checkpoint,
+            "run_name": getattr(args, "name", None), "seed": int(args.seed),
+            "num_envs": int(num_envs), "plans": n_plans,
+            "rollouts": n_roll + 1,
+            "params_sha256": after[0], "opt_state_sha256": after[1],
+            "summary": summary, "greedy": greedy, "sampled": sampled,
+        }
+        out_dir = str(getattr(args, "readout_out", "") or "")
+        if not out_dir:
+            try:
+                out_dir = wandb.run.dir if wandb.run is not None else "."
+            except Exception:
+                out_dir = "."
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, READOUT_FILE if checkpoint is None
+                            else f"readout_ckpt_ep{int(episode):09d}.json")
+        with open(path, "w") as _fh:
+            _json.dump(doc, _fh, indent=1)
+        _lg = {"readout/sampled": summary["sampled"],
+               "readout/measured": summary["measured"],
+               "readout/refused": sum(summary["refused"].values()),
+               "readout/distinct_plans": summary["distinct_plans"],
+               "readout/greedy_in_sample": int(summary["greedy_in_sample"])}
+        for _nm in ("quality", "latency_log_ratio", "memory_log_ratio"):
+            if summary[_nm] is not None:
+                _lg[f"readout/{_nm}_median"] = summary[_nm]["median"]
+            if greedy[_nm] is not None:
+                _lg[f"readout/greedy/{_nm}"] = greedy[_nm]
+        wandb.log(_lg)
+        if wandb.run is not None:
+            wandb.save(path, base_path=out_dir, policy="now")
+        print(f"[readout] {summary['measured']} of {summary['sampled']} "
+              f"sampled plans measured, {summary['distinct_plans']} distinct, "
+              f"greedy plan {greedy['plan_hash']} "
+              f"({'in' if summary['greedy_in_sample'] else 'not in'} the "
+              f"sample) -> {path}", flush=True)
+        return doc
 
     # ---- THE PREFERENCE SWEEP'S OWN RESTORE (ticket dsnn-dfw.86) --------
     # The arithmetic half only, and of it only what a ROLLOUT reads: the
