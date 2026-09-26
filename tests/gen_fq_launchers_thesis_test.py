@@ -37,17 +37,17 @@ rather than on 150 files:
   8c, 8d. The long conditioned rows and condC's PopArt form left with condC
      (owner rulings 2026-09-25).  Arm C keeps the symlog form everywhere,
      recurrent targets included.
-  9. THE RECURRENT BLOCK: --example RSNN_SHD --dataset shd crossed with three
-     temporal rules (bptt, rtrl, window2; tbptt left the matrix, owner ruling
-     2026-09-25, round 2 Q11 a, dsnn-dfw.232), the same four arms and the
-     same five seeds = 60 further runs, named `<arm>_rsnn_<rule>_s<seed>`,
+  9. THE RECURRENT BLOCK: --example RSNN_SHD --dataset shd crossed with two
+     temporal rules (bptt and rtrl. tbptt and window2 are deprecated, owner
+     ruling 2026-09-26, dsnn-dfw.232), the same four arms and the
+     same five seeds = 40 further runs, named `<arm>_rsnn_<rule>_s<seed>`,
      carrying the NN256/TLM flags unchanged (apart from 8b above) and
      GENERATED BUT HELD.  The rule is part of the target key, so a
      recurrent run is one (arm, target, seed) triple like every other row.
      rtrl renders on an 8-GPU node (round-robin by seed, gpu19 then gpu20,
      never paired) because its measurement pipeline stalls at 3 actors
-     (owner ruling 2026-09-21); the other two rules keep the 4-GPU
-     profile on gpu15/16/18.
+     (owner ruling 2026-09-21); bptt keeps the 4-GPU profile on
+     gpu15/16/18.
 """
 from __future__ import annotations
 
@@ -80,9 +80,9 @@ TARGETS = ("nn256", "tlm")
 TEMPORAL_RULES = ("tbptt", "bptt", "rtrl", "window2")
 RSNN_TARGETS = tuple(f"rsnn_{r}" for r in TEMPORAL_RULES)
 ALL_TARGETS = TARGETS + RSNN_TARGETS
-#: THE RULES THE MATRIX RUNS: tbptt left it (owner ruling 2026-09-25, round 2
-#: Q11 a; dsnn-dfw.232).  The frozen order-only reference rows keep it.
-MATRIX_RULES = ("bptt", "rtrl", "window2")
+#: THE RULES THE MATRIX RUNS: tbptt and window2 are deprecated (owner ruling
+#: 2026-09-26, dsnn-dfw.232).  No row runs them.
+MATRIX_RULES = ("bptt", "rtrl")
 MATRIX_RSNN_TARGETS = tuple(f"rsnn_{r}" for r in MATRIX_RULES)
 MATRIX_TARGETS = TARGETS + MATRIX_RSNN_TARGETS
 RSNN_EXAMPLE = "RSNN_SHD"
@@ -213,7 +213,7 @@ def gen():
 
 @pytest.fixture(scope="module")
 def matrix(gen):
-    """Every run of the matrix -- the 40 core rows, the 60 recurrent rows
+    """Every run of the matrix -- the 40 core rows, the 40 recurrent rows
     and the 9 defense rows -- without the smoke arms.  What is shared is
     asserted over
     this whole set, so a recurrent row cannot quietly drift away from the
@@ -255,7 +255,7 @@ def core(gen):
 
 @pytest.fixture(scope="module")
 def snn(gen):
-    """The 60 recurrent rows (--example RSNN_SHD)."""
+    """The 40 recurrent rows (--example RSNN_SHD)."""
     arms = gen.thesis_snn_arms()
     assert arms, "the generator emits no recurrent thesis arm"
     return arms
@@ -318,10 +318,10 @@ def test_the_core_matrix_is_four_arms_two_targets_five_seeds(gen, core):
     assert "C_popart_tlm_s250197" in names      # the owner's own example
 
 
-def test_the_whole_matrix_is_the_core_forty_the_recurrent_sixty_and_the_defense(
+def test_the_whole_matrix_is_the_core_forty_the_recurrent_forty_and_the_defense(
         gen, matrix, core, snn, defense):
-    """One naming rule, one (arm, target, seed) triple per row, five of the
-    six targets (rsnn_tbptt left the matrix, dsnn-dfw.232).
+    """One naming rule, one (arm, target, seed) triple per row, four of the
+    six targets (tbptt and window2 are deprecated, dsnn-dfw.232).
 
     The recurrent rules are TARGETS and not a fourth coordinate, so the whole
     matrix is still `THESIS_ARMS x targets x THESIS_SEEDS` and
@@ -330,15 +330,15 @@ def test_the_whole_matrix_is_the_core_forty_the_recurrent_sixty_and_the_defense(
     """
     assert tuple(sorted(gen.THESIS_TARGETS)) == tuple(sorted(ALL_TARGETS))
     assert len(gen.THESIS_TARGETS) == 6
-    assert len(core) == 40 and len(snn) == 60 and len(defense) == 9
-    assert len(matrix) == len(core) + len(snn) + len(defense) == 109
+    assert len(core) == 40 and len(snn) == 40 and len(defense) == 9
+    assert len(matrix) == len(core) + len(snn) + len(defense) == 89
     got = {(a["thesis_arm"], a["thesis_target"], a["thesis_seed"])
            for a in matrix}
     want = {(arm, t, s) for arm in ARMS for t in MATRIX_TARGETS for s in SEEDS}
     want |= {(arm, "nn256", s) for arm in DEFENSE_ARMS for s in DEFENSE_SEEDS}
     assert got == want
     names = [a["name"] for a in matrix]
-    assert len(set(names)) == len(names) == 109
+    assert len(set(names)) == len(names) == 89
     for a in matrix:
         assert a["name"] == gen.thesis_run_name(
             a["thesis_arm"], a["thesis_target"], a["thesis_seed"])
@@ -373,7 +373,7 @@ def test_only_the_first_block_is_submittable_the_rest_is_held(gen, matrix):
     held = [a for a in matrix if a.get("held")]
     # 16 core rows (A and B at the four later seeds), every recurrent row and
     # every defense row
-    assert len(held) == 16 + 60 + 9 == 85
+    assert len(held) == 16 + 40 + 9 == 65
     for a in held:
         text = gen.render(a)
         assert "*** HELD" in text and "ABORT(73)" in text, a["name"]
@@ -1218,8 +1218,8 @@ def test_the_run_name_helper_refuses_an_unknown_coordinate(gen):
     # naming helper produces `<arm>_rsnn_<rule>_s<seed>` with no second rule.
     assert gen.thesis_run_name("C_popart", "rsnn_bptt", "250199") == \
         "C_popart_rsnn_bptt_s250199"
-    assert gen.thesis_run_name("A", "rsnn_window2", "250201") == \
-        "A_rsnn_window2_s250201"
+    assert gen.thesis_run_name("A", "rsnn_rtrl", "250201") == \
+        "A_rsnn_rtrl_s250201"
     for bad in (("X", "tlm", "250197"), ("C", "snn", "250197"),
                 ("C", "rsnn", "250197"), ("C", "rsnn_window3", "250197"),
                 ("C", "tlm", "1")):
@@ -1268,7 +1268,7 @@ def test_auto_stop_needs_the_checkpoint_the_matrix_gives_it(gen, matrix):
         _auto.check_auto_stop_args(ns)          # raises on a bad pair
         assert _auto.check_points(ns) == (250, 500), a["name"]
         checked += 1
-    assert checked == 109
+    assert checked == 89
 
 
 def test_target_nodes_routing(monkeypatch):
@@ -1299,13 +1299,13 @@ def test_target_nodes_routing(monkeypatch):
 
 # ------------------------------------------------- 9. the recurrent block
 
-def test_the_recurrent_block_is_three_rules_four_arms_five_seeds(gen, snn):
-    """3 x 4 x 5 = 60 rows (owner rulings 2026-09-16 and 2026-09-25; tbptt
-    left the matrix, dsnn-dfw.232)."""
+def test_the_recurrent_block_is_two_rules_four_arms_five_seeds(gen, snn):
+    """2 x 4 x 5 = 40 rows (owner rulings 2026-09-16 and 2026-09-25. tbptt
+    and window2 are deprecated, owner ruling 2026-09-26, dsnn-dfw.232)."""
     assert gen.THESIS_TEMPORAL_RULES == TEMPORAL_RULES
     assert gen.THESIS_RSNN_TARGETS == RSNN_TARGETS
     assert gen.THESIS_MATRIX_RULES == MATRIX_RULES
-    assert len(snn) == len(MATRIX_RULES) * len(ARMS) * len(SEEDS) == 60
+    assert len(snn) == len(MATRIX_RULES) * len(ARMS) * len(SEEDS) == 40
     got = {(a["thesis_rule"], a["thesis_arm"], a["thesis_seed"]) for a in snn}
     want = {(r, arm, s) for r in MATRIX_RULES for arm in ARMS
             for s in SEEDS}
@@ -1333,7 +1333,7 @@ def test_every_recurrent_row_is_the_rsnn_shd_target(gen, snn):
         assert (f"\n  --example {RSNN_FORM[a['thesis_rule']][0]}\n"
                 in text), a["name"]
         assert "\n  --dataset shd\n" in text, a["name"]
-    # the three rules of the matrix are present, each on 20 rows
+    # the two rules of the matrix are present, each on 20 rows
     assert {a["thesis_rule"] for a in snn} == set(MATRIX_RULES)
     # --dataset shd is a value ppo.py's own argparse offers
     ppo = open(os.path.join(_ALPHAGRAD, "src", "alphagrad", "approx",
@@ -1357,7 +1357,7 @@ def test_the_recurrent_seeds_are_the_five_the_owner_named(gen, snn):
 def test_the_recurrent_run_names_are_unique_and_spelled_as_ruled(gen, snn,
                                                                  matrix):
     names = [a["name"] for a in snn]
-    assert len(set(names)) == len(names) == 60
+    assert len(set(names)) == len(names) == 40
     for a in snn:
         assert a["name"] == (f"{a['thesis_arm']}_rsnn_{a['thesis_rule']}"
                              f"_s{a['thesis_seed']}"), a["name"]
@@ -1367,7 +1367,7 @@ def test_the_recurrent_run_names_are_unique_and_spelled_as_ruled(gen, snn,
     assert "B_rsnn_rtrl_s250201" in names
     assert not any(n.startswith("condC_") for n in names)
     # and no recurrent name collides with a core name
-    assert len({a["name"] for a in matrix}) == 109
+    assert len({a["name"] for a in matrix}) == 89
 
 
 def test_every_recurrent_row_carries_the_nn256_and_tlm_flags_unchanged(
@@ -1491,17 +1491,17 @@ def test_the_recurrent_scheduling_matches_the_rest_of_the_matrix(gen, snn):
         text = gen.render(a)
         assert "#SBATCH --dependency=singleton\n" in text, a["name"]
         assert f"#SBATCH -w {a['node']}\n" in text, a["name"]
-    # 60 rows, NOT one even round robin any more (owner ruling 2026-09-21):
-    # the 40 non-rtrl rows split 14, 13 and 13 over the three 4-GPU nodes,
-    # and the 20 rtrl rows split over the two 8-GPU nodes BY SEED (uneven,
-    # since the five seeds do not divide two nodes evenly).
+    # 40 rows, NOT one even round robin any more (owner ruling 2026-09-21):
+    # the 20 bptt rows split 7, 7 and 6 over the three 4-GPU nodes, and the
+    # 20 rtrl rows split over the two 8-GPU nodes BY SEED (uneven, since the
+    # five seeds do not divide two nodes evenly).
     counts = {}
     for a in snn:
         counts[a["node"]] = counts.get(a["node"], 0) + 1
-    assert counts == {"pgi15-gpu15": 14, "pgi15-gpu16": 13,
-                      "pgi15-gpu18": 13, "pgi15-gpu19": 12,
+    assert counts == {"pgi15-gpu15": 7, "pgi15-gpu16": 7,
+                      "pgi15-gpu18": 6, "pgi15-gpu19": 12,
                       "pgi15-gpu20": 8}, counts
-    assert sum(counts.values()) == 60
+    assert sum(counts.values()) == 40
 
 
 def test_rtrl_renders_on_an_eight_gpu_node_round_robin_by_seed(gen, snn):
@@ -1510,8 +1510,8 @@ def test_rtrl_renders_on_an_eight_gpu_node_round_robin_by_seed(gen, snn):
     approximations, so every rtrl row -- every arm -- renders on an 8-GPU
     node with --ray-measure 7, round-robin BY SEED (gpu19 first) so a seed's
     node does not depend on which arm generated it, and never paired with a
-    sibling on the same node.  bptt and window2 keep the 4-GPU profile on
-    the three other released nodes."""
+    sibling on the same node.  bptt keeps the 4-GPU profile on the three
+    other released nodes."""
     assert gen.THESIS_RSNN_RTRL_NODES == ("pgi15-gpu19", "pgi15-gpu20")
     assert gen.THESIS_RSNN_OTHER_NODES == (
         "pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu18")

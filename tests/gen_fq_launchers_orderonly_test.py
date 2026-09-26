@@ -517,8 +517,9 @@ def test_the_matrix_and_the_campaign_still_have_their_own_counts(gen):
     """The order-only rows are thesis arms -- they carry the singleton and the
     target shape -- but they are not matrix coordinates, and the matrix plus
     the two smoke runs must still be exactly what the rulings say: the 40
-    core rows and the 60 recurrent rows once condC and tbptt left
-    (2026-09-25, dsnn-dfw.232), plus the 9 defense rows of dsnn-dfw.231."""
+    core rows and the 40 recurrent rows once condC left (2026-09-25) and
+    tbptt and window2 were deprecated (2026-09-26, dsnn-dfw.232), plus the 9
+    defense rows of dsnn-dfw.231."""
     # dsnn-dfw.45 added a second order-only round (the recurrent target,
     # `orderonly_rsnn`), excluded here exactly as `orderonly` (NN256) is, the
     # 2026-09-19 ruling added the five-seed BASELINE (`orderonly_final`),
@@ -533,9 +534,9 @@ def test_the_matrix_and_the_campaign_still_have_their_own_counts(gen):
               and not a.get("paired") and not a.get("sweepl")
               and not a.get("sweepl2") and not a.get("sweepl3")]
     assert len(gen.thesis_core_arms()) == 40
-    assert len(gen.thesis_snn_arms()) == 60
+    assert len(gen.thesis_snn_arms()) == 40
     assert len(gen.thesis_defense_arms()) == 9
-    assert len(matrix) == 109
+    assert len(matrix) == 89
     assert len(gen.thesis_smoke_arms()) == 2
     assert len(gen.orderonly_arms()) == N_RUNS
     assert len(gen.orderonly_final_arms()) == FINAL_N_RUNS

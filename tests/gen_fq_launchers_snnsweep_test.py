@@ -1,20 +1,19 @@
 """Ticket `dsnn-dfw.45` -- ORDER-ONLY SCALARIZATION TUNING ON THE RECURRENT
-TARGET, plus the no-temporal-edge reference.
+TARGET.
 
 Owner rulings 2026-09-19, pinned on `tools/gen_fq_launchers.py` rather than
-on 39 files:
+on 36 files:
 
   1. THE ROWS: the NN256 order-only section (dsnn-dfw.29) on rsnn_bptt and
      rsnn_rtrl instead of nn256 -- five weight pairs x three seeds plus one
      preference-conditioned row per seed, per rule (18 x 2 = 36) -- named
      `orderonly_rsnn_<rule>_l<X>m<Y>_s<seed>` and
-     `orderonly_rsnn_<rule>_pref_s<seed>`; plus `rsnn_tbptt` at (2, 0) for the
-     three seeds, the no-temporal-edge reference, named
-     `orderonly_rsnn_tbptt_l2m0_s<seed>` (3 rows, 39 total).
+     `orderonly_rsnn_<rule>_pref_s<seed>`.  The three rsnn_tbptt reference
+     rows left: tbptt is deprecated (owner ruling 2026-09-26, dsnn-dfw.232).
   2. THE ARM: --approx-profile none with --fixed-order free, the C form, the
      same weights, on RSNN_SHD with --temporal-rule set from the row's rule.
   3. THE NODE IS THE RULE (not the seed, unlike the NN256 round): bptt on
-     pgi15-gpu14, rtrl on pgi15-gpu8, tbptt on pgi15-gpu8 after rtrl.
+     pgi15-gpu14, rtrl on pgi15-gpu8.
      pgi15-gpu8 is a node this generator did not know before this ticket:
      NODE_GRES_TYPE, NODE_GPUS, NODE_CPUS, NODE_MEM, NODE_CUDA_BIN and
      NODE_CUDA_WANT all gain a row (owner ruling 2026-09-19, evidence job
@@ -41,8 +40,6 @@ RULES = ("bptt", "rtrl")
 SEEDS = ("250197", "250198", "250199")
 WEIGHTS = (("2", "0"), ("1.5", "0.5"), ("1", "1"), ("0.5", "1.5"), ("0", "2"))
 NODES = {"bptt": "pgi15-gpu14", "rtrl": "pgi15-gpu8"}
-TBPTT_NODE = "pgi15-gpu8"
-TBPTT_WEIGHTS = ("2", "0")
 PROFILE = "none"
 ORDER = "free"
 EPISODES = "1000"
@@ -51,8 +48,6 @@ PARETO_DUMP_EVERY = "10"
 TAU = "0.90"
 N_RUNS_PER_RULE = 18
 N_RSNN_RUNS = N_RUNS_PER_RULE * len(RULES)          # 36
-N_TBPTT_RUNS = len(SEEDS)                           # 3
-N_TOTAL_RUNS = N_RSNN_RUNS + N_TBPTT_RUNS           # 39
 
 _EXPORT = re.compile(r"^\s*export\s+([A-Za-z_][A-Za-z0-9_]*)=", re.M)
 
@@ -82,14 +77,8 @@ def rows(gen):
 
 @pytest.fixture(scope="module")
 def rsnn_rows(rows):
-    """The 36 swept rows (bptt and rtrl), without the 3 tbptt reference
-    rows -- most tests below are about the sweep, not the reference."""
-    return [a for a in rows if a["thesis_target"] != "rsnn_tbptt"]
-
-
-@pytest.fixture(scope="module")
-def tbptt_rows(rows):
-    return [a for a in rows if a["thesis_target"] == "rsnn_tbptt"]
+    """The 36 swept rows (bptt and rtrl)."""
+    return list(rows)
 
 
 def _cli(gen, a) -> dict:
@@ -102,26 +91,21 @@ def _by_name(rows, name):
 
 # --------------------------------------------------------------- 1. the rows
 
-def test_the_rows_are_two_rules_of_eighteen_plus_three_tbptt_references(
-        gen, rows, rsnn_rows, tbptt_rows):
+def test_the_rows_are_two_rules_of_eighteen(gen, rows):
     assert gen.ORDERONLY_RSNN_RULES == RULES
     assert gen.ORDERONLY_RSNN_RUNS_PER_RULE == N_RUNS_PER_RULE
-    assert len(rsnn_rows) == N_RSNN_RUNS
-    assert len(tbptt_rows) == N_TBPTT_RUNS
-    assert len(rows) == N_TOTAL_RUNS
+    assert len(rows) == N_RSNN_RUNS
     names = [a["name"] for a in rows]
     assert len(set(names)) == len(names)
     want = {f"orderonly_rsnn_{r}_l{lc}m{lm}_s{s}"
             for r in RULES for lc, lm in WEIGHTS for s in SEEDS}
     want |= {f"orderonly_rsnn_{r}_pref_s{s}" for r in RULES for s in SEEDS}
-    want |= {f"orderonly_rsnn_tbptt_l2m0_s{s}" for s in SEEDS}
     assert set(names) == want
     for a in rows:
         assert _cli(gen, a)["--name"] == a["name"]
     # the owner's own example spellings
     assert "orderonly_rsnn_bptt_l1.5m0.5_s250198" in names
     assert "orderonly_rsnn_rtrl_pref_s250197" in names
-    assert "orderonly_rsnn_tbptt_l2m0_s250199" in names
 
 
 def test_the_seeds_and_weights_are_the_nn256_rounds_own(gen):
@@ -160,19 +144,6 @@ def test_the_arm_is_order_only_on_the_recurrent_target(gen, rsnn_rows):
         rule = a["thesis_target"].removeprefix("rsnn_")
         assert rule in RULES, a["name"]
         assert cli["--temporal-rule"] == rule, a["name"]
-
-
-def test_the_tbptt_reference_carries_no_temporal_rule_edge(gen, tbptt_rows):
-    for a in tbptt_rows:
-        cli = _cli(gen, a)
-        assert cli["--approx-profile"] == PROFILE, a["name"]
-        assert cli["--fixed-order"] == ORDER, a["name"]
-        assert cli["--example"] == "RSNN_SHD", a["name"]
-        assert cli["--dataset"] == "shd", a["name"]
-        assert cli["--temporal-rule"] == "tbptt", a["name"]
-        assert a["thesis_target"] == "rsnn_tbptt", a["name"]
-        assert cli["--lambda-cmp"] == "2" and cli["--lambda-mem"] == "0"
-        assert "--preference-conditioned" not in cli, a["name"]
 
 
 def test_every_row_is_the_c_form(gen, rows):
@@ -252,16 +223,6 @@ def test_the_node_is_the_rule(gen, rsnn_rows):
     assert per_node == {"pgi15-gpu14": 18, "pgi15-gpu8": 18}
 
 
-def test_the_tbptt_reference_is_on_gpu8_after_rtrl(gen, tbptt_rows):
-    """Owner ruling 2026-09-19: tbptt goes on pgi15-gpu8 after the rtrl rows
-    (gpu13 is taken by the dsnn-dfw.44 run today), overriding the
-    description's 'shorter queue; gpu13 if free'."""
-    assert gen.ORDERONLY_RSNN_TBPTT_NODE == TBPTT_NODE == "pgi15-gpu8"
-    for a in tbptt_rows:
-        assert a["node"] == TBPTT_NODE, a["name"]
-        assert a["job"] == gen.orderonly_job_name(TBPTT_NODE), a["name"]
-
-
 def test_every_order_only_recurrent_job_is_a_cross_agent_per_node_singleton(
         gen, rows):
     for a in rows:
@@ -293,8 +254,8 @@ def test_pgi15_gpu8_is_now_a_node_the_generator_knows(gen):
     assert gen.node_gres("pgi15-gpu8", 4) == "gpu:nvidia_rtx_6000_ada_generation:4"
 
 
-def test_the_hardware_lines_follow_the_node(gen, rsnn_rows, tbptt_rows):
-    for a in rsnn_rows + tbptt_rows:
+def test_the_hardware_lines_follow_the_node(gen, rsnn_rows):
+    for a in rsnn_rows:
         text = gen.render(a)
         node, gpus = a["node"], a["gpus"]
         assert gpus == gen.node_gpu_count(node), a["name"]
@@ -382,8 +343,6 @@ def test_the_helpers_refuse_a_row_outside_the_rulings(gen):
         "orderonly_rsnn_bptt_l1.5m0.5_s250198"
     assert gen.orderonly_rsnn_pref_run_name("rtrl", "250199") == \
         "orderonly_rsnn_rtrl_pref_s250199"
-    assert gen.orderonly_rsnn_arm_name("250197") == \
-        "orderonly_rsnn_tbptt_l2m0_s250197"
     for bad_rule in ("tbptt", "window2", "bogus"):
         with pytest.raises(gen.CampaignRowError):
             gen.orderonly_rsnn_run_name(bad_rule, "2", "0", "250197")
@@ -394,8 +353,6 @@ def test_the_helpers_refuse_a_row_outside_the_rulings(gen):
     for bad in (("bptt", "3", "0", "250197"), ("rtrl", "1", "1", "250200")):
         with pytest.raises(gen.CampaignRowError):
             gen.orderonly_rsnn_run_name(*bad)
-    with pytest.raises(gen.CampaignRowError):
-        gen.orderonly_rsnn_arm_name("250200")
     # a conditioned row that also names a fixed weight says two things
     with pytest.raises(gen.CampaignRowError):
         gen.orderonly_rsnn_arm(rule="bptt", seed="250197", lam_cmp="1",
@@ -446,13 +403,13 @@ def test_the_matrix_and_the_campaign_still_have_their_own_counts(gen):
               and not a.get("paired") and not a.get("sweepl")
               and not a.get("sweepl2") and not a.get("sweepl3")]
     # condC left the matrix and the 9 defense rows joined it (2026-09-25);
-    # the 20 tbptt rows left it too (dsnn-dfw.232)
+    # the tbptt and window2 rows left it too (dsnn-dfw.232)
     assert len(gen.thesis_core_arms()) == 40
-    assert len(gen.thesis_snn_arms()) == 60
-    assert len(matrix) == 109
+    assert len(gen.thesis_snn_arms()) == 40
+    assert len(matrix) == 89
     assert len(gen.thesis_smoke_arms()) == 2
     assert len(gen.orderonly_arms()) == 18
-    assert len(gen.orderonly_rsnn_arms()) == N_TOTAL_RUNS
+    assert len(gen.orderonly_rsnn_arms()) == N_RSNN_RUNS
     block = gen.thesis_block1_arms()
     assert len(block) == gen.THESIS_BLOCK1 == 24
     assert not any(a.get("orderonly") for a in block)
@@ -462,8 +419,7 @@ def test_the_matrix_and_the_campaign_still_have_their_own_counts(gen):
 def test_no_arm_outside_this_section_gained_the_orderonly_rsnn_flag(gen):
     for a in gen.ARMS:
         if a.get("orderonly_rsnn"):
-            assert a["thesis_target"] in ("rsnn_bptt", "rsnn_rtrl",
-                                          "rsnn_tbptt"), a["name"]
+            assert a["thesis_target"] in ("rsnn_bptt", "rsnn_rtrl"), a["name"]
         else:
             assert a.get("thesis_target") not in ("rsnn_bptt", "rsnn_rtrl") \
                 or not a.get("orderonly"), a["name"]

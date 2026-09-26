@@ -1,4 +1,4 @@
-# dsnn-dfw.232, .264: rows of thesis_arm run no tbptt and export DSNN_SHD_DIR.
+# dsnn-dfw.232, .264: no row runs tbptt or window2, thesis rows get DSNN_SHD_DIR.
 from __future__ import annotations
 
 import importlib.util
@@ -12,7 +12,9 @@ _GEN = os.path.join(_ALPHAGRAD, "tools", "gen_fq_launchers.py")
 
 SEEDS = ("250197", "250198", "250199", "250200", "250201")
 ARMS = ("A", "B", "C", "C_popart")
-MATRIX_RULES = ("bptt", "rtrl", "window2")
+MATRIX_RULES = ("bptt", "rtrl")
+DEPRECATED_RULES = ("tbptt", "window2")
+DEPRECATED_TARGETS = ("rsnn_tbptt", "rsnn_window2")
 SHD_DIR = "/Scratch/assmuth/mrg/cache/dsnn_shd"
 MNIST_LINE = "export DSNN_MNIST_DIR=/Scratch/assmuth/mrg/cache/dsnn_mnist\n"
 SHD_LINE = f"export DSNN_SHD_DIR={SHD_DIR}\n"
@@ -53,40 +55,37 @@ def frozen(gen):
     return rows
 
 
-def test_no_row_thesis_arm_emits_runs_the_tbptt_rule(gen, emitted, frozen):
-    for a in emitted:
-        assert a.get("thesis_rule") != "tbptt", a["name"]
-        assert a.get("thesis_target") != "rsnn_tbptt", a["name"]
-        assert "tbptt" not in _TEMPORAL_RULE.findall(gen.render(a)), a["name"]
+def test_no_row_runs_a_deprecated_rule(gen):
+    for a in gen.ARMS:
+        assert a.get("thesis_rule") not in DEPRECATED_RULES, a["name"]
+        assert a.get("thesis_target") not in DEPRECATED_TARGETS, a["name"]
+        text = gen.render(a)
+        assert not set(_TEMPORAL_RULE.findall(text)) & set(DEPRECATED_RULES), \
+            a["name"]
+        assert "RSNN_SHD_W2" not in text, a["name"]
     snn = gen.thesis_snn_arms()
     got = {(a["thesis_rule"], a["thesis_arm"], a["thesis_seed"]) for a in snn}
     assert got == {(r, arm, s) for r in MATRIX_RULES for arm in ARMS
                    for s in SEEDS}
-    assert len(snn) == len(got) == 60
+    assert len(snn) == len(got) == 40
     assert gen.THESIS_MATRIX_RULES == MATRIX_RULES
-    reference = [a for a in frozen if a.get("thesis_rule") == "tbptt"]
-    assert sorted(a["name"] for a in reference) == [
-        f"orderonly_rsnn_tbptt_l2m0_s{s}" for s in SEEDS[:3]]
-    for a in reference:
-        assert _TEMPORAL_RULE.findall(gen.render(a)) == ["tbptt"], a["name"]
+    assert {a["thesis_rule"] for a in gen.orderonly_rsnn_arms()} == \
+        set(MATRIX_RULES)
 
 
-def test_thesis_arm_refuses_the_tbptt_rule(gen):
+def test_thesis_arm_refuses_the_deprecated_rules(gen):
     n0 = len(gen.ARMS)
     try:
-        for arm in ARMS:
-            with pytest.raises(gen.CampaignRowError) as e:
-                gen.thesis_arm(arm=arm, target="rsnn_tbptt", seed=SEEDS[0],
-                               node="pgi15-gpu15",
-                               name=f"throwaway_{arm}_rsnn_tbptt")
-            assert "dsnn-dfw.232" in str(e.value), str(e.value)
+        for target in DEPRECATED_TARGETS:
+            for arm in ARMS:
+                with pytest.raises(gen.CampaignRowError) as e:
+                    gen.thesis_arm(arm=arm, target=target, seed=SEEDS[0],
+                                   node="pgi15-gpu15",
+                                   name=f"throwaway_{arm}_{target}")
+                assert "deprecated" in str(e.value), str(e.value)
+                assert "dsnn-dfw.232" in str(e.value), str(e.value)
     finally:
         del gen.ARMS[n0:]
-    assert gen.thesis_temporal_rule("rsnn_tbptt") == "tbptt"
-    cli = gen.thesis_cli(arm="C", target="rsnn_tbptt", seed=SEEDS[0],
-                         node="pgi15-gpu8", name="throwaway", episodes="1",
-                         checkpoint_every="1", auto_stop=True)
-    assert cli["--temporal-rule"] == "tbptt"
 
 
 def test_every_row_thesis_arm_emits_exports_the_shd_directory(gen, emitted,
