@@ -101,7 +101,8 @@ compile_variant() {  # name gx-dir gpu [extra args]
 compile_variant core core "${GPUS[0]}" &
 compile_variant pre pre "${GPUS[1]}" &
 compile_variant fix fix "${GPUS[2]}" &
-compile_variant fix128 fix "${GPUS[3]}" --tie-min-bytes "$TIE128" &
+( compile_variant fix128 fix "${GPUS[3]}" --tie-min-bytes "$TIE128"
+  compile_variant fixboth fix "${GPUS[3]}" --tie-both ) &
 wait
 grep -h "^\[compile\]" "$OUT"/logs/compile_*.log | "$PY" -c '
 import json, sys
@@ -114,7 +115,7 @@ echo "[time] compile done at $((SECONDS - T0)) s"
 
 # ---------------------- 3. TIME (one process, paired, base = core-v2) ---------------------
 CUDA_VISIBLE_DEVICES=${GPUS[0]} JAX_PLATFORMS=cuda PYTHONPATH="$OUT/gx/fix/src:$AG/src" \
-  "$PY" tools/b11_gpu_ab.py time --out "$OUT" --variants core,pre,fix,fix128 \
+  "$PY" tools/b11_gpu_ab.py time --out "$OUT" --variants core,pre,fix,fix128,fixboth \
   --targets "$(echo $TARGETS | tr ' ' ,)" > "$OUT/logs/time.log" 2>&1
 echo "time exit $?"
 echo "[time] timing done at $((SECONDS - T0)) s"
@@ -136,7 +137,7 @@ wait
 
 echo
 echo "=================== SUMMARY (job ${SLURM_JOB_ID:-local}, $((SECONDS - T0)) s) ==================="
-echo "base = graphax core ${GX[core]}; pre = ${GX[pre]}; fix = ${GX[fix]}; fix128 = fix with the tie from 128 MiB"
+echo "base = graphax core ${GX[core]}; pre = ${GX[pre]}; fix = ${GX[fix]}; fix128 = fix with the tie from 128 MiB; fixboth = fix with both barrier outputs read"
 cat "$OUT/summary.txt"
 echo
 echo "GPU tests (expected: fix_all 0, pre_concat 1, core_concat 0, off_narrow 1, pre_narrow 0, pre_memobj 0):"

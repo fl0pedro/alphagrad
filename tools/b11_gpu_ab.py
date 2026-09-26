@@ -209,8 +209,16 @@ def cmd_compile(a):
     import numpy as np
     import graphax
     from jax.experimental.serialize_executable import serialize
+    mm = importlib.import_module("graphax.sparse.ops.matmul")
     if a.tie_min_bytes is not None:
-        importlib.import_module("graphax.sparse.ops.matmul")._TIE_MIN_BYTES = int(a.tie_min_bytes)
+        mm._TIE_MIN_BYTES = int(a.tie_min_bytes)
+    if a.tie_both:
+        # The variant in which the contraction reads both barrier outputs, the large operand's too.
+        def _tie_both(x, y):
+            if max(x.size * x.dtype.itemsize, y.size * y.dtype.itemsize) < mm._TIE_MIN_BYTES:
+                return x, y
+            return jax.lax.optimization_barrier((x, y))
+        mm._tie_to_large = _tie_both
     lm, env, ev = _build(a.target, dict(kv.split("=", 1) for kv in a.cli))
     plans = json.loads((Path(a.out) / "plans" / f"{a.target}.json").read_text())
     out = Path(a.out) / "exe" / a.variant / a.target
@@ -424,6 +432,7 @@ def main(argv=None):
         else:
             s.add_argument("--variant", required=True)
             s.add_argument("--tie-min-bytes", default=None)
+            s.add_argument("--tie-both", action="store_true")
     s = sub.add_parser("time")
     s.add_argument("--out", required=True)
     s.add_argument("--variants", required=True)
