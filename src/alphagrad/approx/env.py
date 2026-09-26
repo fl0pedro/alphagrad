@@ -2933,9 +2933,9 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
             "ref_measure_windows": (measure_counts or {}).get("ref_windows"),
             "ref_measure_secs": (measure_counts or {}).get("ref_secs"),
             "ref_timing": (measure_counts or {}).get("ref_timing"),
-            # THE FIRST EXECUTION'S SECONDS, per half (owner ruling
-            # 2026-09-25): it set the counts above, and with inner 1 and
-            # windows 1 it is the whole sample.
+            # THE COLD READING, per half (decision 2026-09-26, dsnn-19wc): the
+            # first execution, which is the quality execution when the plan
+            # has one. It sets no count and is not in the sample.
             "measure_first_s": (measure_counts or {}).get("first_s"),
             "ref_measure_first_s": (measure_counts or {}).get("ref_first_s"),
             # THE PLAN THIS ONE'S NUMBERS CAME FROM (owner ruling
@@ -3921,9 +3921,9 @@ class EnvConfig(NamedTuple):
     # variation is 0.56 percent. The fixed counts were a specification
     # (commit 61e7027e, "the spec's 20"), never a noise measurement.
     #
-    # The counts are derived from the FIRST TIMED execution's measured time
-    # `t` (owner rulings 2026-09-25: no warm-ups, and a first execution past
-    # the budget is the whole sample; see `first_execution_counts`):
+    # The counts are derived from the WARM execution's measured time `t`, the
+    # execution after the cold one (owner rulings 2026-09-25, decision
+    # 2026-09-26, dsnn-19wc; see `warm_execution_counts`):
     #     inner   = clamp(ceil(measure_window_secs / t), 5, 50)
     #     windows = clamp(round(measure_budget_secs / (inner * t)),
     #                     1, num_data_points * reps_per_point)
@@ -4835,22 +4835,31 @@ def _densify_gradient(jac, shapes):
     return jax.tree_util.tree_unflatten(treedef, dense)
 
 
-def dense_measured_program(config, ex, sparse: bool):
+def dense_output(config, sparse: bool):
     # The quality channels read the form the dense executable returned: every
     # sparse leaf materialised outside the timed executions, a skipped path
     # the zeros of its nominal shape. A carried target's consumers read the
-    # stored classes as they are.
+    # stored classes as they are. None: the output is that form already.
     from alphagrad.approx.common.rsnn_shd import is_full_rollout
     if (not sparse or int(getattr(config, "carried_outputs", 0) or 0) > 0
             or is_full_rollout(config)):
-        return ex
+        return None
     shapes = _nominal_gradient_shapes(config)
 
-    def run(*a):
-        out = ex(*a)
+    def dense(out):
         if config.has_aux:
             return out[0], _densify_gradient(out[1], shapes)
         return _densify_gradient(out, shapes)
+    return dense
+
+
+def dense_measured_program(config, ex, sparse: bool):
+    dense = dense_output(config, sparse)
+    if dense is None:
+        return ex
+
+    def run(*a):
+        return dense(ex(*a))
     return run
 
 
@@ -5451,14 +5460,25 @@ def resolve_measure_windows(t_exec_s: float, inner: int, budget_s: float,
     return int(min(cap, max(1, want)))
 
 
-def first_execution_counts(t_first_s: float, window_s: float, budget_s: float,
-                           hi: int, cap: int) -> tuple[int, int, bool]:
-    # (inner, windows, whole): a first execution past the budget is the whole
-    # sample (owner ruling 2026-09-25); otherwise it sets the counts and leaves.
-    if math.isfinite(t_first_s) and float(t_first_s) > float(budget_s):
+def warm_execution_counts(t_warm_s: float, window_s: float, budget_s: float,
+                          hi: int, cap: int) -> tuple[int, int, bool]:
+    # (inner, windows, whole) from the warm execution, the one after the cold
+    # reading (decision 2026-09-26, dsnn-19wc). Past the budget it is the whole
+    # sample; otherwise it stays in the sample and the windows follow it.
+    if math.isfinite(t_warm_s) and float(t_warm_s) > float(budget_s):
         return 1, 1, True
-    inner = resolve_measure_inner(t_first_s, window_s, hi)
-    return inner, resolve_measure_windows(t_first_s, inner, budget_s, cap), False
+    inner = resolve_measure_inner(t_warm_s, window_s, hi)
+    return inner, resolve_measure_windows(t_warm_s, inner, budget_s, cap), False
+
+
+def sample_secs(latency_ns, inner: int, warm: bool) -> float:
+    # Seconds of execution in a latency sample. With `warm` the first reading
+    # is the warm execution, one run; every other reading is a window of
+    # `inner` runs.
+    s = [float(x) for x in latency_ns]
+    if warm and s:
+        return (s[0] + int(inner) * sum(s[1:])) / 1e9
+    return int(inner) * sum(s) / 1e9
 
 
 def interleave_windows(n_a: int, n_b: int) -> list:
@@ -6949,7 +6969,7 @@ _COSINE_REF_MAX = 128
 _COSINE_REF_STATS = {"hits": 0, "misses": 0}
 
 
-def _cosine_reference(ref_ex, ref_key, args, device, probe_seed):
+def _cosine_reference(ref_ex, ref_key, args, device, probe_seed, cold=None):
     """The reference gradient on ONE probe batch, computed once and reused.
 
     THE KEY is ``(the reference executable's compile key, device, PROBE SEED,
@@ -6970,7 +6990,12 @@ def _cosine_reference(ref_ex, ref_key, args, device, probe_seed):
         _COSINE_REF_STATS["hits"] += 1
         return hit[1]
     _COSINE_REF_STATS["misses"] += 1
-    out = ref_ex(*args)
+    # The reference's quality execution is timed; the first one is its cold
+    # reading (decision 2026-09-26, dsnn-19wc).
+    _t0 = time.perf_counter()
+    out = jax.block_until_ready(ref_ex(*args))
+    if cold is not None and cold.get("ref") is None:
+        cold["ref"] = time.perf_counter() - _t0
     if len(_COSINE_REF) >= _COSINE_REF_MAX:
         _COSINE_REF.clear()
     _COSINE_REF[key] = (ref_ex, out)
@@ -7009,7 +7034,7 @@ _QUALITY_NO_CHANNEL = object()
 
 
 def _grad_cosine_quality(config, compiled_approx, ref_ex, ref_key, base_args,
-                         device, k_batches: int = 1):
+                         device, k_batches: int = 1, dense=None, cold=None):
     """THE GRADIENT COSINE: cos(g_approx, g_exact) at the INITIAL weights,
     averaged over ``k_batches`` fixed probe batches of REAL data.
 
@@ -7078,7 +7103,14 @@ def _grad_cosine_quality(config, compiled_approx, ref_ex, ref_key, base_args,
         # environment row serves row 0's exact gradient to every other row.
         _seed = _probe_seed(config, "train", None, k)
         # A candidate error propagates: the caller scores it as a refusal (Q53).
+        # The candidate's first quality execution is its cold reading
+        # (decision 2026-09-26, dsnn-19wc); `dense` runs outside the timing.
+        _t0 = time.perf_counter()
         out_a = jax.block_until_ready(compiled_approx(*a))
+        if cold is not None and cold.get("cand") is None:
+            cold["cand"] = time.perf_counter() - _t0
+        if dense is not None:
+            out_a = dense(out_a)
         with _reference_errors(
                 f"the reference failed on probe batch {k} of the gradient "
                 f"cosine"):
@@ -7110,7 +7142,8 @@ def _grad_cosine_quality(config, compiled_approx, ref_ex, ref_key, base_args,
                 # The CACHED REV-EXACT REFERENCE, not a same-order exact
                 # program: one executable for the process, one execution per
                 # probe batch (agent/ref16, owner ruling 2026-09-18).
-                out_e = _cosine_reference(ref_ex, ref_key, a, device, _seed)
+                out_e = _cosine_reference(ref_ex, ref_key, a, device, _seed,
+                                          cold=cold)
                 jac_e = _loss_rows(config, out_e[1] if config.has_aux
                                    else out_e)
             jax.block_until_ready(jac_e)
@@ -10689,6 +10722,10 @@ def _callback_measured(
     # measured plan's reference gets. `program` is the compiled candidate,
     # or None when none exists.
     _st = {"program": None, "ref_timed": False}
+    # THE COLD READINGS of this measurement, in seconds, per half (decision
+    # 2026-09-26, dsnn-19wc): the first execution of each half, which is its
+    # quality execution when the plan has one. None until it runs.
+    _cold = {"cand": None, "ref": None}
 
     def _score_refusal(kind: str, reason: str, detail: dict, program):
         _REFUSAL_SCORER[0] = None
@@ -10698,7 +10735,8 @@ def _callback_measured(
                           "bytes_limit_source": _limit_src,
                           "measure_latency": bool(config.measure_latency)}
         _ref_rec = None
-        _counts_r = {"inner": 0, "windows": 0, "secs": 0.0, "first_s": 0.0,
+        _counts_r = {"inner": 0, "windows": 0, "secs": 0.0,
+                     "first_s": float(_cold["cand"] or 0.0),
                      "ref_inner": 0, "ref_windows": 0, "ref_secs": 0.0,
                      "ref_first_s": 0.0, "ref_timing": None}
         _r_static = None
@@ -10741,28 +10779,33 @@ def _callback_measured(
                 _r_timing = ("timed" if _r_once is None or _st["ref_timed"]
                              else "reused")
                 if _r_once is None:
-                    # The same rule as the measured plan's reference below:
-                    # the first execution is timed and sets the counts.
+                    # The same rule as the measured plan's reference below: a
+                    # cold reading, unless its quality execution gave one,
+                    # then the warm execution, which sets the counts.
                     _r_first = 0.0
                     _r_windows = _r_points * _r_reps
                     _r_loop = _r_windows
+                    _r_inner = _r_cfg_inner
                     _r_lat_s: list = []
                     _r_pk_s: list = []
                     if config.measure_latency:
-                        _rl0, _rp0, _rs0, _ro0 = _time_one_rep(
+                        if _cold["ref"] is None:
+                            _rl0, _rp0, _rs0, _ro0 = _time_one_rep(
+                                _r_ex, _r_args_all[0], _r_devs, 1)
+                            del _ro0, _rs0, _rp0
+                            _cold["ref"] = float(_rl0) / 1e9
+                        _r_first = float(_cold["ref"])
+                        _rl1, _rp1, _rs1, _ro1 = _time_one_rep(
                             _r_ex, _r_args_all[0], _r_devs, 1)
-                        del _ro0, _rs0
-                        _r_first = float(_rl0) / 1e9
-                        _r_inner, _rw, _r_whole = first_execution_counts(
-                            _r_first, _r_window_s, _r_budget_s, _r_cfg_inner,
-                            _r_windows)
+                        del _ro1, _rs1
+                        _r_lat_s.append(_rl1)
+                        _r_pk_s.append(_rp1)
+                        _r_inner, _rw, _r_whole = warm_execution_counts(
+                            float(_rl1) / 1e9, _r_window_s, _r_budget_s,
+                            _r_cfg_inner, _r_windows)
                         if _r_whole:
                             _r_windows = 1
                             _r_loop = 0
-                            _r_lat_s.append(_rl0)
-                            _r_pk_s.append(_rp0)
-                    else:
-                        _r_inner = _r_cfg_inner
                     for _ib in range(_r_loop):
                         _p = _ib % _r_points
                         _l, _pk, _s, _o = _time_one_rep(
@@ -10774,8 +10817,8 @@ def _callback_measured(
                         "lat": tuple(_r_lat_s), "peak": tuple(_r_pk_s),
                         "inner": int(_r_inner), "windows": int(_r_windows),
                         "first": float(_r_first),
-                        "secs": (float(sum(_r_lat_s)) * _r_inner / 1e9
-                                 + (_r_first if _r_loop else 0.0)),
+                        "secs": sample_secs(_r_lat_s, _r_inner,
+                                            bool(config.measure_latency)),
                         "static": _static_memory_bytes(_r_ex)}
                     _REF_ONCE[_r_key] = _r_once
             except MeasureToolchainFault:
@@ -11043,7 +11086,7 @@ def _callback_measured(
     # `reps_per_point` timing repetitions is now the CAP on the number of
     # timed windows, not the number itself (owner ruling 2026-09-14; see
     # `EnvConfig.measure_budget_secs`). The windows a plan actually gets are
-    # derived from its first timed execution's measured time so that the plan
+    # derived from its warm execution's measured time so that the plan
     # costs about `measure_budget_secs` of executions however fast or slow it
     # is, and they are spread ROUND-ROBIN over the data points. Reps exist
     # only to average timer noise, so without --measure-latency we take 1 rep
@@ -11130,6 +11173,75 @@ def _callback_measured(
     # compiled fine can still exhaust the device here. Excluded from the
     # gradient rather than scored.
     try:
+        # ---- GRADIENT COSINE, FIRST (decision 2026-09-26, dsnn-19wc) -----
+        # ONE scoring per PLAN: the probe batches are fixed across plans, so
+        # repeating over the calibration samples would re-measure the same
+        # number. It runs BEFORE the cost loop. Its executions are the cold
+        # readings of the two halves: timed, recorded, never in a latency
+        # sample and never setting a count. The timing and peak windows never
+        # contain it. The quality inputs stay their own draw (dsnn-ughs).
+        if is_terminal and _qmetric == "grad_cosine":
+            _gc = _grad_cosine_quality(
+                config, compiled_cost, _ref_ex, paired_ref_key, list(args),
+                callback_device, _grad_cosine_k(config),
+                dense=dense_output(config, _measure_sparse),
+                cold=_cold if config.measure_latency else None)
+            if _gc is _QUALITY_NO_CHANNEL:
+                # NO CHANNEL IS NOT A REFUSAL. This configuration has no data
+                # generator and no rev-exact reference, so there is no probe
+                # batch, no plan of this run can be scored, and refusing would
+                # refuse every terminal of every episode -- the run would
+                # measure nothing at all. The channel reads 0.0 and says so
+                # once, which is what it did before dsnn-dfw.51 and what the
+                # analytic AD benchmarks and the toy envs depend on.
+                if not _WALK_UNDEFINED_WARNED:
+                    _WALK_UNDEFINED_WARNED.append(1)
+                    print(
+                        "[measure] WARNING quality channel: the GRADIENT "
+                        "COSINE HAS NO CHANNEL for this configuration (no "
+                        "data_gen, so no probe batch can be drawn). The "
+                        "channel reads "
+                        "0.0 for every plan of this run; ask for "
+                        "ALPHAGRAD_QUALITY_METRIC=jac_cosine to score at the "
+                        "calibration samples instead, or =none to drop the "
+                        "channel.", flush=True)
+                cosines.append(0.0)
+            elif _gc is None:
+                # AN UNDEFINED COSINE IS A REFUSED MEASUREMENT, NOT A SCORE
+                # (owner ruling 2026-09-19, dsnn-dfw.51). It used to read 0.0,
+                # which under `--reward-mode lagrangian --quality-floor 0.90`
+                # is a full constraint violation: on RSNN_SHD bptt (job 66633)
+                # every measure actor printed the warning below and more than
+                # half the order-only plans were penalised for a step position
+                # that fired nothing. The taxonomy this file already applies to
+                # an OOM and to an untraceable plan applies here: the
+                # apparatus could not measure the plan, so the measurement is
+                # MISSING DATA -- counted, recorded, and excluded from the
+                # update -- and never the worst possible number.
+                if not _WALK_UNDEFINED_WARNED:
+                    _WALK_UNDEFINED_WARNED.append(1)
+                    print(
+                        "[measure] WARNING quality channel: the GRADIENT "
+                        "COSINE is UNDEFINED for this measurement (the exact "
+                        "gradient is identically zero on every probe batch "
+                        "this plan was scored on). "
+                        "Every affected measurement is REFUSED and excluded "
+                        "from the update; watch `refused/quality-undefined`. "
+                        "On a spiking target this means the sampled steps "
+                        "fired nothing: widen the probe "
+                        "(ALPHAGRAD_GRAD_COSINE_K) or raise the target's "
+                        "firing rate.", flush=True)
+                _tr = _truncated_reward()
+                _log_refused("quality-undefined:grad_cosine", _tr)
+                return _wire(tokens, eqn_ids, _tr)
+            else:
+                _gc_q, _gc_frobs, _gc_cos = _gc
+                cosines.append(_gc_q)
+                if _fid_on:
+                    _rel_frobs.extend(float(x) for x in _gc_frobs)
+                    _cos_logged.extend(float(x) for x in _gc_cos)
+        _pf("cb.quality_walk")
+
         # THE MEASUREMENT INPUTS, materialised ONCE. The paired rev-exact
         # reference (ticket .9) measures its executable over the SAME DATA
         # with the SAME instrument (see _time_one_rep) -- but since
@@ -11183,24 +11295,30 @@ def _callback_measured(
         # with the candidate's instead of forming a second block after them.
 
         # ---- THE CANDIDATE'S BUDGET (owner rulings 2026-09-14 and
-        # 2026-09-25). One second of executions per plan, whatever the plan
-        # costs (see `EnvConfig.measure_budget_secs`). Every execution is
-        # timed, by the one instrument, and none runs untimed first: the
-        # first execution sets the counts. Past the budget it is the whole
-        # sample; otherwise it leaves the sample and the windows follow.
-        _t_cand = 0.0
+        # 2026-09-25, decision 2026-09-26, dsnn-19wc). One second of
+        # executions per plan, whatever the plan costs (see
+        # `EnvConfig.measure_budget_secs`). Every execution is timed and none
+        # runs untimed. The first execution is the cold reading: the quality
+        # execution above, or one run here when the plan has none. It sets no
+        # count and is not in the sample. The next execution is warm and
+        # sets the counts. Past the budget it is the whole sample; otherwise
+        # it stays in the sample and the windows follow it.
         _n_loop = 0
         if config.measure_latency:
+            if _cold["cand"] is None:
+                _lc, _pc, _sc, _oc = _time_one_rep(
+                    compiled_cost, eval_args_all[0], unique_devices, 1)
+                del _oc, _sc, _pc
+                _cold["cand"] = float(_lc) / 1e9
             _lat0, _peak0, _peak_src, _out0 = _time_one_rep(
                 compiled_cost, eval_args_all[0], unique_devices, 1)
             del _out0
-            _t_cand = float(_lat0) / 1e9
-            _inner, _n_windows, _whole = first_execution_counts(
-                _t_cand, _window_s, _budget_s, _cfg_inner, n_points * n_reps)
-            if _whole:
-                latency_samples.append(_lat0)
-                peak_mem_samples.append(_peak0)
-            else:
+            latency_samples.append(_lat0)
+            peak_mem_samples.append(_peak0)
+            _inner, _n_windows, _whole = warm_execution_counts(
+                float(_lat0) / 1e9, _window_s, _budget_s, _cfg_inner,
+                n_points * n_reps)
+            if not _whole:
                 _n_loop = _n_windows
         else:
             # THE BUDGET IS A TIMING INSTRUMENT. With --measure-latency off
@@ -11219,9 +11337,10 @@ def _callback_measured(
         # from the window rule, applied to ITS OWN execution time -- a 121 us
         # program fills a 50 ms window 413 times over and takes the ceiling
         # of 50, where the candidate takes the floor of 5.
-        # Its first execution counts too (owner ruling 2026-09-25): timed by
-        # the instrument, it sets the inner, and past the budget it is the
-        # reference's whole sample.
+        # It follows the candidate's rule (decision 2026-09-26, dsnn-19wc):
+        # the cold reading is its quality execution, or one run here when
+        # this measurement has none; the warm execution sets its inner, and
+        # past the budget it is the reference's whole sample.
         _ref_inner = 0
         _ref_windows = 0
         _ref_loop = 0
@@ -11240,24 +11359,31 @@ def _callback_measured(
         if _paired and _ref_once is None:
             _ref_windows = n_ref_points * n_ref_reps
             _ref_loop = _ref_windows
-            with _reference_errors(
-                    f"the reference ({_ref_kind}) failed in its first "
-                    f"execution"):
-                if config.measure_latency:
-                    _rl0, _rp0, _rs0, _ro0 = _time_one_rep(
+            _ref_inner = _cfg_inner
+            if config.measure_latency:
+                if _cold["ref"] is None:
+                    with _reference_errors(
+                            f"the reference ({_ref_kind}) failed in its "
+                            f"first execution"):
+                        _rl0, _rp0, _rs0, _ro0 = _time_one_rep(
+                            _ref_ex, ref_eval_args_all[0], unique_devices, 1)
+                    del _ro0, _rs0, _rp0
+                    _cold["ref"] = float(_rl0) / 1e9
+                _t_ref = float(_cold["ref"])
+                with _reference_errors(
+                        f"the reference ({_ref_kind}) failed in its warm "
+                        f"execution"):
+                    _rl1, _rp1, _rs1, _ro1 = _time_one_rep(
                         _ref_ex, ref_eval_args_all[0], unique_devices, 1)
-                    del _ro0, _rs0
-                    _t_ref = float(_rl0) / 1e9
-                    _ref_inner, _rw, _r_whole = first_execution_counts(
-                        _t_ref, _window_s, _budget_s, _cfg_inner,
-                        _ref_windows)
-                    if _r_whole:
-                        _ref_windows = 1
-                        _ref_loop = 0
-                        _ref_lat_samples.append(_rl0)
-                        _ref_peak_samples.append(_rp0)
-                else:
-                    _ref_inner = _cfg_inner
+                del _ro1, _rs1
+                _ref_lat_samples.append(_rl1)
+                _ref_peak_samples.append(_rp1)
+                _ref_inner, _rw, _r_whole = warm_execution_counts(
+                    float(_rl1) / 1e9, _window_s, _budget_s, _cfg_inner,
+                    _ref_windows)
+                if _r_whole:
+                    _ref_windows = 1
+                    _ref_loop = 0
             _ref_timed_now = True
         elif _paired:
             _ref_inner = int(_ref_once["inner"])
@@ -11323,8 +11449,8 @@ def _callback_measured(
                 "peak": tuple(_ref_peak_samples),
                 "inner": int(_ref_inner), "windows": int(_ref_windows),
                 "first": float(_t_ref),
-                "secs": (float(sum(_ref_lat_samples)) * _ref_inner / 1e9
-                         + (_t_ref if _ref_loop else 0.0)),
+                "secs": sample_secs(_ref_lat_samples, _ref_inner,
+                                    bool(config.measure_latency)),
                 "static": _static_memory_bytes(_ref_ex)}
             _REF_ONCE[_ref_once_k] = _ref_once
             _st["ref_timed"] = True
@@ -11345,16 +11471,19 @@ def _callback_measured(
                 _rev_ex = cached_compile(
                     b"rev-exact:" + paired_ref_key, _do_compile_rev_exact)
                 if config.measure_latency:
-                    # The rev-exact's first execution counts, like every
-                    # other half's (owner ruling 2026-09-25).
+                    # The rev-exact follows every other half's rule (decision
+                    # 2026-09-26, dsnn-19wc): a cold reading, then the warm
+                    # execution, which sets the counts and stays in the sample.
                     _rl0, _rp0, _rs0, _ro0 = _time_one_rep(
                         _rev_ex, ref_eval_args_all[0], unique_devices, 1)
                     del _ro0, _rs0, _rp0
-                    _rv_inner, _rv_w, _rv_whole = first_execution_counts(
-                        float(_rl0) / 1e9, _window_s, _budget_s, _cfg_inner,
+                    _rl1, _rp1, _rs1, _ro1 = _time_one_rep(
+                        _rev_ex, ref_eval_args_all[0], unique_devices, 1)
+                    del _ro1, _rs1, _rp1
+                    _rv_lat.append(_rl1)
+                    _rv_inner, _rv_w, _rv_whole = warm_execution_counts(
+                        float(_rl1) / 1e9, _window_s, _budget_s, _cfg_inner,
                         _ref_windows)
-                    if _rv_whole:
-                        _rv_lat.append(_rl0)
                     for _w in range(1 if _rv_whole else _ref_windows):
                         if not _rv_whole:
                             _l, _pk, _s, _o = _time_one_rep(
@@ -11374,12 +11503,12 @@ def _callback_measured(
                 float(_aggregate_samples(_tl_lat, want_top_quartile=True))
                 if _tl_lat else 0.0,
                 len(_rv_lat))
-        # SECONDS OF EXECUTION actually spent inside timed windows, per half:
-        # the first execution and the windows that followed it. Window w of a
-        # half took ``latency_ns[w] * inner`` nanoseconds, which is the
-        # quantity the budget is a target for. The quality run is outside it.
-        _meas_secs = (float(sum(latency_samples)) * _inner / 1e9
-                      + (_t_cand if _n_loop else 0.0))
+        # SECONDS OF EXECUTION in the latency sample, per half: the warm
+        # execution and the windows that followed it. Window w of a half took
+        # ``latency_ns[w] * inner`` nanoseconds, which is the quantity the
+        # budget is a target for. The cold reading is outside it.
+        _meas_secs = sample_secs(latency_samples, _inner,
+                                 bool(config.measure_latency))
         _ref_secs = float(_ref_once["secs"]) if _paired else 0.0
         _ref_secs_now = _ref_secs if _ref_timed_now else 0.0
         _pf("cb.exec_measure")
@@ -11394,8 +11523,8 @@ def _callback_measured(
         # It costs ONE untimed execution per scored point, and only under the
         # consumers that need one: `jac_cosine`, which scores per point, and
         # the fidelity / cosine-log subsample, which needs point 0 alone. The
-        # campaign runs `grad_cosine`, which scores once per PLAN below, so on
-        # every campaign arm this loop executes nothing at all.
+        # campaign runs `grad_cosine`, which scores once per PLAN before the
+        # cost loop, so on every campaign arm this loop executes nothing.
         _quality_points = 0
         if compiled_exact is not None and _qmetric == "jac_cosine":
             _quality_points = n_points
@@ -11479,69 +11608,6 @@ def _callback_measured(
         # calibration samples would re-measure the same number. Runs after
         # the cost loop so the timing/peak windows above never contain it.
         _pf("cb.exec_measure")
-        # ---- GRADIENT COSINE --------------------------------------------
-        # ONE scoring per PLAN, like the walk: the probe batches are fixed
-        # across plans, so repeating over the calibration samples would
-        # re-measure the same number. Runs after the cost loop so the
-        # timing/peak windows never contain it.
-        if is_terminal and _qmetric == "grad_cosine":
-            _gc = _grad_cosine_quality(
-                config, quality_program, _ref_ex, paired_ref_key, list(args),
-                callback_device, _grad_cosine_k(config))
-            if _gc is _QUALITY_NO_CHANNEL:
-                # NO CHANNEL IS NOT A REFUSAL. This configuration has no data
-                # generator and no rev-exact reference, so there is no probe
-                # batch, no plan of this run can be scored, and refusing would
-                # refuse every terminal of every episode -- the run would
-                # measure nothing at all. The channel reads 0.0 and says so
-                # once, which is what it did before dsnn-dfw.51 and what the
-                # analytic AD benchmarks and the toy envs depend on.
-                if not _WALK_UNDEFINED_WARNED:
-                    _WALK_UNDEFINED_WARNED.append(1)
-                    print(
-                        "[measure] WARNING quality channel: the GRADIENT "
-                        "COSINE HAS NO CHANNEL for this configuration (no "
-                        "data_gen, so no probe batch can be drawn). The "
-                        "channel reads "
-                        "0.0 for every plan of this run; ask for "
-                        "ALPHAGRAD_QUALITY_METRIC=jac_cosine to score at the "
-                        "calibration samples instead, or =none to drop the "
-                        "channel.", flush=True)
-                cosines.append(0.0)
-            elif _gc is None:
-                # AN UNDEFINED COSINE IS A REFUSED MEASUREMENT, NOT A SCORE
-                # (owner ruling 2026-09-19, dsnn-dfw.51). It used to read 0.0,
-                # which under `--reward-mode lagrangian --quality-floor 0.90`
-                # is a full constraint violation: on RSNN_SHD bptt (job 66633)
-                # every measure actor printed the warning below and more than
-                # half the order-only plans were penalised for a step position
-                # that fired nothing. The taxonomy this file already applies to
-                # an OOM and to an untraceable plan applies here: the
-                # apparatus could not measure the plan, so the measurement is
-                # MISSING DATA -- counted, recorded, and excluded from the
-                # update -- and never the worst possible number.
-                if not _WALK_UNDEFINED_WARNED:
-                    _WALK_UNDEFINED_WARNED.append(1)
-                    print(
-                        "[measure] WARNING quality channel: the GRADIENT "
-                        "COSINE is UNDEFINED for this measurement (the exact "
-                        "gradient is identically zero on every probe batch "
-                        "this plan was scored on). "
-                        "Every affected measurement is REFUSED and excluded "
-                        "from the update; watch `refused/quality-undefined`. "
-                        "On a spiking target this means the sampled steps "
-                        "fired nothing: widen the probe "
-                        "(ALPHAGRAD_GRAD_COSINE_K) or raise the target's "
-                        "firing rate.", flush=True)
-                _tr = _truncated_reward()
-                _log_refused("quality-undefined:grad_cosine", _tr)
-                return _wire(tokens, eqn_ids, _tr)
-            else:
-                _gc_q, _gc_frobs, _gc_cos = _gc
-                cosines.append(_gc_q)
-                if _fid_on:
-                    _rel_frobs.extend(float(x) for x in _gc_frobs)
-                    _cos_logged.extend(float(x) for x in _gc_cos)
         if is_terminal and _qmetric == "loss_drop":
             _ld = _loss_drop_quality(
                 config, quality_program, list(args), callback_device)
@@ -11970,7 +12036,7 @@ def _callback_measured(
         "inner": int(_inner),
         "windows": int(_n_windows),
         "secs": float(_meas_secs),
-        "first_s": float(_t_cand),
+        "first_s": float(_cold["cand"] or 0.0),
         "ref_inner": int(_ref_inner),
         "ref_windows": int(_ref_windows),
         "ref_secs": float(_ref_secs),

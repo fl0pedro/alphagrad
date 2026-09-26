@@ -23,6 +23,9 @@ LAT = int(REWARD_INDEX["latency_ns"])
 MEM = int(REWARD_INDEX["peak_memory"])
 REF_POINTS = 2
 REF_REPS = 3
+# The warm execution is the first reading of every sample (decision 2026-09-26,
+# dsnn-19wc).
+WARM = 1
 
 
 class _SwollenAnalysis:
@@ -125,9 +128,10 @@ class _Instrument:
         mine = self.windows[start:]
         ref = [(lat, peak) for ex, lat, peak in mine if self._is_ref(ex)]
         cand = [(lat, peak) for ex, lat, peak in mine if not self._is_ref(ex)]
-        # The first timed execution of each half sets its counts and, under
-        # the budget, leaves the sample (owner ruling 2026-09-25); the
-        # windows that follow it are the sample.
+        # The first timed execution of each half is its cold reading, outside
+        # the sample (no quality metric here). The warm execution after it
+        # and the windows that follow are the sample (decision 2026-09-26,
+        # dsnn-19wc).
         self.first = (cand[:1], ref[:1])
         return rec, ref[1:], cand[1:]
 
@@ -170,7 +174,7 @@ def test_the_second_plan_runs_no_reference_window_and_pairs_against_the_first(
     samples = _samples(2)
     rec_a, ref_a, cand_a = paired.measure(env, fwd, samples)
     cand_first_a, ref_first_a = paired.first
-    assert len(ref_a) == REF_POINTS * REF_REPS, ref_a
+    assert len(ref_a) == WARM + REF_POINTS * REF_REPS, ref_a
     assert cand_a and len(cand_first_a) == 1 and len(ref_first_a) == 1
     rec_b, ref_b, cand_b = paired.measure(env, rev, samples)
     cand_first_b, ref_first_b = paired.first
@@ -203,7 +207,7 @@ def test_the_second_plan_runs_no_reference_window_and_pairs_against_the_first(
     assert rec_b["ref_measure_windows"] == REF_POINTS * REF_REPS
     assert rec_b["measure_first_s"] == cand_first_b[0][0] / 1e9
     assert rec_a["ref_measure_first_s"] == ref_first_a[0][0] / 1e9
-    assert rec_a["measure_windows"] == len(cand_a)
+    assert rec_a["measure_windows"] == len(cand_a) - WARM
     secs_a, secs_b = paired.episode_ref_secs
     assert len(secs_a) == 1 and secs_a[0] > 0.0
     assert secs_b == [0.0]
@@ -215,7 +219,7 @@ def test_a_refused_plan_pairs_against_the_reference_of_the_plan_before(
     fwd, rev = _orders(env)
     samples = _samples(2)
     rec_a, ref_a, _ = paired.measure(env, fwd, samples)
-    assert len(ref_a) == REF_POINTS * REF_REPS
+    assert len(ref_a) == WARM + REF_POINTS * REF_REPS
     paired.swell = True
     rec_b, ref_b, cand_b = paired.measure(env, rev, samples)
     assert rec_b["refused"] == "gate"
@@ -234,7 +238,7 @@ def test_a_refusal_times_the_reference_for_the_plans_after_it(paired):
     paired.swell = True
     rec_a, ref_a, cand_a = paired.measure(env, fwd, samples)
     assert rec_a["refused"] == "gate"
-    assert len(ref_a) == REF_POINTS * REF_REPS and cand_a == []
+    assert len(ref_a) == WARM + REF_POINTS * REF_REPS and cand_a == []
     assert rec_a["ref_timing"] == "timed"
     paired.swell = False
     rec_b, ref_b, cand_b = paired.measure(env, rev, samples)
@@ -250,8 +254,8 @@ def test_other_eval_sample_shapes_time_their_own_reference(paired):
     fwd, rev = _orders(env)
     rec_a, ref_a, _ = paired.measure(env, fwd, _samples(2))
     rec_b, ref_b, _ = paired.measure(env, rev, _samples(3))
-    assert len(ref_a) == 2 * REF_REPS
-    assert len(ref_b) == 3 * REF_REPS
+    assert len(ref_a) == WARM + 2 * REF_REPS
+    assert len(ref_b) == WARM + 3 * REF_REPS
     assert rec_a["ref_timing"] == rec_b["ref_timing"] == "timed"
     rec_c, ref_c, _ = paired.measure(env, fwd, _samples(3))
     assert ref_c == [] and rec_c["ref_timing"] == "reused"
@@ -265,8 +269,8 @@ def test_another_reference_protocol_times_its_own_reference(paired):
     samples = _samples(2)
     rec_a, ref_a, _ = paired.measure(env_a, fwd, samples)
     rec_b, ref_b, _ = paired.measure(env_b, rev, samples)
-    assert len(ref_a) == REF_POINTS * REF_REPS
-    assert len(ref_b) == REF_POINTS * (REF_REPS + 1)
+    assert len(ref_a) == WARM + REF_POINTS * REF_REPS
+    assert len(ref_b) == WARM + REF_POINTS * (REF_REPS + 1)
     assert rec_b["ref_timing"] == "timed"
 
 
@@ -287,7 +291,7 @@ def test_a_plan_refused_after_its_reference_windows_records_them_as_timed(
     monkeypatch.setattr(env_mod, "_prof_add", real)
     env_mod.pop_measure_oom()
     assert rec_a["refused"] == "oom:measurement"
-    assert len(ref_a) == REF_POINTS * REF_REPS
+    assert len(ref_a) == WARM + REF_POINTS * REF_REPS
     assert rec_a["ref_timing"] == "timed"
     assert rec_a["ref_latency_ns"] == _median(lat for lat, _ in ref_a)
     rec_b, ref_b, _ = paired.measure(env, rev, samples)

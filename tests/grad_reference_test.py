@@ -339,8 +339,10 @@ def test_rev_exact_telemetry_is_one_paired_ratio_per_episode(monkeypatch):
     tel = _drain()["paired_ref"]["records"][-1]["rev_exact"]
     assert len(seen["rev-exact"]) == 1
     assert tel is not None
-    assert tel["windows"] == (env.config.ref_num_data_points
-                              * env.config.ref_reps_per_point)
+    # The rev-exact's warm execution and then the reference's own windows
+    # (decision 2026-09-26, dsnn-19wc).
+    assert tel["windows"] == 1 + (env.config.ref_num_data_points
+                                  * env.config.ref_reps_per_point)
     assert tel["latency_ratio"] > 0.0 and math.isfinite(tel["latency_ratio"])
     assert tel["latency_ratio"] == tel["latency_ns"] / tel["reference_latency_ns"]
     rev_temp = _triple(seen["rev-exact"][0])[0]
