@@ -7758,6 +7758,95 @@ def _latency_quantiles(rec, args):
              "ref_latency_p50_ns": float(ref)})
 
 
+def _plan_hashes(plan_states, n_envs):
+    # The content hash of each environment's terminal plan, from the five wires the callback hashed (env._plan_content_key).
+    from alphagrad.approx.env import _plan_content_key
+    if plan_states is None:
+        return None
+    wires = [getattr(plan_states, k, None) for k in
+             ("order", "sparsity_specs", "face_specs", "face_skips")]
+    if any(w is None for w in wires):
+        return None
+    order, specs, faces, skips = (np.asarray(w) for w in wires)
+    joins = getattr(plan_states, "face_joins", None)
+    joins = None if joins is None else np.asarray(joins)
+    if order.ndim != 2 or order.shape[0] != int(n_envs):
+        return None
+    return [_plan_content_key(
+                [int(v) for v in order[e]], specs[e], faces[e], skips[e],
+                None if joins is None else joins[e]).hex()
+            for e in range(int(n_envs))]
+
+
+def _join_plan_records(records, episode, n_envs, plan_states=None):
+    # dsnn-dfw.301: each environment takes the record of its own plan, by (episode, env_index), else by plan_hash. A record with measured_from takes the numbers of the plan it names.
+    from alphagrad.approx.common.gate_telemetry import record_env_index
+    records = [r for r in (records or ()) if isinstance(r, dict)]
+    counts = {"by_env_index": 0, "by_plan_hash": 0, "measured_from": 0,
+              "unresolved": 0, "unjoined": 0, "duplicate": 0,
+              "other_episode": 0}
+    timed: dict = {}
+    for r in records:
+        h = r.get("plan_hash")
+        if h and r.get("measured_from") is None:
+            timed.setdefault((r.get("pid"), h), r)
+            timed.setdefault((None, h), r)
+
+    def _numbers(r):
+        if r.get("measured_from") is None:
+            return r
+        counts["measured_from"] += 1
+        h = r.get("plan_hash")
+        got = timed.get((r.get("pid"), h)) or timed.get((None, h))
+        if got is None:
+            counts["unresolved"] += 1
+        return got
+
+    rows: dict = {}
+    pending = []
+    for r in records:
+        if r.get("episode") is not None and int(r["episode"]) != int(episode):
+            counts["other_episode"] += 1
+            continue
+        e = record_env_index(r)
+        if e is None or e >= int(n_envs):
+            pending.append(r)
+            continue
+        if e in rows:
+            counts["duplicate"] += 1
+            continue
+        num = _numbers(r)
+        if num is not None:
+            rows[e] = num
+            counts["by_env_index"] += 1
+    hashes = _plan_hashes(plan_states, n_envs) if pending else None
+    for r in pending:
+        h = r.get("plan_hash")
+        hits = [e for e, he in enumerate(hashes or ())
+                if h and he == h and e not in rows]
+        if not hits:
+            counts["unjoined"] += 1
+            continue
+        num = _numbers(r)
+        if num is None:
+            continue
+        for e in hits:
+            rows[e] = num
+        counts["by_plan_hash"] += len(hits)
+    return rows, counts
+
+
+def _ratio_dists(records, args, episode, n_envs, plan_states=None):
+    # Per environment row: its band sample, memory source, latency quantiles and their detail.
+    rows, counts = _join_plan_records(records, episode, n_envs, plan_states)
+    out = {}
+    for e, rec in rows.items():
+        smp, source = _band_sample(rec, args)
+        if smp is not None:
+            out[e] = (smp, source) + _latency_quantiles(rec, args)
+    return out, counts
+
+
 def _dump_pareto(archive, args, ep, *, final=False, rule=None):
     """Persist the front + a replayable best_sequences.json. Never raises.
 
@@ -14985,7 +15074,8 @@ def main(args=None):
     def host_log(
         ep, all_rets, actions_pack, mean_r, mets, diag_pack=None,
         popart_stats=None, attn_entropy=None, warmup=False, true_return=None,
-        probe_metrics=None, extra_log=None, vp_metrics=None):
+        probe_metrics=None, extra_log=None, vp_metrics=None,
+        plan_states=None):
         ep = int(ep)
         all_rets = np.array(all_rets)  # (num_envs, NUM_REWARDS)
         v_idx_arr = np.array(actions_pack[0])
@@ -15832,19 +15922,16 @@ def main(args=None):
                     log_dict["mem_objective/log_total_ratio"] = float(
                         np.mean(np.log(_mt)))
                 # TICKET dsnn-dfw.44: this episode's per-window ratio SAMPLES,
-                # keyed by the plan's elimination order -- the same key
-                # `_decode_arch` hands the archive. Two envs that drew one
-                # order share one sample, so the first record wins.
+                # per environment row. Since dsnn-dfw.301 a record joins its
+                # environment by (episode, env_index), else by plan_hash: the
+                # order alone gave every plan of a fixed-order episode the
+                # numbers of its first record.
                 if _RATIO_ARCHIVE:
-                    _rd: dict = {}
-                    for _r in _plog_recs:
-                        _smp, _msrc = _band_sample(_r, args)
-                        if _smp is None:
-                            continue
-                        _k = tuple(int(v) for v in (_r.get("order") or ()))
-                        if _k and _k not in _rd:
-                            _rd[_k] = ((_smp, _msrc)
-                                       + _latency_quantiles(_r, args))
+                    _rd, _rd_join = _ratio_dists(
+                        _plog_recs, args, ep, int(all_rets.shape[0]),
+                        plan_states)
+                    for _jk, _jv in _rd_join.items():
+                        log_dict[f"pareto/join/{_jk}"] = int(_jv)
                     host_state["_ratio_dists"] = _rd
                 host_state["_gate_drain"] = (
                     {"records": list(_plog_local.get("records") or ())},
@@ -16305,13 +16392,13 @@ def main(args=None):
                 # TICKET dsnn-dfw.44. A band, not a reward slot: the reward's
                 # reference floor maps every plan at or below parity onto 0,
                 # which is exactly the half of the axis a front must keep.
-                _rdists = host_state.get("_ratio_dists") or {}
+                # Taken once: an episode never reads the samples of another.
+                _rdists = host_state.pop("_ratio_dists", None) or {}
                 _sols = []
                 for i in elig_idx:
                     _seq = _decode_arch(i)
-                    _s = _seq["seq"] if isinstance(_seq, dict) else _seq
-                    _key = tuple(int(v) for v, _calls in _s)
-                    _dist = _rdists.get(_key)
+                    # dsnn-dfw.301: the record of this environment row, never the first record of its order.
+                    _dist = _rdists.get(i)
                     if _dist is None:
                         # The plan drain missed this env's record; a point
                         # without its band is not archived and is counted.
@@ -17639,6 +17726,7 @@ def main(args=None):
             probe_metrics=probe_metrics,
             vp_metrics=vp_metrics,
             extra_log=lag_extra,
+            plan_states=_fe.get("plan_states"),
         )
         # Mid-training top-N snapshot. Skips the wandb table log so we
         # don't pollute the offline run with duplicate tables — only the
@@ -17684,13 +17772,14 @@ def main(args=None):
     def _psweep_episode(ep, w, pref_row, roll, drain):
         """ONE swept episode's plans, their bands, and the front they enter.
 
-        THE JOIN IS THE ELIMINATION ORDER, exactly as it is in the trainer's
-        epilogue: a measure actor is another process and its records carry no
-        environment row, so the per-window paired log ratios are keyed by the
-        order the plan eliminated in and matched against the decoded plan. A
-        plan whose record did not arrive, and a plan whose measurement came
-        back sentinelled, are EXCLUDED from the front and COUNTED -- a
-        refused measurement is missing data, never a point.
+        THE JOIN IS THE ENVIRONMENT ROW, exactly as it is in the trainer's
+        epilogue (dsnn-dfw.301): a record names its row in env_index, and a
+        record without one is matched by plan_hash against the plan of the
+        row. The elimination order alone gave every plan of a fixed-order
+        episode the ratios of its first record. A plan whose record did not
+        arrive, and a plan whose measurement came back sentinelled, are
+        EXCLUDED from the front and COUNTED -- a refused measurement is
+        missing data, never a point.
         """
         _traj, _es = roll[1], roll[0]
         _rets = np.asarray(roll[2])
@@ -17701,14 +17790,10 @@ def main(args=None):
             _traj.micro_quant_dtype_seq, _es.face_specs, _es.face_skips)]
         _recs = list((drain.get("local_plan") or {}).get("records", ()))
         _recs.extend((drain.get("pool_plan") or {}).get("records", ()))
-        _bands = {}
-        for _r in _recs:
-            _rl = (_r or {}).get("ratio_log")
-            if not _rl:
-                continue
-            _k = tuple(int(v) for v in (_r.get("order") or ()))
-            if _k and _k not in _bands:
-                _bands[_k] = _rl
+        # dsnn-dfw.301: by environment row, as in the trainer's epilogue.
+        _joined, _join_counts = _join_plan_records(_recs, ep, num_envs, _es)
+        _bands = {e: r["ratio_log"] for e, r in _joined.items()
+                  if r.get("ratio_log")}
         _sent_ch = np.asarray(COMPUTE_REWARD_INDICES, dtype=np.int64)
         _added = 0
         for i in range(num_envs):
@@ -17717,7 +17802,7 @@ def main(args=None):
                 _arr[7][i], _arr[8][i], args.max_substeps)
             _plan = _arch_plan_from_seq(_seq, _arr[9], _arr[10], i)
             _key = tuple(int(v) for v, _calls in _seq)
-            _band = _bands.get(_key)
+            _band = _bands.get(i)
             _live = not bool(np.all(
                 _rets[i][_sent_ch] <= float(SENTINEL_COST) * 0.99))
             _why = (None if (_live and _band is not None)
@@ -17748,7 +17833,9 @@ def main(args=None):
               + (f", median latency log ratio "
                  f"{np.median([p['band']['latency']['median'] for p in _ok]):+.4f}"
                  f" memory {np.median([p['band']['memory']['median'] for p in _ok]):+.4f}"
-                 if _ok else ""), flush=True)
+                 if _ok else "")
+              + (f", {_join_counts['unjoined']} records unjoined"
+                 if _join_counts["unjoined"] else ""), flush=True)
 
     def _pipe_update_dispatch(prev):
         """Dispatch the pending episode's PPO update; do NOT wait for it.
@@ -17787,7 +17874,7 @@ def main(args=None):
         if _TWO_GRAPH:
             _swap_graph(_GSTATES.rule_for(int(prev["ctx"]["ep"])))
         try:
-            (agent, opt_state, _unused_states, _metrics, _tot_rew, _acts,
+            (agent, opt_state, _end_states, _metrics, _tot_rew, _acts,
              global_step, _diag, popart_m1, popart_m2, popart_w, _attn,
              _true_ret, probes, probe_opt_state, _probe_mets,
              vprobes, vprobe_opt_state, _vp_mets,
@@ -17796,7 +17883,7 @@ def main(args=None):
             _ctx.update(
                 agent=agent, opt_state=opt_state, global_step=global_step,
                 metrics=_metrics, total_rewards_full=_tot_rew,
-                actions_pack=_acts, diag_pack=_diag,
+                actions_pack=_acts, diag_pack=_diag, plan_states=_end_states,
                 popart_m1=popart_m1, popart_m2=popart_m2, popart_w=popart_w,
                 attn_ent=_attn, true_scalar_return=_true_ret,
                 probe_metrics=_probe_mets, vp_metrics=_vp_mets,
@@ -18600,6 +18687,7 @@ def main(args=None):
                     _wmets,
                     None,
                     warmup=True,
+                    plan_states=_wend,
                 )
             _R = np.concatenate(_wG, axis=0)
             _live_m = np.concatenate(_wlive, axis=0)
@@ -19095,7 +19183,7 @@ def main(args=None):
         (
             agent,
             opt_state,
-            _,
+            _end_states,
             metrics,
             total_rewards_full,
             actions_pack,
@@ -19144,6 +19232,7 @@ def main(args=None):
             agent=agent, opt_state=opt_state, global_step=global_step,
             metrics=metrics, total_rewards_full=total_rewards_full,
             actions_pack=actions_pack, diag_pack=diag_pack,
+            plan_states=_end_states,
             popart_m1=popart_m1, popart_m2=popart_m2, popart_w=popart_w,
             attn_ent=attn_ent, true_scalar_return=true_scalar_return,
             probe_metrics=probe_metrics, vp_metrics=vp_metrics,
