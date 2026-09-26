@@ -37,9 +37,9 @@
    ],
    "face": {
     "chunk_counts": [
-     48
+     45
     ],
-    "chunk_tokens_sha": "e7b9e423bfd03944",
+    "chunk_tokens_sha": "c6178630d6d27f0c",
     "comp_valid": [
      [
       [],
@@ -53,8 +53,8 @@
       2
      ]
     ],
-    "entropy": "3f2f0434",
-    "logp": "bf10745c",
+    "entropy": "3f2f377f",
+    "logp": "bf11c206",
     "n_live": 1,
     "pair_valid": [
      [
@@ -473,10 +473,10 @@
    ],
    "face": {
     "chunk_counts": [
-     48,
-     76
+     45,
+     85
     ],
-    "chunk_tokens_sha": "e04f091b423db0d2",
+    "chunk_tokens_sha": "c4a6a086a3eaa6aa",
     "comp_valid": [
      [
       [],
@@ -499,8 +499,8 @@
       4
      ]
     ],
-    "entropy": "3fac2f6c",
-    "logp": "bf854a8d",
+    "entropy": "3fad087c",
+    "logp": "bf8c094a",
     "n_live": 2,
     "pair_valid": [
      [
@@ -795,10 +795,10 @@
    ],
    "face": {
     "chunk_counts": [
-     68,
-     96
+     65,
+     105
     ],
-    "chunk_tokens_sha": "f03ae837cdd72c70",
+    "chunk_tokens_sha": "51003eb4726ff241",
     "comp_valid": [
      [
       [],
@@ -834,8 +834,8 @@
       7
      ]
     ],
-    "entropy": "40480d12",
-    "logp": "c04291a2",
+    "entropy": "40485802",
+    "logp": "c04e4e58",
     "n_live": 2,
     "pair_valid": [
      [
@@ -1178,9 +1178,9 @@
    "step": 4,
    "target_vertex": 4,
    "value": [
-    "bc46d6f6",
-    "bd8b90ee",
-    "ba662052"
+    "3cf4a2ea",
+    "bdfac933",
+    "bc2b7906"
    ],
    "vertex": 3,
    "vertex_mask_fill": [
@@ -1190,11 +1190,11 @@
    "vertex_probs_live": [
     [
      1,
-     "3f02da31"
+     "3f00a502"
     ],
     [
      3,
-     "3efa4b9d"
+     "3efeb5fb"
     ]
    ]
   }
