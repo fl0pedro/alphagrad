@@ -4,15 +4,8 @@ import os
 
 
 def _ray_measure_compiler_options():
-    """Mirror of env._measure_compiler_options (legacy Ray measure
-    path): per-executable autotune-0 + no-Triton for measure compiles,
-    ALPHAGRAD_MEASURE_COMPILER_OPTS=0 to disable. Typed values only."""
-    if os.environ.get("ALPHAGRAD_MEASURE_COMPILER_OPTS", "1") == "0":
-        return None
-    return {
-        "xla_gpu_autotune_level": 0,
-        "xla_gpu_enable_triton_gemm": False,
-    }
+    # Per owner ruling 2026-09-26 Q5 b and probe dsnn-dfw.309: no compiler options are set.
+    return None
 
 from dataclasses import dataclass
 from functools import partial
