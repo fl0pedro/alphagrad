@@ -340,7 +340,8 @@ def test_the_sentinel_fills_the_card_when_twice_the_args_fit():
     triple, rec = memory_sentinel(REF3, limit)
     assert rec["branch"] == "fill" and triple == (limit - a - o, o, a)
     eps = 2.0 ** -10 * min(REF3)
-    want = -math.log((limit - a - o + eps) / (t + eps))
+    # One total since 2026-09-26 (Q1 a): the sentinel's total is the card.
+    want = -math.log((limit + eps) / (t + a + o + eps))
     assert mem_objective(triple, REF3)[0] == pytest.approx(want, abs=1e-12)
 
 
@@ -351,8 +352,7 @@ def test_the_sentinel_splits_the_card_when_they_do_not():
     half = (limit - o) / 2.0
     assert rec["branch"] == "split" and triple == (half, o, half)
     eps = 2.0 ** -10 * min(REF3)
-    want = (-math.log((half + eps) / (t + eps))
-            - math.log((half + eps) / (a + eps)))
+    want = -math.log((2 * half + o + eps) / (t + a + o + eps))
     assert mem_objective(triple, REF3)[0] == pytest.approx(want, abs=1e-12)
 
 
@@ -443,14 +443,17 @@ def test_a_refused_plan_above_the_reference_stops_the_measurement(
 
 
 # ------------------------------------------------------------ 5. eps on slot 11
-def test_eps_reads_a_halved_output_as_log_2_over_a_zero_reference_temp():
+def test_eps_stays_and_a_zero_reference_temp_is_part_of_the_total():
+    # Since the one total (owner ruling 2026-09-26, Q1 a) a halved output moves slot 11 by its
+    # share of the total, and the logged temp ratio stays finite through eps.
     ref = (0.0, 1024.0, 4096.0)
     value, rec = mem_objective((0.0, 512.0, 4096.0), ref)
     assert rec["eps"] == 2.0 ** -10 * 1024.0
     assert rec["ratios"]["temp"] == 1.0 and rec["ratios"]["args"] == 1.0
-    assert abs(value - math.log(2.0)) < 0.001
+    assert value == -math.log((4096.0 + 512.0 + 1.0) / (4096.0 + 1024.0 + 1.0))
     value, rec = mem_objective((64.0, 1024.0, 4096.0), ref)
-    assert value == -math.log((64.0 + 1.0) / (0.0 + 1.0))
+    assert value == -math.log((64.0 + 4096.0 + 1024.0 + 1.0) / (4096.0 + 1024.0 + 1.0))
+    assert rec["ratios"]["temp"] == (64.0 + 1.0) / (0.0 + 1.0)
 
 
 def test_eps_is_two_to_the_minus_ten_of_the_smallest_nonzero_reference():
