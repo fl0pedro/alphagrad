@@ -1,4 +1,4 @@
-# dsnn-dfw.232: no row thesis_arm emits runs the tbptt rule.
+# dsnn-dfw.232, .264: rows of thesis_arm run no tbptt and export DSNN_SHD_DIR.
 from __future__ import annotations
 
 import importlib.util
@@ -13,6 +13,9 @@ _GEN = os.path.join(_ALPHAGRAD, "tools", "gen_fq_launchers.py")
 SEEDS = ("250197", "250198", "250199", "250200", "250201")
 ARMS = ("A", "B", "C", "C_popart")
 MATRIX_RULES = ("bptt", "rtrl", "window2")
+SHD_DIR = "/Scratch/assmuth/mrg/cache/dsnn_shd"
+MNIST_LINE = "export DSNN_MNIST_DIR=/Scratch/assmuth/mrg/cache/dsnn_mnist\n"
+SHD_LINE = f"export DSNN_SHD_DIR={SHD_DIR}\n"
 _FROZEN_KEYS = ("orderonly", "orderonly_rsnn", "orderonly_final",
                 "orderonly_tlm_final", "sweepl", "sweepl2", "sweepl3")
 _TEMPORAL_RULE = re.compile(r"^\s+--temporal-rule (\S+)$", re.M)
@@ -84,3 +87,39 @@ def test_thesis_arm_refuses_the_tbptt_rule(gen):
                          node="pgi15-gpu8", name="throwaway", episodes="1",
                          checkpoint_every="1", auto_stop=True)
     assert cli["--temporal-rule"] == "tbptt"
+
+
+def test_every_row_thesis_arm_emits_exports_the_shd_directory(gen, emitted,
+                                                              frozen):
+    for a in emitted:
+        text = gen.render(a)
+        assert MNIST_LINE + SHD_LINE in text, a["name"]
+        assert text.count("export DSNN_SHD_DIR=") == 1, a["name"]
+        assert a.get("shd_dir") is True, a["name"]
+        assert "DSNN_SHD_DIR" not in (a.get("env") or {}), a["name"]
+    ids = {id(a) for a in emitted}
+    others = [a for a in gen.ARMS if id(a) not in ids]
+    assert len(others) > len(frozen)
+    for a in others:
+        assert "DSNN_SHD_DIR" not in gen.render(a), a["name"]
+    names = {a["name"] for a in emitted}
+    assert {"C_popart_rsnn_rtrl_s250197", "C_popart_nn256_s250197",
+            "smoke_C_tlm"} <= names
+
+
+def test_the_shd_directory_goes_through_the_stack_allow_lists(gen):
+    names = gen.STACK_ENV_NAMES
+    assert "DSNN_SHD_DIR" in names
+    assert names.index("DSNN_SHD_DIR") == names.index("DSNN_MNIST_DIR") + 1
+    assert "DSNN_SHD_DIR" in gen.CAMPAIGN_ENV_ALLOWED
+    assert "DSNN_SHD_DIR" in gen.THESIS_ENV_ALLOWED
+    assert "DSNN_SHD_DIR" not in gen.THESIS_TARGET_ENV_ALLOWED
+    assert f"{gen.CAMPAIGN_CACHE}/dsnn_shd" == SHD_DIR
+    on = "\n".join(gen._scratch_stack_block({}, jax_cache=False,
+                                            shd_dir=True)) + "\n"
+    off = "\n".join(gen._scratch_stack_block({}, jax_cache=False)) + "\n"
+    assert MNIST_LINE + SHD_LINE in on
+    assert "DSNN_SHD_DIR" not in off
+    ds = open(os.path.join(_ALPHAGRAD, "src", "alphagrad", "approx", "common",
+                           "datasets.py")).read()
+    assert 'os.environ.get("DSNN_SHD_DIR")' in ds

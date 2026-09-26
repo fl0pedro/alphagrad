@@ -80,7 +80,7 @@ CAMPAIGN_STACK = f"{CAMPAIGN_ROOT}/stack"
 CAMPAIGN_RUNS = f"{CAMPAIGN_ROOT}/runs"
 CAMPAIGN_PY = "/Scratch/assmuth/t57/stack/venv/bin/python"
 CAMPAIGN_WANDB_HOME = "/Scratch/assmuth/t57/home"     # .netrc + .config/wandb
-CAMPAIGN_CACHE = "/Scratch/assmuth/mrg/cache"          # dsnn_wikitext, dsnn_mnist
+CAMPAIGN_CACHE = "/Scratch/assmuth/mrg/cache"          # dsnn_wikitext, dsnn_mnist, dsnn_shd
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(os.path.dirname(_HERE), "src")
@@ -1657,6 +1657,7 @@ NO_FLAG_ENV = [
 ]
 
 STACK_ENV_NAMES = ("HOME", "PYTHONPATH", "DSNN_WIKITEXT_DIR", "DSNN_MNIST_DIR",
+                   "DSNN_SHD_DIR",  # a row thesis_arm emits (dsnn-dfw.264)
                    "PATH")   # PATH: the measure toolchain block (finding 03)
 
 #: Every `export NAME=` a campaign launcher may contain.  The test derives the
@@ -3268,6 +3269,7 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
                ray_measure_timeout: str = THESIS_RAY_MEASURE_TIMEOUT,
                cores_per_actor: str | None = THESIS_CORES_PER_ACTOR,
                jax_cache: bool = False,
+               shd_dir: bool = True,
                measure_path: bool = True,
                mem_objective_weight: str | None = THESIS_MEM_OBJECTIVE_WEIGHT,
                whole_node: bool = True,
@@ -3336,6 +3338,9 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
         # compile cache under any order.  A frozen round passes True and
         # keeps the cache it ran with.
         jax_cache=jax_cache,
+        # dsnn-dfw.264: DSNN_SHD_DIR beside the other two data caches.  A
+        # frozen round passes False and keeps its environment.
+        shd_dir=shd_dir,
         # dsnn-dfw.99: the retention bound and the process recycle ride
         # with the target shape, and a row that renders `None` for either of
         # the two drops that one export again.  dsnn-dfw.169: the measure
@@ -3588,7 +3593,7 @@ def thesis_pair_arm(rows: list[dict]) -> dict:
         name=name, job=thesis_job_name(node), kind="train", runtime="scratch",
         node=node, time=a["time"], gpus=gpus, singleton=True, thesis=True,
         paired=True, halves=halves,
-        jax_cache=a["jax_cache"],
+        jax_cache=a["jax_cache"], shd_dir=a["shd_dir"],
         thesis_arm=arm_name, thesis_target=target,
         thesis_rule=thesis_temporal_rule(target),
         env=dict(a["env"]),
@@ -4031,6 +4036,8 @@ for _sweepl_tag, _sweepl_overrides in sweepl_configs():
             ray_measure_timeout=CAMPAIGN_RAY_MEASURE_TIMEOUT,
             cores_per_actor=None,
             jax_cache=True,
+            # dsnn-dfw.264 moves the matrix rows; this round keeps its env.
+            shd_dir=False,
             # The rulings of 2026-09-25 (dsnn-dfw.169, dsnn-mep, dsnn-dfw.208)
             # move the matrix rows; this round keeps its measure path, its
             # memory channel, its oracle and its memory request.
@@ -4213,6 +4220,8 @@ for _sweepl2_tag, _sweepl2_overrides in sweepl2_configs():
             ray_measure_timeout=CAMPAIGN_RAY_MEASURE_TIMEOUT,
             cores_per_actor=None,
             jax_cache=True,
+            # dsnn-dfw.264 moves the matrix rows; this round keeps its env.
+            shd_dir=False,
             # The rulings of 2026-09-25 (dsnn-dfw.169, dsnn-mep, dsnn-dfw.208)
             # move the matrix rows; this round keeps its measure path, its
             # memory channel, its oracle and its memory request.
@@ -4382,6 +4391,8 @@ for _sweepl3_tag, _sweepl3_overrides in sweepl3_configs():
             ray_measure_timeout=CAMPAIGN_RAY_MEASURE_TIMEOUT,
             cores_per_actor=None,
             jax_cache=True,
+            # dsnn-dfw.264 moves the matrix rows; this round keeps its env.
+            shd_dir=False,
             # The rulings of 2026-09-25 (dsnn-dfw.169, dsnn-mep, dsnn-dfw.208)
             # move the matrix rows; this round keeps its measure path, its
             # memory channel, its oracle and its memory request.
@@ -5508,7 +5519,8 @@ def _stack_exists_check() -> list[str]:
 
 
 def _scratch_stack_block(target_env: dict | None = None,
-                         jax_cache: bool = True) -> list[str]:
+                         jax_cache: bool = True,
+                         shd_dir: bool = False) -> list[str]:
     """The environment of a campaign arm: the stack, the plumbing, the TLM
     shape, the measurement vars, the no-flag knobs.  Nothing else.
 
@@ -5524,6 +5536,7 @@ def _scratch_stack_block(target_env: dict | None = None,
         f"export PYTHONPATH={CAMPAIGN_STACK}/graphax/src:{CAMPAIGN_STACK}/alphagrad/src",
         f"export DSNN_WIKITEXT_DIR={CAMPAIGN_CACHE}/dsnn_wikitext",
         f"export DSNN_MNIST_DIR={CAMPAIGN_CACHE}/dsnn_mnist",
+    ] + ([f"export DSNN_SHD_DIR={CAMPAIGN_CACHE}/dsnn_shd"] if shd_dir else []) + [
         f"cd {CAMPAIGN_STACK}/alphagrad",
         "",
         "# ---------------------- THE ENVIRONMENT (args only) -------------------",
@@ -5763,7 +5776,8 @@ def render(a: dict) -> str:
                 f"{'set' if _jc else 'unset'}; a row without the JAX compile "
                 f"cache sets it, a row with the cache does not (dsnn-dfw.247)")
         L.extend(_scratch_stack_block(
-            a.get("env") or {}, jax_cache=a.get("jax_cache", True)))
+            a.get("env") or {}, jax_cache=a.get("jax_cache", True),
+            shd_dir=bool(a.get("shd_dir", False))))
     else:
         # A wave/cpu/tool arm (owner ruling 2026-09-14): the same stack, the
         # same node-local $HOME for wandb, and the same ABORT(66) check as a

@@ -399,7 +399,11 @@ def test_every_export_in_an_order_only_launcher_is_allowed(gen, rows):
     for a in rows:
         exported = set(_EXPORT.findall(gen.render(a)))
         assert exported <= allowed, (a["name"], sorted(exported - allowed))
-        assert set(gen.CAMPAIGN_ENV_ALLOWED) <= exported, a["name"]
+        # dsnn-dfw.264: DSNN_SHD_DIR is on the rows thesis_arm emits only;
+        # a frozen round keeps the environment it ran with.
+        assert "DSNN_SHD_DIR" not in exported, a["name"]
+        assert set(gen.CAMPAIGN_ENV_ALLOWED) - {"DSNN_SHD_DIR"} <= exported, \
+            a["name"]
         assert "ALPHAGRAD_NN_HIDDEN" in exported, a["name"]
 
 
