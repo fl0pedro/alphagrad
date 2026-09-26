@@ -2160,6 +2160,8 @@ not a summary.""",
 #
 # 2026-09-25 (owner rulings, grill rounds 1-3): condC left the matrix, and the
 # defense arms A_popart, A_popart_lq4 and A_popart_lq64 joined it on NN256.
+# The rsnn_tbptt rows left it too (round 2 Q11 a, dsnn-dfw.232), after the
+# check of dsnn-dfw.262.
 #
 # THE RECURRENT TARGET IS FOUR TARGETS, NOT ONE.  --example RSNN_SHD
 # --dataset shd is shared by all four and --temporal-rule is the one flag
@@ -2169,8 +2171,9 @@ not a summary.""",
 # triple `<arm>_<target>_s<seed>`; with the key `rsnn_bptt` that spelling IS
 # the `<arm>_rsnn_<rule>_s<seed>` the owner asked for, and there is no second
 # naming rule to keep in step with the first.  The recurrent block is
-# therefore 4 rules x 4 arms x 5 seeds = 80 rows, and the whole thesis
-# section is 40 + 80 rows, the 9 defense rows and the two smoke runs.
+# therefore 3 rules x 4 arms x 5 seeds = 60 rows (THESIS_MATRIX_RULES), and
+# the whole thesis section is 40 + 60 rows, the 9 defense rows and the two
+# smoke runs.
 #
 # --example STAYS RSNN_SHD ON ALL FOUR, window2 INCLUDED.  window2 builds a
 # different graph -- two step copies joined by the temporal edge -- but
@@ -2179,7 +2182,7 @@ not a summary.""",
 # is how a run asks for the window arm").  A launcher that named
 # RSNN_SHD_W2 itself would be a second place saying the same thing.
 #
-# EVERY ONE OF THE 100 IS HELD: the owner released the NN256/TLM first block
+# EVERY RECURRENT ROW IS HELD: the owner released the NN256/TLM first block
 # only and no RSNN_SHD run.  See _THESIS_SNN_HELD.
 #
 # WHY A AND B CARRY NO QUALITY FLOOR (owner ruling 2026-09-16, night).  A and
@@ -2642,9 +2645,10 @@ def thesis_job_name(node: str) -> str:
 # set); the trainer derives the provable bound per graph and prints it
 # ("face width: derived bound N").  The campaign arms already run without it.
 # ---------------------------------------------------------------------------
-#: THE RECURRENT TARGET's four temporal rules, which are the four SNN arms of
-#: the matrix (owner ruling 2026-09-16).  The rule says HOW the state carried
-#: between time steps enters the gradient:
+#: THE RECURRENT TARGET's four temporal rules, which were the four SNN arms of
+#: the matrix (owner ruling 2026-09-16; THESIS_MATRIX_RULES below is the three
+#: it runs now).  The rule says HOW the state carried between time steps
+#: enters the gradient:
 #:
 #:   tbptt     no temporal edge.  The truncated baseline, and ppo.py's default.
 #:   bptt      the one-step body plus the given FUTURE adjoint over the suffix.
@@ -2656,6 +2660,12 @@ def thesis_job_name(node: str) -> str:
 #: thesis test pins it against common/rsnn_shd.TEMPORAL_RULES, which is the
 #: tuple ppo.py builds `--temporal-rule`'s choices from.
 THESIS_TEMPORAL_RULES = ("tbptt", "bptt", "rtrl", "window2")
+#: THE RULES THE MATRIX RUNS (owner ruling 2026-09-25, round 2 Q11 a;
+#: dsnn-dfw.232).  tbptt is out: no carry is the Skip container on the rtrl
+#: graph, which gives tbptt's gradient bit for bit (dsnn-dfw.262).
+#: `thesis_arm` refuses rsnn_tbptt; the frozen order-only reference rows keep
+#: it through `thesis_cli`.
+THESIS_MATRIX_RULES = ("bptt", "rtrl", "window2")
 THESIS_RSNN_EXAMPLE = "RSNN_SHD"
 #: The batched one-step body, rsnn_shd.RSNN_VMAP_TARGET; window2 has none.
 THESIS_RSNN_VMAP_EXAMPLE = "VmappedRSNN_SHD"
@@ -3274,6 +3284,10 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
              f"arm {arm!r} is not one of {tuple(THESIS_ARM_SPEC)}")
     _require(target in THESIS_TARGET_CLI,
              f"target {target!r} is not one of {THESIS_TARGETS}")
+    _require(thesis_temporal_rule(target) in (None,) + THESIS_MATRIX_RULES,
+             f"target {target!r} runs a rule the matrix no longer runs "
+             f"(owner ruling 2026-09-25, round 2 Q11 a; dsnn-dfw.232); the "
+             f"recurrent rows run {THESIS_MATRIX_RULES}")
     _require(arm not in THESIS_DEFENSE_ARMS or target == THESIS_DEFENSE_TARGET,
              f"arm {arm!r} is a defense arm and runs on "
              f"{THESIS_DEFENSE_TARGET} only (dsnn-dfw.231), not on {target!r}")
@@ -3431,7 +3445,7 @@ def thesis_block1_arms() -> list[dict]:
 
 
 def thesis_snn_arms() -> list[dict]:
-    """The 80 rows of the recurrent target, in generation order.
+    """The 60 rows of the recurrent target, in generation order.
 
     The order-only recurrent rows (ticket dsnn-dfw.45) carry a
     `thesis_rule` too -- that is what a reader wants from them -- but they
@@ -3644,8 +3658,9 @@ del _i, _arm, _target, _seed, _node, _half, _row, _rows, _HALVES, _SLOT
 # ---------------------------------------------------------------------------
 # THE RECURRENT BLOCK (owner ruling 2026-09-16).  The same four arms and the
 # same five seeds as the matrix above, on --example RSNN_SHD --dataset shd,
-# crossed with the four temporal rules: 4 x 4 x 5 = 80 rows (100 before condC
-# left the matrix on 2026-09-25).
+# crossed with the three temporal rules of THESIS_MATRIX_RULES: 3 x 4 x 5 = 60
+# rows (100 before condC left the matrix on 2026-09-25, 80 before the tbptt
+# rows left it, dsnn-dfw.232).
 #
 # NOTHING ELSE MOVES.  These rows go through the same `thesis_cli`, so the
 # reward form per arm, the free spatial order, the thousand episodes, the
@@ -3667,9 +3682,9 @@ del _i, _arm, _target, _seed, _node, _half, _row, _rows, _HALVES, _SLOT
 # arm -- renders on an 8-GPU node with --ray-measure 7, round-robin BY SEED
 # over the two released 8-GPU nodes (gpu19 first) so a seed always lands on
 # the same node and no rtrl row is paired with another on the same node
-# (`thesis_pair_arm` is never called here).  tbptt, bptt and window2 keep
-# the 4-GPU profile, round-robin over the three released 4-GPU nodes: 60
-# rows over 3 nodes is 20 each, exactly.
+# (`thesis_pair_arm` is never called here).  bptt and window2 keep the
+# 4-GPU profile, round-robin over the three released 4-GPU nodes: 40 rows
+# over 3 nodes is 14, 13 and 13.
 # ---------------------------------------------------------------------------
 #: The two 8-GPU nodes, in round-robin order (gpu19 first, owner ruling).
 THESIS_RSNN_RTRL_NODES = ("pgi15-gpu19", "pgi15-gpu20")
@@ -3691,10 +3706,6 @@ def thesis_snn_node(target: str, seed: str, i: int) -> str:
     return THESIS_RSNN_OTHER_NODES[i % len(THESIS_RSNN_OTHER_NODES)]
 
 _THESIS_RSNN_WHAT = {
-    "tbptt": """TEMPORAL RULE tbptt, the baseline and ppo.py's default on
-this target: NO temporal edge.  The carried state is a constant, the graph is
-one recurrent step, and the credit is truncated and spatial only.  It is the
-row every other rule is read against.""",
     "bptt": """TEMPORAL RULE bptt: THE FUTURE FEEDS IN.  An edge from the next
 state to the loss carries the adjoint dL(>t)/ds_t from a detached backward
 pass over the suffix, so the gradient is exactly the contribution step t
@@ -3715,7 +3726,7 @@ the rule and nothing else.""",
 }
 
 _THESIS_SNN_HELD = """The recurrent block is GENERATED so that the matrix is
-complete and reviewable, and every one of its 80 rows is HELD: the owner
+complete and reviewable, and every one of its 60 rows is HELD: the owner
 authorised the NN256/TLM first block only and released no RSNN_SHD run.  A
 held launcher that is submitted by mistake aborts 73 before it starts
 anything.  Remove `held=` from the recurrent loop in
@@ -3723,19 +3734,19 @@ tools/gen_fq_launchers.py and regenerate when the owner releases them."""
 
 
 def thesis_snn_order() -> list[tuple[str, str, str]]:
-    """(arm, target, seed) for the 80 recurrent rows, in GENERATION order.
+    """(arm, target, seed) for the 60 recurrent rows, in GENERATION order.
 
     Rule, then arm, then seed.  Not a submission order: every row is held.
     """
     order: list[tuple[str, str, str]] = []
-    for rule in THESIS_TEMPORAL_RULES:
+    for rule in THESIS_MATRIX_RULES:
         for a in THESIS_ARMS:
             for s in THESIS_SEEDS:
                 order.append((a, f"rsnn_{rule}", s))
     return order
 
 
-# --- the 80 runs of the recurrent block -------------------------------------
+# --- the 60 runs of the recurrent block -------------------------------------
 _rsnn_other_i = 0
 for _i, (_arm, _target, _seed) in enumerate(thesis_snn_order()):
     if thesis_temporal_rule(_target) == "rtrl":

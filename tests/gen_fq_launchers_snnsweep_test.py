@@ -441,10 +441,11 @@ def test_the_matrix_and_the_campaign_still_have_their_own_counts(gen):
               and not a.get("orderonly_tlm_final")
               and not a.get("paired") and not a.get("sweepl")
               and not a.get("sweepl2") and not a.get("sweepl3")]
-    # condC left the matrix and the 9 defense rows joined it (2026-09-25)
+    # condC left the matrix and the 9 defense rows joined it (2026-09-25);
+    # the 20 tbptt rows left it too (dsnn-dfw.232)
     assert len(gen.thesis_core_arms()) == 40
-    assert len(gen.thesis_snn_arms()) == 80
-    assert len(matrix) == 129
+    assert len(gen.thesis_snn_arms()) == 60
+    assert len(matrix) == 109
     assert len(gen.thesis_smoke_arms()) == 2
     assert len(gen.orderonly_arms()) == 18
     assert len(gen.orderonly_rsnn_arms()) == N_TOTAL_RUNS
