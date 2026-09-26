@@ -50,14 +50,16 @@ def test_the_assembled_ray_ppo_cli_rejects_it_too():
 def test_the_other_flags_from_the_same_block_still_parse():
     """A sanity check that the deletion did not take neighbours with it:
     --ref-num-data-points / --ref-reps-per-point (owner ruling 2026-09-14,
-    same date, different ticket) and --latency-warmup are untouched."""
+    same date, different ticket) are untouched. --latency-warmup went on
+    2026-09-25 (owner ruling: no warm-ups), so it is refused too."""
     p = _ppo_ray_parser()
     ns = p.parse_args([
         "--ref-num-data-points", "3", "--ref-reps-per-point", "7",
-        "--latency-warmup", "2",
     ])
     assert ns.ref_num_data_points == 3
     assert ns.ref_reps_per_point == 7
-    assert ns.latency_warmup == 2
+    assert not hasattr(ns, "latency_warmup")
     assert not hasattr(ns, "percentile_keep")
     assert not hasattr(ns, "latency_winsor")
+    with pytest.raises(SystemExit):
+        p.parse_args(["--latency-warmup", "2"])

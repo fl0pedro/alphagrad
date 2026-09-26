@@ -11,10 +11,12 @@ hot-path entirely.
 
 from __future__ import annotations
 
+import contextlib
 import gzip
 import os
 import struct
 import urllib.request
+import uuid
 from pathlib import Path
 
 import jax.numpy as jnp
@@ -41,6 +43,18 @@ _MNIST_FILES = {
     "test_images": "t10k-images-idx3-ubyte.gz",
     "test_labels": "t10k-labels-idx1-ubyte.gz",
 }
+
+
+@contextlib.contextmanager
+def _atomic_write(target: Path):
+    # One name per writer, then a rename: a reader sees the old file or none.
+    tmp = target.with_name(f"{target.name}.{uuid.uuid4().hex}.part")
+    try:
+        yield tmp
+        os.replace(tmp, target)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def loss_mode() -> str:
@@ -74,7 +88,8 @@ def _download_mnist(cache: Path) -> None:
             continue
         url = f"{_MNIST_MIRROR}/{fname}"
         print(f"  fetching {url} -> {target}")
-        urllib.request.urlretrieve(url, target)
+        with _atomic_write(target) as tmp:
+            urllib.request.urlretrieve(url, tmp)
 
 
 def _read_idx_images(path: Path) -> np.ndarray:
@@ -200,7 +215,8 @@ def load_wikitext2(vocab_size: int, subset: str = "train") -> np.ndarray:
     z = cache / "wikitext-2-v1.zip"
     if not z.exists():
         print(f"  fetching {_WIKITEXT_URL} -> {z}")
-        urllib.request.urlretrieve(_WIKITEXT_URL, z)
+        with _atomic_write(z) as tmp:
+            urllib.request.urlretrieve(_WIKITEXT_URL, tmp)
     import zipfile
     from collections import Counter
     with zipfile.ZipFile(z) as zf:
@@ -271,16 +287,16 @@ def _download_shd(cache: Path, subset: str) -> Path:
     gz = cache / f"{fname}.gz"
     if not gz.exists():
         print(f"  fetching {url} -> {gz}", flush=True)
-        urllib.request.urlretrieve(url, gz)
+        with _atomic_write(gz) as tmp:
+            urllib.request.urlretrieve(url, tmp)
     print(f"  unpacking {gz} -> {target}", flush=True)
-    tmp = cache / f"{fname}.part"
-    with gzip.open(gz, "rb") as src, open(tmp, "wb") as dst:
+    with (_atomic_write(target) as tmp,
+          gzip.open(gz, "rb") as src, open(tmp, "xb") as dst):
         while True:
             chunk = src.read(1 << 22)
             if not chunk:
                 break
             dst.write(chunk)
-    tmp.replace(target)
     return target
 
 
@@ -364,10 +380,8 @@ def _shd_binned(subset: str) -> tuple[np.ndarray, np.ndarray]:
         # wrote "<...>.npz.part.npz" and the rename then failed on a file that
         # was never created. The rename is what makes a half-written cache
         # impossible.
-        tmp = cache / (npz.name + ".part")
-        with open(tmp, "wb") as fh:
+        with _atomic_write(npz) as tmp, open(tmp, "xb") as fh:
             np.savez(fh, x=out[0], y=out[1])
-        tmp.replace(npz)
     _SHD_BINNED[subset] = out
     return out
 

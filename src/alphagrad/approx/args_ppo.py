@@ -205,11 +205,7 @@ def add_ppo_args(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
     )
     # --- Latency-measurement noise control (see env.py EnvConfig) ----------
     # `--latency-inner-reps` is shared with az; see COMMON_DEFAULTS.
-    p.add_argument(
-        "--latency-warmup", type=int, default=0,
-        help="Discard the first K executions per data point before timing "
-        "(first-touch / cache warm-up). Try 3.",
-    )
+    # --latency-warmup was deleted 2026-09-25 (owner ruling: no warm-ups).
     p.add_argument(
         "--measure-grad", action="store_true",
         help="DEPRECATED NO-OP, accepted so archived launchers and replay "

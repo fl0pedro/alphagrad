@@ -954,10 +954,9 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *,
         measure_window_secs=float(getattr(args, "measure_window_secs", 0.05)),
         # Latency-measurement knobs — THIS env (inside the CpuApproximationActor)
         # does the actual pooled measurement, so the flags must be forwarded
-        # here or --latency-inner-reps/--latency-warmup are silently inert
-        # in every pooled Ray run.
+        # here or --latency-inner-reps is silently inert in every pooled Ray
+        # run.
         latency_inner_reps=int(getattr(args, "latency_inner_reps", 1)),
-        latency_warmup=int(getattr(args, "latency_warmup", 0)),
         # THE SCALAR-OUTPUT CONTRACT, armed by a property of the EXAMPLE:
         # True for every trainable family (registered target = model + loss),
         # False for the analytic AD benchmarks, which have no training loss.

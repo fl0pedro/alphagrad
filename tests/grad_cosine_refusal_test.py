@@ -356,19 +356,25 @@ def test_a_configuration_with_no_quality_channel_is_not_a_refusal(monkeypatch):
 # ---------------------------------------------------------------------------
 # 4. the probe width the recurrent target asks for
 # ---------------------------------------------------------------------------
-def test_the_recurrent_generator_asks_for_five_probe_batches(monkeypatch):
-    """dsnn-dfw.51. 43 of the 99 legal step positions of the recording the
-    campaign drew are silent, so one batch refuses 43 percent of every
-    measurement; five takes that to 1.5 percent."""
+def test_no_recurrent_generator_asks_for_more_than_one_probe_batch(
+        monkeypatch):
+    """K = 1 everywhere (owner ruling 2026-09-25, dsnn-dfw.221): quality is
+    one batch per plan. The step-position generator drew five because 43 of
+    its 99 positions are silent (dsnn-dfw.51); it is superseded by the full
+    rollout, and both ask for one."""
+    from alphagrad.approx.common.rsnn_shd import rsnn_rollout_gen
+
     monkeypatch.delenv("ALPHAGRAD_GRAD_COSINE_K", raising=False)
-    gen = rsnn_data_gen(jax.random.PRNGKey(7), dataset=None,
-                        temporal_rule="rtrl")
+    gens = [rsnn_data_gen(jax.random.PRNGKey(7), dataset=None,
+                          temporal_rule="rtrl"),
+            rsnn_rollout_gen(jax.random.PRNGKey(7), dataset=None,
+                             temporal_rule="rtrl")]
+    for gen in gens:
+        class _Cfg:
+            data_gen = gen
 
-    class _Cfg:
-        data_gen = gen
-
-    assert int(getattr(gen, "probe_batches")) == 5
-    assert envmod._grad_cosine_k(_Cfg) == 5
+        assert int(getattr(gen, "probe_batches")) == 1
+        assert envmod._grad_cosine_k(_Cfg) == 1
     assert envmod._grad_cosine_k() == 1
     monkeypatch.setenv("ALPHAGRAD_GRAD_COSINE_K", "2")
     assert envmod._grad_cosine_k(_Cfg) == 2, "the env var must still override"

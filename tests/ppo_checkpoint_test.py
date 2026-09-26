@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 
 import equinox as eqx
 import jax
@@ -389,6 +390,70 @@ def test_an_argument_that_only_one_side_has_raises():
 def test_an_argument_of_an_unknown_type_raises_rather_than_being_dropped():
     with pytest.raises(ckpt.CheckpointError, match="cannot be written"):
         ckpt.args_to_json(_ns(weird=object()))
+
+
+# dsnn-dfw.274 (owner ruling 2026-09-26): other GPU numbers resume, another GPU model does not.
+_BLACKWELL = {
+    "device_kind": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    "nvidia_smi_name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation "
+                       "Edition"}
+_H100 = {"device_kind": "NVIDIA H100 80GB HBM3",
+         "nvidia_smi_name": "NVIDIA H100 80GB HBM3"}
+
+
+class _Device:
+    def __init__(self, device_kind, platform):
+        self.device_kind, self.platform = device_kind, platform
+
+
+def test_a_resume_on_other_gpu_numbers_of_the_same_model_passes():
+    saved = ckpt.args_to_json(_ns(gpus="4", measure_gpus="5,6,7"))
+    ckpt.check_resume_args(saved, _ns(resume="/x", gpus="0",
+                                      measure_gpus="1,2,3"))
+    ckpt.check_resume_gpu_model({"trainer_gpu_model": dict(_BLACKWELL)},
+                                dict(_BLACKWELL))
+    ckpt.check_resume_gpu_model(
+        {"trainer_gpu_model": dict(_BLACKWELL, nvidia_smi_name=None)},
+        dict(_BLACKWELL))
+
+
+def test_a_resume_on_another_gpu_model_raises_and_names_both():
+    with pytest.raises(ckpt.CheckpointError) as e:
+        ckpt.check_resume_gpu_model({"trainer_gpu_model": dict(_BLACKWELL)},
+                                    dict(_H100))
+    assert _BLACKWELL["device_kind"] in str(e.value), str(e.value)
+    assert _H100["device_kind"] in str(e.value), str(e.value)
+    with pytest.raises(ckpt.CheckpointError, match="RTX 6000 Ada"):
+        ckpt.check_resume_gpu_model(
+            {"trainer_gpu_model": dict(_BLACKWELL)},
+            dict(_BLACKWELL, nvidia_smi_name="NVIDIA RTX 6000 Ada Generation"))
+
+
+def test_a_checkpoint_without_the_gpu_model_field_raises():
+    with pytest.raises(ckpt.CheckpointError, match="trainer_gpu_model"):
+        ckpt.check_resume_gpu_model(_example_meta(), dict(_BLACKWELL))
+    with pytest.raises(ckpt.CheckpointError, match="trainer_gpu_model"):
+        ckpt.check_resume_gpu_model(
+            _example_meta(trainer_gpu_model={"nvidia_smi_name": "x"}),
+            dict(_BLACKWELL))
+
+
+def test_the_trainer_gpu_model_is_the_device_kind_and_the_nvidia_smi_name():
+    def smi(cmd, **kw):
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout="0, NVIDIA A\n4, NVIDIA B\n", stderr="")
+
+    def missing(cmd, **kw):
+        raise FileNotFoundError("nvidia-smi")
+
+    assert ckpt.trainer_gpu_model(_Device("B", "gpu"), "4", run=smi) == {
+        "device_kind": "B", "nvidia_smi_name": "NVIDIA B"}
+    assert ckpt.trainer_gpu_model(_Device("cpu", "cpu"), "0", run=smi) == {
+        "device_kind": "cpu", "nvidia_smi_name": None}
+    assert ckpt.trainer_gpu_model(_Device("B", "gpu"), "4", run=missing) == {
+        "device_kind": "B", "nvidia_smi_name": None}
+    assert ckpt.trainer_gpu_model(_Device("B", "gpu"), "7", run=smi) == {
+        "device_kind": "B", "nvidia_smi_name": None}
 
 
 def test_reading_something_that_is_not_a_checkpoint_raises(tmp_path):

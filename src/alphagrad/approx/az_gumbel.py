@@ -183,7 +183,6 @@ if _GAZ_RAY_N > 0:
         "reps_per_point": int(os.environ.get("ALPHAGRAD_GAZ_REPS", "4")),
         "latency_inner_reps": int(A.latency_inner_reps),
         "latency_samples": 1,
-        "latency_warmup": 0,
         "terminal_rewards_only": False,
         "num_eval_samples": int(A.ndata),
         "hidden_dim": 256,

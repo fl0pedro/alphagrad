@@ -503,7 +503,10 @@ def test_every_export_in_a_campaign_launcher_is_allowed(gen, campaign):
         exported = set(_EXPORT.findall(text))
         assert exported <= allowed, (a["name"], sorted(exported - allowed))
         # and the allowed set is exactly what is exported (nothing dormant)
-        assert exported == allowed, (a["name"], sorted(allowed - exported))
+        # but DSNN_SHD_DIR, which only a row thesis_arm emits exports
+        # (dsnn-dfw.264)
+        assert exported == allowed - {"DSNN_SHD_DIR"}, \
+            (a["name"], sorted(allowed - exported))
         for k, v in gen.CAMPAIGN_ENV:
             assert f"export {k}={v}\n" in text, (a["name"], k)
     # the three measurement-plumbing vars and the TLM shape, nothing else of

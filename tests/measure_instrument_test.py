@@ -14,8 +14,11 @@ timed by the campaign loop at --latency-inner-reps 5, so the floor read
 13-15% below an honest exact plan for the whole v57-v66 campaign. The paired
 reference of ticket .9 is measured by `_campaign_measure_cost`, which is
 `_time_one_rep` in the same loop the candidate runs, over the same eval args
-with the same (inner, warmup) and the same median -- these tests pin that,
-plus the warmup and cold-start properties the instrument carries.
+with the same inner and the same median -- these tests pin that. Since
+2026-09-25 (owner ruling) no execution runs untimed. Since 2026-09-26
+(dsnn-19wc, dsnn-ep8v) the first execution of each half is its cold reading,
+the warm run after it gives provisional counts and the first window sets the
+final ones (tests/measure_first_execution_test.py).
 
 SINCE 2026-09-14 THE POINTS AND THE REPS ARE THE REFERENCE'S OWN (owner
 ruling; `EnvConfig.ref_num_data_points` / `ref_reps_per_point`, defaults 5
@@ -35,15 +38,12 @@ import pytest
 from alphagrad.approx import env as env_mod
 
 
-def _campaign_loop_reference(ex, eval_args_all, devices, inner, warmup, n_reps):
-    """What ``_callback``'s measurement loop does, written out: warmup +
-    n_points x n_reps calls to _time_one_rep, medianed. The reference must
-    equal THIS, which is the whole point."""
-    import jax
+def _campaign_loop_reference(ex, eval_args_all, devices, inner, n_reps):
+    """What ``_callback``'s measurement loop does, written out: n_points x
+    n_reps calls to _time_one_rep, medianed. The reference must equal THIS,
+    which is the whole point."""
     lat, peak = [], []
     for eval_args in eval_args_all:
-        for _ in range(warmup):
-            jax.block_until_ready(ex(*eval_args))
         for _ in range(n_reps):
             _l, _p, _s, _o = env_mod._time_one_rep(ex, eval_args, devices, inner)
             lat.append(_l)
@@ -70,9 +70,9 @@ def test_reference_and_plan_share_one_instrument(monkeypatch):
     eval_args_all = [(i,) for i in range(5)]
 
     ref = env_mod._campaign_measure_cost(
-        object(), eval_args_all, [], inner=5, warmup=0, n_reps=4)
+        object(), eval_args_all, [], inner=5, n_reps=4)
     plan = _campaign_loop_reference(
-        lambda *a: None, eval_args_all, [], inner=5, warmup=0, n_reps=4)
+        lambda *a: None, eval_args_all, [], inner=5, n_reps=4)
 
     assert ref == plan
     assert ref[0] == pytest.approx(200_000.0)     # 1e6 / 5
@@ -90,9 +90,9 @@ def test_a_throughput_protocol_would_read_low(monkeypatch):
     monkeypatch.setattr(env_mod, "_time_one_rep", _fake_rep)
     eval_args_all = [(0,)]
     plan = env_mod._campaign_measure_cost(
-        object(), eval_args_all, [], inner=5, warmup=0, n_reps=4)[0]
+        object(), eval_args_all, [], inner=5, n_reps=4)[0]
     legacy = env_mod._campaign_measure_cost(
-        object(), eval_args_all, [], inner=20, warmup=0, n_reps=4)[0]
+        object(), eval_args_all, [], inner=20, n_reps=4)[0]
     assert legacy < plan
     assert legacy / plan == pytest.approx(0.25)
 
@@ -128,12 +128,12 @@ def test_reference_matches_the_campaign_measurement_of_the_same_executable():
 
     devices = list(jax.local_devices())
     eval_args_all = [[x, W] for _ in range(3)]
-    inner, warmup, n_reps = 5, 1, 4
+    inner, n_reps = 5, 4
 
     plan_lat, plan_peak = _campaign_loop_reference(
-        ex, eval_args_all, devices, inner, warmup, n_reps)
+        ex, eval_args_all, devices, inner, n_reps)
     ref_lat, ref_peak = env_mod._campaign_measure_cost(
-        ex, eval_args_all, devices, inner, warmup, n_reps)
+        ex, eval_args_all, devices, inner, n_reps)
 
     assert plan_lat > 0.0 and ref_lat > 0.0
     # Generous: a shared CPU box moves ~20% between back-to-back windows. The
@@ -144,100 +144,37 @@ def test_reference_matches_the_campaign_measurement_of_the_same_executable():
     assert ref_peak == pytest.approx(plan_peak, rel=0.5, abs=1.0)
 
 
-def test_campaign_measure_cost_honours_warmup_and_reps(monkeypatch):
-    """Instrument parameters are actually plumbed: warmup calls happen outside
-    the timing window, and points x reps samples are taken."""
-    import jax
-    calls = {"warm": 0, "timed": 0}
+def test_campaign_measure_cost_honours_points_and_reps(monkeypatch):
+    """Instrument parameters are actually plumbed: points x reps samples are
+    taken, and nothing executes outside a timed window (owner ruling
+    2026-09-25: no warm-ups)."""
+    calls = {"untimed": 0, "timed": 0}
 
     def _fake_rep(ex, eval_args, devices, inner):
         calls["timed"] += 1
         return 100.0, 1.0, "runtime_delta", None
 
     monkeypatch.setattr(env_mod, "_time_one_rep", _fake_rep)
-    monkeypatch.setattr(jax, "block_until_ready", lambda x: x)
 
     def _ex(*_a):
-        calls["warm"] += 1
+        calls["untimed"] += 1
         return None
 
     env_mod._campaign_measure_cost(
-        _ex, [(0,), (1,), (2,)], [], inner=5, warmup=2, n_reps=4)
+        _ex, [(0,), (1,), (2,)], [], inner=5, n_reps=4)
     assert calls["timed"] == 12               # 3 points x 4 reps
-    assert calls["warm"] == 6                 # 3 points x 2 warmups
+    assert calls["untimed"] == 0
 
 
 # ---------------------------------------------------------------------------
-# COLD-START (2026-08-26). Without a warmup the FIRST timed sample of a plan is
-# the FIRST EXECUTION of a freshly compiled executable, so first-touch lands
-# inside a timed window. The campaign path's 5x4=20-sample median absorbs one
-# cold sample almost completely, but a reference is a fresh compile the first
-# time it is measured and any low-sample paired harness is fully exposed.
-# ALPHAGRAD_MEASURE_WARMUP (default 1) closes it for both.
+# COLD START. The first execution of a freshly compiled executable pays
+# first-touch. Since 2026-09-25 (owner ruling) it is TIMED, never a warm-up.
+# Since 2026-09-26 (dsnn-19wc, dsnn-ep8v) it is the cold reading: it sets no
+# count and is not in the sample. The warm run after it gives provisional counts
+# and is not in the sample either, unless it is past the budget; the first
+# window sets the final counts (tests/measure_first_execution_test.py). The
+# median below is what protects a many-window sample from one inflated reading.
 # ---------------------------------------------------------------------------
-
-
-def test_warmup_defaults_to_one_and_is_overridable(monkeypatch):
-    from types import SimpleNamespace as NS
-    monkeypatch.delenv("ALPHAGRAD_MEASURE_WARMUP", raising=False)
-    assert env_mod._resolve_warmup(NS()) == 1
-    assert env_mod._resolve_warmup(NS(latency_warmup=0)) == 1
-    # an explicit config value always wins
-    assert env_mod._resolve_warmup(NS(latency_warmup=3)) == 3
-    # ...and the old behaviour is one env var away
-    monkeypatch.setenv("ALPHAGRAD_MEASURE_WARMUP", "0")
-    assert env_mod._resolve_warmup(NS()) == 0
-    assert env_mod._resolve_warmup(NS(latency_warmup=0)) == 0
-    assert env_mod._resolve_warmup(NS(latency_warmup=3)) == 3
-
-
-def test_first_timed_sample_is_not_the_first_execution(monkeypatch):
-    """The property that matters, pinned directly: at least one execution of
-    the executable happens BEFORE the first timed rep of every data point."""
-    import jax
-    log = []
-
-    def _ex(*_a):
-        log.append("exec")
-        return None
-
-    def _fake_rep(ex, eval_args, devices, inner):
-        log.append("TIMED")
-        return 100.0, 1.0, "runtime_delta", None
-
-    monkeypatch.setattr(env_mod, "_time_one_rep", _fake_rep)
-    monkeypatch.setattr(jax, "block_until_ready", lambda x: x)
-
-    env_mod._campaign_measure_cost(
-        _ex, [(0,), (1,)], [], inner=5, warmup=1, n_reps=4)
-
-    assert log[0] == "exec"                    # warmup ran first
-    assert log.count("TIMED") == 8             # 2 points x 4 reps
-    first_timed = log.index("TIMED")
-    assert "exec" in log[:first_timed]
-    second_point = log.index("exec", first_timed)
-    assert log[second_point + 1] == "TIMED"
-
-
-def test_reference_inherits_the_warmup(monkeypatch):
-    """The reference is a FRESH compile the first time it is measured, so it
-    is the most cold-start-exposed measurement in the loop. Routing it
-    through _campaign_measure_cost makes it inherit the warmup."""
-    import jax
-    execs = {"n": 0}
-
-    def _ex(*_a):
-        execs["n"] += 1
-        return None
-
-    monkeypatch.setattr(
-        env_mod, "_time_one_rep",
-        lambda *a, **k: (100.0, 1.0, "runtime_delta", None))
-    monkeypatch.setattr(jax, "block_until_ready", lambda x: x)
-
-    env_mod._campaign_measure_cost(
-        _ex, [(0,)] * 5, [], inner=5, warmup=1, n_reps=4)
-    assert execs["n"] == 5                     # one untimed warmup per point
 
 
 def test_median_of_twenty_absorbs_one_cold_sample():
@@ -291,9 +228,8 @@ def test_the_quality_gate_is_gone():
 # all of it the reference's.
 #
 # `EnvConfig.ref_num_data_points` / `ref_reps_per_point` (defaults 5 and 32)
-# fork the POINTS and the REPS only. The inner reps, the warmup, the eval
-# args and the median stay shared, so the tests above still describe one
-# instrument.
+# fork the POINTS and the REPS only. The inner rule, the eval args and the
+# median stay shared, so the tests above still describe one instrument.
 
 
 def _one_instrument_toy_env(**kw):
@@ -381,9 +317,12 @@ def test_the_reference_runs_its_own_points_and_reps(_paired_log_cpu,
     from collections import Counter
     counts = sorted(Counter(seen).values())
     # One executable took 3 x 5 = 15 windows (the reference) and every other
-    # one took 2 x 2 = 4 (the candidate). Before the ruling every group was 4.
-    assert counts.count(15) == 1, counts
-    assert set(counts) == {4, 15}, counts
+    # one took 2 x 2 = 4 (the candidate), the first of them at the warm run's
+    # counts, each half after its cold reading and its warm run (owner,
+    # 2026-09-26, dsnn-ep8v; no quality metric here, so the cold reading is a
+    # timed run). Before the ruling of 2026-09-14 every group was 4.
+    assert counts.count(17) == 1, counts
+    assert set(counts) == {6, 17}, counts
 
 
 def test_the_reference_compile_key_does_not_depend_on_the_rep_counts(
@@ -433,7 +372,9 @@ def test_the_reference_compile_key_does_not_depend_on_the_rep_counts(
 # plans cost 293 s of its 405 s, to take twenty samples of a reading whose
 # coefficient of variation is 0.56 percent.
 #
-# The counts now come from ONE warm-up execution's measured time: the window
+# The counts come from the WARM execution's measured time, the one after the
+# cold reading (decision 2026-09-26, dsnn-19wc; the first timed execution's on
+# 2026-09-25, one warm-up's until then): the window
 # rule picks the executions per window, the budget picks the number of
 # windows, and --num-data-points x --reps-per-point is the CAP on that
 # number. The reference keeps its own window count and takes only its inner
@@ -548,9 +489,10 @@ def test_the_budget_bounds_the_windows_end_to_end(_paired_log_cpu,
         measure_budget_secs=1e-9)
     vs = sorted(int(v) for v in np.asarray(env.valid_vertices))
     _walk(env, vs)
-    # One candidate window plus the reference's own one, which the budget
-    # does NOT govern: its count is ref_points x ref_reps.
-    assert len(seen) == 2, seen
+    # Per half, the cold reading and the warm run, which is past the
+    # budget and so the whole sample: no window follows it. The reference's
+    # own count is ref_points x ref_reps = 1 either way.
+    assert seen == [1, 1, 1, 1], seen
 
 
 def test_the_candidate_windows_are_spread_over_the_data_points(
@@ -906,8 +848,8 @@ def test_the_record_puts_each_half_on_its_own_side(
     `ref_latency_ns` for a candidate 135x the reference's cost. This pins
     every step between the two timed halves and the reward: which half each
     reading is filed under, the ratio, and its SIGN -- through the real
-    callback, under the interleaved schedule, with the warm probe running,
-    and with the dedupe armed.
+    callback, under the interleaved schedule, with the first window
+    setting the counts, and with the dedupe armed.
     """
     monkeypatch.setenv("ALPHAGRAD_PLAN_LOG", "1")
     env_mod.consume_plan_records()

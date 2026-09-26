@@ -1538,24 +1538,10 @@ def rsnn_data_gen(key=None, *, dataset: str | None = None,
     fn.data_slots = slots
     #: Redraw per (environment, episode) rather than once per process.
     fn.resample_per_env_episode = True
-    #: HOW MANY PROBE BATCHES THE GRADIENT COSINE NEEDS (dsnn-dfw.51).
-    #:
-    #: A probe batch of this generator is a STEP POSITION, and the recording
-    #: goes silent well before it ends: on the recording the campaign drew
-    #: (931 of the real SHD train split) only 57 of the 100 bins carry any
-    #: input spike, and the exact gradient of the step loss is IDENTICALLY
-    #: ZERO at 43 of the 99 legal positions -- every t from 57 to 99 (probe
-    #: 66655, float64 on the CPU). The cosine is undefined on such a batch and
-    #: the measurement is refused, so with one batch 43 percent of every
-    #: measurement on this target is missing data.
-    #:
-    #: FIVE, because 0.4343 ** 5 = 0.015: one measurement in 65 still draws
-    #: five silent steps and is refused, which is a rate a run can carry, and
-    #: because five is the number the owner's own probe-count sweep compared
-    #: against thirty and found no difference in correlation -- so the extra
-    #: four draws cost four executions of a 784 us program and buy back 42
-    #: percent of the channel.
-    fn.probe_batches = 5
+    # K = 1 (owner ruling 2026-09-25, dsnn-dfw.221). The step position drew
+    # five because 43 of its 99 positions are silent (probe 66655); the step
+    # position is superseded by the full rollout.
+    fn.probe_batches = 1
     fn.meta = meta
     # THE QUALITY REFERENCE, when the carry itself is approximated (owner
     # ruling 2026-09-16). The in-band gradient cosine scores the plan against
@@ -1987,7 +1973,9 @@ def rsnn_rollout_gen(key=None, *, dataset: str | None = None,
     fn.full_rollout = True
     fn.host_draw = True
     fn.resample_per_env_episode = True
-    fn.probe_batches = 5
+    # Quality is one batch of B recordings per plan, K = 1 (owner ruling
+    # 2026-09-25, dsnn-dfw.221).
+    fn.probe_batches = 1
     fn.meta = meta
     fn.carry_container = cont
     fn.temporal_rule = rule

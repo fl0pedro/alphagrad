@@ -125,7 +125,13 @@ class _Instrument:
         mine = self.windows[start:]
         ref = [(lat, peak) for ex, lat, peak in mine if self._is_ref(ex)]
         cand = [(lat, peak) for ex, lat, peak in mine if not self._is_ref(ex)]
-        return rec, ref, cand
+        # The first timed execution of each half is its cold reading and the
+        # second its warm run, both outside the sample (no quality metric
+        # here). The first window and the windows after it are the sample
+        # (owner, 2026-09-26, dsnn-ep8v).
+        self.first = (cand[:1], ref[:1])
+        self.warm = (cand[1:2], ref[1:2])
+        return rec, ref[2:], cand[2:]
 
 
 def _median(values):
@@ -165,10 +171,16 @@ def test_the_second_plan_runs_no_reference_window_and_pairs_against_the_first(
     fwd, rev = _orders(env)
     samples = _samples(2)
     rec_a, ref_a, cand_a = paired.measure(env, fwd, samples)
+    cand_first_a, ref_first_a = paired.first
+    cand_warm_a, ref_warm_a = paired.warm
     assert len(ref_a) == REF_POINTS * REF_REPS, ref_a
-    assert cand_a
+    assert cand_a and len(cand_first_a) == 1 and len(ref_first_a) == 1
+    assert rec_a["measure_warm_s"] == cand_warm_a[0][0] / 1e9
+    assert rec_a["ref_measure_warm_s"] == ref_warm_a[0][0] / 1e9
     rec_b, ref_b, cand_b = paired.measure(env, rev, samples)
-    assert ref_b == [], "the second plan timed the reference again"
+    cand_first_b, ref_first_b = paired.first
+    assert ref_b == [] and ref_first_b == [], (
+        "the second plan timed the reference again")
     assert cand_b
     ref_lat = _median(lat for lat, _ in ref_a)
     ref_mem = _median(peak for _, peak in ref_a)
@@ -190,9 +202,13 @@ def test_the_second_plan_runs_no_reference_window_and_pairs_against_the_first(
         [lat for lat, _ in cand_b], [lat for lat, _ in ref_a],
         env_mod._LAT_FLOOR_NS, 0.0)
     assert rec_b["ratio_log"]["latency"]["windows"] == [float(w) for w in want]
-    for k in ("ref_measure_inner", "ref_measure_windows", "ref_measure_secs"):
+    for k in ("ref_measure_inner", "ref_measure_windows", "ref_measure_secs",
+              "ref_measure_first_s"):
         assert rec_b[k] == rec_a[k], k
     assert rec_b["ref_measure_windows"] == REF_POINTS * REF_REPS
+    assert rec_b["measure_first_s"] == cand_first_b[0][0] / 1e9
+    assert rec_a["ref_measure_first_s"] == ref_first_a[0][0] / 1e9
+    assert rec_a["measure_windows"] == len(cand_a)
     secs_a, secs_b = paired.episode_ref_secs
     assert len(secs_a) == 1 and secs_a[0] > 0.0
     assert secs_b == [0.0]

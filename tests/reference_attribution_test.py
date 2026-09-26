@@ -357,14 +357,15 @@ def test_only_a_zero_reference_gradient_leaves_the_quality_undefined(
 
 # --------------------------------- 2. dsnn-63j: the timing loop
 # (the function the reference fails once from, samples, latency, the site)
+# Every execution is timed (owner ruling 2026-09-25): with the latency on the
+# first `_time_one_rep` call is the reference's first execution, with it off
+# there is none and the first call is an interleaved window.
 TIMING = {
-    "probe": ("_probe_one", ONE_POINT, True, "in its probe or warm-up"),
-    "warm-up": ("_callback_measured", ONE_POINT, False,
-                "in its probe or warm-up"),
-    "window-warm-up": ("_callback_measured", TWO_POINTS, True,
-                       "in its interleaved windows"),
-    "window": ("_time_one_rep", ONE_POINT, True,
+    "first": ("_time_one_rep", ONE_POINT, True, "in its first execution"),
+    "window": ("_time_one_rep", ONE_POINT, False,
                "in its interleaved windows"),
+    "window-two-points": ("_time_one_rep", TWO_POINTS, False,
+                          "in its interleaved windows"),
 }
 
 
@@ -422,7 +423,7 @@ def test_a_reference_oom_in_the_timing_loop_raises_in_the_pool(
         measured, monkeypatch, fake_ray):
     env = _toy_env()
     _fake_compile(monkeypatch, ref=_wrap(
-        _once_from("_probe_one", ERRORS["oom"]())))
+        _once_from("_time_one_rep", ERRORS["oom"]())))
     pool, actor = _pool(env)
     with pytest.raises(env_mod.ReferenceFault):
         _pooled(pool, env)
