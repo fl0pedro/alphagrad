@@ -456,7 +456,8 @@ def test_on_rsnn_shd_a_diag_on_the_carried_face_moves_the_args_term():
     assert diag["mem_objective_eps"] == exact["mem_objective_eps"]
     assert diag["mem_ratios"]["out"] == exact["mem_ratios"]["out"] == 1.0
     assert diag["mem_ratios"]["args"] == exact["mem_ratios"]["args"] == 1.0
-    assert diag["mem_ratios"]["temp"] < exact["mem_ratios"]["temp"] / 20.0
+    # The Diag temp check runs on the GPU (gpu_tests/mem_objective_gpu_test.py, owner ruling 2026-09-26 Q16 a):
+    # on XLA:CPU the join's interior pad writes the dense grid, 219,725,872 B of Diag temp (dsnn-dfw.299).
     assert diag["rewards"][MSLOT] == -math.log(diag["mem_total_ratio"])
     # Since the one total (owner ruling 2026-09-26, Q1 a) the Diag gains the log of the total's
     # fall, not of the temp term's alone.
