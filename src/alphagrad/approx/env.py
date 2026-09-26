@@ -2910,6 +2910,7 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
             "ref_output_bytes": (paired_ref or {}).get("output_bytes"),
             "ref_args_bytes": (paired_ref or {}).get("args_bytes"),
             "mem_ratios": (mem_objective_rec or {}).get("ratios"),
+            "mem_total_ratio": (mem_objective_rec or {}).get("total_ratio"),
             "mem_objective_eps": (mem_objective_rec or {}).get("eps"),
             "candidate_latency_ns": (paired_ref or {}).get(
                 "candidate_latency_ns"),
@@ -3649,12 +3650,13 @@ _AXIS_FEAT_GROUP_ID = 3
 #                        ALPHAGRAD_SPARSITY). READ THE HACKABILITY WARNING
 #                        on `_SPARSITY_STATS` before weighting it.
 #  11 mem_objective  — THE MEMORY OBJECTIVE (dsnn-xvi, owner ruling
-#                        2026-09-24): -(log(temp/temp*) + log(args/args*)
-#                        + log(out/out*)) from memory_analysis() of the
+#                        2026-09-24, one total since 2026-09-26, Q1 a):
+#                        -log((temp + args + out)/(temp* + args* + out*))
+#                        from memory_analysis() of the
 #                        timed executable and of the rev-exact reference
 #                        (*), one PopArt channel, never symlogged. Terminal
 #                        only, under --cost-form paired-log; 0.0 otherwise.
-#                        The three raw ratios ride the plan-log record.
+#                        The three raw ratios ride the plan-log record, logged only.
 #                        APPENDED, never inserted.
 NUM_REWARDS = 12
 REWARD_NAMES: tuple[str, ...] = (
@@ -5658,9 +5660,11 @@ def mem_objective(candidate, reference) -> tuple[float, dict]:
         "args": (c_args + eps) / (r_args + eps),
         "out": (c_out + eps) / (r_out + eps),
     }
-    value = -(math.log(ratios["temp"]) + math.log(ratios["args"])
-              + math.log(ratios["out"]))
-    return float(value), {"ratios": ratios, "eps": float(eps)}
+    # One log ratio of the total static bytes, the quantity the static gate reads. The three ratios are logged only (owner ruling 2026-09-26, Q1 a).
+    total = (c_temp + c_args + c_out + eps) / (r_temp + r_args + r_out + eps)
+    value = -math.log(total)
+    return float(value), {"ratios": ratios, "total_ratio": float(total),
+                          "eps": float(eps)}
 
 
 def _record_paired_ref(rec: dict) -> None:
@@ -11922,7 +11926,7 @@ def _callback_measured(
     # ---- THE MEMORY OBJECTIVE, reward slot 11 (dsnn-xvi) -------------
     # Static values, so no windows and no pairing noise: the timed
     # executable's three memory_analysis() numbers against the
-    # reference's, as one log sum. A refused plan never reaches this line.
+    # reference's, as one log ratio of the totals. A refused plan never reaches this line.
     mem_obj = 0.0
     _mem_obj_rec = None
     if _paired:

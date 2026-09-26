@@ -293,8 +293,9 @@ def test_a_compile_failure_is_scored_at_the_timeout_with_the_sentinel(
     assert reward[LAT] == np.float32(-d_lat)
     assert rec["rewards"][MEM] == -d_mem
     eps = 2.0 ** -10 * min(x for x in ref if x > 0.0)
+    # One total since 2026-09-26 (Q1 a): the sentinel's total is the whole card.
     assert rec["rewards"][MOBJ] == -math.log(
-        (cand[0] + eps) / (ref[0] + eps))
+        (cand[0] + cand[2] + cand[1] + eps) / (ref[0] + ref[2] + ref[1] + eps))
     assert rec["mem_ratios"]["out"] == 1.0
     assert rec["mem_ratios"]["args"] == 1.0
     assert reward[QUAL] == 0.0

@@ -512,8 +512,8 @@ FIDELITY_HEAD = "value_head_fid"
 # checkpoint keeps loading. INDICES ARE ONLY EVER APPENDED.
 SPARSITY_HEAD = "value_head_spars"
 # --mem-objective-weight != 0 APPENDS a head on reward slot 11
-# (``mem_objective``, dsnn-xvi: the three static memory_analysis() log ratios
-# against rev-exact as one sum). Same discipline: default 0 => no head, no
+# (``mem_objective``, dsnn-xvi: one log ratio of the total static memory_analysis() bytes
+# against rev-exact, since 2026-09-26). Same discipline: default 0 => no head, no
 # pytree leaf, every checkpoint keeps loading. INDICES ARE ONLY EVER APPENDED.
 MEM_OBJECTIVE_HEAD = "value_head_memobj"
 # Resolved from --quality-metric in `main`; names the quantity reward slot 6
@@ -1171,7 +1171,7 @@ def configure_symlog(args) -> str:
     # mask-is-bit-identical caveat.
     if float(getattr(args, "sparsity_weight", 0.0) or 0.0) != 0.0:
         _exempt = _exempt + (int(REWARD_INDEX["sparsity"]),)
-    # THE MEMORY OBJECTIVE (slot 11) is a log sum already; symlog on top
+    # THE MEMORY OBJECTIVE (slot 11) is a log ratio already; symlog on top
     # would bend it a second time. Same conditional, same flag-off caveat.
     if float(getattr(args, "mem_objective_weight", 0.0) or 0.0) != 0.0:
         _exempt = _exempt + (int(REWARD_INDEX["mem_objective"]),)
@@ -5444,7 +5444,7 @@ def make_argparser() -> argparse.ArgumentParser:
         "--mem-objective-weight", type=float, default=0.0,
         dest="mem_objective_weight",
         help="Weight on the MEMORY OBJECTIVE value head (reward slot 11): "
-             "-(log(temp/temp*) + log(args/args*) + log(out/out*)) from "
+             "-log((temp + args + out) / (temp* + args* + out*)) from "
              "memory_analysis() of the timed executable against the "
              "rev-exact reference (*), static, measured on every terminal "
              "plan under --cost-form paired-log and normalised once by "
@@ -7829,7 +7829,7 @@ def _build_head_weights(args) -> np.ndarray:
     if SPARSITY_HEAD in VALUE_HEAD_ATTRS:
         weights[HEAD_NAMES.index("sparsity")] = np.float32(
             getattr(args, "sparsity_weight", 0.0) or 0.0)
-    # --mem-objective-weight W adds ``+ W*mem_objective``, RAW (a log sum
+    # --mem-objective-weight W adds ``+ W*mem_objective``, RAW (a log ratio
     # already, never symlogged). The head exists only when W != 0.
     if MEM_OBJECTIVE_HEAD in VALUE_HEAD_ATTRS:
         weights[HEAD_NAMES.index("mem_objective")] = np.float32(
@@ -8335,7 +8335,7 @@ def main(args=None):
     # configure_sparsity so the appended head order stays deterministic.
     _memobj_weight = configure_mem_objective(args)
     if _memobj_weight != 0.0:
-        print(f"[cfg] memory objective (three static log ratios vs "
+        print(f"[cfg] memory objective (the total static log ratio vs "
               f"rev-exact, slot 11): weight={_memobj_weight:g} "
               f"heads={NUM_VALUE_HEADS} ({', '.join(HEAD_NAMES)})",
               flush=True)
@@ -15769,6 +15769,19 @@ def main(args=None):
                 # (ticket .7: a counter read in a process that does not own
                 # it reads 0 and nothing says so).
                 host_state["_gate_records"] = list(_plog_recs)
+                # The three static log ratios of slot 11 over the measured plans, logged only: the channel trains on their total (owner, 2026-09-26, Q1 a).
+                _mo = [r for r in _plog_recs
+                       if isinstance(r, dict) and r.get("mem_ratios")
+                       and not r.get("refused")]
+                for _mk in ("temp", "args", "out"):
+                    if _mo:
+                        log_dict[f"mem_objective/log_{_mk}_ratio"] = float(
+                            np.mean([np.log(r["mem_ratios"][_mk]) for r in _mo]))
+                _mt = [r["mem_total_ratio"] for r in _mo
+                       if r.get("mem_total_ratio")]
+                if _mt:
+                    log_dict["mem_objective/log_total_ratio"] = float(
+                        np.mean(np.log(_mt)))
                 # TICKET dsnn-dfw.44: this episode's per-window ratio SAMPLES,
                 # keyed by the plan's elimination order -- the same key
                 # `_decode_arch` hands the archive. Two envs that drew one

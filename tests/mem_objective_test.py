@@ -1,5 +1,6 @@
 # THE MEMORY OBJECTIVE, reward slot 11 (dsnn-xvi, owner ruling 2026-09-24):
-#   r_mem = -(log(temp/temp*) + log(args/args*) + log(out/out*))
+#   r_mem = -log((temp + args + out) / (temp* + args* + out*))
+# since the owner ruling of 2026-09-26 (Q1 a), the three separate ratios logged only,
 # from memory_analysis() of the timed executable and of the reference (*),
 # jax.grad of the target (dsnn-xta; the graphax rev-exact until 2026-09-24),
 # under --cost-form paired-log, one PopArt channel, no symlog.
@@ -104,8 +105,7 @@ def _triple(ex):
 def _formula(cand, ref):
     (t, o, a), (t_r, o_r, a_r) = cand, ref
     e = _eps(ref)
-    return -(math.log((t + e) / (t_r + e)) + math.log((a + e) / (a_r + e))
-             + math.log((o + e) / (o_r + e)))
+    return -math.log((t + a + o + e) / (t_r + a_r + o_r + e))
 
 
 def _spy_executables(monkeypatch):
@@ -151,22 +151,40 @@ def test_slot_11_was_appended_in_both_tables():
 
 
 # ------------------------------------------------------ 2. the pure formula
-def test_mem_objective_is_the_negated_log_sum_of_three_ratios():
+def test_mem_objective_is_the_negated_log_of_the_total_ratio():
     same = (512.0, 256.0, 1024.0)
     e = 2.0 ** -10 * 256.0
     assert envmod.mem_objective(same, same) == (
-        0.0, {"ratios": {"temp": 1.0, "args": 1.0, "out": 1.0}, "eps": e})
+        0.0, {"ratios": {"temp": 1.0, "args": 1.0, "out": 1.0},
+              "total_ratio": 1.0, "eps": e})
     v, rec = envmod.mem_objective((256.0, 256.0, 512.0), same)
     half_t, half_a = (256.0 + e) / (512.0 + e), (512.0 + e) / (1024.0 + e)
-    assert v == -(math.log(half_t) + math.log(half_a) + math.log(1.0))
+    total = (256.0 + 512.0 + 256.0 + e) / (512.0 + 1024.0 + 256.0 + e)
+    assert v == -math.log(total)
     assert rec == {"ratios": {"temp": half_t, "args": half_a, "out": 1.0},
-                   "eps": e}
-    assert v == pytest.approx(2.0 * math.log(2.0), abs=2e-3)
-    # an exact 0 is finite through eps, on both sides of that term only
+                   "total_ratio": total, "eps": e}
+    assert v == pytest.approx(math.log(1792.0 / 1024.0), abs=1e-3)
+    # the three ratios are logged, not summed
+    assert v != pytest.approx(-(math.log(half_t) + math.log(half_a)), abs=1e-3)
+    # a zero term is plain arithmetic in the total, and eps keeps a zero total finite
     v, rec = envmod.mem_objective((0.0, 256.0, 1024.0), same)
-    assert v == -(math.log(e / (512.0 + e)))
-    assert rec == {"ratios": {"temp": e / (512.0 + e), "args": 1.0,
-                              "out": 1.0}, "eps": e}
+    assert v == -math.log((1280.0 + e) / (1792.0 + e))
+    assert rec["ratios"]["temp"] == e / (512.0 + e)
+    v, _rec = envmod.mem_objective((0.0, 0.0, 0.0), same)
+    assert v == -math.log(e / (1792.0 + e)) and math.isfinite(v)
+
+
+def test_the_pilot_quant_plan_scores_about_minus_0_07_on_the_total():
+    # Pilot NN256 C_popart: the reference 42.1 MB temp, 13.8 MB args, 0.81 MB out, a Quant plan
+    # 47 MB, 13.8 MB, 0.41 MB (dsnn-dfw.276). The three-ratio form gave it +0.57.
+    ref = (42.1e6, 0.81e6, 13.8e6)
+    quant = (47.0e6, 0.41e6, 13.8e6)
+    v, rec = envmod.mem_objective(quant, ref)
+    assert v == pytest.approx(-math.log(61.21 / 56.71), abs=1e-5)
+    assert -0.08 < v < -0.07
+    old = -sum(math.log(rec["ratios"][k]) for k in ("temp", "args", "out"))
+    assert old == pytest.approx(0.57, abs=5e-3)
+    assert rec["total_ratio"] == pytest.approx(61.21 / 56.71, rel=1e-4)
 
 
 # ------------------------------------------ 3. the reference scores exactly 0
@@ -199,8 +217,8 @@ def test_the_reference_scores_exactly_zero(monkeypatch):
     assert rec["mem_args_bytes"] == rec["ref_args_bytes"] > 0.0
 
 
-# ---------------------------- 4. bit-for-bit the three memory_analysis ratios
-def test_the_objective_is_the_three_memory_analysis_ratios_bit_for_bit(
+# ------------------------------- 4. bit-for-bit the memory_analysis total
+def test_the_objective_is_the_memory_analysis_total_bit_for_bit(
         monkeypatch):
     seen = _spy_executables(monkeypatch)
     env = _make_env()
@@ -220,6 +238,8 @@ def test_the_objective_is_the_three_memory_analysis_ratios_bit_for_bit(
     assert rec["mem_ratios"] == {"temp": (cand[0] + e) / (ref[0] + e),
                                  "args": (cand[2] + e) / (ref[2] + e),
                                  "out": (cand[1] + e) / (ref[1] + e)}
+    assert rec["mem_total_ratio"] == (
+        (cand[0] + cand[2] + cand[1] + e) / (ref[0] + ref[2] + ref[1] + e))
     assert (rec["mem_temp_bytes"], rec["mem_output_bytes"],
             rec["mem_args_bytes"]) == cand
     assert (rec["ref_temp_bytes"], rec["ref_output_bytes"],
@@ -228,7 +248,7 @@ def test_the_objective_is_the_three_memory_analysis_ratios_bit_for_bit(
           f"ratios={rec['mem_ratios']} r_mem={expect:+.6f}")
 
 
-def test_a_zero_temp_plan_is_finite_through_eps_on_that_term():
+def test_a_zero_temp_plan_is_finite_and_scores_above_zero():
     env = _make_env()
     r = _run_plan(env, _rev_order(env), skip_everything=True)
     rec = _last_record()
@@ -244,10 +264,9 @@ def test_a_zero_temp_plan_is_finite_through_eps_on_that_term():
     e = _eps(ref)
     assert rec["mem_objective_eps"] == e
     assert rec["mem_ratios"]["temp"] == e / (ref[0] + e)
-    expect = -(math.log(rec["mem_ratios"]["temp"])
-               + math.log(rec["mem_ratios"]["args"])
-               + math.log(rec["mem_ratios"]["out"]))
+    expect = _formula(cand, ref)
     assert rec["rewards"][MSLOT] == expect
+    assert rec["mem_total_ratio"] == pytest.approx(math.exp(-expect), rel=1e-12)
     assert float(r[MSLOT]) > 0.0                      # cheaper -> above 0
 
 
@@ -419,9 +438,7 @@ def test_on_rsnn_shd_a_diag_on_the_carried_face_moves_the_args_term():
     # programs' memory_analysis() say, and the diag plan's move is read
     # AGAINST THE EXACT PLAN, both being divided by one reference.
     assert exact["mem_objective_eps"] > 0.0
-    assert exact["rewards"][MSLOT] == -(math.log(exact["mem_ratios"]["temp"])
-                                        + math.log(exact["mem_ratios"]["args"])
-                                        + math.log(exact["mem_ratios"]["out"]))
+    assert exact["rewards"][MSLOT] == -math.log(exact["mem_total_ratio"])
     assert exact["ref_args_bytes"] == diag["ref_args_bytes"]
     assert exact["ref_temp_bytes"] == diag["ref_temp_bytes"]
     assert exact["ref_output_bytes"] == diag["ref_output_bytes"]
@@ -440,7 +457,18 @@ def test_on_rsnn_shd_a_diag_on_the_carried_face_moves_the_args_term():
     assert diag["mem_ratios"]["out"] == exact["mem_ratios"]["out"] == 1.0
     assert diag["mem_ratios"]["args"] == exact["mem_ratios"]["args"] == 1.0
     assert diag["mem_ratios"]["temp"] < exact["mem_ratios"]["temp"] / 20.0
-    assert diag["rewards"][MSLOT] == -(math.log(diag["mem_ratios"]["temp"])
-                                       + math.log(diag["mem_ratios"]["args"])
-                                       + math.log(diag["mem_ratios"]["out"]))
-    assert diag["rewards"][MSLOT] - exact["rewards"][MSLOT] > 3.0
+    assert diag["rewards"][MSLOT] == -math.log(diag["mem_total_ratio"])
+    # Since the one total (owner ruling 2026-09-26, Q1 a) the Diag gains the log of the total's
+    # fall, not of the temp term's alone.
+    gain = diag["rewards"][MSLOT] - exact["rewards"][MSLOT]
+    assert gain == pytest.approx(
+        math.log(exact["mem_total_ratio"] / diag["mem_total_ratio"]), rel=1e-9)
+    assert gain > 0.0
+    print(f"[mem-objective] RSNN_SHD rtrl: the Diag gains {gain:+.4f} on slot 11")
+
+
+def test_the_three_log_ratios_are_logged_on_wandb():
+    import inspect
+    src = inspect.getsource(ppo.main)
+    assert 'log_dict[f"mem_objective/log_{_mk}_ratio"]' in src
+    assert 'log_dict["mem_objective/log_total_ratio"]' in src

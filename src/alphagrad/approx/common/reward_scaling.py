@@ -86,8 +86,8 @@ REWARD_NAMES: tuple[str, ...] = (
     # the same channel of the other. See env.py's slot-10 entry, and its
     # hackability warning, before putting a weight here.
     "sparsity",
-    # index 11: THE MEMORY OBJECTIVE (dsnn-xvi, owner ruling 2026-09-24):
-    # -(log(temp/temp*) + log(args/args*) + log(out/out*)) from
+    # index 11: THE MEMORY OBJECTIVE (dsnn-xvi, owner rulings 2026-09-24 and 2026-09-26 Q1 a):
+    # -log((temp + args + out) / (temp* + args* + out*)) from
     # memory_analysis() of the timed executable against the rev-exact
     # reference. A cost, stored negated, already logarithmic. APPENDED.
     "mem_objective",
@@ -129,7 +129,7 @@ MEM_OBJECTIVE_IDX: int = REWARD_INDEX["mem_objective"]
 # SPARSITY joins them for the same reason as FIDELITY: `clip(1 - ratio,
 # -1, 1)` is bounded by construction, so symlog would only discount its
 # per-unit price against the ~1e5..1e10 cost channels.
-# MEM_OBJECTIVE is a log sum already; symlog on top would bend it twice.
+# MEM_OBJECTIVE is a log ratio already; symlog on top would bend it twice.
 NO_SYMLOG_REWARD_INDICES: tuple[int, ...] = (
     COSINE_SIM_IDX, FIDELITY_IDX, BKSTEP_ACC_IDX, SPARSITY_IDX,
     MEM_OBJECTIVE_IDX)
