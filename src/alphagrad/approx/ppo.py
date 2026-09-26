@@ -59,6 +59,32 @@ def _pin_driver_cores() -> None:
 
 _pin_driver_cores()
 
+
+def _argv_value(argv, flag):
+    val = None
+    for i, tok in enumerate(argv):
+        if tok == flag and i + 1 < len(argv):
+            val = argv[i + 1]
+        elif tok.startswith(flag + "="):
+            val = tok.split("=", 1)[1]
+    return val
+
+
+def _actors_measure(ray_measure) -> bool:
+    return (int(ray_measure or 0) > 0
+            and os.environ.get("ALPHAGRAD_POOL_TERMINAL_LOCAL", "0") != "1")
+
+
+def _own_gpus_before_jax() -> None:
+    # The imports below start the JAX backend, so the trainer's GPUs are narrowed here, off sys.argv (dsnn-dfw.288).
+    argv = sys.argv[1:]
+    if _actors_measure(_argv_value(argv, "--ray-measure")):
+        from alphagrad.approx.common.device_guard import own_gpus_only
+        own_gpus_only(_argv_value(argv, "--gpus") or "0")
+
+
+_own_gpus_before_jax()
+
 # tqdm allocates a multiprocessing.RLock on first use (`TqdmDefaultWriteLock`)
 # for cross-process bar coordination. The RLock is backed by a named POSIX
 # semaphore on macOS / Linux; if the process is signal-killed (SIGTERM from
@@ -6986,14 +7012,22 @@ def _resolve_num_envs(arg_value: int, example: str) -> int:
     return os.cpu_count() or 64
 
 
-def _resolve_main_device(args):
+def _resolve_main_device(args, own_only: bool = False):
     if not args.exec_on_gpu:
         return None
     try:
         gpus = jax.devices("gpu")
     except Exception:
         gpus = []
-    if len(gpus) < 2:
+    # With measure actors the trainer sees only --gpus; without them it measures on its other GPUs.
+    own = len(str(args.gpus).split(","))
+    if own_only and len(gpus) > own:
+        raise RuntimeError(
+            f"the trainer's JAX sees {len(gpus)} GPUs and --gpus {args.gpus} "
+            f"names {own}: its backend started before CUDA_VISIBLE_DEVICES "
+            f"was narrowed, so it holds the measure actors' cards "
+            f"(dsnn-dfw.288)")
+    if len(gpus) < (1 if own_only else 2):
         raise RuntimeError(
             f"--exec-on-gpu requested but only {len(gpus)} GPU(s) found. "
             "Check your --gpus argument and CUDA_VISIBLE_DEVICES."
@@ -7658,11 +7692,12 @@ def _mem_reward_index(mem_type: str) -> int:
 
 
 def _band_archive(args):
-    from alphagrad.approx.common.pareto_archive import RatioBandArchive
+    from alphagrad.approx.common.pareto_archive import QuantileFrontArchive
     # Quality, latency and peak memory only, and quality is no filter: a plan under tau stays when it is faster or smaller (owner, 2026-09-26).
-    return RatioBandArchive(
+    # The latency is banded by its quantiles, and the front has no cap (owner ruling 2026-09-26, Q12).
+    return QuantileFrontArchive(
         obj_names=(args.cmp_type, args.mem_type, "quality"),
-        senses=("min", "min", "max"), cap=64)
+        senses=("min", "min", "max"), banded=(args.cmp_type,))
 
 
 def _log_ratio(x, ref, floor) -> float:
@@ -7706,6 +7741,110 @@ def _band_sample(rec, args):
     return ({args.cmp_type: lat, args.mem_type: mem,
              "quality": [float(rec["rewards"][REWARD_INDEX["quality"]])]},
             source)
+
+
+def _latency_quantiles(rec, args):
+    from alphagrad.approx import env as _env
+    # p10 to p90 of the plan's per-execution latency, as log ratios against its paired reference's median (owner ruling 2026-09-26, Q12).
+    rec = rec or {}
+    ref = rec.get("ref_latency_p50_ns")
+    ns = {f"p{p}": rec.get(f"candidate_latency_p{p}_ns")
+          for p in _env.LATENCY_QUANTILES}
+    if not ref or any(v is None for v in ns.values()):
+        return None, None
+    return ({args.cmp_type: {k: _log_ratio(v, ref, _env._LAT_FLOOR_NS)
+                             for k, v in ns.items()}},
+            {"candidate_latency_ns": {k: float(v) for k, v in ns.items()},
+             "ref_latency_p50_ns": float(ref)})
+
+
+def _plan_hashes(plan_states, n_envs):
+    # The content hash of each environment's terminal plan, from the five wires the callback hashed (env._plan_content_key).
+    from alphagrad.approx.env import _plan_content_key
+    if plan_states is None:
+        return None
+    wires = [getattr(plan_states, k, None) for k in
+             ("order", "sparsity_specs", "face_specs", "face_skips")]
+    if any(w is None for w in wires):
+        return None
+    order, specs, faces, skips = (np.asarray(w) for w in wires)
+    joins = getattr(plan_states, "face_joins", None)
+    joins = None if joins is None else np.asarray(joins)
+    if order.ndim != 2 or order.shape[0] != int(n_envs):
+        return None
+    return [_plan_content_key(
+                [int(v) for v in order[e]], specs[e], faces[e], skips[e],
+                None if joins is None else joins[e]).hex()
+            for e in range(int(n_envs))]
+
+
+def _join_plan_records(records, episode, n_envs, plan_states=None):
+    # dsnn-dfw.301: each environment takes the record of its own plan, by (episode, env_index), else by plan_hash. A record with measured_from takes the numbers of the plan it names.
+    from alphagrad.approx.common.gate_telemetry import record_env_index
+    records = [r for r in (records or ()) if isinstance(r, dict)]
+    counts = {"by_env_index": 0, "by_plan_hash": 0, "measured_from": 0,
+              "unresolved": 0, "unjoined": 0, "duplicate": 0,
+              "other_episode": 0}
+    timed: dict = {}
+    for r in records:
+        h = r.get("plan_hash")
+        if h and r.get("measured_from") is None:
+            timed.setdefault((r.get("pid"), h), r)
+            timed.setdefault((None, h), r)
+
+    def _numbers(r):
+        if r.get("measured_from") is None:
+            return r
+        counts["measured_from"] += 1
+        h = r.get("plan_hash")
+        got = timed.get((r.get("pid"), h)) or timed.get((None, h))
+        if got is None:
+            counts["unresolved"] += 1
+        return got
+
+    rows: dict = {}
+    pending = []
+    for r in records:
+        if r.get("episode") is not None and int(r["episode"]) != int(episode):
+            counts["other_episode"] += 1
+            continue
+        e = record_env_index(r)
+        if e is None or e >= int(n_envs):
+            pending.append(r)
+            continue
+        if e in rows:
+            counts["duplicate"] += 1
+            continue
+        num = _numbers(r)
+        if num is not None:
+            rows[e] = num
+            counts["by_env_index"] += 1
+    hashes = _plan_hashes(plan_states, n_envs) if pending else None
+    for r in pending:
+        h = r.get("plan_hash")
+        hits = [e for e, he in enumerate(hashes or ())
+                if h and he == h and e not in rows]
+        if not hits:
+            counts["unjoined"] += 1
+            continue
+        num = _numbers(r)
+        if num is None:
+            continue
+        for e in hits:
+            rows[e] = num
+        counts["by_plan_hash"] += len(hits)
+    return rows, counts
+
+
+def _ratio_dists(records, args, episode, n_envs, plan_states=None):
+    # Per environment row: its band sample, memory source, latency quantiles and their detail.
+    rows, counts = _join_plan_records(records, episode, n_envs, plan_states)
+    out = {}
+    for e, rec in rows.items():
+        smp, source = _band_sample(rec, args)
+        if smp is not None:
+            out[e] = (smp, source) + _latency_quantiles(rec, args)
+    return out, counts
 
 
 def _dump_pareto(archive, args, ep, *, final=False, rule=None):
@@ -7755,13 +7894,21 @@ def _dump_pareto(archive, args, ep, *, final=False, rule=None):
                     for m in sorted(_mem[i], key=lambda m: (-m["windows"],
                                                             m["first_episode"]))]
 
+        # The five latency quantiles of each point of the quantile front (dsnn-dfw.293).
+        _qs = getattr(archive, "quantiles", None)
+
+        def _quantiles_of(i):
+            return None if _qs is None else _qs[i]
+
         _doc = {
             "best_overall": {"seq": archive.seqs[_order[0]],
                              "obj": _pts[_order[0]],
-                             "members": _members_of(_order[0])},
+                             "members": _members_of(_order[0]),
+                             "quantiles": _quantiles_of(_order[0])},
             "best_per_channel": {
                 f"rank{r}": {"seq": archive.seqs[i], "obj": _pts[i],
-                             "members": _members_of(i)}
+                             "members": _members_of(i),
+                             "quantiles": _quantiles_of(i)}
                 for r, i in enumerate(_order)
             },
             "_provenance": {"source": "ParetoArchive.dump", "episode": int(ep),
@@ -8421,9 +8568,11 @@ def main(args=None):
             "the delta observation is only wired for --dynamic-substeps."
         )
 
-    # The measure devices are checked while CUDA_VISIBLE_DEVICES is still the trainer's own (dsnn-dfw.245).
+    # The measure devices are checked against the job's CUDA_VISIBLE_DEVICES, before the trainer narrowed its own (dsnn-dfw.245, dsnn-dfw.288).
     from alphagrad.approx.common.device_guard import (
-        measure_devices as _measure_devices)
+        job_visible_devices as _job_visible_devices,
+        measure_devices as _measure_devices,
+        own_gpus_only as _own_gpus_only)
     if args.measure_gpus is not None and not args.exec_on_gpu:
         raise ValueError(
             f"--measure-gpus {args.measure_gpus} names GPUs, but without "
@@ -8431,15 +8580,17 @@ def main(args=None):
     _measure_dev = _measure_devices(
         int(getattr(args, "ray_measure", 0) or 0), args.measure_gpus,
         trainer_gpus=str(args.gpus),
-        visible=os.environ.get("CUDA_VISIBLE_DEVICES"),
+        visible=_job_visible_devices(),
         first_gpu=os.environ.get("ALPHAGRAD_MEASURE_FIRST_GPU"))
 
-    main_device = _resolve_main_device(args)
+    # JAX's default preallocation, every process on its own GPUs only (owner ruling 2026-09-26, dsnn-dfw.288).
+    _own_only = _actors_measure(getattr(args, "ray_measure", 0))
+    if _own_only:
+        _own_gpus_only(str(args.gpus))
+    main_device = _resolve_main_device(args, own_only=_own_only)
     if args.no_jit:
         jax.config.update("jax_disable_jit", True)
 
-    # Preallocation stays off by the owner's ruling of 2026-09-25 (dsnn-dfw.238); the static peak gate reads the card, not this allocator.
-    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpus)
     # Persistent JIT disk cache. Off-by-env when investigating memory leaks:
     # the cache loader may retain in-memory references to every loaded
@@ -9100,36 +9251,23 @@ def main(args=None):
             row names the devices and slot k takes the k-th (dsnn-dfw.245).
             """
             rt = {"py_executable": _sys.executable}
-            if _gpu:
-                # THE FIRST MEASUREMENT DEVICE. 1 by default -- device 0 is
-                # the trainer's. ALPHAGRAD_MEASURE_FIRST_GPU=0 hands the
-                # trainer's own device to an actor as well, which is what the
-                # "one actor per GPU, the trainer's included" probe asks for
-                # (owner question 4, 2026-09-14). It is a knob and not the
-                # default because two processes on one device destroy the
-                # timing isolation the measurement depends on.
-                # measure_devices() applies it when --measure-gpus is unset.
-                # num_gpus=0 makes Ray MASK the GPUs (it sets
-                # CUDA_VISIBLE_DEVICES="" for workers that request none),
-                # which overrode our pin and dropped the actor to CPU. The
-                # NOSET flag tells Ray to leave CUDA_VISIBLE_DEVICES alone so
-                # our explicit pin stands; it must also be exported in the
-                # DRIVER environment so it reaches Ray's worker startup.
-                rt["env_vars"] = {
-                    "CUDA_VISIBLE_DEVICES": str(_measure_dev[idx]),
-                    "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
-                    # Dedicated measure process: no trainer shares this
-                    # actor, so its single pinned GPU IS the measure device
-                    # and env.py must not reserve one for a trainer.
-                    # Measurement semantics must not depend on the TRAINER process's
-                    # allocator: an inherited XLA_PYTHON_CLIENT_ALLOCATOR=platform puts
-                    # raw cudaMalloc/cudaFree in the timed region (154us -> 379us, 2.46x
-                    # flat, probe jobs 59598/59599) and breaks clear_memory_stats() so
-                    # peak_memory silently becomes the STATIC estimate. Pin the default
-                    # (BFC) allocator in every measure actor.
-                    "XLA_PYTHON_CLIENT_ALLOCATOR": "default",
-                    "ALPHAGRAD_MEASURE_ACTOR": "1",
-                }
+            # THE FIRST MEASUREMENT DEVICE. 1 by default -- device 0 is
+            # the trainer's. ALPHAGRAD_MEASURE_FIRST_GPU=0 hands the
+            # trainer's own device to an actor as well, which is what the
+            # "one actor per GPU, the trainer's included" probe asks for
+            # (owner question 4, 2026-09-14). It is a knob and not the
+            # default because two processes on one device destroy the
+            # timing isolation the measurement depends on.
+            # measure_devices() applies it when --measure-gpus is unset.
+            # num_gpus=0 makes Ray MASK the GPUs (it sets
+            # CUDA_VISIBLE_DEVICES="" for workers that request none),
+            # which overrode our pin and dropped the actor to CPU. The
+            # NOSET flag tells Ray to leave CUDA_VISIBLE_DEVICES alone so
+            # our explicit pin stands; it must also be exported in the
+            # DRIVER environment so it reaches Ray's worker startup.
+            # A CPU measure actor sees no GPU, so it cannot preallocate the trainer's (dsnn-dfw.288).
+            rt["env_vars"] = _measure_actor_env(
+                _measure_dev[idx] if _gpu else None)
             return {"runtime_env": rt, "num_gpus": 0}
         # The actor slices CPU cores by ``num_cpu_workers`` BEFORE importing
         # jax, so XLA sizes its Eigen pool to that slice. ppo.py never set it,
@@ -9178,6 +9316,7 @@ def main(args=None):
         from alphagrad.approx.common.device_guard import (
             ActorStartRefused as _ActorStartRefused,
             gpu_uuids as _gpu_uuids,
+            measure_actor_env as _measure_actor_env,
             wait_device_free as _wait_device_free)
         _gpu_uuid_of = _gpu_uuids() if _gpu else {}
 
@@ -9198,12 +9337,10 @@ def main(args=None):
                     f"slots; nothing is started (dsnn-dfw.229)")
             _uuid = None
             if _gpu:
-                # The trainer's own pid is not a timed process: its JAX
-                # backend may hold an idle context on a measure device.
+                # The trainer sees only --gpus, so a process of ours on a measure device, the trainer included, is a busy device (dsnn-dfw.288).
                 _dev = _measure_dev[_slot]
                 _uuid = _gpu_uuid_of.get(_dev)
-                _wait_device_free(_dev, slot=_slot, uuid=_uuid,
-                                  exclude_pids=(os.getpid(),))
+                _wait_device_free(_dev, slot=_slot, uuid=_uuid)
             _next_id[0] += 1
             return CpuApproximationActor.options(**_actor_opts(_slot)).remote(
                 _args_dict, variant=None, actor_id=_next_id[0],
@@ -14937,7 +15074,8 @@ def main(args=None):
     def host_log(
         ep, all_rets, actions_pack, mean_r, mets, diag_pack=None,
         popart_stats=None, attn_entropy=None, warmup=False, true_return=None,
-        probe_metrics=None, extra_log=None, vp_metrics=None):
+        probe_metrics=None, extra_log=None, vp_metrics=None,
+        plan_states=None):
         ep = int(ep)
         all_rets = np.array(all_rets)  # (num_envs, NUM_REWARDS)
         v_idx_arr = np.array(actions_pack[0])
@@ -15207,8 +15345,9 @@ def main(args=None):
                 _ref_counts[_kk] = int(_ref_counts.get(_kk, 0)) + int(_v)
         _ref_total = int(_ref_counts.pop("total", 0))
         # SCORED against EXCLUDED (owner rulings 2026-09-24 Q42, Q48): every
-        # refusal takes the finite sentinel and trains, except a call the
-        # deadline killed; each count names its fate where it is taken.
+        # refusal takes the finite sentinel and trains, a call the deadline
+        # killed too since 2026-09-26 (Q9b c), except an undefined quality;
+        # each count names its fate where it is taken.
         _ref_scored = int(_ref_counts.pop("scored", 0))
         _ref_excluded = int(_ref_counts.pop("excluded", 0))
         for _k in sorted(_ref_counts):
@@ -15783,18 +15922,16 @@ def main(args=None):
                     log_dict["mem_objective/log_total_ratio"] = float(
                         np.mean(np.log(_mt)))
                 # TICKET dsnn-dfw.44: this episode's per-window ratio SAMPLES,
-                # keyed by the plan's elimination order -- the same key
-                # `_decode_arch` hands the archive. Two envs that drew one
-                # order share one sample, so the first record wins.
+                # per environment row. Since dsnn-dfw.301 a record joins its
+                # environment by (episode, env_index), else by plan_hash: the
+                # order alone gave every plan of a fixed-order episode the
+                # numbers of its first record.
                 if _RATIO_ARCHIVE:
-                    _rd: dict = {}
-                    for _r in _plog_recs:
-                        _smp, _msrc = _band_sample(_r, args)
-                        if _smp is None:
-                            continue
-                        _k = tuple(int(v) for v in (_r.get("order") or ()))
-                        if _k and _k not in _rd:
-                            _rd[_k] = (_smp, _msrc)
+                    _rd, _rd_join = _ratio_dists(
+                        _plog_recs, args, ep, int(all_rets.shape[0]),
+                        plan_states)
+                    for _jk, _jv in _rd_join.items():
+                        log_dict[f"pareto/join/{_jk}"] = int(_jv)
                     host_state["_ratio_dists"] = _rd
                 host_state["_gate_drain"] = (
                     {"records": list(_plog_local.get("records") or ())},
@@ -16255,28 +16392,30 @@ def main(args=None):
                 # TICKET dsnn-dfw.44. A band, not a reward slot: the reward's
                 # reference floor maps every plan at or below parity onto 0,
                 # which is exactly the half of the axis a front must keep.
-                _rdists = host_state.get("_ratio_dists") or {}
+                # Taken once: an episode never reads the samples of another.
+                _rdists = host_state.pop("_ratio_dists", None) or {}
                 _sols = []
                 for i in elig_idx:
                     _seq = _decode_arch(i)
-                    _s = _seq["seq"] if isinstance(_seq, dict) else _seq
-                    _key = tuple(int(v) for v, _calls in _s)
-                    _dist = _rdists.get(_key)
+                    # dsnn-dfw.301: the record of this environment row, never the first record of its order.
+                    _dist = _rdists.get(i)
                     if _dist is None:
                         # The plan drain missed this env's record; a point
                         # without its band is not archived and is counted.
                         host_state["pareto_missing_band"] = 1 + int(
                             host_state.get("pareto_missing_band", 0))
                         continue
-                    _sols.append((_dist[0], _seq,
-                                  float(all_rets[i][cosine_idx]), _dist[1]))
+                    _sols.append((_seq, float(all_rets[i][cosine_idx]),
+                                  _dist))
                 _AS_ADMITTED = sum(
-                    int(pareto_archive.add(_d, _sq, ep, quality=_q,
-                                           mem_source=_ms))
-                    for _d, _sq, _q, _ms in _sols)
+                    int(pareto_archive.add(_d[0], _sq, ep, quality=_q,
+                                           mem_source=_d[1], quantiles=_d[2],
+                                           detail=_d[3]))
+                    for _sq, _q, _d in _sols)
                 log_dict["pareto/missing_band"] = int(
                     host_state.get("pareto_missing_band", 0))
                 log_dict["pareto/merged"] = int(pareto_archive.n_merged)
+                log_dict["pareto/repeats"] = int(pareto_archive.n_repeats)
                 if pareto_archive.pts:
                     _bw = [pareto_archive.band_width(i)
                            for i in range(len(pareto_archive.pts))]
@@ -17587,6 +17726,7 @@ def main(args=None):
             probe_metrics=probe_metrics,
             vp_metrics=vp_metrics,
             extra_log=lag_extra,
+            plan_states=_fe.get("plan_states"),
         )
         # Mid-training top-N snapshot. Skips the wandb table log so we
         # don't pollute the offline run with duplicate tables — only the
@@ -17632,13 +17772,14 @@ def main(args=None):
     def _psweep_episode(ep, w, pref_row, roll, drain):
         """ONE swept episode's plans, their bands, and the front they enter.
 
-        THE JOIN IS THE ELIMINATION ORDER, exactly as it is in the trainer's
-        epilogue: a measure actor is another process and its records carry no
-        environment row, so the per-window paired log ratios are keyed by the
-        order the plan eliminated in and matched against the decoded plan. A
-        plan whose record did not arrive, and a plan whose measurement came
-        back sentinelled, are EXCLUDED from the front and COUNTED -- a
-        refused measurement is missing data, never a point.
+        THE JOIN IS THE ENVIRONMENT ROW, exactly as it is in the trainer's
+        epilogue (dsnn-dfw.301): a record names its row in env_index, and a
+        record without one is matched by plan_hash against the plan of the
+        row. The elimination order alone gave every plan of a fixed-order
+        episode the ratios of its first record. A plan whose record did not
+        arrive, and a plan whose measurement came back sentinelled, are
+        EXCLUDED from the front and COUNTED -- a refused measurement is
+        missing data, never a point.
         """
         _traj, _es = roll[1], roll[0]
         _rets = np.asarray(roll[2])
@@ -17649,14 +17790,10 @@ def main(args=None):
             _traj.micro_quant_dtype_seq, _es.face_specs, _es.face_skips)]
         _recs = list((drain.get("local_plan") or {}).get("records", ()))
         _recs.extend((drain.get("pool_plan") or {}).get("records", ()))
-        _bands = {}
-        for _r in _recs:
-            _rl = (_r or {}).get("ratio_log")
-            if not _rl:
-                continue
-            _k = tuple(int(v) for v in (_r.get("order") or ()))
-            if _k and _k not in _bands:
-                _bands[_k] = _rl
+        # dsnn-dfw.301: by environment row, as in the trainer's epilogue.
+        _joined, _join_counts = _join_plan_records(_recs, ep, num_envs, _es)
+        _bands = {e: r["ratio_log"] for e, r in _joined.items()
+                  if r.get("ratio_log")}
         _sent_ch = np.asarray(COMPUTE_REWARD_INDICES, dtype=np.int64)
         _added = 0
         for i in range(num_envs):
@@ -17665,7 +17802,7 @@ def main(args=None):
                 _arr[7][i], _arr[8][i], args.max_substeps)
             _plan = _arch_plan_from_seq(_seq, _arr[9], _arr[10], i)
             _key = tuple(int(v) for v, _calls in _seq)
-            _band = _bands.get(_key)
+            _band = _bands.get(i)
             _live = not bool(np.all(
                 _rets[i][_sent_ch] <= float(SENTINEL_COST) * 0.99))
             _why = (None if (_live and _band is not None)
@@ -17696,7 +17833,9 @@ def main(args=None):
               + (f", median latency log ratio "
                  f"{np.median([p['band']['latency']['median'] for p in _ok]):+.4f}"
                  f" memory {np.median([p['band']['memory']['median'] for p in _ok]):+.4f}"
-                 if _ok else ""), flush=True)
+                 if _ok else "")
+              + (f", {_join_counts['unjoined']} records unjoined"
+                 if _join_counts["unjoined"] else ""), flush=True)
 
     def _pipe_update_dispatch(prev):
         """Dispatch the pending episode's PPO update; do NOT wait for it.
@@ -17735,7 +17874,7 @@ def main(args=None):
         if _TWO_GRAPH:
             _swap_graph(_GSTATES.rule_for(int(prev["ctx"]["ep"])))
         try:
-            (agent, opt_state, _unused_states, _metrics, _tot_rew, _acts,
+            (agent, opt_state, _end_states, _metrics, _tot_rew, _acts,
              global_step, _diag, popart_m1, popart_m2, popart_w, _attn,
              _true_ret, probes, probe_opt_state, _probe_mets,
              vprobes, vprobe_opt_state, _vp_mets,
@@ -17744,7 +17883,7 @@ def main(args=None):
             _ctx.update(
                 agent=agent, opt_state=opt_state, global_step=global_step,
                 metrics=_metrics, total_rewards_full=_tot_rew,
-                actions_pack=_acts, diag_pack=_diag,
+                actions_pack=_acts, diag_pack=_diag, plan_states=_end_states,
                 popart_m1=popart_m1, popart_m2=popart_m2, popart_w=popart_w,
                 attn_ent=_attn, true_scalar_return=_true_ret,
                 probe_metrics=_probe_mets, vp_metrics=_vp_mets,
@@ -18548,6 +18687,7 @@ def main(args=None):
                     _wmets,
                     None,
                     warmup=True,
+                    plan_states=_wend,
                 )
             _R = np.concatenate(_wG, axis=0)
             _live_m = np.concatenate(_wlive, axis=0)
@@ -19043,7 +19183,7 @@ def main(args=None):
         (
             agent,
             opt_state,
-            _,
+            _end_states,
             metrics,
             total_rewards_full,
             actions_pack,
@@ -19092,6 +19232,7 @@ def main(args=None):
             agent=agent, opt_state=opt_state, global_step=global_step,
             metrics=metrics, total_rewards_full=total_rewards_full,
             actions_pack=actions_pack, diag_pack=diag_pack,
+            plan_states=_end_states,
             popart_m1=popart_m1, popart_m2=popart_m2, popart_w=popart_w,
             attn_ent=attn_ent, true_scalar_return=true_scalar_return,
             probe_metrics=probe_metrics, vp_metrics=vp_metrics,

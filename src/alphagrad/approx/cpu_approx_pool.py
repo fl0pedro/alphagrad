@@ -52,6 +52,46 @@ from alphagrad.approx.common.device_guard import ActorStartRefused
 # the policy gradient is pushed away from the offending action.
 _SENTINEL_REWARD_VALUE = -1e10
 
+# A killed plan waits at least this long for a respawning actor to score it, so a short deadline does not decide the race.
+_RESPAWN_WAIT_MIN_S = 60.0
+# The static bytes a call reported when its compile ended, kept outside its actor so they outlive a kill (dsnn-dfw.302).
+_STATIC_BOARD_CAP = 4096
+
+
+class _StaticBoard:
+    # One Ray actor per pool. The oldest entries go first, since the pool reads an entry only right after its kill.
+
+    def __init__(self):
+        self._held: collections.OrderedDict = collections.OrderedDict()
+
+    def put(self, token: str, triple) -> bool:
+        self._held[str(token)] = [float(x) for x in triple]
+        while len(self._held) > _STATIC_BOARD_CAP:
+            self._held.popitem(last=False)
+        return True
+
+    def take(self, token: str):
+        return self._held.pop(str(token), None)
+
+
+class _StaticReport:
+    # Called in the measure actor when the compile ends. The put is acknowledged before the timed runs start.
+
+    def __init__(self, board, token: str):
+        self.board = board
+        self.token = str(token)
+
+    def __call__(self, triple) -> None:
+        import ray
+        try:
+            ray.get(self.board.put.remote(self.token, [float(x) for x in triple]),
+                    timeout=30.0)
+        except Exception as _exc:
+            print(f"[static] the static bytes of call {self.token} did not "
+                  f"reach the board ({type(_exc).__name__}: "
+                  f"{str(_exc)[:160]}): a kill of this call keeps the full "
+                  f"card", flush=True)
+
 
 def _sentinel_callback_output(
     max_tokens: int,
@@ -145,8 +185,11 @@ class CpuApproxPool:
         Q48: one deadline, no cold budget). When exceeded, the future
         is cancelled, the actor is killed, a replacement is requested
         from ``respawn_factory`` (in a daemon thread so the
-        ``evaluate`` call returns quickly), and the sentinel is
-        returned: a killed call is excluded from the update and counted.
+        ``evaluate`` call returns quickly), and a killed terminal call
+        goes to the next free actor, which scores it as the failed plan
+        ``deadline`` (owner ruling 2026-09-26, Q9b c). Its memory is the
+        static bytes the killed call reported when its compile ended, or the
+        full card when the compile had not ended (dsnn-dfw.302).
         An actor gets no plan before its construction has finished (its
         ``ready`` call), so construction never runs against a deadline.
     respawn_factory
@@ -258,6 +301,16 @@ class CpuApproxPool:
         # What each terminal call left in its actor, taken right after the call (dsnn-dfw.201).
         self._kept = self._empty_kept()
         self._n_takes_failed = 0
+        # A call the deadline kills is a failed plan: a free actor scores it (owner ruling 2026-09-26, Q9b c).
+        self._respawns_in_flight = 0
+        self._n_deadline_scored = 0
+        self._n_deadline_unscored = 0
+        # The board that holds the static bytes of each terminal call until a kill reads them (dsnn-dfw.302).
+        self._board = None
+        self._board_tried = False
+        self._static_seq = 0
+        self._n_deadline_static = 0
+        self._n_static_takes_failed = 0
         # ---- the PIPELINED submission (owner ruling 2026-09-14) ----
         # One worker thread, created on first use, and at most ONE batch in
         # flight on it. See `submit_batch` for why the limit is a fact of the
@@ -276,19 +329,87 @@ class CpuApproxPool:
     def _is_terminal(order, step) -> bool:
         return int(step) >= int(np.asarray(order).reshape(-1).shape[0])
 
-    def _record_timeout(self, timeout_s: float, *, order, specs, step,
-                        face_specs, face_skips, reward) -> None:
-        # A terminal call the deadline killed is excluded, counted and
-        # recorded with the reason "timeout" (owner ruling 2026-09-24 Q48).
+    def _record_unscored_deadline(self, timeout_s: float, why: str, *, order,
+                                  specs, step, face_specs, face_skips,
+                                  reward) -> None:
+        # A killed plan that no actor could score: excluded, counted and recorded, the one apparatus fault left.
         from alphagrad.approx import env as _env
+        with self._lock:
+            self._n_deadline_unscored += 1
         _env.record_pool_refusal(
-            "timeout", order=order, rule_specs=specs, face_specs=face_specs,
+            "deadline", order=order, rule_specs=specs, face_specs=face_specs,
             face_skips=face_skips, stop=int(step), reward_vec=reward,
-            refusal_detail={"refusal_timeout_s": float(timeout_s)},
+            refusal_detail={"refusal_timeout_s": float(timeout_s),
+                            "refusal_where": why},
             scored=False)
-        print(f"[refused] timeout step={int(step)} after "
-              f"{float(timeout_s):.0f}s: excluded from the update",
-              flush=True)
+        print(f"[refused] deadline step={int(step)} after "
+              f"{float(timeout_s):.0f}s could not be scored ({why}): "
+              f"excluded from the update", flush=True)
+
+    def _await_actor(self, timeout_s: float) -> bool:
+        # True once an actor is free in the pool. Waits only while a respawn is in flight, at most max(timeout_s, _RESPAWN_WAIT_MIN_S).
+        stop = time.time() + max(float(timeout_s), _RESPAWN_WAIT_MIN_S)
+        while True:
+            with self._lock:
+                if self._closed:
+                    return False
+                if self._alive:
+                    return True
+                waiting = self._respawns_in_flight > 0
+            if not waiting or time.time() >= stop:
+                return False
+            time.sleep(0.02)
+
+    def _static_board(self):
+        # None without a Ray runtime to host it: a kill then keeps the full card.
+        import ray
+        with self._lock:
+            if (self._board is not None or self._board_tried
+                    or self._closed):
+                return self._board
+            self._board_tried = True
+            _live = getattr(ray, "is_initialized", None)
+            if _live is None or not _live():
+                return None
+            try:
+                self._board = ray.remote(num_cpus=0)(_StaticBoard).remote()
+            except Exception as _exc:
+                print(f"[static] the static bytes board could not be "
+                      f"started ({type(_exc).__name__}: {str(_exc)[:200]}): "
+                      f"every kill keeps the full card", flush=True)
+            return self._board
+
+    def _static_to(self, terminal: bool, timeout_s: float):
+        # A token, and the reporter the actor calls when the compile of this terminal call ends.
+        if not terminal or timeout_s <= 0:
+            return None, None
+        board = self._static_board()
+        if board is None:
+            return None, None
+        with self._lock:
+            self._static_seq += 1
+            token = f"{os.getpid()}:{id(self)}:{self._static_seq}"
+        return token, _StaticReport(board, token)
+
+    def _take_static(self, token):
+        # The static bytes the killed call reported, or None when its compile had not ended.
+        import ray
+        if token is None or self._board is None:
+            return None
+        try:
+            got = ray.get(self._board.take.remote(token), timeout=10.0)
+        except Exception as _exc:
+            if _is_toolchain_fault(_exc):
+                raise
+            with self._lock:
+                self._n_static_takes_failed += 1
+            print(f"[static] the static bytes of the killed call {token} "
+                  f"could not be read ({type(_exc).__name__}: "
+                  f"{str(_exc)[:160]}): it keeps the full card "
+                  f"(static_takes_failed={self._n_static_takes_failed})",
+                  flush=True)
+            return None
+        return None if got is None else tuple(float(x) for x in got)
 
     @staticmethod
     def _empty_kept() -> dict:
@@ -502,8 +623,10 @@ class CpuApproxPool:
             return
 
         self._n_respawn_requested += 1
+        with self._lock:
+            self._respawns_in_flight += 1
 
-        def _respawn_in_background() -> None:
+        def _respawn_body() -> None:
             try:
                 new_handle = self._respawn(actor)
             except ActorStartRefused as _exc:
@@ -535,6 +658,13 @@ class CpuApproxPool:
                         pass
                     return
                 self._alive.append(new_handle)
+
+        def _respawn_in_background() -> None:
+            try:
+                _respawn_body()
+            finally:
+                with self._lock:
+                    self._respawns_in_flight -= 1
 
         t = threading.Thread(target=_respawn_in_background, daemon=True)
         t.start()
@@ -679,6 +809,8 @@ class CpuApproxPool:
         episode: int | None = None,
         env_row: int | None = None,
         rule: str | None = None,
+        refuse: str | None = None,
+        refuse_static: Any = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Dispatch one ``(order, specs, step)`` request to a pool
         actor and return ``(tokens, eqn_ids, reward)`` as numpy arrays.
@@ -718,7 +850,7 @@ class CpuApproxPool:
             # than block — the rollout will continue with this step
             # treated as a "bad action".
             print(f"[SENTINEL] pool-drained (no actor) step={int(step)}", flush=True)
-            return _sentinel_callback_output(
+            _sv = _sentinel_callback_output(
                 self._max_tokens,
                 self._num_rewards,
                 self._cosine_sim_idx,
@@ -729,9 +861,16 @@ class CpuApproxPool:
                 self._eqn_dtype,
                 self._emit_eqn_ids,
             )
+            if refuse is not None and self._is_terminal(order_np, step):
+                self._record_unscored_deadline(
+                    self._deadline(), "no live actor", order=order_np,
+                    specs=specs_np, step=step, face_specs=face_specs,
+                    face_skips=face_skips, reward=_sv[-1])
+            return _sv
 
         future = None
         take = None
+        token = None
         try:
             # Prefer the cached ObjectRef when one is available — Ray
             # sees ``ObjectRef`` and skips re-serialising the per-call
@@ -748,6 +887,10 @@ class CpuApproxPool:
             # debugging escape hatch. THE SAME NUMBER travels with the
             # request: the actor scores a refused plan at this deadline.
             timeout = self._deadline()
+            # dsnn-dfw.302: the actor hands out the static bytes of a terminal plan when its compile ends.
+            token, static_to = ((None, None) if refuse is not None else
+                                self._static_to(
+                                    self._is_terminal(order_np, step), timeout))
             future = actor.evaluate.remote(
                 np.asarray(order_np),
                 np.asarray(specs_np),
@@ -762,6 +905,10 @@ class CpuApproxPool:
                 env_row=(None if env_row is None else int(env_row)),
                 rule=(None if rule is None else str(rule)),
                 timeout_s=(float(timeout) if timeout > 0 else None),
+                refuse=refuse,
+                refuse_static=(None if refuse_static is None
+                               else [float(x) for x in refuse_static]),
+                static_to=static_to,
             )
             # An actor runs calls in send order: the flag of the call above.
             flag = actor.pop_oom_flag.remote()
@@ -793,11 +940,23 @@ class CpuApproxPool:
                 self._eqn_dtype,
                 self._emit_eqn_ids,
             )
-            if self._is_terminal(order_np, step):
-                self._record_timeout(
-                    timeout, order=order_np, specs=specs_np, step=step,
-                    face_specs=face_specs, face_skips=face_skips,
-                    reward=_sv[-1])
+            if not self._is_terminal(order_np, step):
+                return _sv
+            if refuse is None:
+                # The static bytes the killed call reported when its compile ended, None when it had not ended (dsnn-dfw.302).
+                _static = self._take_static(token)
+                if self._await_actor(timeout):
+                    # A failed plan (owner ruling 2026-09-26, Q9b c): the next free actor scores it as "deadline".
+                    return self.evaluate(
+                        order_np, specs_np, step, eval_samples, init=init,
+                        face_specs=face_specs, face_skips=face_skips,
+                        episode=episode, env_row=env_row, rule=rule,
+                        refuse="deadline", refuse_static=_static)
+            self._record_unscored_deadline(
+                timeout, ("its scoring call hit the deadline as well"
+                          if refuse is not None else "no live actor"),
+                order=order_np, specs=specs_np, step=step,
+                face_specs=face_specs, face_skips=face_skips, reward=_sv[-1])
             return _sv
         except RayActorError:
             self._n_actor_errors += 1
@@ -807,7 +966,7 @@ class CpuApproxPool:
                 flush=True,
             )
             self._poison(actor, future=future)
-            return _sentinel_callback_output(
+            _sv = _sentinel_callback_output(
                 self._max_tokens,
                 self._num_rewards,
                 self._cosine_sim_idx,
@@ -818,6 +977,12 @@ class CpuApproxPool:
                 self._eqn_dtype,
                 self._emit_eqn_ids,
             )
+            if refuse is not None and self._is_terminal(order_np, step):
+                self._record_unscored_deadline(
+                    self._deadline(), "its scoring actor died", order=order_np,
+                    specs=specs_np, step=step, face_specs=face_specs,
+                    face_skips=face_skips, reward=_sv[-1])
+            return _sv
         except Exception as _exc:
             # Apparatus faults stop the run, as in evaluate_batch (Q53).
             if _is_toolchain_fault(_exc) or isinstance(_exc, ActorStartRefused):
@@ -835,7 +1000,7 @@ class CpuApproxPool:
                 flush=True,
             )
             self._poison(actor, future=future)
-            return _sentinel_callback_output(
+            _sv = _sentinel_callback_output(
                 self._max_tokens,
                 self._num_rewards,
                 self._cosine_sim_idx,
@@ -846,6 +1011,12 @@ class CpuApproxPool:
                 self._eqn_dtype,
                 self._emit_eqn_ids,
             )
+            if refuse is not None and self._is_terminal(order_np, step):
+                self._record_unscored_deadline(
+                    self._deadline(), "its scoring call raised", order=order_np,
+                    specs=specs_np, step=step, face_specs=face_specs,
+                    face_skips=face_skips, reward=_sv[-1])
+            return _sv
         # The flag of this row (Q52), as in evaluate_batch.
         try:
             was_oom = bool(ray.get(flag, timeout=10.0))
@@ -864,6 +1035,11 @@ class CpuApproxPool:
             return out
         if take is not None:
             self._take_call(take, f"step={int(step)}", 30.0)
+        if refuse is not None:
+            with self._lock:
+                self._n_deadline_scored += 1
+                if refuse_static is not None:
+                    self._n_deadline_static += 1
         if was_oom:
             fresh = self._recycle_actor(actor)
             self._n_oom_recycles += 1
@@ -1124,6 +1300,13 @@ class CpuApproxPool:
         takes: dict[int, Any] = {}
         f_timeouts: dict[int, float] = {}
         nxt = 0
+        # The slots the deadline killed, waiting for a free actor to score them as "deadline" (dsnn-dfw.292).
+        redo: collections.deque = collections.deque()
+        rescoring: set = set()
+        # dsnn-dfw.302: the token of each terminal slot, and the static bytes a killed slot reported.
+        tokens: dict = {}
+        redo_static: dict = {}
+        with_static: set = set()
 
         def _adopt() -> bool:
             # An actor respawned after a kill lands in ``self._alive``; it
@@ -1135,13 +1318,35 @@ class CpuApproxPool:
             free.append(len(held) - 1)
             return True
 
-        def _dispatch(j: int, i: int) -> None:
+        def _unscored(i: int, why: str) -> None:
+            self._record_unscored_deadline(
+                f_timeouts.get(i, 0.0) or self._deadline(), why,
+                order=order_batch[i], specs=specs_batch[i],
+                step=step_batch[i],
+                face_specs=(None if face_specs_batch is None
+                            else face_specs_batch[i]),
+                face_skips=(None if face_skips_batch is None
+                            else face_skips_batch[i]),
+                reward=rewards_out[i])
+
+        def _dispatch(j: int, i: int, refuse: str | None = None,
+                      refuse_static: Any = None) -> None:
             actor = held[j]
             self._n_calls += 1
+            if refuse is not None:
+                rescoring.add(i)
+                if refuse_static is not None:
+                    with_static.add(i)
             try:
                 # THE SAME NUMBER travels with the request: the actor
                 # scores a refused plan at the deadline of this slot.
                 _to = self._deadline()
+                # dsnn-dfw.302: the actor hands out the static bytes of a terminal plan when its compile ends.
+                _tok, _rep = ((None, None) if refuse is not None else
+                              self._static_to(self._is_terminal(
+                                  order_batch[i], step_batch[i]), _to))
+                if _tok is not None:
+                    tokens[i] = _tok
                 fut = actor.evaluate.remote(
                     np.asarray(order_batch[i]),
                     np.asarray(specs_batch[i]),
@@ -1159,6 +1364,10 @@ class CpuApproxPool:
                              else int(env_rows[i])),
                     rule=(None if rule is None else str(rule)),
                     timeout_s=(float(_to) if _to > 0 else None),
+                    refuse=refuse,
+                    refuse_static=(None if refuse_static is None
+                                   else [float(x) for x in refuse_static]),
+                    static_to=_rep,
                 )
                 # An actor runs calls in send order: the flag of this call.
                 flags[i] = actor.pop_oom_flag.remote()
@@ -1177,6 +1386,8 @@ class CpuApproxPool:
                 self._poison(actor, future=None)
                 held[j] = None
                 _sentinel_slot(i)
+                if refuse is not None:
+                    _unscored(i, "its scoring call could not be sent")
 
         def _collect(fut) -> None:
             i, j, _dl = pending.pop(fut)
@@ -1191,10 +1402,16 @@ class CpuApproxPool:
                     eqn_ids_out[i] = self._wire(
                         _res[1], self._eqn_dtype, "eqn_ids")
                 rewards_out[i] = np.asarray(reward, dtype=np.float32)
+                # A killed slot that was scored again is a row like any other.
+                sentinel_mask[i] = False
                 with self._lock:
                     self._measures_since_recycle[id(actor)] = (
                         self._measures_since_recycle.get(id(actor), 0) + 1
                     )
+                    if i in rescoring:
+                        self._n_deadline_scored += 1
+                        if i in with_static:
+                            self._n_deadline_static += 1
                 # Every row (Q52): an in-callback OOM is a scored, finite row.
                 try:
                     _was_oom = bool(ray.get(flags[i], timeout=10.0))
@@ -1245,16 +1462,17 @@ class CpuApproxPool:
                 self._poison(actor, future=fut)
                 held[j] = None
                 _sentinel_slot(i)
+                takes.pop(i, None)
                 # A non-terminal slot (a tokenization stall) is no plan.
                 if self._is_terminal(order_batch[i], step_batch[i]):
-                    self._record_timeout(
-                        f_timeouts.get(i, 0.0), order=order_batch[i],
-                        specs=specs_batch[i], step=step_batch[i],
-                        face_specs=(None if face_specs_batch is None
-                                    else face_specs_batch[i]),
-                        face_skips=(None if face_skips_batch is None
-                                    else face_skips_batch[i]),
-                        reward=rewards_out[i])
+                    if i in rescoring:
+                        _unscored(i, "its scoring call hit the deadline "
+                                     "as well")
+                    else:
+                        # A failed plan (owner ruling 2026-09-26, Q9b c): a free actor scores it as "deadline".
+                        # dsnn-dfw.302: with the static bytes it reported when its compile ended, None when it had not ended.
+                        redo_static[i] = self._take_static(tokens.pop(i, None))
+                        redo.append(i)
             except RayActorError:
                 self._n_actor_errors += 1
                 print(
@@ -1265,6 +1483,8 @@ class CpuApproxPool:
                 self._poison(actor, future=fut)
                 held[j] = None
                 _sentinel_slot(i)
+                if i in rescoring:
+                    _unscored(i, "its scoring actor died")
             except Exception as _exc:
                 # The actor's measure toolchain gate fired (finding 03).
                 # Ray re-raises the actor's exception as a RayTaskError
@@ -1292,13 +1512,22 @@ class CpuApproxPool:
                 self._poison(actor, future=fut)
                 held[j] = None
                 _sentinel_slot(i)
+                if i in rescoring:
+                    _unscored(i, "its scoring call raised")
 
-        while nxt < N or pending:
-            while nxt < N and (free or _adopt()):
+        while nxt < N or redo or pending:
+            while (redo or nxt < N) and (free or _adopt()):
                 j = free.popleft()
-                _dispatch(j, nxt)
-                nxt += 1
+                if redo:
+                    k = redo.popleft()
+                    _dispatch(j, k, refuse="deadline",
+                              refuse_static=redo_static.pop(k, None))
+                else:
+                    _dispatch(j, nxt)
+                    nxt += 1
             if not pending:
+                if redo and self._await_actor(self._deadline()):
+                    continue
                 # Every actor of the batch is dead and nothing is in flight.
                 for i in range(nxt, N):
                     print(
@@ -1307,6 +1536,9 @@ class CpuApproxPool:
                         flush=True,
                     )
                     _sentinel_slot(i)
+                for i in redo:
+                    _unscored(i, "no live actor")
+                redo.clear()
                 nxt = N
                 break
             now = time.time()
@@ -1384,6 +1616,10 @@ class CpuApproxPool:
                 "oom_recycles": self._n_oom_recycles,
                 "proactive_recycles": self._n_proactive_recycles,
                 "takes_failed": self._n_takes_failed,
+                "deadline_scored": self._n_deadline_scored,
+                "deadline_unscored": self._n_deadline_unscored,
+                "deadline_static": self._n_deadline_static,
+                "static_takes_failed": self._n_static_takes_failed,
             }
 
     def fetch_timeout_delta(self) -> int:
@@ -1604,6 +1840,13 @@ class CpuApproxPool:
         for a in old:
             try:
                 ray.kill(a, no_restart=True)
+            except Exception:
+                pass
+        with self._lock:
+            board, self._board = self._board, None
+        if board is not None:
+            try:
+                ray.kill(board, no_restart=True)
             except Exception:
                 pass
 

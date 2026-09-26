@@ -6,8 +6,8 @@ latency is log(timeout / t_ref) with THE configured deadline, for every kind;
 memory is the candidate's real static ratios when a compiled program exists
 (a ``gate`` refusal) and the (c') sentinel otherwise (a ``compile`` refusal),
 on slot 5 and on slot 11; quality is 0. The reason rides the plan-log record
-and the refusal counters. A call the deadline killed is excluded instead
-(refusal_rules_test.py).
+and the refusal counters. Since 2026-09-26 (Q9b c) a call the deadline killed is
+scored too, as ``deadline`` (refusal_rules_test.py).
 """
 from __future__ import annotations
 
@@ -356,7 +356,8 @@ def test_refused_reward_is_never_better_than_a_plan_that_passed_the_gate(
     d_lat, d_mem, _ = paired_log_costs(0.9e6, edge[0], REF["latency_ns"],
                                        REF["memory_bytes"])
     measured = (-d_lat, -d_mem, mem_objective(edge, REF["static"])[0])
-    for kind in ("compile", "oom", "untraceable", "muls-cap", "raised"):
+    for kind in ("compile", "oom", "untraceable", "muls-cap", "raised",
+                 "deadline"):
         slots, _ = env_mod.refused_reward(kind, timeout_s=0.001,
                                           reference=REF)
         assert slots[LAT] < measured[0]

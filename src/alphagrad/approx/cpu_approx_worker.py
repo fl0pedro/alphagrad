@@ -224,6 +224,9 @@ class CpuApproximationServer:
         episode: int | None = None,
         env_row: int | None = None,
         timeout_s: float | None = None,
+        refuse: str | None = None,
+        refuse_static: Any = None,
+        static_to: Any = None,
     ):
         """Run the per-step reward pipeline once.
 
@@ -274,6 +277,19 @@ class CpuApproximationServer:
         import jax.numpy as jnp
         import numpy as np
         from alphagrad.approx.env import MAX_TOKENS, NUM_REWARDS, _callback
+        # The pool sends a call its deadline killed to this actor to be scored as a failed plan (dsnn-dfw.292).
+        from alphagrad.approx.env import (
+            _COMPILE_END_SINK as _sink_cell, _FORCED_REFUSAL as _refuse_cell,
+            forced_refusal as _forced)
+        _refuse_was = _refuse_cell[0]
+        if refuse is None and refuse_static is not None:
+            raise ValueError(
+                "static bytes travel only with the forced refusal of a "
+                "killed call (refuse='deadline')")
+        _refuse = (None if refuse is None
+                   else _forced(refuse, timeout_s, static=refuse_static))
+        # static_to takes this call's static bytes when its compile ends (dsnn-dfw.302).
+        _sink_was = _sink_cell[0]
 
         if episode is not None:
             # A3 rotation, pooled path. One env-var write per call; `_walk_seed`
@@ -310,6 +326,8 @@ class CpuApproximationServer:
         # The flag belongs to this call (Q52); an unread earlier one is stale.
         self._last_was_oom = False
         try:
+            _refuse_cell[0] = _refuse
+            _sink_cell[0] = static_to
             # env._callback takes face_specs / face_skips between the
             # per-vertex specs and `stop`. With no caller-supplied wires,
             # EMPTY (-1 / 0) is the documented per-vertex mode and is
@@ -514,6 +532,8 @@ class CpuApproximationServer:
             # is what keeps a raising measurement from stamping the next one.
             _env_slot_cell[0] = _slot_was
             _timeout_cell[0] = _timeout_was
+            _refuse_cell[0] = _refuse_was
+            _sink_cell[0] = _sink_was
 
     def precompile(self, order: Any, sparsity_specs: Any, step: int) -> bool:
         """STAGE-2 async: compile-only warm of the shared cluster cache.
@@ -810,12 +830,7 @@ def _build_env_from_args(args_dict: dict, variant: str | None, *,
     args = SimpleNamespace(**args_dict)
     if variant is not None:
         _apply_variant_preset(args, variant)
-    # Mirror the trainer's default — the CPU worker never benefits from
-    # the GPU preallocator (it usually lands on CPU jax devices anyway),
-    # and the env's `_callback` can transiently allocate GPU buffers via
-    # `exec_on_gpu` mode.
-    # Preallocation stays off by the owner's ruling of 2026-09-25 (dsnn-dfw.238); the static peak gate reads the card, not this allocator.
-    os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    # JAX's default preallocation on the one GPU this actor sees (owner ruling 2026-09-26, dsnn-dfw.288).
 
     key = jrand.PRNGKey(int(getattr(args, "seed", seed)))
     key, args_key, eval_key = jrand.split(key, 3)

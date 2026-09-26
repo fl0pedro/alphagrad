@@ -1,6 +1,7 @@
 # dsnn-dfw.223: the measurement pool serves a batch as a work queue, not in waves of M. A slot
 # goes to the first free actor, so a fast plan does not hold its actor until the slowest plan of
-# its wave is back, and a deadline kill takes only the killed slot with it.
+# its wave is back, and a deadline kill takes only the killed actor with it. Since 2026-09-26
+# (Q9b c, dsnn-dfw.292) a free actor then scores the killed plan as the failed plan "deadline".
 from __future__ import annotations
 
 import sys
@@ -78,7 +79,7 @@ class _Remote:
     def remote(self, *a, **k):
         if self._on is not None:
             self._on(*a)
-        return _Future(self._fn, self._dur(*a) if callable(self._dur) else self._dur,
+        return _Future(self._fn, self._dur(*a, **k) if callable(self._dur) else self._dur,
                        self._clock, *a, **k)
 
 
@@ -89,7 +90,9 @@ class _Actor:
         self.name = name
         self.killed = False
         self.slots: list = []
-        self.evaluate = _Remote(self._evaluate, lambda order, *a: float(order[0]), clock,
+        self.evaluate = _Remote(self._evaluate,
+                                lambda order, *a, **k: 0.0 if k.get("refuse") else float(order[0]),
+                                clock,
                                 on_dispatch=lambda order, *a: self.slots.append(int(order[1])))
         self.pop_oom_flag = _Remote(lambda: False, 0.0, clock)
         self.ready = _Remote(lambda: True, 0.0, clock)
@@ -126,7 +129,7 @@ def test_a_free_actor_takes_the_next_slot_instead_of_waiting_for_its_wave(sim_ra
     assert pool.live_actors() == actors
 
 
-def test_a_deadline_kill_takes_only_the_killed_slot(sim_ray):
+def test_a_deadline_kill_takes_only_the_killed_actor(sim_ray):
     _ray, clock = sim_ray
     t = 0.02
     actors = [_Actor("a0", clock), _Actor("a1", clock)]
@@ -134,9 +137,10 @@ def test_a_deadline_kill_takes_only_the_killed_slot(sim_ray):
     t0 = time.time()
     _tok, _eqn, rewards, mask = _batch(pool, [100 * t, 0.0, 0.0, 0.0])
     assert time.time() - t0 < 5.0
-    assert mask.tolist() == [True, False, False, False]
+    assert mask.tolist() == [False, False, False, False], "the killed plan enters the update"
     assert actors[0].killed and not actors[1].killed
     assert actors[0].slots == [0]
-    assert actors[1].slots == [1, 2, 3]
+    assert actors[1].slots == [1, 2, 3, 0], "a free actor scores the killed plan"
+    assert pool.stats()["deadline_scored"] == 1
     assert pool.stats()["timeouts"] == 1
     assert pool.live_actors() == [actors[1]]

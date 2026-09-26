@@ -1448,12 +1448,13 @@ def _record_zero_work_plan() -> None:
 # with `--plan-log` off.
 #
 # THE KIND is the reason's prefix: `oom`, `untraceable`, `muls-cap`,
-# `no-target-fun`, `raised`, `gate`, `compile`, `timeout`,
+# `no-target-fun`, `raised`, `gate`, `compile`, `deadline`,
 # `quality-undefined`. The detail after the colon stays on the plan record's
 # `refused` field, which is not aggregated. Since 2026-09-24 (Q42, Q48) every
-# refusal is scored except a call the deadline killed (`timeout`) and an
-# undefined quality, which stay excluded; each count also lands in `scored`
-# or `excluded`.
+# refusal is scored except an undefined quality, which stays excluded, and
+# since 2026-09-26 (Q9b c) a call the deadline killed is a failed plan scored
+# as `deadline` (archived logs carry the old excluded `timeout`); each count
+# also lands in `scored` or `excluded`.
 #
 # `oracle` IS GONE (owner ruling 2026-09-18). It named the gradient oracle's
 # own float64 compile failing inside the measurement, which was 3.9 percent of
@@ -1493,9 +1494,37 @@ def consume_refused_counts() -> dict:
 #   memory    the real static ratios when a compiled program exists, else
 #             the (c') sentinel of `memory_sentinel`;
 #   quality   0.
-# A call the deadline killed is not a refused plan: it is counted and
-# excluded (`timeout`), and `refused_reward` refuses to score it.
+# A call the deadline killed is a failed plan since 2026-09-26 (Q9b c): the
+# pool sends it again to a free actor with the forced refusal `deadline`. Its
+# memory is the static bytes the killed call reported when its compile ended,
+# or the full card when the compile had not ended (dsnn-dfw.302).
 _MEASURE_TIMEOUT_S: list = [None]
+# The refusal the current call is forced to, set by the server for the pool's rescoring of a killed call.
+_FORCED_REFUSAL: list = [None]
+# The server sets this per call: it takes the static bytes (temp, output, args) of the plan's program when its compile ends.
+_COMPILE_END_SINK: list = [None]
+
+
+def forced_refusal(kind: str, timeout_s, static=None) -> tuple:
+    if kind != "deadline":
+        raise ValueError(
+            f"only a call the deadline killed is forced to a refusal, got "
+            f"{kind!r}")
+    if static is not None:
+        static = tuple(float(x) for x in static)
+        if len(static) != 3 or not all(
+                math.isfinite(x) and x >= 0.0 for x in static):
+            raise ValueError(
+                f"the static bytes of a killed call are (temp, output, "
+                f"args), finite and not negative, got {static!r}")
+    return ("deadline", "deadline",
+            {"refusal_where": "the pool's deadline",
+             "refusal_timeout_s": None if timeout_s is None else float(timeout_s),
+             # True: the killed call's compile had ended, and its static bytes score its memory.
+             "refusal_compiled": static is not None},
+            static)
+
+
 _HOST_LIMIT_NOTED: list = []
 MEM_OBJECTIVE_EPS_FRACTION = 2.0 ** -10
 # The scorer of the terminal measurement in progress; `_callback` hands it a
@@ -1570,8 +1599,9 @@ def refused_reward(kind: str, *, timeout_s, reference, candidate_static=None,
                    counts=(0.0, 0.0)) -> tuple[list, dict]:
     if kind == "timeout":
         raise ValueError(
-            "a call the deadline killed is excluded from the update and "
-            "never scored (owner ruling 2026-09-24 Q48)")
+            "a call the deadline killed has the kind `deadline` since "
+            "2026-09-26 (Q9b c). `timeout` names the excluded kill of "
+            "archived logs and is never scored.")
     t = None if timeout_s is None else float(timeout_s)
     if t is None or not math.isfinite(t) or t <= 0.0:
         raise RuntimeError(
@@ -2955,6 +2985,11 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
                 "ref_inner_p"),
             "ref_measure_windows_provisional": (measure_counts or {}).get(
                 "ref_windows_p"),
+            # The quantiles of the per-execution latency over each half's timed windows (owner ruling 2026-09-26, Q12).
+            **latency_quantile_fields(
+                "candidate", (measure_counts or {}).get("lat_q")),
+            **latency_quantile_fields(
+                "ref", (measure_counts or {}).get("ref_lat_q")),
             # THE PLAN THIS ONE'S NUMBERS CAME FROM (owner ruling
             # 2026-09-14). None on every measured plan. An integer names the
             # index, within this episode and this measure actor, of the
@@ -5227,6 +5262,24 @@ def paired_cost_floor() -> str:
             f"{PAIRED_COST_FLOOR_CHOICES} (set by ppo.py from "
             f"--paired-cost-floor), got {want!r}")
     return want
+
+
+LATENCY_QUANTILES = (10, 25, 50, 75, 90)
+
+
+def latency_quantiles(samples) -> dict | None:
+    # p10 to p90 of the per-execution latency over the timed windows, in ns (owner ruling 2026-09-26, Q12). One reading fills every field.
+    s = np.asarray([float(x) for x in samples], dtype=np.float64)
+    if s.size == 0:
+        return None
+    return {f"p{q}": float(v)
+            for q, v in zip(LATENCY_QUANTILES, np.percentile(s, LATENCY_QUANTILES))}
+
+
+def latency_quantile_fields(half: str, q: dict | None) -> dict:
+    # candidate_latency_p10_ns ... ref_latency_p90_ns, the record fields of latency_quantiles.
+    return {f"{half}_latency_p{p}_ns": (None if q is None else q[f"p{p}"])
+            for p in LATENCY_QUANTILES}
 
 
 def _time_one_rep(ex, eval_args, unique_devices, inner):
@@ -10778,7 +10831,8 @@ def _callback_measured(
     # once they have run.
     _sizing = {"cand": None}
 
-    def _score_refusal(kind: str, reason: str, detail: dict, program):
+    def _score_refusal(kind: str, reason: str, detail: dict, program,
+                       static=None):
         _REFUSAL_SCORER[0] = None
         _timeout = measure_timeout_s()
         _limit, _limit_src = allocator_bytes_limit(_gate_dev)
@@ -10796,7 +10850,7 @@ def _callback_measured(
                      "ref_inner": 0, "ref_windows": 0, "ref_secs": 0.0,
                      "ref_first_s": 0.0, "ref_warm_s": 0.0,
                      "ref_inner_p": 0, "ref_windows_p": 0,
-                     "ref_timing": None}
+                     "ref_timing": None, "lat_q": None, "ref_lat_q": None}
         _r_static = None
         if _paired:
             _r_ex = _compile_reference()
@@ -10922,6 +10976,8 @@ def _callback_measured(
                       else float(_r_peak))
             _ref_for_score.update(latency_ns=_r_lat, memory_bytes=_r_mem,
                                   static=_r_static)
+            _r_q = (latency_quantiles(_r_lat_s) if config.measure_latency
+                    else None)
             _counts_r.update(
                 ref_inner=int(_r_inner), ref_windows=int(_r_windows),
                 ref_secs=float(_r_once["secs"]),
@@ -10929,8 +10985,10 @@ def _callback_measured(
                 ref_warm_s=float(_r_once["warm"]),
                 ref_inner_p=int(_r_once["inner_p"]),
                 ref_windows_p=int(_r_once["windows_p"]),
-                ref_timing=_r_timing)
+                ref_timing=_r_timing, ref_lat_q=_r_q)
             _ref_rec = {
+                **latency_quantile_fields("ref", _r_q),
+                **latency_quantile_fields("candidate", None),
                 "latency_ns": float(_r_lat),
                 "temp_bytes": float(_r_static[0]),
                 "output_bytes": float(_r_static[1]),
@@ -10942,7 +11000,9 @@ def _callback_measured(
                 "reference": _ref_kind,
                 "rev_exact": None,
             }
-        _cand_static = None
+        # The refused program's static bytes, or the ones a killed call reported when its compile ended (dsnn-dfw.302).
+        _cand_static = (None if static is None
+                        else tuple(float(x) for x in static))
         if program is not None:
             _cand_static = _static_memory_bytes(program)
             if _cand_static is None:
@@ -10950,9 +11010,9 @@ def _callback_measured(
                     f"a {kind} refusal: memory_analysis() returned nothing "
                     f"for the refused candidate, so its memory ratios cannot "
                     f"be read")
-            if _r_static is not None:
-                check_memory_bounds(_cand_static, _r_static,
-                                    f"the refused plan ({reason})")
+        if _cand_static is not None and _r_static is not None:
+            check_memory_bounds(_cand_static, _r_static,
+                                f"the refused plan ({reason})")
         _slots, _info = refused_reward(
             kind, timeout_s=_timeout, reference=_ref_for_score,
             candidate_static=_cand_static,
@@ -11002,6 +11062,11 @@ def _callback_measured(
             _refusal_detail("measurement", exc), _st["program"])
 
     _REFUSAL_SCORER[0] = _score_raise
+    if (_early_refusal is None and is_terminal
+            and _FORCED_REFUSAL[0] is not None):
+        # The pool's deadline killed this plan in another actor. It is scored here, before its compile, on the static bytes that actor reported when its compile ended, or on the full card (dsnn-dfw.302).
+        _fk, _fr, _fd, _fs = _FORCED_REFUSAL[0]
+        return _score_refusal(_fk, _fr, _fd, None, static=_fs)
     if _early_refusal is not None:
         return _score_refusal(*_early_refusal, None)
     compiled_approx = None
@@ -11023,6 +11088,11 @@ def _callback_measured(
         return _score_refusal(*_compile_refusal("approx compile", _exc),
                               None)
     _st["program"] = compiled_approx
+    if is_terminal and _COMPILE_END_SINK[0] is not None:
+        # The compile has ended: the static bytes leave this actor before the gate and the timed runs, so they outlive a kill (dsnn-dfw.302).
+        _sink_bytes = _static_memory_bytes(compiled_approx)
+        if _sink_bytes is not None:
+            _COMPILE_END_SINK[0](_sink_bytes)
     # ONE EXECUTABLE PER PLAN, THE SPARSE ONE (owner rulings 2026-09-25, grill
     # round 1 Q18 c and round 2 Q2). Until then the cost channels timed a
     # second executable compiled with sparse_representation=True under
@@ -11747,6 +11817,10 @@ def _callback_measured(
         if config.measure_latency
         else 0.0
     )
+    _lat_q = (latency_quantiles(latency_samples) if config.measure_latency
+              else None)
+    _ref_lat_q = (latency_quantiles(_ref_lat_samples)
+                  if _paired and config.measure_latency else None)
     # Fake-fast guard: a positive-but-implausibly-small reading is clamped UP
     # to the floor rather than trusted — a degenerate (zero-work) plan must
     # not report an unbeatable latency. 0.0 stays 0.0 (= "not measured").
@@ -11895,6 +11969,8 @@ def _callback_measured(
                       f"(rev-exact {_rv_med/1e3:.1f}us, reference "
                       f"{_tl_med/1e3:.1f}us)", flush=True)
             _paired_ref_rec = {
+                **latency_quantile_fields("candidate", _lat_q),
+                **latency_quantile_fields("ref", _ref_lat_q),
                 "ratio_log": _ratio_log,
                 # POSITIVE units (ticket .45 logs these as ref/*).
                 "latency_ns": float(_ref_lat_ns),
@@ -12148,6 +12224,8 @@ def _callback_measured(
         "ref_windows_p": int(_ref_once["windows_p"]) if _paired else 0,
         "ref_timing": (None if not _paired
                        else "timed" if _ref_timed_now else "reused"),
+        "lat_q": _lat_q,
+        "ref_lat_q": _ref_lat_q,
     }
     _LAST_MEASURE_COUNTS.clear()
     _LAST_MEASURE_COUNTS.update(_measure_counts)
