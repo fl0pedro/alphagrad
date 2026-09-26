@@ -247,6 +247,7 @@ def test_the_quantile_front_survives_the_checkpoint_and_refuses_another_kind():
 
 def test_the_trainer_feeds_the_record_quantiles_to_the_front():
     src = inspect.getsource(ppo.main)
-    assert "+ _latency_quantiles(_r, args))" in src
+    assert "_ratio_dists(" in src
+    assert "_latency_quantiles(rec, args)" in inspect.getsource(ppo._ratio_dists)
     assert "quantiles=_d[2]" in src and "detail=_d[3]" in src
     assert 'log_dict["pareto/repeats"]' in src

@@ -188,7 +188,8 @@ def test_the_senses_and_sources_survive_the_checkpoint_and_a_mismatch_raises():
 def test_the_trainer_feeds_the_front_from_the_plan_record():
     src = inspect.getsource(ppo.main)
     assert "return _band_archive(args)" in src
-    assert "_smp, _msrc = _band_sample(_r, args)" in src
+    assert "_ratio_dists(" in src, "the samples are joined per environment row (dsnn-dfw.301)"
+    assert "_band_sample(rec, args)" in inspect.getsource(ppo._ratio_dists)
     assert "mem_source=_d[1]" in src
     sample, source = ppo._band_sample(_measured((1, 2, 3), 0.5, 1.0, 0.97), _args())
     assert source == "watermark" and sample["quality"] == [0.97]
