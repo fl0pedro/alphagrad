@@ -7657,6 +7657,32 @@ def _mem_reward_index(mem_type: str) -> int:
 
 
 
+#: The band front's two objectives beside the windowed latency and memory ratios, one reading per
+#: plan each: quality (the gradient cosine) and the trained memory objective (dsnn-dfw.281).
+BAND_READINGS = (("quality", "max"), ("mem_objective", "max"))
+
+
+def _band_archive(args):
+    from alphagrad.approx.common.pareto_archive import RatioBandArchive
+    # Quality is an objective and no filter: a plan under tau stays when it is faster or smaller (owner, 2026-09-26).
+    return RatioBandArchive(
+        obj_names=(args.cmp_type, args.mem_type) + tuple(
+            n for n, _s in BAND_READINGS),
+        senses=("min", "min") + tuple(s for _n, s in BAND_READINGS),
+        cap=64)
+
+
+def _band_sample(rec, args):
+    rl = (rec or {}).get("ratio_log")
+    if not rl:
+        return None
+    out = {args.cmp_type: rl["latency"]["windows"],
+           args.mem_type: rl["memory"]["windows"]}
+    for name, _s in BAND_READINGS:
+        out[name] = [float(rec["rewards"][REWARD_INDEX[name]])]
+    return out
+
+
 def _dump_pareto(archive, args, ep, *, final=False, rule=None):
     """Persist the front + a replayable best_sequences.json. Never raises.
 
@@ -7683,7 +7709,8 @@ def _dump_pareto(archive, args, ep, *, final=False, rule=None):
             _os.path.join(_dir, f"pareto_front{_tag}.json"),
             extra={"episode": int(ep), "final": bool(final),
                    "temporal_rule": (None if rule is None else str(rule)),
-                   "run_name": getattr(args, "name", None)},
+                   "run_name": getattr(args, "name", None),
+                   "quality_floor": getattr(args, "quality_floor", None)},
         )
         # Replayable form. Objective 0 is the compute channel and objective 1
         # memory (see ParetoArchive construction); lower is better in the
@@ -14771,12 +14798,7 @@ def main(args=None):
         one and band them together.
         """
         if _RATIO_ARCHIVE:
-            from alphagrad.approx.common.pareto_archive import RatioBandArchive
-            return RatioBandArchive(
-                obj_names=(args.cmp_type, args.mem_type),
-                cap=64,
-                quality_floor=args.quality_floor,
-            )
+            return _band_archive(args)
         from alphagrad.approx.common.pareto_archive import ParetoArchive
         return ParetoArchive(
             obj_names=(args.cmp_type, args.mem_type, "cosine_sim"),
@@ -15729,14 +15751,12 @@ def main(args=None):
                 if _RATIO_ARCHIVE:
                     _rd: dict = {}
                     for _r in _plog_recs:
-                        _rl = (_r or {}).get("ratio_log")
-                        if not _rl:
+                        _smp = _band_sample(_r, args)
+                        if _smp is None:
                             continue
                         _k = tuple(int(v) for v in (_r.get("order") or ()))
                         if _k and _k not in _rd:
-                            _rd[_k] = {
-                                args.cmp_type: _rl["latency"]["windows"],
-                                args.mem_type: _rl["memory"]["windows"]}
+                            _rd[_k] = _smp
                     host_state["_ratio_dists"] = _rd
                 host_state["_gate_drain"] = (
                     {"records": list(_plog_local.get("records") or ())},
@@ -16254,12 +16274,10 @@ def main(args=None):
             if pareto_archive.pts:
                 fx = np.stack(pareto_archive.pts).astype(np.float64)
                 # 3 scatter tables: (latency|cmp x cos), (mem x cos), (cmp x mem)
-                # The ratio archive has no cosine axis, so only the third pair
-                # exists there.
-                _scatter = ({"pareto/cmp_vs_mem": (0, 1)} if _RATIO_ARCHIVE
-                            else {"pareto/cmp_vs_cos": (0, 2),
-                                  "pareto/mem_vs_cos": (1, 2),
-                                  "pareto/cmp_vs_mem": (0, 1)})
+                # Both archives hold the quality as objective 2 (dsnn-dfw.281).
+                _scatter = {"pareto/cmp_vs_cos": (0, 2),
+                            "pareto/mem_vs_cos": (1, 2),
+                            "pareto/cmp_vs_mem": (0, 1)}
                 for key, (a, b) in _scatter.items():
                     # Use the episode each point was ADMITTED at, not the
                     # current one: stamping `ep` on every row made the whole

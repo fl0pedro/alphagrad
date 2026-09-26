@@ -417,6 +417,7 @@ def pareto_archive_to_json(archive) -> dict:
         return {
             "kind": "ratio-band",
             "obj_names": [str(n) for n in archive.obj_names],
+            "senses": [str(s) for s in archive.senses],
             "cap": int(archive.cap),
             "pool_cap": int(archive.pool_cap),
             "quality_floor": (None if archive.quality_floor is None
@@ -471,6 +472,12 @@ def pareto_archive_from_json(archive, d: dict) -> None:
             f"archive on this run and {d.get('kind') or 'a reward-vector'} "
             f"archive in the checkpoint.")
     if _band:
+        _senses = [str(s) for s in (d.get("senses")
+                                    or ["min"] * len(d["obj_names"]))]
+        if [str(s) for s in archive.senses] != _senses:
+            raise CheckpointError(
+                f"the Pareto archive's senses are {archive.senses} on this "
+                f"run and {_senses} in the checkpoint.")
         archive.cap = int(d["cap"])
         archive.pool_cap = int(d["pool_cap"])
         archive.pts = [np.asarray(p, dtype=np.float64) for p in d["pts"]]

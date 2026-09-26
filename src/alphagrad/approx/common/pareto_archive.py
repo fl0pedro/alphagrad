@@ -317,10 +317,19 @@ def median_band(x) -> tuple:
 class RatioBandArchive:
 
     def __init__(self, obj_names, cap: int = 64, quality_floor=None,
-                 pool_cap: int = _POOL_CAP):
+                 pool_cap: int = _POOL_CAP, senses=None):
         self.obj_names = list(obj_names)
         if not self.obj_names:
             raise ValueError("RatioBandArchive needs at least one objective")
+        # "min": lower is better; "max": higher is better. A point stores every value as it was measured.
+        self.senses = (["min"] * len(self.obj_names) if senses is None
+                       else [str(s) for s in senses])
+        if (len(self.senses) != len(self.obj_names)
+                or any(s not in ("min", "max") for s in self.senses)):
+            raise ValueError(
+                f"RatioBandArchive senses must name 'min' or 'max' for each "
+                f"of {self.obj_names}, got {senses!r}")
+        self._max = np.array([s == "max" for s in self.senses])
         self.cap = int(cap)
         if self.cap < 1:
             raise ValueError(f"RatioBandArchive cap must be >= 1, got {cap!r}")
@@ -426,8 +435,8 @@ class RatioBandArchive:
             return False
         dominates: list[int] = []
         for i in range(len(self.pts)):
-            better = med < self.lo[i]
-            worse = med > self.hi[i]
+            better = np.where(self._max, med > self.hi[i], med < self.lo[i])
+            worse = np.where(self._max, med < self.lo[i], med > self.hi[i])
             if not better.any() and not worse.any():
                 # Inside the band everywhere: POOL the windows into the point
                 # and re-fit, so a point that is measured again knows more.
@@ -491,7 +500,8 @@ class RatioBandArchive:
         if not self.pts:
             return 0.0
         # The sweep MAXIMISES, so minimisation medians enter negated.
-        pts = -np.stack(self.pts)
+        pts = np.stack(self.pts)
+        pts = np.where(self._max, pts, -pts)
         if self._hv_ref is None:
             self._hv_ref = pts.min(axis=0) - 1.0
         return hypervolume(pts, self._hv_ref)
@@ -526,8 +536,14 @@ class RatioBandArchive:
         _hv = self.hypervolume()
         payload = {
             "objectives": list(self.obj_names),
-            "space": "log ratio against the paired rev-exact reference; "
-                     "0 is parity and lower is better",
+            "senses": dict(zip(self.obj_names, self.senses)),
+            "space": ("log ratio against the paired rev-exact reference; "
+                      "0 is parity and lower is better"
+                      if "max" not in self.senses else
+                      "each objective as it was measured; senses names the "
+                      "better direction (min: lower, max: higher); a latency "
+                      "or memory objective is a log ratio against the paired "
+                      "rev-exact reference, 0 is parity"),
             "band": "90 percent distribution-free interval for the median of "
                     "the pooled per-window paired log ratios",
             "hypervolume": _hv if np.isfinite(_hv) else None,
