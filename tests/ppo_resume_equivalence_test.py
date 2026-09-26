@@ -41,8 +41,10 @@ on Helmholtz, the same target `tools/smoke.sh` uses.
 
 from __future__ import annotations
 
+import json
 import os
 import pickle
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -91,6 +93,20 @@ _ENV = {
 }
 
 
+def _start(work_dir: Path, tag: str, *extra: str, name: str = "eqrun"):
+    cwd = work_dir / f"dir_{tag}"
+    cwd.mkdir()
+    env = {k: v for k, v in os.environ.items() if not k.startswith("ALPHAGRAD_")}
+    env.update(_ENV)
+    env["ALPHAGRAD_EQ_DUMP"] = str(work_dir / tag)
+    r = subprocess.run(
+        [sys.executable, str(_TRAINER), *_COMMON, "--name", name, *extra],
+        cwd=str(cwd), env=env, capture_output=True, text=True,
+        timeout=5400,
+    )
+    return cwd, r
+
+
 def _run(work_dir: Path, tag: str, *extra: str, name: str = "eqrun") -> Path:
     """One trainer run. Returns ITS OWN directory, where its checkpoints are.
 
@@ -103,16 +119,7 @@ def _run(work_dir: Path, tag: str, *extra: str, name: str = "eqrun") -> Path:
     namespace, `--name` included, so two legs of one run that disagreed about
     it would be refused -- correctly, and this file's first version was.
     """
-    cwd = work_dir / f"dir_{tag}"
-    cwd.mkdir()
-    env = {k: v for k, v in os.environ.items() if not k.startswith("ALPHAGRAD_")}
-    env.update(_ENV)
-    env["ALPHAGRAD_EQ_DUMP"] = str(work_dir / tag)
-    r = subprocess.run(
-        [sys.executable, str(_TRAINER), *_COMMON, "--name", name, *extra],
-        cwd=str(cwd), env=env, capture_output=True, text=True,
-        timeout=5400,
-    )
+    cwd, r = _start(work_dir, tag, *extra, name=name)
     if r.returncode != 0:
         raise AssertionError(
             f"the trainer failed for {tag} (rc={r.returncode})\n"
@@ -243,3 +250,62 @@ def test_a_resume_refuses_a_command_line_that_does_not_match(tmp_path):
                              checkpoint_every=2, lr=0.0003)
     with pytest.raises(ckpt.CheckpointError, match="seed"):
         ckpt.check_resume_args(meta["args"], bad)
+
+
+# dsnn-dfw.274 (owner ruling 2026-09-26): a run may resume on other GPU numbers, never on another GPU model.
+@pytest.fixture(scope="module")
+def gpu_leg(tmp_path_factory):
+    work = tmp_path_factory.mktemp("gpu_model")
+    first = _run(work, "gpu_leg1", "--episodes", "2", "--checkpoint-every", "2",
+                 name="gpumodel")
+    return work, _checkpoint(first, 2)
+
+
+def _edited(work: Path, src: Path, tag: str, edit) -> Path:
+    dst = work / f"ckpt_{tag}" / src.name
+    shutil.copytree(src, dst)
+    meta = json.loads((dst / "meta.json").read_text())
+    edit(meta)
+    (dst / "meta.json").write_text(json.dumps(meta, indent=1, sort_keys=True))
+    return dst
+
+
+def test_a_resume_on_other_gpu_numbers_of_the_same_model_runs(gpu_leg):
+    work, mid = gpu_leg
+    _run(work, "gpu_other_numbers", "--episodes", "3", "--checkpoint-every",
+         "2", "--gpus", "1", "--resume", str(mid), name="gpumodel")
+    _dump(work, "gpu_other_numbers", 2)
+    meta = json.loads((mid / "meta.json").read_text())
+    assert meta["trainer_gpu_model"] == {"device_kind": "cpu",
+                                         "nvidia_smi_name": None}
+
+
+def test_a_resume_on_another_gpu_model_raises_and_names_both(gpu_leg):
+    work, mid = gpu_leg
+
+    def other_model(meta):
+        meta["trainer_gpu_model"] = {"device_kind": "NVIDIA H100 80GB HBM3",
+                                     "nvidia_smi_name": "NVIDIA H100 80GB HBM3"}
+
+    path = _edited(work, mid, "gpu_other_model", other_model)
+    _, r = _start(work, "gpu_other_model", "--episodes", "3",
+                  "--checkpoint-every", "2", "--resume", str(path),
+                  name="gpumodel")
+    assert r.returncode != 0, r.stdout[-3000:]
+    assert "CheckpointError" in r.stderr, r.stderr[-3000:]
+    assert "NVIDIA H100 80GB HBM3" in r.stderr, r.stderr[-3000:]
+    assert "trainer is on a cpu" in r.stderr, r.stderr[-3000:]
+    assert not (work / "gpu_other_model.ep2.pkl").exists()
+
+
+def test_an_old_checkpoint_without_the_gpu_model_field_raises(gpu_leg):
+    work, mid = gpu_leg
+    path = _edited(work, mid, "gpu_no_field",
+                   lambda meta: meta.pop("trainer_gpu_model", None))
+    _, r = _start(work, "gpu_no_field", "--episodes", "3",
+                  "--checkpoint-every", "2", "--resume", str(path),
+                  name="gpumodel")
+    assert r.returncode != 0, r.stdout[-3000:]
+    assert "CheckpointError" in r.stderr, r.stderr[-3000:]
+    assert "'trainer_gpu_model'" in r.stderr, r.stderr[-3000:]
+    assert not (work / "gpu_no_field.ep2.pkl").exists()

@@ -24,6 +24,7 @@ import os
 import pickle
 import shutil as _shutil
 import signal
+import subprocess
 from typing import Any, Callable, Optional
 
 import numpy as np
@@ -268,11 +269,17 @@ PPO_CKPT_PREFIX = "ppo_ckpt_ep"
 #: may extend the run, and `--resume` itself because the first leg did not
 #: carry it. `--checkpoint-keep-at` (dsnn-dfw.117) only pins which OLD
 #: checkpoints the pruning skips deleting; it reads no state, changes no
-#: computation and steps no gradient, so it does not touch training. EVERY
+#: computation and steps no gradient, so it does not touch training. `--gpus`
+#: and `--measure-gpus` (owner ruling 2026-09-26, dsnn-dfw.274): a restart
+#: times its reference again, so the GPU numbers add nothing, and the GPU
+#: MODEL is checked on its own by `check_resume_gpu_model`. EVERY
 #: other difference raises: the checkpoint is a state of one configuration
 #: and restoring it under another one is not a resume.
 PPO_RESUME_EXEMPT_ARGS = frozenset(
-    {"episodes", "resume", "checkpoint_keep_at"})
+    {"episodes", "resume", "checkpoint_keep_at", "gpus", "measure_gpus"})
+
+#: The meta.json field that names the GPU model of the trainer's device.
+PPO_GPU_MODEL_FIELD = "trainer_gpu_model"
 
 
 class CheckpointError(RuntimeError):
@@ -298,8 +305,11 @@ def add_checkpoint_args(p) -> None:
         "--resume", type=str, default="", metavar="PATH",
         help="Continue the run saved in the checkpoint directory PATH. The "
              "argument namespace must match the one the checkpoint was "
-             "written with, except --episodes (a resume may extend the run) "
-             "and --resume itself; any other difference raises. When wandb "
+             "written with, except --episodes (a resume may extend the run), "
+             "--resume itself, --checkpoint-keep-at, --gpus and "
+             "--measure-gpus. Any other difference raises, and so does a "
+             "trainer GPU of another model than the one the checkpoint "
+             "records. When wandb "
              "is on the resumed run attaches to the SAME wandb run by id.")
 
 
@@ -564,8 +574,9 @@ def _jsonable(value):
 def check_resume_args(saved: dict, args) -> None:
     """RAISE unless the live arguments match the saved ones.
 
-    Exempt: `--episodes`, because a resume may extend the run, and `--resume`
-    itself. Everything else is part of the state the checkpoint is a state OF.
+    Exempt: `--episodes`, because a resume may extend the run, `--resume`
+    itself, and the names in PPO_RESUME_EXEMPT_ARGS. Everything else is part
+    of the state the checkpoint is a state OF.
     """
     live = args_to_json(args)
     problems = []
@@ -595,6 +606,65 @@ def check_resume_args(saved: dict, args) -> None:
             f"resume may EXTEND a run; it cannot shorten one, because the "
             f"learning-rate schedule's horizon is built from --episodes and a "
             f"shorter horizon is a different schedule.")
+
+
+# ---------------------------------------------------------------------------
+# The GPU model of the trainer (owner ruling 2026-09-26, dsnn-dfw.274): a run
+# may resume on other GPU numbers, but never on another GPU model.
+# ---------------------------------------------------------------------------
+
+def _nvidia_smi_name(gpu_index: str, run) -> str | None:
+    why = None
+    try:
+        out = run(["nvidia-smi", "--query-gpu=index,name",
+                   "--format=csv,noheader"],
+                  capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        why = repr(exc)
+    else:
+        if out.returncode != 0:
+            why = f"nvidia-smi exited {out.returncode}: {out.stderr.strip()}"
+        else:
+            for line in out.stdout.splitlines():
+                index, _, name = line.partition(",")
+                if index.strip() == str(gpu_index).strip():
+                    return name.strip()
+            why = f"nvidia-smi lists no GPU {gpu_index}"
+    print(f"[checkpoint] the nvidia-smi name of the trainer's GPU "
+          f"{gpu_index} is not known: {why}", flush=True)
+    return None
+
+
+def trainer_gpu_model(device, gpu_index: str, run=subprocess.run) -> dict:
+    return {"device_kind": str(device.device_kind),
+            "nvidia_smi_name": (_nvidia_smi_name(gpu_index, run)
+                                if device.platform == "gpu" else None)}
+
+
+def _gpu_model_text(model: dict) -> str:
+    name = model.get("nvidia_smi_name")
+    return (str(model["device_kind"])
+            + ("" if name is None else f" (nvidia-smi: {name})"))
+
+
+def check_resume_gpu_model(meta: dict, live: dict) -> None:
+    saved = meta.get(PPO_GPU_MODEL_FIELD)
+    if not isinstance(saved, dict) or "device_kind" not in saved:
+        raise CheckpointError(
+            f"the checkpoint has no {PPO_GPU_MODEL_FIELD!r} field with a "
+            f"device_kind, so the GPU model its run started on is not known. "
+            f"A run may resume only on the GPU model it started on (owner "
+            f"ruling 2026-09-26, dsnn-dfw.274), and a checkpoint written "
+            f"before that field existed cannot say which model that was.")
+    names = (saved.get("nvidia_smi_name"), live.get("nvidia_smi_name"))
+    if (saved["device_kind"] != live["device_kind"]
+            or (None not in names and names[0] != names[1])):
+        raise CheckpointError(
+            f"the checkpoint was written on a {_gpu_model_text(saved)} and "
+            f"this run's trainer is on a {_gpu_model_text(live)}. A run may "
+            f"resume on other GPU numbers but never on another GPU model, "
+            f"because latency is comparable only within one model (owner "
+            f"ruling 2026-09-26, dsnn-dfw.274).")
 
 
 # ---------------------------------------------------------------------------

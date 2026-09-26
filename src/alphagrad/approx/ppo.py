@@ -8406,6 +8406,13 @@ def main(args=None):
     key = jrand.PRNGKey(args.seed)
     key, args_key = jrand.split(key)
 
+    # CHECKPOINT: the trainer's GPU model, taken once at the start, and a resume on another model refused (dsnn-dfw.274).
+    _TRAINER_GPU_MODEL = _ckpt.trainer_gpu_model(
+        main_device if main_device is not None else jax.devices()[0],
+        str(args.gpus).split(",")[0].strip())
+    if _RESUME_META is not None:
+        _ckpt.check_resume_gpu_model(_RESUME_META, _TRAINER_GPU_MODEL)
+
     # Resolve example, build env, derive masks.
     dataset_arg = None if args.dataset == "none" else args.dataset
     use_dataset = dataset_arg is not None and (
@@ -17828,6 +17835,7 @@ def main(args=None):
                if _TWO_GRAPH else None)
         return {
             "args": _CKPT_ARGS,
+            _ckpt.PPO_GPU_MODEL_FIELD: dict(_TRAINER_GPU_MODEL),
             "wandb_run_id": str(_rid or ""),
             "pareto_archive": _ckpt.pareto_archive_to_json(pareto_archive),
             "two_graph": _tg,

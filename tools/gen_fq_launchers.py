@@ -80,7 +80,7 @@ CAMPAIGN_STACK = f"{CAMPAIGN_ROOT}/stack"
 CAMPAIGN_RUNS = f"{CAMPAIGN_ROOT}/runs"
 CAMPAIGN_PY = "/Scratch/assmuth/t57/stack/venv/bin/python"
 CAMPAIGN_WANDB_HOME = "/Scratch/assmuth/t57/home"     # .netrc + .config/wandb
-CAMPAIGN_CACHE = "/Scratch/assmuth/mrg/cache"          # dsnn_wikitext, dsnn_mnist
+CAMPAIGN_CACHE = "/Scratch/assmuth/mrg/cache"          # dsnn_wikitext, dsnn_mnist, dsnn_shd
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(os.path.dirname(_HERE), "src")
@@ -1657,6 +1657,7 @@ NO_FLAG_ENV = [
 ]
 
 STACK_ENV_NAMES = ("HOME", "PYTHONPATH", "DSNN_WIKITEXT_DIR", "DSNN_MNIST_DIR",
+                   "DSNN_SHD_DIR",  # a row thesis_arm emits (dsnn-dfw.264)
                    "PATH")   # PATH: the measure toolchain block (finding 03)
 
 #: Every `export NAME=` a campaign launcher may contain.  The test derives the
@@ -2160,6 +2161,7 @@ not a summary.""",
 #
 # 2026-09-25 (owner rulings, grill rounds 1-3): condC left the matrix, and the
 # defense arms A_popart, A_popart_lq4 and A_popart_lq64 joined it on NN256.
+# The rsnn_tbptt and rsnn_window2 rows left it too (dsnn-dfw.232).
 #
 # THE RECURRENT TARGET IS FOUR TARGETS, NOT ONE.  --example RSNN_SHD
 # --dataset shd is shared by all four and --temporal-rule is the one flag
@@ -2169,8 +2171,9 @@ not a summary.""",
 # triple `<arm>_<target>_s<seed>`; with the key `rsnn_bptt` that spelling IS
 # the `<arm>_rsnn_<rule>_s<seed>` the owner asked for, and there is no second
 # naming rule to keep in step with the first.  The recurrent block is
-# therefore 4 rules x 4 arms x 5 seeds = 80 rows, and the whole thesis
-# section is 40 + 80 rows, the 9 defense rows and the two smoke runs.
+# therefore 2 rules x 4 arms x 5 seeds = 40 rows (THESIS_MATRIX_RULES), and
+# the whole thesis section is 40 + 40 rows, the 9 defense rows and the two
+# smoke runs.
 #
 # --example STAYS RSNN_SHD ON ALL FOUR, window2 INCLUDED.  window2 builds a
 # different graph -- two step copies joined by the temporal edge -- but
@@ -2179,7 +2182,7 @@ not a summary.""",
 # is how a run asks for the window arm").  A launcher that named
 # RSNN_SHD_W2 itself would be a second place saying the same thing.
 #
-# EVERY ONE OF THE 100 IS HELD: the owner released the NN256/TLM first block
+# EVERY RECURRENT ROW IS HELD: the owner released the NN256/TLM first block
 # only and no RSNN_SHD run.  See _THESIS_SNN_HELD.
 #
 # WHY A AND B CARRY NO QUALITY FLOOR (owner ruling 2026-09-16, night).  A and
@@ -2642,7 +2645,7 @@ def thesis_job_name(node: str) -> str:
 # set); the trainer derives the provable bound per graph and prints it
 # ("face width: derived bound N").  The campaign arms already run without it.
 # ---------------------------------------------------------------------------
-#: THE RECURRENT TARGET's four temporal rules, which are the four SNN arms of
+#: THE RECURRENT TARGET's four temporal rules, which were the four SNN arms of
 #: the matrix (owner ruling 2026-09-16).  The rule says HOW the state carried
 #: between time steps enters the gradient:
 #:
@@ -2656,6 +2659,8 @@ def thesis_job_name(node: str) -> str:
 #: thesis test pins it against common/rsnn_shd.TEMPORAL_RULES, which is the
 #: tuple ppo.py builds `--temporal-rule`'s choices from.
 THESIS_TEMPORAL_RULES = ("tbptt", "bptt", "rtrl", "window2")
+#: Owner, 2026-09-26: tbptt and window2 are deprecated. No row may run them.
+THESIS_MATRIX_RULES = ("bptt", "rtrl")
 THESIS_RSNN_EXAMPLE = "RSNN_SHD"
 #: The batched one-step body, rsnn_shd.RSNN_VMAP_TARGET; window2 has none.
 THESIS_RSNN_VMAP_EXAMPLE = "VmappedRSNN_SHD"
@@ -3258,6 +3263,7 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
                ray_measure_timeout: str = THESIS_RAY_MEASURE_TIMEOUT,
                cores_per_actor: str | None = THESIS_CORES_PER_ACTOR,
                jax_cache: bool = False,
+               shd_dir: bool = True,
                measure_path: bool = True,
                mem_objective_weight: str | None = THESIS_MEM_OBJECTIVE_WEIGHT,
                whole_node: bool = True,
@@ -3274,6 +3280,10 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
              f"arm {arm!r} is not one of {tuple(THESIS_ARM_SPEC)}")
     _require(target in THESIS_TARGET_CLI,
              f"target {target!r} is not one of {THESIS_TARGETS}")
+    _require(thesis_temporal_rule(target) in (None,) + THESIS_MATRIX_RULES,
+             f"target {target!r} runs a deprecated temporal rule (owner, "
+             f"2026-09-26, dsnn-dfw.232: tbptt and window2 are deprecated). "
+             f"The recurrent rows run {THESIS_MATRIX_RULES}.")
     _require(arm not in THESIS_DEFENSE_ARMS or target == THESIS_DEFENSE_TARGET,
              f"arm {arm!r} is a defense arm and runs on "
              f"{THESIS_DEFENSE_TARGET} only (dsnn-dfw.231), not on {target!r}")
@@ -3322,6 +3332,9 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
         # compile cache under any order.  A frozen round passes True and
         # keeps the cache it ran with.
         jax_cache=jax_cache,
+        # dsnn-dfw.264: DSNN_SHD_DIR beside the other two data caches.  A
+        # frozen round passes False and keeps its environment.
+        shd_dir=shd_dir,
         # dsnn-dfw.99: the retention bound and the process recycle ride
         # with the target shape, and a row that renders `None` for either of
         # the two drops that one export again.  dsnn-dfw.169: the measure
@@ -3431,7 +3444,7 @@ def thesis_block1_arms() -> list[dict]:
 
 
 def thesis_snn_arms() -> list[dict]:
-    """The 80 rows of the recurrent target, in generation order.
+    """The 40 rows of the recurrent target, in generation order.
 
     The order-only recurrent rows (ticket dsnn-dfw.45) carry a
     `thesis_rule` too -- that is what a reader wants from them -- but they
@@ -3574,7 +3587,7 @@ def thesis_pair_arm(rows: list[dict]) -> dict:
         name=name, job=thesis_job_name(node), kind="train", runtime="scratch",
         node=node, time=a["time"], gpus=gpus, singleton=True, thesis=True,
         paired=True, halves=halves,
-        jax_cache=a["jax_cache"],
+        jax_cache=a["jax_cache"], shd_dir=a["shd_dir"],
         thesis_arm=arm_name, thesis_target=target,
         thesis_rule=thesis_temporal_rule(target),
         env=dict(a["env"]),
@@ -3644,8 +3657,9 @@ del _i, _arm, _target, _seed, _node, _half, _row, _rows, _HALVES, _SLOT
 # ---------------------------------------------------------------------------
 # THE RECURRENT BLOCK (owner ruling 2026-09-16).  The same four arms and the
 # same five seeds as the matrix above, on --example RSNN_SHD --dataset shd,
-# crossed with the four temporal rules: 4 x 4 x 5 = 80 rows (100 before condC
-# left the matrix on 2026-09-25).
+# crossed with the two temporal rules of THESIS_MATRIX_RULES: 2 x 4 x 5 = 40
+# rows (100 before condC left the matrix on 2026-09-25, 80 before the tbptt
+# rows and 60 before the window2 rows left it, dsnn-dfw.232).
 #
 # NOTHING ELSE MOVES.  These rows go through the same `thesis_cli`, so the
 # reward form per arm, the free spatial order, the thousand episodes, the
@@ -3667,9 +3681,9 @@ del _i, _arm, _target, _seed, _node, _half, _row, _rows, _HALVES, _SLOT
 # arm -- renders on an 8-GPU node with --ray-measure 7, round-robin BY SEED
 # over the two released 8-GPU nodes (gpu19 first) so a seed always lands on
 # the same node and no rtrl row is paired with another on the same node
-# (`thesis_pair_arm` is never called here).  tbptt, bptt and window2 keep
-# the 4-GPU profile, round-robin over the three released 4-GPU nodes: 60
-# rows over 3 nodes is 20 each, exactly.
+# (`thesis_pair_arm` is never called here).  bptt keeps the 4-GPU profile,
+# round-robin over the three released 4-GPU nodes: 20 rows over 3 nodes is
+# 7, 7 and 6.
 # ---------------------------------------------------------------------------
 #: The two 8-GPU nodes, in round-robin order (gpu19 first, owner ruling).
 THESIS_RSNN_RTRL_NODES = ("pgi15-gpu19", "pgi15-gpu20")
@@ -3691,10 +3705,6 @@ def thesis_snn_node(target: str, seed: str, i: int) -> str:
     return THESIS_RSNN_OTHER_NODES[i % len(THESIS_RSNN_OTHER_NODES)]
 
 _THESIS_RSNN_WHAT = {
-    "tbptt": """TEMPORAL RULE tbptt, the baseline and ppo.py's default on
-this target: NO temporal edge.  The carried state is a constant, the graph is
-one recurrent step, and the credit is truncated and spatial only.  It is the
-row every other rule is read against.""",
     "bptt": """TEMPORAL RULE bptt: THE FUTURE FEEDS IN.  An edge from the next
 state to the loss carries the adjoint dL(>t)/ds_t from a detached backward
 pass over the suffix, so the gradient is exactly the contribution step t
@@ -3704,18 +3714,10 @@ weights to the carried state carries the influence matrix ds(t-1)/dW from a
 detached pass over the prefix, so eliminating that vertex is one real-time
 recurrent-learning step and the gradient is exactly dL_t/dW through the whole
 prefix.""",
-    "window2": """TEMPORAL RULE window2, THE TWO-COPY WINDOW.  Not another
-given edge on the one-step body: a different graph, two step copies joined by
-the temporal edge, with NO given quantity at all.  It is the one arm where
-the policy picks the DIRECTION of the temporal credit itself, because the
-temporal edge is an ordinary edge of the graph and the order across it is
-free.  --example stays RSNN_SHD; common/rsnn_shd.target_example reads the
-rule and resolves the target it builds (RSNN_SHD_W2), so the launcher names
-the rule and nothing else.""",
 }
 
 _THESIS_SNN_HELD = """The recurrent block is GENERATED so that the matrix is
-complete and reviewable, and every one of its 80 rows is HELD: the owner
+complete and reviewable, and every one of its 40 rows is HELD: the owner
 authorised the NN256/TLM first block only and released no RSNN_SHD run.  A
 held launcher that is submitted by mistake aborts 73 before it starts
 anything.  Remove `held=` from the recurrent loop in
@@ -3723,19 +3725,19 @@ tools/gen_fq_launchers.py and regenerate when the owner releases them."""
 
 
 def thesis_snn_order() -> list[tuple[str, str, str]]:
-    """(arm, target, seed) for the 80 recurrent rows, in GENERATION order.
+    """(arm, target, seed) for the 40 recurrent rows, in GENERATION order.
 
     Rule, then arm, then seed.  Not a submission order: every row is held.
     """
     order: list[tuple[str, str, str]] = []
-    for rule in THESIS_TEMPORAL_RULES:
+    for rule in THESIS_MATRIX_RULES:
         for a in THESIS_ARMS:
             for s in THESIS_SEEDS:
                 order.append((a, f"rsnn_{rule}", s))
     return order
 
 
-# --- the 80 runs of the recurrent block -------------------------------------
+# --- the 40 runs of the recurrent block -------------------------------------
 _rsnn_other_i = 0
 for _i, (_arm, _target, _seed) in enumerate(thesis_snn_order()):
     if thesis_temporal_rule(_target) == "rtrl":
@@ -4020,6 +4022,8 @@ for _sweepl_tag, _sweepl_overrides in sweepl_configs():
             ray_measure_timeout=CAMPAIGN_RAY_MEASURE_TIMEOUT,
             cores_per_actor=None,
             jax_cache=True,
+            # dsnn-dfw.264 moves the matrix rows; this round keeps its env.
+            shd_dir=False,
             # The rulings of 2026-09-25 (dsnn-dfw.169, dsnn-mep, dsnn-dfw.208)
             # move the matrix rows; this round keeps its measure path, its
             # memory channel, its oracle and its memory request.
@@ -4202,6 +4206,8 @@ for _sweepl2_tag, _sweepl2_overrides in sweepl2_configs():
             ray_measure_timeout=CAMPAIGN_RAY_MEASURE_TIMEOUT,
             cores_per_actor=None,
             jax_cache=True,
+            # dsnn-dfw.264 moves the matrix rows; this round keeps its env.
+            shd_dir=False,
             # The rulings of 2026-09-25 (dsnn-dfw.169, dsnn-mep, dsnn-dfw.208)
             # move the matrix rows; this round keeps its measure path, its
             # memory channel, its oracle and its memory request.
@@ -4371,6 +4377,8 @@ for _sweepl3_tag, _sweepl3_overrides in sweepl3_configs():
             ray_measure_timeout=CAMPAIGN_RAY_MEASURE_TIMEOUT,
             cores_per_actor=None,
             jax_cache=True,
+            # dsnn-dfw.264 moves the matrix rows; this round keeps its env.
+            shd_dir=False,
             # The rulings of 2026-09-25 (dsnn-dfw.169, dsnn-mep, dsnn-dfw.208)
             # move the matrix rows; this round keeps its measure path, its
             # memory channel, its oracle and its memory request.
@@ -4894,19 +4902,13 @@ def orderonly_tlm_final_arms() -> list[dict]:
 # on pgi15-gpu8 (RTX 6000 Ada), cleared 2026-09-19: a matched 12.8 pair at
 # /usr/local/cuda-12, proven by job 66542 (NODE_CUDA_WANT, NODE_CUDA_BIN).
 #
-# rsnn_tbptt, the NO-TEMPORAL-EDGE REFERENCE, is not swept: one weight, (2, 0),
-# at the three seeds, three rows total.  It is not a sixth rule beside bptt
-# and rtrl -- it is the baseline every temporal rule is read against -- and it
-# is queued on pgi15-gpu8, after the rtrl rows (owner ruling: gpu13 is taken
-# by the dsnn-dfw.44 run today).
+# The three rsnn_tbptt reference rows left with the rule (dsnn-dfw.232).
 # ---------------------------------------------------------------------------
 ORDERONLY_RSNN_RULES = ("bptt", "rtrl")
 #: ONE NODE PER RULE (not per seed: the round above puts the seed on one
 #: node because it spans three GPU models per seed; here every seed of one
 #: rule already shares a node, so the rule is the axis that must not split).
 ORDERONLY_RSNN_NODES = {"bptt": "pgi15-gpu14", "rtrl": "pgi15-gpu8"}
-ORDERONLY_RSNN_TBPTT_NODE = "pgi15-gpu8"
-ORDERONLY_RSNN_TBPTT_WEIGHTS = ("2", "0")
 
 _ORDERONLY_RSNN_HEAD = f"""ORDER-ONLY SCALARIZATION TUNING ON THE RECURRENT
 TARGET (ticket dsnn-dfw.45) under the owner's rulings of 2026-09-19.  The
@@ -4954,12 +4956,6 @@ weights to the carried state carries the influence matrix ds(t-1)/dW from a
 detached pass over the prefix, so eliminating that vertex is one real-time
 recurrent-learning step.""",
 }
-
-_ORDERONLY_RSNN_TBPTT_WHAT = """rsnn_tbptt, THE NO-TEMPORAL-EDGE REFERENCE
-(ticket dsnn-dfw.45): no given edge crosses the step boundary, the carried
-state is a constant, and the credit is truncated and spatial only.  Three
-seeds at the (2, 0) weight alone -- it is the baseline bptt and rtrl are read
-against, not a third swept rule -- queued on pgi15-gpu8 after the rtrl rows."""
 
 
 def orderonly_rsnn_run_name(rule: str, lam_cmp: str, lam_mem: str,
@@ -5084,60 +5080,6 @@ for _rule in ORDERONLY_RSNN_RULES:
         orderonly_rsnn_arm(rule=_rule, seed=_seed, lam_cmp=_lc, lam_mem=_lm,
                           pref=_lc is None)
 del _rule, _seed, _lc, _lm
-
-
-def orderonly_rsnn_arm_name(seed: str) -> str:
-    """`orderonly_rsnn_tbptt_l2m0_s<seed>`.  Named like the swept rows (the
-    weight in the name) so the same `fq_orderonly_*` glob that preflights and
-    queues bptt and rtrl by node also finds the reference rows."""
-    lam_cmp, lam_mem = ORDERONLY_RSNN_TBPTT_WEIGHTS
-    if seed not in ORDERONLY_SEEDS:
-        raise CampaignRowError(
-            f"seed {seed!r} is not one of {ORDERONLY_SEEDS}")
-    return f"orderonly_rsnn_tbptt_l{lam_cmp}m{lam_mem}_s{seed}"
-
-
-def orderonly_rsnn_tbptt_arm(*, seed: str) -> dict:
-    """One rsnn_tbptt reference row -> one `arm(...)`.  Returns the arm."""
-    node = ORDERONLY_RSNN_TBPTT_NODE
-    target = "rsnn_tbptt"
-    lam_cmp, lam_mem = ORDERONLY_RSNN_TBPTT_WEIGHTS
-    name = orderonly_rsnn_arm_name(seed)
-    # dsnn-dfw.84 (2026-09-21) is a thesis-matrix finding; this row is
-    # order-only, not a matrix coordinate, so it keeps its own recorded 0.05
-    # rather than picking up the near-zero bonus.
-    cli = thesis_cli(arm=ORDERONLY_ARM, target=target, seed=seed, node=node,
-                     name=name, episodes=THESIS_EPISODES,
-                     checkpoint_every=THESIS_CHECKPOINT_EVERY,
-                     auto_stop=True, face_entropy_weight="0.05")
-    cli["--approx-profile"] = ORDERONLY_PROFILE
-    cli["--lambda-cmp"] = lam_cmp
-    cli["--lambda-mem"] = lam_mem
-    gpus = thesis_row_gpus(target, node)
-    a = dict(
-        name=name, job=orderonly_job_name(node), kind="train",
-        runtime="scratch",
-        node=node, time=THESIS_TIME, gpus=gpus, singleton=True, thesis=True,
-        orderonly_rsnn=True, thesis_arm=ORDERONLY_ARM, thesis_target=target,
-        thesis_rule=thesis_temporal_rule(target),
-        thesis_seed=seed, orderonly_weights=(lam_cmp, lam_mem),
-        env=thesis_target_form(target, batched=False)[1],
-        required_flags=ORDERONLY_REQUIRED_FLAGS,
-        required_flags_file=" ".join(THESIS_FLAGS_FILES),
-        cli=cli,
-        purpose=_ORDERONLY_RSNN_HEAD + "\n\n" + _ORDERONLY_RSNN_TBPTT_WHAT,
-        prediction=_ORDERONLY_RSNN_PREDICTION,
-        falsifier=_ORDERONLY_RSNN_FALSIFIER,
-    )
-    if node in NODE_CUDA_BIN:
-        a["cuda_bin"] = NODE_CUDA_BIN[node]
-    arm_(**a)
-    return a
-
-
-for _seed in ORDERONLY_SEEDS:
-    orderonly_rsnn_tbptt_arm(seed=_seed)
-del _seed
 
 
 def orderonly_rsnn_arms() -> list[dict]:
@@ -5497,7 +5439,8 @@ def _stack_exists_check() -> list[str]:
 
 
 def _scratch_stack_block(target_env: dict | None = None,
-                         jax_cache: bool = True) -> list[str]:
+                         jax_cache: bool = True,
+                         shd_dir: bool = False) -> list[str]:
     """The environment of a campaign arm: the stack, the plumbing, the TLM
     shape, the measurement vars, the no-flag knobs.  Nothing else.
 
@@ -5513,6 +5456,7 @@ def _scratch_stack_block(target_env: dict | None = None,
         f"export PYTHONPATH={CAMPAIGN_STACK}/graphax/src:{CAMPAIGN_STACK}/alphagrad/src",
         f"export DSNN_WIKITEXT_DIR={CAMPAIGN_CACHE}/dsnn_wikitext",
         f"export DSNN_MNIST_DIR={CAMPAIGN_CACHE}/dsnn_mnist",
+    ] + ([f"export DSNN_SHD_DIR={CAMPAIGN_CACHE}/dsnn_shd"] if shd_dir else []) + [
         f"cd {CAMPAIGN_STACK}/alphagrad",
         "",
         "# ---------------------- THE ENVIRONMENT (args only) -------------------",
@@ -5752,7 +5696,8 @@ def render(a: dict) -> str:
                 f"{'set' if _jc else 'unset'}; a row without the JAX compile "
                 f"cache sets it, a row with the cache does not (dsnn-dfw.247)")
         L.extend(_scratch_stack_block(
-            a.get("env") or {}, jax_cache=a.get("jax_cache", True)))
+            a.get("env") or {}, jax_cache=a.get("jax_cache", True),
+            shd_dir=bool(a.get("shd_dir", False))))
     else:
         # A wave/cpu/tool arm (owner ruling 2026-09-14): the same stack, the
         # same node-local $HOME for wandb, and the same ABORT(66) check as a
