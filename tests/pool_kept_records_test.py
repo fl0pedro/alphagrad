@@ -80,6 +80,8 @@ class _Evaluate:
         self._actor = actor
 
     def remote(self, order, specs, step, **kw):
+        if kw.get("refuse"):
+            return _Future(self._actor._refuse, order, kw["refuse"])
         if int(np.asarray(order).reshape(-1)[1]) - 10 == STUCK:
             return _Stuck()
         return _Future(self._actor._evaluate, order, specs, step, **kw)
@@ -116,6 +118,15 @@ class _Actor:
         self.records.append(rec)
         row = SCORED if kind == OOM else MEASURED
         return (np.full((TOK,), 7, np.int32), np.full((TOK,), 3, np.int32), row.copy())
+
+    def _refuse(self, order, reason):
+        # The real actor scores a forced refusal before the compile: a record, a count, the sentinel row.
+        plan = int(np.asarray(order).reshape(-1)[0])
+        self.terminals += 1
+        self.records.append({"plan": plan, "pid": self.name, "refused": reason})
+        for k in (reason, "total", "scored"):
+            self.refused[k] = self.refused.get(k, 0) + 1
+        return (np.full((TOK,), 7, np.int32), np.full((TOK,), 3, np.int32), SCORED.copy())
 
     def _pop(self):
         was, self._flag = self._flag, False
@@ -199,19 +210,25 @@ def test_an_actor_the_oom_path_recycles_leaves_its_records_and_its_refusal(fake_
 
 def test_an_actor_the_deadline_kills_leaves_the_records_of_its_earlier_plans(
         fake_ray, trainer_counts):
-    from alphagrad.approx.common.measure_pool import merge_pool_plan_records
+    from alphagrad.approx.common.measure_pool import (
+        merge_pool_collapse_stats, merge_pool_plan_records)
 
     pool, actors, _fresh = _pool(2, timeout_s=0.01, respawn=False)
     _tok, _eqn, rewards, mask = _batch(pool, [CLEAN, CLEAN, STUCK])
     killed = [a for a in actors if a.killed]
     assert len(killed) == 1 and pool.stats()["timeouts"] == 1
-    assert mask.tolist() == [False, False, True]
+    # dsnn-dfw.292: the killed plan is a failed plan, scored by the free actor, in the update.
+    assert mask.tolist() == [False, False, False]
+    np.testing.assert_array_equal(rewards[2], SCORED)
     drain = merge_pool_plan_records(pool)
-    assert sorted(r["plan"] for r in drain["records"]) == [0, 1]
+    assert sorted(r["plan"] for r in drain["records"]) == [0, 1, 2]
     assert {r["pid"] for r in drain["records"]} == {"a0", "a1"}
     assert killed[0].name in {r["actor"] for r in drain["records"]}
-    local = trainer_counts.consume_plan_records()["records"]
-    assert [r["refused"] for r in local] == ["timeout"], "the killed call keeps its own record"
+    assert [(r["plan"], r["refused"]) for r in drain["records"]
+            if r.get("refused")] == [(2, "deadline")]
+    counts = merge_pool_collapse_stats(pool, {})
+    assert (counts["refused_deadline"], counts["refused_scored"]) == (1, 1)
+    assert trainer_counts.consume_plan_records()["records"] == []
 
 
 def test_the_single_dispatch_takes_the_records_before_the_recycle(fake_ray):

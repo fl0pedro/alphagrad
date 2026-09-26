@@ -1448,12 +1448,13 @@ def _record_zero_work_plan() -> None:
 # with `--plan-log` off.
 #
 # THE KIND is the reason's prefix: `oom`, `untraceable`, `muls-cap`,
-# `no-target-fun`, `raised`, `gate`, `compile`, `timeout`,
+# `no-target-fun`, `raised`, `gate`, `compile`, `deadline`,
 # `quality-undefined`. The detail after the colon stays on the plan record's
 # `refused` field, which is not aggregated. Since 2026-09-24 (Q42, Q48) every
-# refusal is scored except a call the deadline killed (`timeout`) and an
-# undefined quality, which stay excluded; each count also lands in `scored`
-# or `excluded`.
+# refusal is scored except an undefined quality, which stays excluded, and
+# since 2026-09-26 (Q9b c) a call the deadline killed is a failed plan scored
+# as `deadline` (archived logs carry the old excluded `timeout`); each count
+# also lands in `scored` or `excluded`.
 #
 # `oracle` IS GONE (owner ruling 2026-09-18). It named the gradient oracle's
 # own float64 compile failing inside the measurement, which was 3.9 percent of
@@ -1493,9 +1494,24 @@ def consume_refused_counts() -> dict:
 #   memory    the real static ratios when a compiled program exists, else
 #             the (c') sentinel of `memory_sentinel`;
 #   quality   0.
-# A call the deadline killed is not a refused plan: it is counted and
-# excluded (`timeout`), and `refused_reward` refuses to score it.
+# A call the deadline killed is a failed plan since 2026-09-26 (Q9b c): the
+# pool sends it again to a free actor with the forced refusal `deadline`,
+# scored with no program.
 _MEASURE_TIMEOUT_S: list = [None]
+# The refusal the current call is forced to, set by the server for the pool's rescoring of a killed call.
+_FORCED_REFUSAL: list = [None]
+
+
+def forced_refusal(kind: str, timeout_s) -> tuple:
+    if kind != "deadline":
+        raise ValueError(
+            f"only a call the deadline killed is forced to a refusal, got "
+            f"{kind!r}")
+    return ("deadline", "deadline",
+            {"refusal_where": "the pool's deadline",
+             "refusal_timeout_s": None if timeout_s is None else float(timeout_s)})
+
+
 _HOST_LIMIT_NOTED: list = []
 MEM_OBJECTIVE_EPS_FRACTION = 2.0 ** -10
 # The scorer of the terminal measurement in progress; `_callback` hands it a
@@ -1570,8 +1586,9 @@ def refused_reward(kind: str, *, timeout_s, reference, candidate_static=None,
                    counts=(0.0, 0.0)) -> tuple[list, dict]:
     if kind == "timeout":
         raise ValueError(
-            "a call the deadline killed is excluded from the update and "
-            "never scored (owner ruling 2026-09-24 Q48)")
+            "a call the deadline killed has the kind `deadline` since "
+            "2026-09-26 (Q9b c). `timeout` names the excluded kill of "
+            "archived logs and is never scored.")
     t = None if timeout_s is None else float(timeout_s)
     if t is None or not math.isfinite(t) or t <= 0.0:
         raise RuntimeError(
@@ -11029,6 +11046,10 @@ def _callback_measured(
             _refusal_detail("measurement", exc), _st["program"])
 
     _REFUSAL_SCORER[0] = _score_raise
+    if (_early_refusal is None and is_terminal
+            and _FORCED_REFUSAL[0] is not None):
+        # The pool's deadline killed this plan in another actor: it is scored here, before its compile.
+        _early_refusal = _FORCED_REFUSAL[0]
     if _early_refusal is not None:
         return _score_refusal(*_early_refusal, None)
     compiled_approx = None

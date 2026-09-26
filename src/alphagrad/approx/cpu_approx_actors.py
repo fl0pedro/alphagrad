@@ -263,6 +263,7 @@ class CpuApproximationActor:
         env_row: int | None = None,
         rule: str | None = None,
         timeout_s: float | None = None,
+        refuse: str | None = None,
     ):
         # ``rule`` IS THE GRAPH THIS PLAN WAS ACTED ON (owner ruling
         # 2026-09-22). A run that alternates sends it on every dispatch and
@@ -305,6 +306,7 @@ class CpuApproximationActor:
             eval_samples=eval_samples, init=init, point_idx=point_idx,
             face_specs=face_specs, face_skips=face_skips,
             episode=episode, env_row=env_row, timeout_s=timeout_s,
+            refuse=refuse,
         )
 
     def _server(self, rule: str | None):

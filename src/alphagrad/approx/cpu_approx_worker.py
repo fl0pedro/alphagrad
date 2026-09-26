@@ -224,6 +224,7 @@ class CpuApproximationServer:
         episode: int | None = None,
         env_row: int | None = None,
         timeout_s: float | None = None,
+        refuse: str | None = None,
     ):
         """Run the per-step reward pipeline once.
 
@@ -274,6 +275,11 @@ class CpuApproximationServer:
         import jax.numpy as jnp
         import numpy as np
         from alphagrad.approx.env import MAX_TOKENS, NUM_REWARDS, _callback
+        # The pool sends a call its deadline killed to this actor to be scored as a failed plan (dsnn-dfw.292).
+        from alphagrad.approx.env import (
+            _FORCED_REFUSAL as _refuse_cell, forced_refusal as _forced)
+        _refuse_was = _refuse_cell[0]
+        _refuse = None if refuse is None else _forced(refuse, timeout_s)
 
         if episode is not None:
             # A3 rotation, pooled path. One env-var write per call; `_walk_seed`
@@ -310,6 +316,7 @@ class CpuApproximationServer:
         # The flag belongs to this call (Q52); an unread earlier one is stale.
         self._last_was_oom = False
         try:
+            _refuse_cell[0] = _refuse
             # env._callback takes face_specs / face_skips between the
             # per-vertex specs and `stop`. With no caller-supplied wires,
             # EMPTY (-1 / 0) is the documented per-vertex mode and is
@@ -514,6 +521,7 @@ class CpuApproximationServer:
             # is what keeps a raising measurement from stamping the next one.
             _env_slot_cell[0] = _slot_was
             _timeout_cell[0] = _timeout_was
+            _refuse_cell[0] = _refuse_was
 
     def precompile(self, order: Any, sparsity_specs: Any, step: int) -> bool:
         """STAGE-2 async: compile-only warm of the shared cluster cache.

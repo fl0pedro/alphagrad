@@ -1,7 +1,9 @@
 # dsnn-dkz, owner rulings 2026-09-24 Q42-Q48: one 300 s deadline without a cold
-# budget and a readiness wait, a killed call excluded and counted, every other
-# refusal scored in the pool and in-process, the (c') memory sentinel with its
-# two checks, eps = 2^-10 x the smallest nonzero reference value on slot 11.
+# budget and a readiness wait, every refusal scored in the pool and in-process,
+# the (c') memory sentinel with its two checks, eps = 2^-10 x the smallest
+# nonzero reference value on slot 11. Since 2026-09-26 (Q9b c, dsnn-dfw.292) a
+# call the deadline kills is a failed plan too: a free actor scores it as
+# "deadline", and only a kill that no actor can score is excluded.
 from __future__ import annotations
 
 import csv
@@ -320,6 +322,18 @@ def test_a_raise_after_the_program_exists_is_scored_on_its_memory(
                   program=_triple(seen[b"approx"]))
 
 
+def test_a_call_the_deadline_killed_is_scored_as_a_failed_plan(paired,
+                                                               monkeypatch):
+    # dsnn-dfw.292: the pool sends the killed plan to a free actor with this forced refusal.
+    monkeypatch.setattr(env_mod, "_FORCED_REFUSAL",
+                        [env_mod.forced_refusal("deadline", DEADLINE)])
+    reward, counts, recs, seen = _run(monkeypatch)
+    assert b"approx" not in seen, "a killed plan is not compiled again"
+    rec = recs[-1]
+    _check_scored(reward, rec, counts, reason="deadline", program=None)
+    assert rec["refusal_where"] == "the pool's deadline"
+
+
 def test_an_apparatus_fault_still_stops_the_measurement(paired, monkeypatch):
     def faulty(make):
         raise env_mod.MeasureToolchainFault("TOOLCHAIN FAULT injected")
@@ -391,8 +405,10 @@ def test_refused_reward_puts_the_sentinel_on_slot_5_and_slot_11(monkeypatch):
     assert slots[MOBJ] == mem_objective(triple, REF3)[0]
     assert info["refusal_sentinel"] == sent
     assert info["refusal_program"] is False
-    with pytest.raises(ValueError, match="never scored"):
-        env_mod.refused_reward("timeout", timeout_s=DEADLINE, reference=ref)
+    # A call the deadline killed is scored like any refusal without a program (Q9b c).
+    killed, _info = env_mod.refused_reward("deadline", timeout_s=DEADLINE,
+                                           reference=ref)
+    assert killed == slots
 
 
 # ------------------------------------------------------- 4a. O == O* exactly
@@ -523,6 +539,7 @@ class _Actor:
         self.killed = False
         self.timeouts: list = []
         self.order: list = []
+        self.refuse_seen: list = []
         self.ready = _Method(future, self._ready, lambda: build)
         self.pop_oom_flag = _Method(future, lambda: False, lambda: 0.0)
         self.consume_call_telemetry = _Method(future, lambda: {}, lambda: 0.0)
@@ -537,6 +554,7 @@ class _Actor:
 
     def _evaluate(self, order, specs, step, **kw):
         self.order.append("evaluate")
+        self.refuse_seen.append(kw.get("refuse"))
         tokens = np.full((TOK,), 7, np.int32)
         eqn = np.full((TOK,), 3, np.int32)
         reward = np.full((NUM_REWARDS,), -100.0, np.float32)
@@ -606,9 +624,11 @@ def test_a_respawned_actor_is_ready_before_it_gets_a_plan(fake_ray,
     while pool.size() == 0 and time.time() < stop:
         time.sleep(0.01)
     assert pool.size() == 1
-    assert fresh[-1].built and fresh[-1].order == ["ready"]
+    # The respawned actor is ready first, then scores the killed plan as "deadline" (Q9b c).
+    assert fresh[-1].built and fresh[-1].order == ["ready", "evaluate"]
+    assert fresh[-1].refuse_seen == ["deadline"]
     _batch(pool)
-    assert fresh[-1].order == ["ready", "evaluate"]
+    assert fresh[-1].order == ["ready", "evaluate", "evaluate"]
     assert not fresh[-1].killed
 
 
@@ -627,37 +647,51 @@ def test_there_is_no_cold_budget(fake_ray, pool_env):
     assert actor.killed and actor.timeouts == [t]
 
 
-# ------------------------------------------------ 2. a killed call is excluded
-def test_a_killed_call_is_excluded_counted_and_logged_as_timeout(
+# ---------------------------------------------- 2. a killed call is a failed plan
+def test_a_killed_call_goes_to_a_free_actor_to_be_scored_as_deadline(
         fake_ray, pool_env, capsys):
     t = 0.01
     slow, fast = _Actor(fake_ray, run=2 * t), _Actor(fake_ray)
     pool = _pool([slow, fast], timeout_s=t)
     tokens, _eqn, rewards, mask = _batch(pool, n=2)
-    assert mask.tolist() == [True, False]
     assert slow.killed and not fast.killed
-    assert _is_hard_sentinel(rewards[0]) and (tokens[0] == 0).all()
-    assert rewards[1, 0] == -100.0
-    assert env_mod.consume_refused_counts() == {
-        "timeout": 1, "total": 1, "excluded": 1}
-    recs = env_mod.consume_plan_records()["records"]
-    assert len(recs) == 1
-    rec = recs[0]
-    assert rec["refused"] == "timeout"
-    assert rec["refusal_timeout_s"] == t
-    assert "refusal_latency_ns" not in rec
-    assert rec["rewards"] == [float(x) for x in rewards[0]]
-    assert "[refused] timeout step=3" in capsys.readouterr().out
+    assert fast.refuse_seen == [None, "deadline"]
+    assert mask.tolist() == [False, False], "a failed plan enters the update"
+    assert rewards[0, 0] == -100.0 and rewards[1, 0] == -100.0
+    assert pool.stats()["timeouts"] == 1
+    assert pool.stats()["deadline_scored"] == 1
+    # The scoring actor counts and records the plan; nothing is left in this process.
+    assert env_mod.consume_refused_counts() == {}
+    assert env_mod.consume_plan_records()["records"] == []
+    assert "[SENTINEL] batch timeout slot=0" in capsys.readouterr().out
 
 
-def test_the_single_dispatch_excludes_a_killed_call(fake_ray, pool_env):
+def test_the_single_dispatch_sends_a_killed_call_to_a_free_actor(
+        fake_ray, pool_env):
+    t = 0.01
+    slow, fast = _Actor(fake_ray, run=2 * t), _Actor(fake_ray)
+    pool = _pool([slow, fast], timeout_s=t)
+    out = pool.evaluate(np.arange(3, dtype=np.int32),
+                        np.full((3, 1, 3), -1, np.int32), 3, None)
+    assert slow.killed and fast.refuse_seen == ["deadline"]
+    assert not _is_hard_sentinel(out[-1]) and out[-1][0] == -100.0
+    assert pool.stats()["deadline_scored"] == 1
+
+
+def test_a_kill_that_no_actor_can_score_is_excluded_and_recorded(
+        fake_ray, pool_env, capsys):
     t = 0.01
     pool = _pool([_Actor(fake_ray, run=2 * t)], timeout_s=t)
     out = pool.evaluate(np.arange(3, dtype=np.int32),
                         np.full((3, 1, 3), -1, np.int32), 3, None)
     assert _is_hard_sentinel(out[-1])
     assert env_mod.consume_refused_counts() == {
-        "timeout": 1, "total": 1, "excluded": 1}
+        "deadline": 1, "total": 1, "excluded": 1}
+    rec = env_mod.consume_plan_records()["records"][-1]
+    assert rec["refused"] == "deadline" and rec["refusal_where"] == "no live actor"
+    assert rec["refusal_timeout_s"] == t
+    assert pool.stats()["deadline_unscored"] == 1
+    assert "could not be scored (no live actor)" in capsys.readouterr().out
 
 
 def test_a_killed_tokenization_step_is_no_plan(fake_ray, pool_env):

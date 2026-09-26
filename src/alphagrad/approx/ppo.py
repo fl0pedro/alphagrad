@@ -15231,8 +15231,9 @@ def main(args=None):
                 _ref_counts[_kk] = int(_ref_counts.get(_kk, 0)) + int(_v)
         _ref_total = int(_ref_counts.pop("total", 0))
         # SCORED against EXCLUDED (owner rulings 2026-09-24 Q42, Q48): every
-        # refusal takes the finite sentinel and trains, except a call the
-        # deadline killed; each count names its fate where it is taken.
+        # refusal takes the finite sentinel and trains, a call the deadline
+        # killed too since 2026-09-26 (Q9b c), except an undefined quality;
+        # each count names its fate where it is taken.
         _ref_scored = int(_ref_counts.pop("scored", 0))
         _ref_excluded = int(_ref_counts.pop("excluded", 0))
         for _k in sorted(_ref_counts):

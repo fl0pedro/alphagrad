@@ -52,6 +52,9 @@ from alphagrad.approx.common.device_guard import ActorStartRefused
 # the policy gradient is pushed away from the offending action.
 _SENTINEL_REWARD_VALUE = -1e10
 
+# A killed plan waits at least this long for a respawning actor to score it, so a short deadline does not decide the race.
+_RESPAWN_WAIT_MIN_S = 60.0
+
 
 def _sentinel_callback_output(
     max_tokens: int,
@@ -145,8 +148,9 @@ class CpuApproxPool:
         Q48: one deadline, no cold budget). When exceeded, the future
         is cancelled, the actor is killed, a replacement is requested
         from ``respawn_factory`` (in a daemon thread so the
-        ``evaluate`` call returns quickly), and the sentinel is
-        returned: a killed call is excluded from the update and counted.
+        ``evaluate`` call returns quickly), and a killed terminal call
+        goes to the next free actor, which scores it as the failed plan
+        ``deadline`` (owner ruling 2026-09-26, Q9b c).
         An actor gets no plan before its construction has finished (its
         ``ready`` call), so construction never runs against a deadline.
     respawn_factory
@@ -258,6 +262,10 @@ class CpuApproxPool:
         # What each terminal call left in its actor, taken right after the call (dsnn-dfw.201).
         self._kept = self._empty_kept()
         self._n_takes_failed = 0
+        # A call the deadline kills is a failed plan: a free actor scores it (owner ruling 2026-09-26, Q9b c).
+        self._respawns_in_flight = 0
+        self._n_deadline_scored = 0
+        self._n_deadline_unscored = 0
         # ---- the PIPELINED submission (owner ruling 2026-09-14) ----
         # One worker thread, created on first use, and at most ONE batch in
         # flight on it. See `submit_batch` for why the limit is a fact of the
@@ -276,19 +284,36 @@ class CpuApproxPool:
     def _is_terminal(order, step) -> bool:
         return int(step) >= int(np.asarray(order).reshape(-1).shape[0])
 
-    def _record_timeout(self, timeout_s: float, *, order, specs, step,
-                        face_specs, face_skips, reward) -> None:
-        # A terminal call the deadline killed is excluded, counted and
-        # recorded with the reason "timeout" (owner ruling 2026-09-24 Q48).
+    def _record_unscored_deadline(self, timeout_s: float, why: str, *, order,
+                                  specs, step, face_specs, face_skips,
+                                  reward) -> None:
+        # A killed plan that no actor could score: excluded, counted and recorded, the one apparatus fault left.
         from alphagrad.approx import env as _env
+        with self._lock:
+            self._n_deadline_unscored += 1
         _env.record_pool_refusal(
-            "timeout", order=order, rule_specs=specs, face_specs=face_specs,
+            "deadline", order=order, rule_specs=specs, face_specs=face_specs,
             face_skips=face_skips, stop=int(step), reward_vec=reward,
-            refusal_detail={"refusal_timeout_s": float(timeout_s)},
+            refusal_detail={"refusal_timeout_s": float(timeout_s),
+                            "refusal_where": why},
             scored=False)
-        print(f"[refused] timeout step={int(step)} after "
-              f"{float(timeout_s):.0f}s: excluded from the update",
-              flush=True)
+        print(f"[refused] deadline step={int(step)} after "
+              f"{float(timeout_s):.0f}s could not be scored ({why}): "
+              f"excluded from the update", flush=True)
+
+    def _await_actor(self, timeout_s: float) -> bool:
+        # True once an actor is free in the pool. Waits only while a respawn is in flight, at most max(timeout_s, _RESPAWN_WAIT_MIN_S).
+        stop = time.time() + max(float(timeout_s), _RESPAWN_WAIT_MIN_S)
+        while True:
+            with self._lock:
+                if self._closed:
+                    return False
+                if self._alive:
+                    return True
+                waiting = self._respawns_in_flight > 0
+            if not waiting or time.time() >= stop:
+                return False
+            time.sleep(0.02)
 
     @staticmethod
     def _empty_kept() -> dict:
@@ -502,8 +527,10 @@ class CpuApproxPool:
             return
 
         self._n_respawn_requested += 1
+        with self._lock:
+            self._respawns_in_flight += 1
 
-        def _respawn_in_background() -> None:
+        def _respawn_body() -> None:
             try:
                 new_handle = self._respawn(actor)
             except ActorStartRefused as _exc:
@@ -535,6 +562,13 @@ class CpuApproxPool:
                         pass
                     return
                 self._alive.append(new_handle)
+
+        def _respawn_in_background() -> None:
+            try:
+                _respawn_body()
+            finally:
+                with self._lock:
+                    self._respawns_in_flight -= 1
 
         t = threading.Thread(target=_respawn_in_background, daemon=True)
         t.start()
@@ -679,6 +713,7 @@ class CpuApproxPool:
         episode: int | None = None,
         env_row: int | None = None,
         rule: str | None = None,
+        refuse: str | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Dispatch one ``(order, specs, step)`` request to a pool
         actor and return ``(tokens, eqn_ids, reward)`` as numpy arrays.
@@ -718,7 +753,7 @@ class CpuApproxPool:
             # than block — the rollout will continue with this step
             # treated as a "bad action".
             print(f"[SENTINEL] pool-drained (no actor) step={int(step)}", flush=True)
-            return _sentinel_callback_output(
+            _sv = _sentinel_callback_output(
                 self._max_tokens,
                 self._num_rewards,
                 self._cosine_sim_idx,
@@ -729,6 +764,12 @@ class CpuApproxPool:
                 self._eqn_dtype,
                 self._emit_eqn_ids,
             )
+            if refuse is not None and self._is_terminal(order_np, step):
+                self._record_unscored_deadline(
+                    self._deadline(), "no live actor", order=order_np,
+                    specs=specs_np, step=step, face_specs=face_specs,
+                    face_skips=face_skips, reward=_sv[-1])
+            return _sv
 
         future = None
         take = None
@@ -762,6 +803,7 @@ class CpuApproxPool:
                 env_row=(None if env_row is None else int(env_row)),
                 rule=(None if rule is None else str(rule)),
                 timeout_s=(float(timeout) if timeout > 0 else None),
+                refuse=refuse,
             )
             # An actor runs calls in send order: the flag of the call above.
             flag = actor.pop_oom_flag.remote()
@@ -793,11 +835,20 @@ class CpuApproxPool:
                 self._eqn_dtype,
                 self._emit_eqn_ids,
             )
-            if self._is_terminal(order_np, step):
-                self._record_timeout(
-                    timeout, order=order_np, specs=specs_np, step=step,
+            if not self._is_terminal(order_np, step):
+                return _sv
+            if refuse is None and self._await_actor(timeout):
+                # A failed plan (owner ruling 2026-09-26, Q9b c): the next free actor scores it as "deadline".
+                return self.evaluate(
+                    order_np, specs_np, step, eval_samples, init=init,
                     face_specs=face_specs, face_skips=face_skips,
-                    reward=_sv[-1])
+                    episode=episode, env_row=env_row, rule=rule,
+                    refuse="deadline")
+            self._record_unscored_deadline(
+                timeout, ("its scoring call hit the deadline as well"
+                          if refuse is not None else "no live actor"),
+                order=order_np, specs=specs_np, step=step,
+                face_specs=face_specs, face_skips=face_skips, reward=_sv[-1])
             return _sv
         except RayActorError:
             self._n_actor_errors += 1
@@ -807,7 +858,7 @@ class CpuApproxPool:
                 flush=True,
             )
             self._poison(actor, future=future)
-            return _sentinel_callback_output(
+            _sv = _sentinel_callback_output(
                 self._max_tokens,
                 self._num_rewards,
                 self._cosine_sim_idx,
@@ -818,6 +869,12 @@ class CpuApproxPool:
                 self._eqn_dtype,
                 self._emit_eqn_ids,
             )
+            if refuse is not None and self._is_terminal(order_np, step):
+                self._record_unscored_deadline(
+                    self._deadline(), "its scoring actor died", order=order_np,
+                    specs=specs_np, step=step, face_specs=face_specs,
+                    face_skips=face_skips, reward=_sv[-1])
+            return _sv
         except Exception as _exc:
             # Apparatus faults stop the run, as in evaluate_batch (Q53).
             if _is_toolchain_fault(_exc) or isinstance(_exc, ActorStartRefused):
@@ -835,7 +892,7 @@ class CpuApproxPool:
                 flush=True,
             )
             self._poison(actor, future=future)
-            return _sentinel_callback_output(
+            _sv = _sentinel_callback_output(
                 self._max_tokens,
                 self._num_rewards,
                 self._cosine_sim_idx,
@@ -846,6 +903,12 @@ class CpuApproxPool:
                 self._eqn_dtype,
                 self._emit_eqn_ids,
             )
+            if refuse is not None and self._is_terminal(order_np, step):
+                self._record_unscored_deadline(
+                    self._deadline(), "its scoring call raised", order=order_np,
+                    specs=specs_np, step=step, face_specs=face_specs,
+                    face_skips=face_skips, reward=_sv[-1])
+            return _sv
         # The flag of this row (Q52), as in evaluate_batch.
         try:
             was_oom = bool(ray.get(flag, timeout=10.0))
@@ -864,6 +927,9 @@ class CpuApproxPool:
             return out
         if take is not None:
             self._take_call(take, f"step={int(step)}", 30.0)
+        if refuse is not None:
+            with self._lock:
+                self._n_deadline_scored += 1
         if was_oom:
             fresh = self._recycle_actor(actor)
             self._n_oom_recycles += 1
@@ -1124,6 +1190,9 @@ class CpuApproxPool:
         takes: dict[int, Any] = {}
         f_timeouts: dict[int, float] = {}
         nxt = 0
+        # The slots the deadline killed, waiting for a free actor to score them as "deadline" (dsnn-dfw.292).
+        redo: collections.deque = collections.deque()
+        rescoring: set = set()
 
         def _adopt() -> bool:
             # An actor respawned after a kill lands in ``self._alive``; it
@@ -1135,9 +1204,22 @@ class CpuApproxPool:
             free.append(len(held) - 1)
             return True
 
-        def _dispatch(j: int, i: int) -> None:
+        def _unscored(i: int, why: str) -> None:
+            self._record_unscored_deadline(
+                f_timeouts.get(i, 0.0) or self._deadline(), why,
+                order=order_batch[i], specs=specs_batch[i],
+                step=step_batch[i],
+                face_specs=(None if face_specs_batch is None
+                            else face_specs_batch[i]),
+                face_skips=(None if face_skips_batch is None
+                            else face_skips_batch[i]),
+                reward=rewards_out[i])
+
+        def _dispatch(j: int, i: int, refuse: str | None = None) -> None:
             actor = held[j]
             self._n_calls += 1
+            if refuse is not None:
+                rescoring.add(i)
             try:
                 # THE SAME NUMBER travels with the request: the actor
                 # scores a refused plan at the deadline of this slot.
@@ -1159,6 +1241,7 @@ class CpuApproxPool:
                              else int(env_rows[i])),
                     rule=(None if rule is None else str(rule)),
                     timeout_s=(float(_to) if _to > 0 else None),
+                    refuse=refuse,
                 )
                 # An actor runs calls in send order: the flag of this call.
                 flags[i] = actor.pop_oom_flag.remote()
@@ -1177,6 +1260,8 @@ class CpuApproxPool:
                 self._poison(actor, future=None)
                 held[j] = None
                 _sentinel_slot(i)
+                if refuse is not None:
+                    _unscored(i, "its scoring call could not be sent")
 
         def _collect(fut) -> None:
             i, j, _dl = pending.pop(fut)
@@ -1191,10 +1276,14 @@ class CpuApproxPool:
                     eqn_ids_out[i] = self._wire(
                         _res[1], self._eqn_dtype, "eqn_ids")
                 rewards_out[i] = np.asarray(reward, dtype=np.float32)
+                # A killed slot that was scored again is a row like any other.
+                sentinel_mask[i] = False
                 with self._lock:
                     self._measures_since_recycle[id(actor)] = (
                         self._measures_since_recycle.get(id(actor), 0) + 1
                     )
+                    if i in rescoring:
+                        self._n_deadline_scored += 1
                 # Every row (Q52): an in-callback OOM is a scored, finite row.
                 try:
                     _was_oom = bool(ray.get(flags[i], timeout=10.0))
@@ -1245,16 +1334,15 @@ class CpuApproxPool:
                 self._poison(actor, future=fut)
                 held[j] = None
                 _sentinel_slot(i)
+                takes.pop(i, None)
                 # A non-terminal slot (a tokenization stall) is no plan.
                 if self._is_terminal(order_batch[i], step_batch[i]):
-                    self._record_timeout(
-                        f_timeouts.get(i, 0.0), order=order_batch[i],
-                        specs=specs_batch[i], step=step_batch[i],
-                        face_specs=(None if face_specs_batch is None
-                                    else face_specs_batch[i]),
-                        face_skips=(None if face_skips_batch is None
-                                    else face_skips_batch[i]),
-                        reward=rewards_out[i])
+                    if i in rescoring:
+                        _unscored(i, "its scoring call hit the deadline "
+                                     "as well")
+                    else:
+                        # A failed plan (owner ruling 2026-09-26, Q9b c): a free actor scores it as "deadline".
+                        redo.append(i)
             except RayActorError:
                 self._n_actor_errors += 1
                 print(
@@ -1265,6 +1353,8 @@ class CpuApproxPool:
                 self._poison(actor, future=fut)
                 held[j] = None
                 _sentinel_slot(i)
+                if i in rescoring:
+                    _unscored(i, "its scoring actor died")
             except Exception as _exc:
                 # The actor's measure toolchain gate fired (finding 03).
                 # Ray re-raises the actor's exception as a RayTaskError
@@ -1292,13 +1382,20 @@ class CpuApproxPool:
                 self._poison(actor, future=fut)
                 held[j] = None
                 _sentinel_slot(i)
+                if i in rescoring:
+                    _unscored(i, "its scoring call raised")
 
-        while nxt < N or pending:
-            while nxt < N and (free or _adopt()):
+        while nxt < N or redo or pending:
+            while (redo or nxt < N) and (free or _adopt()):
                 j = free.popleft()
-                _dispatch(j, nxt)
-                nxt += 1
+                if redo:
+                    _dispatch(j, redo.popleft(), refuse="deadline")
+                else:
+                    _dispatch(j, nxt)
+                    nxt += 1
             if not pending:
+                if redo and self._await_actor(self._deadline()):
+                    continue
                 # Every actor of the batch is dead and nothing is in flight.
                 for i in range(nxt, N):
                     print(
@@ -1307,6 +1404,9 @@ class CpuApproxPool:
                         flush=True,
                     )
                     _sentinel_slot(i)
+                for i in redo:
+                    _unscored(i, "no live actor")
+                redo.clear()
                 nxt = N
                 break
             now = time.time()
@@ -1384,6 +1484,8 @@ class CpuApproxPool:
                 "oom_recycles": self._n_oom_recycles,
                 "proactive_recycles": self._n_proactive_recycles,
                 "takes_failed": self._n_takes_failed,
+                "deadline_scored": self._n_deadline_scored,
+                "deadline_unscored": self._n_deadline_unscored,
             }
 
     def fetch_timeout_delta(self) -> int:
