@@ -2713,14 +2713,16 @@ def _record_plan(rec: dict) -> None:
     _PLAN_RECORDS.append(rec)
 
 
-def consume_plan_records() -> dict:
+def consume_plan_records(flush_episode: bool = True) -> dict:
     """Pop this process's plan records (mirrors the other pollers)."""
     # THE EPISODE LINE (owner ruling 2026-09-14). The trainer drains this
     # process once per episode, so the drain is the one moment an actor is
     # certain an episode is over -- including the LAST one, which no
     # following episode would ever roll over. `flush_measure_episode` is
     # idempotent and silent when there is nothing to report.
-    flush_measure_episode()
+    # A take after one call is not the end of an episode: the flush would reset the dedupe's plan index.
+    if flush_episode:
+        flush_measure_episode()
     _fb_n = int(_MEASURE_COMPILE_FALLBACKS["n"])
     out = {"records": list(_PLAN_RECORDS),
            "dropped": int(_PLAN_LOG_DROPPED[0]),

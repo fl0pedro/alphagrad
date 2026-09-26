@@ -123,6 +123,8 @@ def merge_pool_collapse_stats(pool, cs: dict | None = None) -> dict:
     contributes nothing and never raises.
     """
     out = dict(cs or {})
+    if pool is not None:
+        out = fold_collapse_stats(out, pool.take_kept("collapse"))
     try:
         import ray as _ray
         actors = list(pool.live_actors()) if pool is not None else []
@@ -133,13 +135,66 @@ def merge_pool_collapse_stats(pool, cs: dict | None = None) -> dict:
             _s = _ray.get(_h.consume_collapse_stats.remote(), timeout=10)
         except Exception:
             continue
-        for _k, _v in (_s or {}).items():
-            if isinstance(_v, bool) or not isinstance(_v, (int, float)):
-                continue
-            if _k == "trunc_max_observed_len":
-                out[_k] = max(out.get(_k, 0), _v)
+        out = fold_collapse_stats(out, _s)
+    return out
+
+
+def fold_collapse_stats(out: dict | None, stats: dict | None) -> dict:
+    out = dict(out or {})
+    for _k, _v in (stats or {}).items():
+        if isinstance(_v, bool) or not isinstance(_v, (int, float)):
+            continue
+        if _k == "trunc_max_observed_len":
+            out[_k] = max(out.get(_k, 0), _v)
+        else:
+            out[_k] = out.get(_k, 0) + _v
+    return out
+
+
+def empty_plan_drain() -> dict:
+    return {"records": [], "dropped": 0, "terminals": 0,
+            "compile_fallbacks": 0, "toolchain_ok": True,
+            "mem_parity": {"records": [], "measured": 0, "dropped": 0},
+            "paired_ref": {"records": [], "dropped": 0}}
+
+
+def fold_plan_drain(out: dict, drain: dict | None, caps: dict | None = None) -> dict:
+    # One rule for an actor's drain and for the records the pool took after each call; a record past a cap is dropped and counted, as in the actor.
+    s = drain or {}
+    caps = caps or {}
+    stamp = "actor_id" in s
+
+    def _put(dst: list, items, cap) -> int:
+        n = 0
+        for x in items:
+            if cap is not None and len(dst) >= int(cap):
+                n += 1
             else:
-                out[_k] = out.get(_k, 0) + _v
+                dst.append(x)
+        return n
+
+    recs = list(s.get("records", ()))
+    if stamp:
+        for _r in recs:
+            if isinstance(_r, dict):
+                _r["actor"] = s["actor_id"]
+    out["dropped"] += _put(out["records"], recs, caps.get("records"))
+    out["dropped"] += int(s.get("dropped", 0))
+    out["terminals"] += int(s.get("terminals", 0))
+    _mp = s.get("mem_parity") or {}
+    out["mem_parity"]["dropped"] += _put(
+        out["mem_parity"]["records"], _mp.get("records", ()),
+        caps.get("mem_parity"))
+    out["mem_parity"]["measured"] += int(_mp.get("measured", 0))
+    out["mem_parity"]["dropped"] += int(_mp.get("dropped", 0))
+    _pr = s.get("paired_ref") or {}
+    out["paired_ref"]["dropped"] += _put(
+        out["paired_ref"]["records"], _pr.get("records", ()),
+        caps.get("paired_ref"))
+    out["paired_ref"]["dropped"] += int(_pr.get("dropped", 0))
+    out["compile_fallbacks"] += int(s.get("compile_fallbacks", 0))
+    out["toolchain_ok"] = out["toolchain_ok"] and bool(
+        s.get("toolchain_ok", True))
     return out
 
 
@@ -183,6 +238,8 @@ def merge_pool_face_stats(pool, pf: dict | None = None) -> dict:
     identical key names.
     """
     out = dict(pf or {})
+    if pool is not None:
+        out = fold_face_stats(out, pool.take_kept("face"))
     try:
         import ray as _ray
         actors = list(pool.live_actors()) if pool is not None else []
@@ -232,7 +289,12 @@ def merge_pool_plan_records(pool) -> dict:
            "mem_parity": {"records": [], "measured": 0, "dropped": 0},
            # The paired rev-exact reference (ticket .9): one record per
            # reference measurement the actors took.
-           "paired_ref": {"records": [], "dropped": 0}}
+           "paired_ref": {"records": [], "dropped": 0},
+           "calls_kept": 0}
+    if pool is not None:
+        _kept = pool.take_kept("plan")
+        out["calls_kept"] = int(_kept.get("calls", 0))
+        fold_plan_drain(out, _kept)
     try:
         import ray as _ray
         actors = list(pool.live_actors()) if pool is not None else []
@@ -253,28 +315,13 @@ def merge_pool_plan_records(pool) -> dict:
             out["actors_failed"] += 1
             continue
         out["actors_polled"] += 1
-        out["terminals"] += int((_s or {}).get("terminals", 0))
-        _mp = (_s or {}).get("mem_parity") or {}
-        out["mem_parity"]["records"].extend(_mp.get("records", ()))
-        out["mem_parity"]["measured"] += int(_mp.get("measured", 0))
-        out["mem_parity"]["dropped"] += int(_mp.get("dropped", 0))
-        _pr = (_s or {}).get("paired_ref") or {}
-        out["paired_ref"]["records"].extend(_pr.get("records", ()))
-        out["paired_ref"]["dropped"] += int(_pr.get("dropped", 0))
-        out["compile_fallbacks"] += int(
-            (_s or {}).get("compile_fallbacks", 0))
+        _s = dict(_s or {})
+        _s.setdefault("actor_id", None)
+        fold_plan_drain(out, _s)
         out["compile_fallbacks_total"] += int(
-            (_s or {}).get("compile_fallbacks_total", 0))
-        out["toolchain_ok"] = out["toolchain_ok"] and bool(
-            (_s or {}).get("toolchain_ok", True))
-        if not (_s or {}).get("enabled", True):
+            _s.get("compile_fallbacks_total", 0))
+        if not _s.get("enabled", True):
             out["actors_disabled"] += 1
-        _aid = (_s or {}).get("actor_id")
-        for _r in (_s or {}).get("records", ()):
-            if isinstance(_r, dict):
-                _r["actor"] = _aid
-            out["records"].append(_r)
-        out["dropped"] += int((_s or {}).get("dropped", 0))
     return out
 
 

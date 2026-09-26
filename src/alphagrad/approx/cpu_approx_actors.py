@@ -403,7 +403,7 @@ class CpuApproximationActor:
         from alphagrad.approx.env import consume_per_face_stats as _consume_pf
         return _consume_pf()
 
-    def consume_plan_records(self) -> dict:
+    def consume_plan_records(self, flush_episode: bool = True) -> dict:
         """Pop this actor's A6 plan-log records (every terminal plan).
 
         Same reason as :meth:`consume_face_stats`: the measurement
@@ -421,7 +421,7 @@ class CpuApproximationActor:
             consume_plan_records as _consume)
         from alphagrad.approx.common.plan_log import (
             stamp_provenance as _stamp)
-        out = _consume()
+        out = _consume(flush_episode=flush_episode)
         out["actor_id"] = self._actor_id
         _stamp(out.get("records") or (),
                device={"cuda_visible_devices": getattr(self, "_device", None),
@@ -471,3 +471,9 @@ class CpuApproximationActor:
         for _k, _v in _e.consume_refused_counts().items():
             out[f"refused_{_k}"] = int(_v)
         return out
+
+    def consume_call_telemetry(self) -> dict:
+        # The pool calls this right after each terminal call, so a kill or a recycle takes nothing with it (dsnn-dfw.201).
+        return {"plan": self.consume_plan_records(flush_episode=False),
+                "collapse": self.consume_collapse_stats(),
+                "face": self.consume_face_stats()}

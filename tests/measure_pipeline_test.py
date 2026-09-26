@@ -348,6 +348,9 @@ def test_the_discarded_attempts_actor_records_are_dropped_not_logged():
         def live_actors(self):
             return list(self._actors)
 
+        def take_kept(self, part):
+            return {}
+
     import sys
     import types
     fake_ray = types.ModuleType("ray")
@@ -515,6 +518,9 @@ def test_a_sync_repeat_leaves_one_set_of_records_stamped_with_the_repeat():
         def live_actors(self):
             return [self._actor]
 
+        def take_kept(self, part):
+            return {}
+
     fake_ray = types.ModuleType("ray")
     fake_ray.get = lambda x, timeout=None: x
     saved_ray = sys.modules.get("ray")
@@ -612,6 +618,9 @@ def test_without_the_actor_drain_a_sync_repeat_keeps_both_attempts():
 
         def live_actors(self):
             return [self._actor]
+
+        def take_kept(self, part):
+            return {}
 
     fake_ray = types.ModuleType("ray")
     fake_ray.get = lambda x, timeout=None: x
@@ -884,6 +893,9 @@ def test_two_overflow_repeats_then_a_collect_leaves_the_counters_readable():
 
         def live_actors(self):
             return [self._actor]
+
+        def take_kept(self, part):
+            return {}
 
     fake_ray = types.ModuleType("ray")
     fake_ray.get = lambda x, timeout=None: x

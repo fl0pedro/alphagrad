@@ -70,6 +70,7 @@ class _Actor:
         self.evaluate = _Remote(self._evaluate)
         self.pop_oom_flag = _Remote(self._pop)
         self.ready = _Remote(lambda: True)
+        self.consume_call_telemetry = _Remote(lambda: {})
 
     def _evaluate(self, order, specs, step, **kw):
         kind = int(np.asarray(order).reshape(-1)[0])

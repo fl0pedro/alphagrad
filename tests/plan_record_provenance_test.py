@@ -41,7 +41,7 @@ def _unwrapped(cls):
 def test_the_measure_actors_drain_stamps_its_records(monkeypatch):
     import alphagrad.approx.env as env
 
-    monkeypatch.setattr(env, "consume_plan_records", lambda: {
+    monkeypatch.setattr(env, "consume_plan_records", lambda flush_episode=True: {
         "records": [{"plan_hash": "aa", "order": [3, 2, 1]}], "dropped": 0, "pid": 1,
         "mem_parity": {"records": [], "measured": 0, "dropped": 0}})
     monkeypatch.setattr(env, "check_mem_parity_complete", lambda parity, who: None)

@@ -34,7 +34,7 @@ def test_consume_plan_records_runs_in_process(monkeypatch):
     import alphagrad.approx.env as env
 
     monkeypatch.setattr(env, "consume_plan_records",
-                        lambda: {"records": [], "dropped": 0, "pid": 1,
+                        lambda flush_episode=True: {"records": [], "dropped": 0, "pid": 1,
                                  "mem_parity": {"records": [], "measured": 0, "dropped": 0}})
     monkeypatch.setattr(env, "check_mem_parity_complete", lambda parity, who: None)
     cls = _unwrapped(actors_mod.CpuApproximationActor)

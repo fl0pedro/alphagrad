@@ -255,6 +255,9 @@ class CpuApproxPool:
         }
         self._n_oom_recycles = 0
         self._n_proactive_recycles = 0
+        # What each terminal call left in its actor, taken right after the call (dsnn-dfw.201).
+        self._kept = self._empty_kept()
+        self._n_takes_failed = 0
         # ---- the PIPELINED submission (owner ruling 2026-09-14) ----
         # One worker thread, created on first use, and at most ONE batch in
         # flight on it. See `submit_batch` for why the limit is a fact of the
@@ -286,6 +289,55 @@ class CpuApproxPool:
         print(f"[refused] timeout step={int(step)} after "
               f"{float(timeout_s):.0f}s: excluded from the update",
               flush=True)
+
+    @staticmethod
+    def _empty_kept() -> dict:
+        from alphagrad.approx.common.measure_pool import empty_plan_drain
+        plan = empty_plan_drain()
+        plan["calls"] = 0
+        return {"plan": plan, "collapse": {}, "face": {}}
+
+    def take_kept(self, part: str) -> dict:
+        with self._lock:
+            if part not in self._kept:
+                raise KeyError(
+                    f"the pool keeps {sorted(self._kept)} per call, not "
+                    f"{part!r}")
+            out = self._kept[part]
+            self._kept[part] = self._empty_kept()[part]
+        return out
+
+    def _keep(self, payload: dict) -> None:
+        from alphagrad.approx import env as _env
+        from alphagrad.approx.common import measure_pool as _mp
+        # The same caps the actor holds its own records under between two drains.
+        caps = {"records": _env._plan_log_cap(),
+                "mem_parity": _env._MEM_PARITY_CAP,
+                "paired_ref": _env._PAIRED_REF_CAP}
+        p = payload or {}
+        with self._lock:
+            _mp.fold_plan_drain(self._kept["plan"], p.get("plan"), caps)
+            self._kept["plan"]["calls"] += 1
+            self._kept["collapse"] = _mp.fold_collapse_stats(
+                self._kept["collapse"], p.get("collapse"))
+            self._kept["face"] = _mp.fold_face_stats(
+                self._kept["face"], p.get("face"))
+
+    def _take_call(self, fut, where: str, timeout: float) -> None:
+        import ray
+        try:
+            payload = ray.get(fut, timeout=timeout)
+        except Exception as _exc:
+            if _is_toolchain_fault(_exc):
+                raise
+            with self._lock:
+                self._n_takes_failed += 1
+            print(f"[POOL] the plan records of {where} could not be taken "
+                  f"from the actor: {type(_exc).__name__}: "
+                  f"{str(_exc)[:160]}; they are MISSING "
+                  f"(takes_failed={self._n_takes_failed})", flush=True)
+            return
+        self._keep(payload)
 
     def submit_batch(self, *args, **kwargs):
         """Start :meth:`evaluate_batch` on a worker thread; return its future.
@@ -679,6 +731,7 @@ class CpuApproxPool:
             )
 
         future = None
+        take = None
         try:
             # Prefer the cached ObjectRef when one is available — Ray
             # sees ``ObjectRef`` and skips re-serialising the per-call
@@ -712,6 +765,8 @@ class CpuApproxPool:
             )
             # An actor runs calls in send order: the flag of the call above.
             flag = actor.pop_oom_flag.remote()
+            if self._is_terminal(order_np, step):
+                take = actor.consume_call_telemetry.remote()
             result = ray.get(future) if timeout <= 0 else ray.get(future, timeout=timeout)
             self._check_arity(result)
             _tk = self._wire(result[0], self._token_dtype, "tokens")
@@ -803,8 +858,12 @@ class CpuApproxPool:
                 f"(n_actor_errors={self._n_actor_errors})",
                 flush=True,
             )
+            if take is not None:
+                self._take_call(take, f"step={int(step)}", 10.0)
             self._poison(actor, future=None)
             return out
+        if take is not None:
+            self._take_call(take, f"step={int(step)}", 30.0)
         if was_oom:
             fresh = self._recycle_actor(actor)
             self._n_oom_recycles += 1
@@ -1062,6 +1121,7 @@ class CpuApproxPool:
             j for j in range(M) if held[j] is not None)
         pending: dict[Any, tuple[int, int, float]] = {}
         flags: dict[int, Any] = {}
+        takes: dict[int, Any] = {}
         f_timeouts: dict[int, float] = {}
         nxt = 0
 
@@ -1102,6 +1162,8 @@ class CpuApproxPool:
                 )
                 # An actor runs calls in send order: the flag of this call.
                 flags[i] = actor.pop_oom_flag.remote()
+                if self._is_terminal(order_batch[i], step_batch[i]):
+                    takes[i] = actor.consume_call_telemetry.remote()
                 f_timeouts[i] = _to
                 pending[fut] = (i, j, time.time() + _to if _to > 0 else 0.0)
             except Exception as _exc:
@@ -1147,9 +1209,13 @@ class CpuApproxPool:
                         f"(n_actor_errors={self._n_actor_errors})",
                         flush=True,
                     )
+                    if i in takes:
+                        self._take_call(takes.pop(i), f"slot={i}", 10.0)
                     self._poison(actor, future=None)
                     held[j] = None
                     return
+                if i in takes:
+                    self._take_call(takes.pop(i), f"slot={i}", 30.0)
                 if _was_oom:
                     # The server's -1e10 row stays masked, a scored row scored.
                     if self._reward_is_sentinel(reward):
@@ -1317,6 +1383,7 @@ class CpuApproxPool:
                 "respawn_refused": self._n_respawn_refused,
                 "oom_recycles": self._n_oom_recycles,
                 "proactive_recycles": self._n_proactive_recycles,
+                "takes_failed": self._n_takes_failed,
             }
 
     def fetch_timeout_delta(self) -> int:

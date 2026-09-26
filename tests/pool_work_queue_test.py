@@ -93,6 +93,7 @@ class _Actor:
                                 on_dispatch=lambda order, *a: self.slots.append(int(order[1])))
         self.pop_oom_flag = _Remote(lambda: False, 0.0, clock)
         self.ready = _Remote(lambda: True, 0.0, clock)
+        self.consume_call_telemetry = _Remote(lambda: {}, 0.0, clock)
 
     def _evaluate(self, order, specs, step, **kw):
         reward = np.full((NUM_REWARDS,), -100.0, np.float32)

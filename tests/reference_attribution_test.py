@@ -232,6 +232,8 @@ class _ServerActor:
             lambda *a, rule=None, **k: server.evaluate(*a, **k))
         self.pop_oom_flag = _Remote(server.pop_oom_flag)
         self.ready = _Remote(lambda: True)
+        # The records stay in this process, where the checks read them.
+        self.consume_call_telemetry = _Remote(lambda: {})
 
 
 def _pool(env):
