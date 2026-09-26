@@ -7657,30 +7657,55 @@ def _mem_reward_index(mem_type: str) -> int:
 
 
 
-#: The band front's two objectives beside the windowed latency and memory ratios, one reading per
-#: plan each: quality (the gradient cosine) and the trained memory objective (dsnn-dfw.281).
-BAND_READINGS = (("quality", "max"), ("mem_objective", "max"))
-
-
 def _band_archive(args):
     from alphagrad.approx.common.pareto_archive import RatioBandArchive
-    # Quality is an objective and no filter: a plan under tau stays when it is faster or smaller (owner, 2026-09-26).
+    # Quality, latency and peak memory only, and quality is no filter: a plan under tau stays when it is faster or smaller (owner, 2026-09-26).
     return RatioBandArchive(
-        obj_names=(args.cmp_type, args.mem_type) + tuple(
-            n for n, _s in BAND_READINGS),
-        senses=("min", "min") + tuple(s for _n, s in BAND_READINGS),
-        cap=64)
+        obj_names=(args.cmp_type, args.mem_type, "quality"),
+        senses=("min", "min", "max"), cap=64)
+
+
+def _log_ratio(x, ref, floor) -> float:
+    return float(np.log(max(float(x), floor)) - np.log(max(float(ref), floor)))
+
+
+def _peak_memory_sample(rec, rl):
+    from alphagrad.approx import env as _env
+    # The device watermark when one was measured, else the static total temp + args + out (owner, 2026-09-26).
+    floor = _env._MEM_LOG_FLOOR_BYTES
+    measured = rec.get("mem_peak_source") == "runtime_delta"
+    if rl and measured and rec.get("mem_channel") == "watermark":
+        return rl["memory"]["windows"], "watermark"
+    ref = rec.get("ref_watermark_bytes")
+    if ref is None:
+        return None, None
+    if measured and rec.get("mem_watermark_bytes") is not None:
+        return [_log_ratio(rec["mem_watermark_bytes"], ref, floor)], "watermark"
+    parts = [rec.get(k) for k in
+             ("mem_temp_bytes", "mem_args_bytes", "mem_output_bytes")]
+    if any(p is None for p in parts):
+        return None, None
+    return [_log_ratio(sum(float(p) for p in parts), ref, floor)], "static"
 
 
 def _band_sample(rec, args):
-    rl = (rec or {}).get("ratio_log")
-    if not rl:
-        return None
-    out = {args.cmp_type: rl["latency"]["windows"],
-           args.mem_type: rl["memory"]["windows"]}
-    for name, _s in BAND_READINGS:
-        out[name] = [float(rec["rewards"][REWARD_INDEX[name]])]
-    return out
+    from alphagrad.approx import env as _env
+    rec = rec or {}
+    rl = rec.get("ratio_log")
+    if rl:
+        lat = rl["latency"]["windows"]
+    elif rec.get("refusal_latency_ns") and rec.get("ref_latency_ns"):
+        # A refused plan has one latency reading: the deadline it was scored at.
+        lat = [_log_ratio(rec["refusal_latency_ns"], rec["ref_latency_ns"],
+                          _env._LAT_FLOOR_NS)]
+    else:
+        return None, None
+    mem, source = _peak_memory_sample(rec, rl)
+    if mem is None:
+        return None, None
+    return ({args.cmp_type: lat, args.mem_type: mem,
+             "quality": [float(rec["rewards"][REWARD_INDEX["quality"]])]},
+            source)
 
 
 def _dump_pareto(archive, args, ep, *, final=False, rule=None):
@@ -15751,12 +15776,12 @@ def main(args=None):
                 if _RATIO_ARCHIVE:
                     _rd: dict = {}
                     for _r in _plog_recs:
-                        _smp = _band_sample(_r, args)
+                        _smp, _msrc = _band_sample(_r, args)
                         if _smp is None:
                             continue
                         _k = tuple(int(v) for v in (_r.get("order") or ()))
                         if _k and _k not in _rd:
-                            _rd[_k] = _smp
+                            _rd[_k] = (_smp, _msrc)
                     host_state["_ratio_dists"] = _rd
                 host_state["_gate_drain"] = (
                     {"records": list(_plog_local.get("records") or ())},
@@ -16230,9 +16255,12 @@ def main(args=None):
                         host_state["pareto_missing_band"] = 1 + int(
                             host_state.get("pareto_missing_band", 0))
                         continue
-                    _sols.append(
-                        (_dist, _seq, float(all_rets[i][cosine_idx])))
-                _AS_ADMITTED = int(pareto_archive.add_many(_sols, ep))
+                    _sols.append((_dist[0], _seq,
+                                  float(all_rets[i][cosine_idx]), _dist[1]))
+                _AS_ADMITTED = sum(
+                    int(pareto_archive.add(_d, _sq, ep, quality=_q,
+                                           mem_source=_ms))
+                    for _d, _sq, _q, _ms in _sols)
                 log_dict["pareto/missing_band"] = int(
                     host_state.get("pareto_missing_band", 0))
                 log_dict["pareto/merged"] = int(pareto_archive.n_merged)

@@ -354,6 +354,8 @@ class RatioBandArchive:
         self.members: list[list] = []
         self.seqs: list = []
         self.eps: list[int] = []
+        # Per point, how many of its pooled measurements took their memory from each source.
+        self.mem_sources: list[dict] = []
         self.all_candidates: list[dict] = []
         self._seen: set = set()
         self._hv_ref: np.ndarray | None = None
@@ -422,7 +424,8 @@ class RatioBandArchive:
     def band_width(self, i: int) -> float:
         return float(np.sum(self.hi[i] - self.lo[i]))
 
-    def add(self, dist, seq, episode: int, quality=None) -> bool:
+    def add(self, dist, seq, episode: int, quality=None,
+            mem_source=None) -> bool:
         if dist is None:
             raise ValueError(
                 "RatioBandArchive.add got no distribution: a plan with no "
@@ -451,6 +454,9 @@ class RatioBandArchive:
                 # anonymous count. The objective-0 pool is the budget.
                 self._record_member(
                     i, seq, int(self.samples[i][0].size) - _before, episode)
+                if mem_source is not None:
+                    _ms = self.mem_sources[i]
+                    _ms[str(mem_source)] = int(_ms.get(str(mem_source), 0)) + 1
                 return False
             if worse.any() and not better.any():
                 return False
@@ -470,11 +476,14 @@ class RatioBandArchive:
             "first_episode": int(episode), "last_episode": int(episode)}]]
         self.seqs = [self.seqs[i] for i in keep] + [seq]
         self.eps = [self.eps[i] for i in keep] + [int(episode)]
+        self.mem_sources = [self.mem_sources[i] for i in keep] + [
+            {} if mem_source is None else {str(mem_source): 1}]
         while len(self.pts) > self.cap:
             widths = [self.band_width(i) for i in range(len(self.pts))]
             drop = int(np.argmax(np.asarray(widths)))
             for lst in (self.pts, self.lo, self.hi, self.samples,
-                        self.counts, self.members, self.seqs, self.eps):
+                        self.counts, self.members, self.seqs, self.eps,
+                        self.mem_sources):
                 del lst[drop]
             self.n_dropped_cap += 1
         key = repr(seq)
@@ -485,6 +494,7 @@ class RatioBandArchive:
                 "obj": self._named(med),
                 "band_lo": self._named(_lo),
                 "band_hi": self._named(_hi),
+                "mem_source": mem_source,
                 "seq": seq,
             })
         return True
@@ -517,6 +527,7 @@ class RatioBandArchive:
                 "windows": {nm: int(self.samples[i][k].size)
                             for k, nm in enumerate(self.obj_names)},
                 "episode": int(self.eps[i]),
+                "mem_source": dict(self.mem_sources[i]),
                 # The REPRESENTATIVE, then every plan that measured inside
                 # this band, best supported first.
                 "seq": self.seqs[i],

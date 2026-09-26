@@ -437,6 +437,8 @@ def pareto_archive_to_json(archive) -> dict:
             "counts": [int(c) for c in archive.counts],
             "seqs": list(archive.seqs),
             "eps": [int(e) for e in archive.eps],
+            "mem_sources": [{str(k): int(v) for k, v in m.items()}
+                            for m in archive.mem_sources],
             "all_candidates": list(archive.all_candidates),
             "seen": sorted(str(s) for s in archive._seen),
             "hv_ref": (None if archive._hv_ref is None
@@ -493,6 +495,9 @@ def pareto_archive_from_json(archive, d: dict) -> None:
         archive.counts = [int(c) for c in d["counts"]]
         archive.seqs = list(d["seqs"])
         archive.eps = [int(e) for e in d["eps"]]
+        archive.mem_sources = [
+            {str(k): int(v) for k, v in m.items()}
+            for m in (d.get("mem_sources") or [{} for _p in d["pts"]])]
         archive.all_candidates = list(d["all_candidates"])
         archive._seen = set(d["seen"])
         archive._hv_ref = (None if d["hv_ref"] is None
