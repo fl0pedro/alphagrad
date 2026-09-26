@@ -414,11 +414,12 @@ def pareto_archive_to_json(archive) -> dict:
     # windows are the state a resumed run needs to keep re-fitting a band
     # that is already tighter than one measurement.
     if hasattr(archive, "samples"):
-        return {
-            "kind": "ratio-band",
+        out = {
+            "kind": ("quantile-front" if hasattr(archive, "quantiles")
+                     else "ratio-band"),
             "obj_names": [str(n) for n in archive.obj_names],
             "senses": [str(s) for s in archive.senses],
-            "cap": int(archive.cap),
+            "cap": None if archive.cap is None else int(archive.cap),
             "pool_cap": int(archive.pool_cap),
             "quality_floor": (None if archive.quality_floor is None
                               else float(archive.quality_floor)),
@@ -446,6 +447,13 @@ def pareto_archive_to_json(archive) -> dict:
             "n_merged": int(archive.n_merged),
             "n_dropped_cap": int(archive.n_dropped_cap),
         }
+        if hasattr(archive, "quantiles"):
+            # dsnn-dfw.293: the quantile front's bands, where they came from, and its repeat count.
+            out.update(banded=[str(b) for b in archive.banded],
+                       quantiles=list(archive.quantiles),
+                       details=list(archive.details),
+                       n_repeats=int(archive.n_repeats))
+        return out
     return {
         "obj_names": [str(n) for n in archive.obj_names],
         "obj_idx": [int(i) for i in archive.obj_idx],
@@ -468,11 +476,13 @@ def pareto_archive_from_json(archive, d: dict) -> None:
             f"the Pareto archive's objectives are {archive.obj_names} on this "
             f"run and {d['obj_names']} in the checkpoint.")
     _band = hasattr(archive, "samples")
-    if _band != (str(d.get("kind") or "") == "ratio-band"):
+    _kind = ("quantile-front" if hasattr(archive, "quantiles")
+             else "ratio-band" if _band else "reward-vector")
+    _saved = str(d.get("kind") or "reward-vector")
+    if _kind != _saved:
         raise CheckpointError(
-            f"the Pareto archive is {'a band' if _band else 'a reward-vector'} "
-            f"archive on this run and {d.get('kind') or 'a reward-vector'} "
-            f"archive in the checkpoint.")
+            f"the Pareto archive is a {_kind} archive on this run and a "
+            f"{_saved} archive in the checkpoint.")
     if _band:
         _senses = [str(s) for s in (d.get("senses")
                                     or ["min"] * len(d["obj_names"]))]
@@ -480,7 +490,12 @@ def pareto_archive_from_json(archive, d: dict) -> None:
             raise CheckpointError(
                 f"the Pareto archive's senses are {archive.senses} on this "
                 f"run and {_senses} in the checkpoint.")
-        archive.cap = int(d["cap"])
+        if _kind == "quantile-front" and (
+                [str(b) for b in archive.banded] != [str(b) for b in d["banded"]]):
+            raise CheckpointError(
+                f"the Pareto front's banded objectives are {archive.banded} "
+                f"on this run and {d['banded']} in the checkpoint.")
+        archive.cap = None if d["cap"] is None else int(d["cap"])
         archive.pool_cap = int(d["pool_cap"])
         archive.pts = [np.asarray(p, dtype=np.float64) for p in d["pts"]]
         archive.lo = [np.asarray(p, dtype=np.float64) for p in d["lo"]]
@@ -504,6 +519,10 @@ def pareto_archive_from_json(archive, d: dict) -> None:
                            else np.asarray(d["hv_ref"], dtype=np.float64))
         archive.n_merged = int(d["n_merged"])
         archive.n_dropped_cap = int(d["n_dropped_cap"])
+        if _kind == "quantile-front":
+            archive.quantiles = [dict(q) for q in d["quantiles"]]
+            archive.details = list(d["details"])
+            archive.n_repeats = int(d["n_repeats"])
         return
     if [int(i) for i in archive.obj_idx] != [int(i) for i in d["obj_idx"]]:
         raise CheckpointError(

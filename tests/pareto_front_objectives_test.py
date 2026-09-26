@@ -3,7 +3,8 @@
 # the device watermark when one was measured, else the static estimate temp + args + out, and each
 # point records its source. A plan of lower quality stays on the front when it is faster or
 # smaller, a plan under tau and a plan of an early episode included. The band archive of
-# dsnn-dfw.44 had two objectives and used quality only as the admission floor (dsnn-dfw.107).
+# dsnn-dfw.44 had two objectives and used quality only as the admission floor (dsnn-dfw.107). Since
+# dsnn-dfw.293 the latency of a point is banded by its quantiles (quantile_front_test.py).
 from __future__ import annotations
 
 import inspect
@@ -20,7 +21,8 @@ import pytest                                                   # noqa: E402
 
 from alphagrad.approx import ppo                                # noqa: E402
 from alphagrad.approx.common import checkpoint as ckpt          # noqa: E402
-from alphagrad.approx.common.pareto_archive import RatioBandArchive  # noqa: E402
+from alphagrad.approx.common.pareto_archive import (            # noqa: E402
+    QuantileFrontArchive, RatioBandArchive)
 from alphagrad.approx.env import NUM_REWARDS, REWARD_INDEX      # noqa: E402
 
 THREE = ["latency", "peak_memory", "quality"]
@@ -148,6 +150,7 @@ def test_the_dump_carries_three_values_and_the_memory_source(tmp_path, monkeypat
             assert list(point[key]) == THREE
             assert all(np.isfinite(v) for v in point[key].values())
         assert point["mem_source"] in ({"watermark": 1}, {"static": 1})
+        assert point["quantiles"] == {"latency": None}, "no quantile fields: the median alone"
     got = sorted((round(p["obj"]["quality"], 6), list(p["mem_source"])[0])
                  for p in doc["front"])
     assert got == [(0.0, "static"), (0.85, "watermark"), (0.93, "watermark"),
@@ -177,7 +180,7 @@ def test_the_senses_and_sources_survive_the_checkpoint_and_a_mismatch_raises():
     ckpt.pareto_archive_from_json(back, doc)
     assert back.senses == archive.senses and len(back.pts) == 5
     assert back.mem_sources == archive.mem_sources
-    other = RatioBandArchive(THREE, senses=["min"] * 3)
+    other = QuantileFrontArchive(THREE, banded=["latency"], senses=["min"] * 3)
     with pytest.raises(ckpt.CheckpointError, match="senses"):
         ckpt.pareto_archive_from_json(other, doc)
 
@@ -186,7 +189,7 @@ def test_the_trainer_feeds_the_front_from_the_plan_record():
     src = inspect.getsource(ppo.main)
     assert "return _band_archive(args)" in src
     assert "_smp, _msrc = _band_sample(_r, args)" in src
-    assert "mem_source=_ms" in src
+    assert "mem_source=_d[1]" in src
     sample, source = ppo._band_sample(_measured((1, 2, 3), 0.5, 1.0, 0.97), _args())
     assert source == "watermark" and sample["quality"] == [0.97]
     assert sorted(sample) == sorted(THREE)

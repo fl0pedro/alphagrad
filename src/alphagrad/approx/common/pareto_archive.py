@@ -559,7 +559,7 @@ class RatioBandArchive:
                     "the pooled per-window paired log ratios",
             "hypervolume": _hv if np.isfinite(_hv) else None,
             "num_points": len(self.pts),
-            "cap": int(self.cap),
+            "cap": None if self.cap is None else int(self.cap),
             "pool_cap": int(self.pool_cap),
             "merged_measurements": int(self.n_merged),
             "dropped_at_cap": int(self.n_dropped_cap),
@@ -580,3 +580,143 @@ class RatioBandArchive:
             payload.update(extra)
         with open(path, "w") as f:
             json.dump(payload, f, indent=2)
+
+
+# Owner ruling 2026-09-26, Q12 (dsnn-dfw.293): the thesis front. A point is one plan. A banded
+# objective carries the five quantiles of the plan's per-execution latency, p10 to p90, in the
+# archive's space. Point A leaves the front only when a point B is at least as good on every
+# objective without a band and B's median lies below A's p10 on each banded one (above A's p90
+# for a "max" objective). A median inside the other point's p10 to p90 band keeps both. The front
+# has no cap and merges no two plans. A record without quantiles falls back to its median alone.
+QUANTILE_KEYS = ("p10", "p25", "p50", "p75", "p90")
+
+
+class QuantileFrontArchive(RatioBandArchive):
+
+    def __init__(self, obj_names, banded, senses=None, pool_cap: int = _POOL_CAP):
+        super().__init__(obj_names, cap=1, quality_floor=None,
+                         pool_cap=pool_cap, senses=senses)
+        self.cap = None
+        self.banded = [str(b) for b in banded]
+        if not self.banded or any(b not in self.obj_names for b in self.banded):
+            raise ValueError(
+                f"QuantileFrontArchive: the banded objectives {self.banded} "
+                f"must be among {self.obj_names}")
+        self._banded = np.array([nm in self.banded for nm in self.obj_names])
+        # Per point: the five quantiles of each banded objective, None where the record had none.
+        self.quantiles: list[dict] = []
+        # Per point: what the caller measured the quantiles from, dumped as it came.
+        self.details: list = []
+        self.n_repeats = 0
+
+    def _quantile_band(self, quantiles, med) -> tuple:
+        q_out = {}
+        lo = med.copy()
+        hi = med.copy()
+        for k, nm in enumerate(self.obj_names):
+            if not self._banded[k]:
+                continue
+            q = (quantiles or {}).get(nm)
+            if q is None:
+                q_out[nm] = None
+                continue
+            if any(p not in q for p in QUANTILE_KEYS):
+                raise ValueError(
+                    f"QuantileFrontArchive: objective {nm!r} needs the five "
+                    f"quantiles {QUANTILE_KEYS}, got {sorted(q)}")
+            v = [float(q[p]) for p in QUANTILE_KEYS]
+            if not np.all(np.isfinite(v)) or any(b < a for a, b in zip(v, v[1:])):
+                raise ValueError(
+                    f"QuantileFrontArchive: the quantiles of {nm!r} must be "
+                    f"finite and non-decreasing, got {v}")
+            q_out[nm] = dict(zip(QUANTILE_KEYS, v))
+            med[k], lo[k], hi[k] = v[2], v[0], v[4]
+        return q_out, med, lo, hi
+
+    def _dominates(self, med_b, med_a, lo_a, hi_a) -> bool:
+        for k in range(len(self.obj_names)):
+            if self._banded[k]:
+                beyond = med_b[k] > hi_a[k] if self._max[k] else med_b[k] < lo_a[k]
+                if not beyond:
+                    return False
+            elif not (med_b[k] >= med_a[k] if self._max[k] else med_b[k] <= med_a[k]):
+                return False
+        return True
+
+    def add(self, dist, seq, episode: int, quality=None, mem_source=None,
+            quantiles=None, detail=None) -> bool:
+        if dist is None:
+            raise ValueError(
+                "QuantileFrontArchive.add got no distribution: a plan with no "
+                "per-window ratios has no point (needs --cost-form "
+                "paired-log and a plan log)")
+        w = self._windows(dist)
+        med = np.array([float(np.median(x)) for x in w], dtype=np.float64)
+        q_out, med, lo, hi = self._quantile_band(quantiles, med)
+        key = repr(seq)
+        for i, ms in enumerate(self.members):
+            if ms[0]["key"] != key:
+                continue
+            # The same plan measured again: counted on its point, which keeps its first measurement.
+            self.counts[i] += 1
+            ms[0]["n"] += 1
+            ms[0]["last_episode"] = int(episode)
+            if mem_source is not None:
+                _ms = self.mem_sources[i]
+                _ms[str(mem_source)] = int(_ms.get(str(mem_source), 0)) + 1
+            self.n_repeats += 1
+            return False
+        for i in range(len(self.pts)):
+            if self._dominates(self.pts[i], med, lo, hi):
+                return False
+        keep = [i for i in range(len(self.pts))
+                if not self._dominates(med, self.pts[i], self.lo[i], self.hi[i])]
+        self.pts = [self.pts[i] for i in keep] + [med]
+        self.lo = [self.lo[i] for i in keep] + [lo]
+        self.hi = [self.hi[i] for i in keep] + [hi]
+        self.samples = [self.samples[i] for i in keep] + [
+            [x[:self.pool_cap] for x in w]]
+        self.counts = [self.counts[i] for i in keep] + [1]
+        self.members = [self.members[i] for i in keep] + [[{
+            "key": key, "seq": seq,
+            "windows": int(min(w[0].size, self.pool_cap)), "n": 1,
+            "first_episode": int(episode), "last_episode": int(episode)}]]
+        self.seqs = [self.seqs[i] for i in keep] + [seq]
+        self.eps = [self.eps[i] for i in keep] + [int(episode)]
+        self.mem_sources = [self.mem_sources[i] for i in keep] + [
+            {} if mem_source is None else {str(mem_source): 1}]
+        self.quantiles = [self.quantiles[i] for i in keep] + [q_out]
+        self.details = [self.details[i] for i in keep] + [detail]
+        if key not in self._seen:
+            self._seen.add(key)
+            self.all_candidates.append({
+                "episode": int(episode),
+                "obj": self._named(med),
+                "band_lo": self._named(lo),
+                "band_hi": self._named(hi),
+                "quantiles": q_out,
+                "detail": detail,
+                "mem_source": mem_source,
+                "seq": seq,
+            })
+        return True
+
+    def front(self) -> list:
+        out = super().front()
+        for i, point in enumerate(out):
+            point["quantiles"] = self.quantiles[i]
+            point["detail"] = self.details[i]
+        return out
+
+    def dump_front(self, path: str, extra: dict | None = None) -> None:
+        super().dump_front(path, extra={
+            "rule": "quantile",
+            "banded": list(self.banded),
+            "band": ("a banded objective: p10 to p90 of the plan's "
+                     "per-execution latency, and its median is p50. A point "
+                     "leaves the front only when another is at least as good "
+                     "on every other objective and its median lies beyond "
+                     "this point's band. A point without quantiles has its "
+                     "median alone. Every other objective: the median."),
+            "repeats": int(self.n_repeats),
+            **(extra or {})})

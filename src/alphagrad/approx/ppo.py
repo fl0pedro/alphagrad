@@ -7692,11 +7692,12 @@ def _mem_reward_index(mem_type: str) -> int:
 
 
 def _band_archive(args):
-    from alphagrad.approx.common.pareto_archive import RatioBandArchive
+    from alphagrad.approx.common.pareto_archive import QuantileFrontArchive
     # Quality, latency and peak memory only, and quality is no filter: a plan under tau stays when it is faster or smaller (owner, 2026-09-26).
-    return RatioBandArchive(
+    # The latency is banded by its quantiles, and the front has no cap (owner ruling 2026-09-26, Q12).
+    return QuantileFrontArchive(
         obj_names=(args.cmp_type, args.mem_type, "quality"),
-        senses=("min", "min", "max"), cap=64)
+        senses=("min", "min", "max"), banded=(args.cmp_type,))
 
 
 def _log_ratio(x, ref, floor) -> float:
@@ -7740,6 +7741,21 @@ def _band_sample(rec, args):
     return ({args.cmp_type: lat, args.mem_type: mem,
              "quality": [float(rec["rewards"][REWARD_INDEX["quality"]])]},
             source)
+
+
+def _latency_quantiles(rec, args):
+    from alphagrad.approx import env as _env
+    # p10 to p90 of the plan's per-execution latency, as log ratios against its paired reference's median (owner ruling 2026-09-26, Q12).
+    rec = rec or {}
+    ref = rec.get("ref_latency_p50_ns")
+    ns = {f"p{p}": rec.get(f"candidate_latency_p{p}_ns")
+          for p in _env.LATENCY_QUANTILES}
+    if not ref or any(v is None for v in ns.values()):
+        return None, None
+    return ({args.cmp_type: {k: _log_ratio(v, ref, _env._LAT_FLOOR_NS)
+                             for k, v in ns.items()}},
+            {"candidate_latency_ns": {k: float(v) for k, v in ns.items()},
+             "ref_latency_p50_ns": float(ref)})
 
 
 def _dump_pareto(archive, args, ep, *, final=False, rule=None):
@@ -7789,13 +7805,21 @@ def _dump_pareto(archive, args, ep, *, final=False, rule=None):
                     for m in sorted(_mem[i], key=lambda m: (-m["windows"],
                                                             m["first_episode"]))]
 
+        # The five latency quantiles of each point of the quantile front (dsnn-dfw.293).
+        _qs = getattr(archive, "quantiles", None)
+
+        def _quantiles_of(i):
+            return None if _qs is None else _qs[i]
+
         _doc = {
             "best_overall": {"seq": archive.seqs[_order[0]],
                              "obj": _pts[_order[0]],
-                             "members": _members_of(_order[0])},
+                             "members": _members_of(_order[0]),
+                             "quantiles": _quantiles_of(_order[0])},
             "best_per_channel": {
                 f"rank{r}": {"seq": archive.seqs[i], "obj": _pts[i],
-                             "members": _members_of(i)}
+                             "members": _members_of(i),
+                             "quantiles": _quantiles_of(i)}
                 for r, i in enumerate(_order)
             },
             "_provenance": {"source": "ParetoArchive.dump", "episode": int(ep),
@@ -15819,7 +15843,8 @@ def main(args=None):
                             continue
                         _k = tuple(int(v) for v in (_r.get("order") or ()))
                         if _k and _k not in _rd:
-                            _rd[_k] = (_smp, _msrc)
+                            _rd[_k] = ((_smp, _msrc)
+                                       + _latency_quantiles(_r, args))
                     host_state["_ratio_dists"] = _rd
                 host_state["_gate_drain"] = (
                     {"records": list(_plog_local.get("records") or ())},
@@ -16293,15 +16318,17 @@ def main(args=None):
                         host_state["pareto_missing_band"] = 1 + int(
                             host_state.get("pareto_missing_band", 0))
                         continue
-                    _sols.append((_dist[0], _seq,
-                                  float(all_rets[i][cosine_idx]), _dist[1]))
+                    _sols.append((_seq, float(all_rets[i][cosine_idx]),
+                                  _dist))
                 _AS_ADMITTED = sum(
-                    int(pareto_archive.add(_d, _sq, ep, quality=_q,
-                                           mem_source=_ms))
-                    for _d, _sq, _q, _ms in _sols)
+                    int(pareto_archive.add(_d[0], _sq, ep, quality=_q,
+                                           mem_source=_d[1], quantiles=_d[2],
+                                           detail=_d[3]))
+                    for _sq, _q, _d in _sols)
                 log_dict["pareto/missing_band"] = int(
                     host_state.get("pareto_missing_band", 0))
                 log_dict["pareto/merged"] = int(pareto_archive.n_merged)
+                log_dict["pareto/repeats"] = int(pareto_archive.n_repeats)
                 if pareto_archive.pts:
                     _bw = [pareto_archive.band_width(i)
                            for i in range(len(pareto_archive.pts))]
