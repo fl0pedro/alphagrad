@@ -16,8 +16,9 @@ reference of ticket .9 is measured by `_campaign_measure_cost`, which is
 `_time_one_rep` in the same loop the candidate runs, over the same eval args
 with the same inner and the same median -- these tests pin that. Since
 2026-09-25 (owner ruling) no execution runs untimed. Since 2026-09-26
-(dsnn-19wc) the first execution of each half is its cold reading and the warm
-one after it sets its counts (tests/measure_first_execution_test.py).
+(dsnn-19wc, dsnn-ep8v) the first execution of each half is its cold reading,
+the warm run after it gives provisional counts and the first window sets the
+final ones (tests/measure_first_execution_test.py).
 
 SINCE 2026-09-14 THE POINTS AND THE REPS ARE THE REFERENCE'S OWN (owner
 ruling; `EnvConfig.ref_num_data_points` / `ref_reps_per_point`, defaults 5
@@ -168,10 +169,11 @@ def test_campaign_measure_cost_honours_points_and_reps(monkeypatch):
 # ---------------------------------------------------------------------------
 # COLD START. The first execution of a freshly compiled executable pays
 # first-touch. Since 2026-09-25 (owner ruling) it is TIMED, never a warm-up.
-# Since 2026-09-26 (dsnn-19wc) it is the cold reading: it sets no count and is
-# not in the sample; the warm execution after it sets the counts and stays in
-# the sample (tests/measure_first_execution_test.py). The median below is what
-# protects a many-window sample from one inflated reading.
+# Since 2026-09-26 (dsnn-19wc, dsnn-ep8v) it is the cold reading: it sets no
+# count and is not in the sample. The warm run after it gives provisional counts
+# and is not in the sample either, unless it is past the budget; the first
+# window sets the final counts (tests/measure_first_execution_test.py). The
+# median below is what protects a many-window sample from one inflated reading.
 # ---------------------------------------------------------------------------
 
 
@@ -315,10 +317,10 @@ def test_the_reference_runs_its_own_points_and_reps(_paired_log_cpu,
     from collections import Counter
     counts = sorted(Counter(seen).values())
     # One executable took 3 x 5 = 15 windows (the reference) and every other
-    # one took 2 x 2 = 4 (the candidate), each after its cold reading and its
-    # warm execution (decision 2026-09-26, dsnn-19wc; no quality metric here,
-    # so the cold reading is a timed run). Before the ruling of 2026-09-14
-    # every group was 4.
+    # one took 2 x 2 = 4 (the candidate), the first of them at the warm run's
+    # counts, each half after its cold reading and its warm run (owner,
+    # 2026-09-26, dsnn-ep8v; no quality metric here, so the cold reading is a
+    # timed run). Before the ruling of 2026-09-14 every group was 4.
     assert counts.count(17) == 1, counts
     assert set(counts) == {6, 17}, counts
 
@@ -487,7 +489,7 @@ def test_the_budget_bounds_the_windows_end_to_end(_paired_log_cpu,
         measure_budget_secs=1e-9)
     vs = sorted(int(v) for v in np.asarray(env.valid_vertices))
     _walk(env, vs)
-    # Per half, the cold reading and the warm execution, which is past the
+    # Per half, the cold reading and the warm run, which is past the
     # budget and so the whole sample: no window follows it. The reference's
     # own count is ref_points x ref_reps = 1 either way.
     assert seen == [1, 1, 1, 1], seen
@@ -846,7 +848,7 @@ def test_the_record_puts_each_half_on_its_own_side(
     `ref_latency_ns` for a candidate 135x the reference's cost. This pins
     every step between the two timed halves and the reward: which half each
     reading is filed under, the ratio, and its SIGN -- through the real
-    callback, under the interleaved schedule, with the warm execution
+    callback, under the interleaved schedule, with the first window
     setting the counts, and with the dedupe armed.
     """
     monkeypatch.setenv("ALPHAGRAD_PLAN_LOG", "1")

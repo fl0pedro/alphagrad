@@ -361,9 +361,10 @@ def test_reference_is_measured_once_per_process(monkeypatch):
     env = _make_env()
     # FORWARD, so the candidate's executable is never the rev-exact one.
     fwd = sorted(int(x) for x in np.asarray(env.valid_vertices))
-    # The reference's timed calls: its cold reading and its warm execution
-    # (decision 2026-09-26, dsnn-19wc; no quality metric here, so the cold
-    # reading is a timed run) and then its own points x reps windows.
+    # The reference's timed calls: its cold reading and its warm run (owner,
+    # 2026-09-26, dsnn-ep8v; no quality metric here, so the cold reading is a
+    # timed run) and then its own points x reps windows, the first of them
+    # at the warm run's inner.
     per_cb = 2 + int(env.config.ref_num_data_points) * int(
         env.config.ref_reps_per_point)
 

@@ -2938,6 +2938,20 @@ def _record_terminal_plan(*, order, rule_specs, face_specs, face_skips,
             # has one. It sets no count and is not in the sample.
             "measure_first_s": (measure_counts or {}).get("first_s"),
             "ref_measure_first_s": (measure_counts or {}).get("ref_first_s"),
+            # THE WARM RUN AND THE PROVISIONAL COUNTS it gave, per half (owner,
+            # 2026-09-26, dsnn-ep8v). The first window ran at them and its
+            # time per run set the final counts above. Past the budget the
+            # warm run is the whole sample and both counts are 1 x 1.
+            "measure_warm_s": (measure_counts or {}).get("warm_s"),
+            "measure_inner_provisional": (measure_counts or {}).get(
+                "inner_p"),
+            "measure_windows_provisional": (measure_counts or {}).get(
+                "windows_p"),
+            "ref_measure_warm_s": (measure_counts or {}).get("ref_warm_s"),
+            "ref_measure_inner_provisional": (measure_counts or {}).get(
+                "ref_inner_p"),
+            "ref_measure_windows_provisional": (measure_counts or {}).get(
+                "ref_windows_p"),
             # THE PLAN THIS ONE'S NUMBERS CAME FROM (owner ruling
             # 2026-09-14). None on every measured plan. An integer names the
             # index, within this episode and this measure actor, of the
@@ -3921,9 +3935,10 @@ class EnvConfig(NamedTuple):
     # variation is 0.56 percent. The fixed counts were a specification
     # (commit 61e7027e, "the spec's 20"), never a noise measurement.
     #
-    # The counts are derived from the WARM execution's measured time `t`, the
-    # execution after the cold one (owner rulings 2026-09-25, decision
-    # 2026-09-26, dsnn-19wc; see `warm_execution_counts`):
+    # The counts are derived from the FIRST WINDOW's time per run `t`. The
+    # warm run after the cold reading gives the provisional counts that
+    # window runs at (owner rulings 2026-09-25 and 2026-09-26, dsnn-19wc,
+    # dsnn-ep8v; see `warm_and_first_window`):
     #     inner   = clamp(ceil(measure_window_secs / t), 5, 50)
     #     windows = clamp(round(measure_budget_secs / (inner * t)),
     #                     1, num_data_points * reps_per_point)
@@ -5462,23 +5477,50 @@ def resolve_measure_windows(t_exec_s: float, inner: int, budget_s: float,
 
 def warm_execution_counts(t_warm_s: float, window_s: float, budget_s: float,
                           hi: int, cap: int) -> tuple[int, int, bool]:
-    # (inner, windows, whole) from the warm execution, the one after the cold
-    # reading (decision 2026-09-26, dsnn-19wc). Past the budget it is the whole
-    # sample; otherwise it stays in the sample and the windows follow it.
+    # (inner, windows, whole) from the warm run, the one after the cold
+    # reading. Past the budget the warm run is the whole sample; otherwise
+    # these are the provisional counts the first window runs at (owner,
+    # 2026-09-26, dsnn-ep8v).
     if math.isfinite(t_warm_s) and float(t_warm_s) > float(budget_s):
         return 1, 1, True
     inner = resolve_measure_inner(t_warm_s, window_s, hi)
     return inner, resolve_measure_windows(t_warm_s, inner, budget_s, cap), False
 
 
-def sample_secs(latency_ns, inner: int, warm: bool) -> float:
-    # Seconds of execution in a latency sample. With `warm` the first reading
-    # is the warm execution, one run; every other reading is a window of
-    # `inner` runs.
+def warm_and_first_window(ex, args, devices, window_s: float, budget_s: float,
+                          hi: int, cap: int) -> dict:
+    # The warm run at inner 1, then, under the budget, the first window at the
+    # provisional counts. The warm run is outside the sample unless it is past
+    # the budget. The first window's time per run sets the final counts by the
+    # window rule, and that window is the sample's first reading (owner,
+    # 2026-09-26, dsnn-ep8v).
+    _l0, _p0, _s0, _o0 = _time_one_rep(ex, args, devices, 1)
+    del _o0
+    warm_s = float(_l0) / 1e9
+    inner_p, windows_p, whole = warm_execution_counts(
+        warm_s, window_s, budget_s, hi, cap)
+    if whole:
+        return {"warm_s": warm_s, "provisional": (1, 1), "inner": 1,
+                "windows": 1, "first_inner": 1, "lat": _l0, "peak": _p0,
+                "src": _s0, "whole": True}
+    _l1, _p1, _s1, _o1 = _time_one_rep(ex, args, devices, inner_p)
+    del _o1
+    t_run = float(_l1) / 1e9
+    inner = resolve_measure_inner(t_run, window_s, hi)
+    return {"warm_s": warm_s, "provisional": (inner_p, windows_p),
+            "inner": inner,
+            "windows": resolve_measure_windows(t_run, inner, budget_s, cap),
+            "first_inner": inner_p, "lat": _l1, "peak": _p1, "src": _s1,
+            "whole": False}
+
+
+def sample_secs(latency_ns, first_inner: int, inner: int) -> float:
+    # Seconds of execution in a latency sample: its first reading ran
+    # `first_inner` times, every other reading `inner` times.
     s = [float(x) for x in latency_ns]
-    if warm and s:
-        return (s[0] + int(inner) * sum(s[1:])) / 1e9
-    return int(inner) * sum(s) / 1e9
+    if not s:
+        return 0.0
+    return (int(first_inner) * s[0] + int(inner) * sum(s[1:])) / 1e9
 
 
 def interleave_windows(n_a: int, n_b: int) -> list:
@@ -10726,6 +10768,9 @@ def _callback_measured(
     # 2026-09-26, dsnn-19wc): the first execution of each half, which is its
     # quality execution when the plan has one. None until it runs.
     _cold = {"cand": None, "ref": None}
+    # The candidate's warm run and first window (`warm_and_first_window`),
+    # once they have run.
+    _sizing = {"cand": None}
 
     def _score_refusal(kind: str, reason: str, detail: dict, program):
         _REFUSAL_SCORER[0] = None
@@ -10735,10 +10780,17 @@ def _callback_measured(
                           "bytes_limit_source": _limit_src,
                           "measure_latency": bool(config.measure_latency)}
         _ref_rec = None
+        _cz_r = _sizing["cand"] or {}
         _counts_r = {"inner": 0, "windows": 0, "secs": 0.0,
                      "first_s": float(_cold["cand"] or 0.0),
+                     "warm_s": float(_cz_r.get("warm_s", 0.0)),
+                     "inner_p": int((_cz_r.get("provisional") or (0, 0))[0]),
+                     "windows_p": int(
+                         (_cz_r.get("provisional") or (0, 0))[1]),
                      "ref_inner": 0, "ref_windows": 0, "ref_secs": 0.0,
-                     "ref_first_s": 0.0, "ref_timing": None}
+                     "ref_first_s": 0.0, "ref_warm_s": 0.0,
+                     "ref_inner_p": 0, "ref_windows_p": 0,
+                     "ref_timing": None}
         _r_static = None
         if _paired:
             _r_ex = _compile_reference()
@@ -10780,12 +10832,16 @@ def _callback_measured(
                              else "reused")
                 if _r_once is None:
                     # The same rule as the measured plan's reference below: a
-                    # cold reading, unless its quality execution gave one,
-                    # then the warm execution, which sets the counts.
+                    # cold reading, unless its quality run gave one, then the
+                    # warm run and the first window, which set its inner.
                     _r_first = 0.0
+                    _r_warm = 0.0
                     _r_windows = _r_points * _r_reps
+                    _r_windows_p = _r_windows
                     _r_loop = _r_windows
                     _r_inner = _r_cfg_inner
+                    _r_inner_p = _r_cfg_inner
+                    _r_first_inner = _r_cfg_inner
                     _r_lat_s: list = []
                     _r_pk_s: list = []
                     if config.measure_latency:
@@ -10795,19 +10851,24 @@ def _callback_measured(
                             del _ro0, _rs0, _rp0
                             _cold["ref"] = float(_rl0) / 1e9
                         _r_first = float(_cold["ref"])
-                        _rl1, _rp1, _rs1, _ro1 = _time_one_rep(
-                            _r_ex, _r_args_all[0], _r_devs, 1)
-                        del _ro1, _rs1
-                        _r_lat_s.append(_rl1)
-                        _r_pk_s.append(_rp1)
-                        _r_inner, _rw, _r_whole = warm_execution_counts(
-                            float(_rl1) / 1e9, _r_window_s, _r_budget_s,
-                            _r_cfg_inner, _r_windows)
-                        if _r_whole:
+                        _rz = warm_and_first_window(
+                            _r_ex, _r_args_all[0], _r_devs, _r_window_s,
+                            _r_budget_s, _r_cfg_inner, _r_windows)
+                        _r_warm = float(_rz["warm_s"])
+                        _r_inner_p = int(_rz["provisional"][0])
+                        _r_inner = int(_rz["inner"])
+                        _r_first_inner = int(_rz["first_inner"])
+                        _r_lat_s.append(_rz["lat"])
+                        _r_pk_s.append(_rz["peak"])
+                        if _rz["whole"]:
                             _r_windows = 1
+                            _r_windows_p = 1
                             _r_loop = 0
+                        else:
+                            _r_loop = _r_windows - 1
+                    _r_start = len(_r_lat_s)
                     for _ib in range(_r_loop):
-                        _p = _ib % _r_points
+                        _p = (_r_start + _ib) % _r_points
                         _l, _pk, _s, _o = _time_one_rep(
                             _r_ex, _r_args_all[_p], _r_devs, _r_inner)
                         del _o, _s
@@ -10816,9 +10877,11 @@ def _callback_measured(
                     _r_once = {
                         "lat": tuple(_r_lat_s), "peak": tuple(_r_pk_s),
                         "inner": int(_r_inner), "windows": int(_r_windows),
-                        "first": float(_r_first),
-                        "secs": sample_secs(_r_lat_s, _r_inner,
-                                            bool(config.measure_latency)),
+                        "first": float(_r_first), "warm": float(_r_warm),
+                        "inner_p": int(_r_inner_p),
+                        "windows_p": int(_r_windows_p),
+                        "secs": sample_secs(_r_lat_s, _r_first_inner,
+                                            _r_inner),
                         "static": _static_memory_bytes(_r_ex)}
                     _REF_ONCE[_r_key] = _r_once
             except MeasureToolchainFault:
@@ -10856,7 +10919,11 @@ def _callback_measured(
             _counts_r.update(
                 ref_inner=int(_r_inner), ref_windows=int(_r_windows),
                 ref_secs=float(_r_once["secs"]),
-                ref_first_s=float(_r_once["first"]), ref_timing=_r_timing)
+                ref_first_s=float(_r_once["first"]),
+                ref_warm_s=float(_r_once["warm"]),
+                ref_inner_p=int(_r_once["inner_p"]),
+                ref_windows_p=int(_r_once["windows_p"]),
+                ref_timing=_r_timing)
             _ref_rec = {
                 "latency_ns": float(_r_lat),
                 "temp_bytes": float(_r_static[0]),
@@ -11300,32 +11367,42 @@ def _callback_measured(
         # `EnvConfig.measure_budget_secs`). Every execution is timed and none
         # runs untimed. The first execution is the cold reading: the quality
         # execution above, or one run here when the plan has none. It sets no
-        # count and is not in the sample. The next execution is warm and
-        # sets the counts. Past the budget it is the whole sample; otherwise
-        # it stays in the sample and the windows follow it.
+        # count and is not in the sample. The warm run follows (owner,
+        # 2026-09-26, dsnn-ep8v). Past the budget it is the whole sample.
+        # Otherwise it only gives provisional counts and is not in the
+        # sample: the first window runs at them, its time per run sets the
+        # final counts, and it stays in the sample as the first window.
         _n_loop = 0
+        _ia0 = 0
+        _inner = _cfg_inner
+        _n_windows = n_points * n_reps
+        _inner_p, _n_windows_p = _inner, _n_windows
+        _first_inner = _inner
+        _warm_s = 0.0
         if config.measure_latency:
             if _cold["cand"] is None:
                 _lc, _pc, _sc, _oc = _time_one_rep(
                     compiled_cost, eval_args_all[0], unique_devices, 1)
                 del _oc, _sc, _pc
                 _cold["cand"] = float(_lc) / 1e9
-            _lat0, _peak0, _peak_src, _out0 = _time_one_rep(
-                compiled_cost, eval_args_all[0], unique_devices, 1)
-            del _out0
-            latency_samples.append(_lat0)
-            peak_mem_samples.append(_peak0)
-            _inner, _n_windows, _whole = warm_execution_counts(
-                float(_lat0) / 1e9, _window_s, _budget_s, _cfg_inner,
-                n_points * n_reps)
-            if not _whole:
-                _n_loop = _n_windows
+            _cz = warm_and_first_window(
+                compiled_cost, eval_args_all[0], unique_devices, _window_s,
+                _budget_s, _cfg_inner, n_points * n_reps)
+            _sizing["cand"] = _cz
+            _warm_s = float(_cz["warm_s"])
+            _inner_p, _n_windows_p = _cz["provisional"]
+            _inner, _n_windows = int(_cz["inner"]), int(_cz["windows"])
+            _first_inner = int(_cz["first_inner"])
+            _peak_src = _cz["src"]
+            latency_samples.append(_cz["lat"])
+            peak_mem_samples.append(_cz["peak"])
+            if not _cz["whole"]:
+                _n_loop = _n_windows - 1
+                _ia0 = 1
         else:
             # THE BUDGET IS A TIMING INSTRUMENT. With --measure-latency off
             # there is no timer noise to integrate, `n_reps` is already 1,
             # and this path stays exactly what it was before the ruling.
-            _inner = _cfg_inner
-            _n_windows = n_points * n_reps
             _n_loop = _n_windows
 
         # ---- THE REFERENCE'S BUDGET -------------------------------------
@@ -11337,13 +11414,19 @@ def _callback_measured(
         # from the window rule, applied to ITS OWN execution time -- a 121 us
         # program fills a 50 ms window 413 times over and takes the ceiling
         # of 50, where the candidate takes the floor of 5.
-        # It follows the candidate's rule (decision 2026-09-26, dsnn-19wc):
+        # It follows the candidate's rule (2026-09-26, dsnn-19wc, dsnn-ep8v):
         # the cold reading is its quality execution, or one run here when
-        # this measurement has none; the warm execution sets its inner, and
-        # past the budget it is the reference's whole sample.
+        # this measurement has none; the warm run gives the provisional
+        # inner, the first window's time per run the final one, and past the
+        # budget the warm run is the reference's whole sample.
         _ref_inner = 0
         _ref_windows = 0
         _ref_loop = 0
+        _ref_inner_p = 0
+        _ref_windows_p = 0
+        _ref_first_inner = 0
+        _ref_warm = 0.0
+        _ib0 = 0
         _t_ref = 0.0
         _ref_once = None
         _ref_timed_now = False
@@ -11358,8 +11441,11 @@ def _callback_measured(
             _ref_once = _REF_ONCE.get(_ref_once_k)
         if _paired and _ref_once is None:
             _ref_windows = n_ref_points * n_ref_reps
+            _ref_windows_p = _ref_windows
             _ref_loop = _ref_windows
             _ref_inner = _cfg_inner
+            _ref_inner_p = _cfg_inner
+            _ref_first_inner = _cfg_inner
             if config.measure_latency:
                 if _cold["ref"] is None:
                     with _reference_errors(
@@ -11372,18 +11458,23 @@ def _callback_measured(
                 _t_ref = float(_cold["ref"])
                 with _reference_errors(
                         f"the reference ({_ref_kind}) failed in its warm "
-                        f"execution"):
-                    _rl1, _rp1, _rs1, _ro1 = _time_one_rep(
-                        _ref_ex, ref_eval_args_all[0], unique_devices, 1)
-                del _ro1, _rs1
-                _ref_lat_samples.append(_rl1)
-                _ref_peak_samples.append(_rp1)
-                _ref_inner, _rw, _r_whole = warm_execution_counts(
-                    float(_rl1) / 1e9, _window_s, _budget_s, _cfg_inner,
-                    _ref_windows)
-                if _r_whole:
+                        f"execution or its first window"):
+                    _rz = warm_and_first_window(
+                        _ref_ex, ref_eval_args_all[0], unique_devices,
+                        _window_s, _budget_s, _cfg_inner, _ref_windows)
+                _ref_warm = float(_rz["warm_s"])
+                _ref_inner_p = int(_rz["provisional"][0])
+                _ref_inner = int(_rz["inner"])
+                _ref_first_inner = int(_rz["first_inner"])
+                _ref_lat_samples.append(_rz["lat"])
+                _ref_peak_samples.append(_rz["peak"])
+                if _rz["whole"]:
                     _ref_windows = 1
+                    _ref_windows_p = 1
                     _ref_loop = 0
+                else:
+                    _ref_loop = _ref_windows - 1
+                    _ib0 = 1
             _ref_timed_now = True
         elif _paired:
             _ref_inner = int(_ref_once["inner"])
@@ -11414,8 +11505,9 @@ def _callback_measured(
         # function, with the same window rule, so the reference is exactly
         # what the campaign path would have printed for the rev-exact plan
         # -- not a throughput timing that reads 13% low.
-        _ia = 0
-        _ib = 0
+        # The first windows ran above at point 0; the loop starts after them.
+        _ia = _ia0
+        _ib = _ib0
         for _who in interleave_windows(
                 _n_loop, _ref_loop if _ref_timed_now else 0):
             if _who == 0:
@@ -11448,9 +11540,11 @@ def _callback_measured(
                 "lat": tuple(_ref_lat_samples),
                 "peak": tuple(_ref_peak_samples),
                 "inner": int(_ref_inner), "windows": int(_ref_windows),
-                "first": float(_t_ref),
-                "secs": sample_secs(_ref_lat_samples, _ref_inner,
-                                    bool(config.measure_latency)),
+                "first": float(_t_ref), "warm": float(_ref_warm),
+                "inner_p": int(_ref_inner_p),
+                "windows_p": int(_ref_windows_p),
+                "secs": sample_secs(_ref_lat_samples, _ref_first_inner,
+                                    _ref_inner),
                 "static": _static_memory_bytes(_ref_ex)}
             _REF_ONCE[_ref_once_k] = _ref_once
             _st["ref_timed"] = True
@@ -11471,24 +11565,23 @@ def _callback_measured(
                 _rev_ex = cached_compile(
                     b"rev-exact:" + paired_ref_key, _do_compile_rev_exact)
                 if config.measure_latency:
-                    # The rev-exact follows every other half's rule (decision
-                    # 2026-09-26, dsnn-19wc): a cold reading, then the warm
-                    # execution, which sets the counts and stays in the sample.
+                    # The rev-exact follows every other half's rule (owner,
+                    # 2026-09-26, dsnn-ep8v): a cold reading, the warm run, and
+                    # the first window, which sets its inner and is its first
+                    # reading. Each of its readings is paired with a fresh
+                    # reference window.
                     _rl0, _rp0, _rs0, _ro0 = _time_one_rep(
                         _rev_ex, ref_eval_args_all[0], unique_devices, 1)
                     del _ro0, _rs0, _rp0
-                    _rl1, _rp1, _rs1, _ro1 = _time_one_rep(
-                        _rev_ex, ref_eval_args_all[0], unique_devices, 1)
-                    del _ro1, _rs1, _rp1
-                    _rv_lat.append(_rl1)
-                    _rv_inner, _rv_w, _rv_whole = warm_execution_counts(
-                        float(_rl1) / 1e9, _window_s, _budget_s, _cfg_inner,
-                        _ref_windows)
-                    for _w in range(1 if _rv_whole else _ref_windows):
-                        if not _rv_whole:
+                    _vz = warm_and_first_window(
+                        _rev_ex, ref_eval_args_all[0], unique_devices,
+                        _window_s, _budget_s, _cfg_inner, _ref_windows)
+                    _rv_lat.append(_vz["lat"])
+                    for _w in range(1 if _vz["whole"] else _ref_windows):
+                        if _w > 0:
                             _l, _pk, _s, _o = _time_one_rep(
                                 _rev_ex, ref_eval_args_all[0],
-                                unique_devices, _rv_inner)
+                                unique_devices, int(_vz["inner"]))
                             del _o, _s
                             _rv_lat.append(_l)
                         _l, _pk, _s, _o = _time_one_rep(
@@ -11503,12 +11596,12 @@ def _callback_measured(
                 float(_aggregate_samples(_tl_lat, want_top_quartile=True))
                 if _tl_lat else 0.0,
                 len(_rv_lat))
-        # SECONDS OF EXECUTION in the latency sample, per half: the warm
-        # execution and the windows that followed it. Window w of a half took
-        # ``latency_ns[w] * inner`` nanoseconds, which is the quantity the
-        # budget is a target for. The cold reading is outside it.
-        _meas_secs = sample_secs(latency_samples, _inner,
-                                 bool(config.measure_latency))
+        # SECONDS OF EXECUTION in the latency sample, per half: the first
+        # window and the windows that followed it, or the warm run alone past
+        # the budget. Window w of a half took ``latency_ns[w] * inner``
+        # nanoseconds, which is the quantity the budget is a target for. The
+        # cold reading and the warm run under the budget are outside it.
+        _meas_secs = sample_secs(latency_samples, _first_inner, _inner)
         _ref_secs = float(_ref_once["secs"]) if _paired else 0.0
         _ref_secs_now = _ref_secs if _ref_timed_now else 0.0
         _pf("cb.exec_measure")
@@ -12037,10 +12130,16 @@ def _callback_measured(
         "windows": int(_n_windows),
         "secs": float(_meas_secs),
         "first_s": float(_cold["cand"] or 0.0),
+        "warm_s": float(_warm_s),
+        "inner_p": int(_inner_p),
+        "windows_p": int(_n_windows_p),
         "ref_inner": int(_ref_inner),
         "ref_windows": int(_ref_windows),
         "ref_secs": float(_ref_secs),
         "ref_first_s": float(_ref_once["first"]) if _paired else 0.0,
+        "ref_warm_s": float(_ref_once["warm"]) if _paired else 0.0,
+        "ref_inner_p": int(_ref_once["inner_p"]) if _paired else 0,
+        "ref_windows_p": int(_ref_once["windows_p"]) if _paired else 0,
         "ref_timing": (None if not _paired
                        else "timed" if _ref_timed_now else "reused"),
     }
