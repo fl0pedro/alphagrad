@@ -1495,21 +1495,34 @@ def consume_refused_counts() -> dict:
 #             the (c') sentinel of `memory_sentinel`;
 #   quality   0.
 # A call the deadline killed is a failed plan since 2026-09-26 (Q9b c): the
-# pool sends it again to a free actor with the forced refusal `deadline`,
-# scored with no program.
+# pool sends it again to a free actor with the forced refusal `deadline`. Its
+# memory is the static bytes the killed call reported when its compile ended,
+# or the full card when the compile had not ended (dsnn-dfw.302).
 _MEASURE_TIMEOUT_S: list = [None]
 # The refusal the current call is forced to, set by the server for the pool's rescoring of a killed call.
 _FORCED_REFUSAL: list = [None]
+# The server sets this per call: it takes the static bytes (temp, output, args) of the plan's program when its compile ends.
+_COMPILE_END_SINK: list = [None]
 
 
-def forced_refusal(kind: str, timeout_s) -> tuple:
+def forced_refusal(kind: str, timeout_s, static=None) -> tuple:
     if kind != "deadline":
         raise ValueError(
             f"only a call the deadline killed is forced to a refusal, got "
             f"{kind!r}")
+    if static is not None:
+        static = tuple(float(x) for x in static)
+        if len(static) != 3 or not all(
+                math.isfinite(x) and x >= 0.0 for x in static):
+            raise ValueError(
+                f"the static bytes of a killed call are (temp, output, "
+                f"args), finite and not negative, got {static!r}")
     return ("deadline", "deadline",
             {"refusal_where": "the pool's deadline",
-             "refusal_timeout_s": None if timeout_s is None else float(timeout_s)})
+             "refusal_timeout_s": None if timeout_s is None else float(timeout_s),
+             # True: the killed call's compile had ended, and its static bytes score its memory.
+             "refusal_compiled": static is not None},
+            static)
 
 
 _HOST_LIMIT_NOTED: list = []
@@ -10818,7 +10831,8 @@ def _callback_measured(
     # once they have run.
     _sizing = {"cand": None}
 
-    def _score_refusal(kind: str, reason: str, detail: dict, program):
+    def _score_refusal(kind: str, reason: str, detail: dict, program,
+                       static=None):
         _REFUSAL_SCORER[0] = None
         _timeout = measure_timeout_s()
         _limit, _limit_src = allocator_bytes_limit(_gate_dev)
@@ -10986,7 +11000,9 @@ def _callback_measured(
                 "reference": _ref_kind,
                 "rev_exact": None,
             }
-        _cand_static = None
+        # The refused program's static bytes, or the ones a killed call reported when its compile ended (dsnn-dfw.302).
+        _cand_static = (None if static is None
+                        else tuple(float(x) for x in static))
         if program is not None:
             _cand_static = _static_memory_bytes(program)
             if _cand_static is None:
@@ -10994,9 +11010,9 @@ def _callback_measured(
                     f"a {kind} refusal: memory_analysis() returned nothing "
                     f"for the refused candidate, so its memory ratios cannot "
                     f"be read")
-            if _r_static is not None:
-                check_memory_bounds(_cand_static, _r_static,
-                                    f"the refused plan ({reason})")
+        if _cand_static is not None and _r_static is not None:
+            check_memory_bounds(_cand_static, _r_static,
+                                f"the refused plan ({reason})")
         _slots, _info = refused_reward(
             kind, timeout_s=_timeout, reference=_ref_for_score,
             candidate_static=_cand_static,
@@ -11048,8 +11064,9 @@ def _callback_measured(
     _REFUSAL_SCORER[0] = _score_raise
     if (_early_refusal is None and is_terminal
             and _FORCED_REFUSAL[0] is not None):
-        # The pool's deadline killed this plan in another actor: it is scored here, before its compile.
-        _early_refusal = _FORCED_REFUSAL[0]
+        # The pool's deadline killed this plan in another actor. It is scored here, before its compile, on the static bytes that actor reported when its compile ended, or on the full card (dsnn-dfw.302).
+        _fk, _fr, _fd, _fs = _FORCED_REFUSAL[0]
+        return _score_refusal(_fk, _fr, _fd, None, static=_fs)
     if _early_refusal is not None:
         return _score_refusal(*_early_refusal, None)
     compiled_approx = None
@@ -11071,6 +11088,11 @@ def _callback_measured(
         return _score_refusal(*_compile_refusal("approx compile", _exc),
                               None)
     _st["program"] = compiled_approx
+    if is_terminal and _COMPILE_END_SINK[0] is not None:
+        # The compile has ended: the static bytes leave this actor before the gate and the timed runs, so they outlive a kill (dsnn-dfw.302).
+        _sink_bytes = _static_memory_bytes(compiled_approx)
+        if _sink_bytes is not None:
+            _COMPILE_END_SINK[0](_sink_bytes)
     # ONE EXECUTABLE PER PLAN, THE SPARSE ONE (owner rulings 2026-09-25, grill
     # round 1 Q18 c and round 2 Q2). Until then the cost channels timed a
     # second executable compiled with sparse_representation=True under

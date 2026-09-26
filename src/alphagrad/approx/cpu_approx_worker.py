@@ -225,6 +225,8 @@ class CpuApproximationServer:
         env_row: int | None = None,
         timeout_s: float | None = None,
         refuse: str | None = None,
+        refuse_static: Any = None,
+        static_to: Any = None,
     ):
         """Run the per-step reward pipeline once.
 
@@ -277,9 +279,17 @@ class CpuApproximationServer:
         from alphagrad.approx.env import MAX_TOKENS, NUM_REWARDS, _callback
         # The pool sends a call its deadline killed to this actor to be scored as a failed plan (dsnn-dfw.292).
         from alphagrad.approx.env import (
-            _FORCED_REFUSAL as _refuse_cell, forced_refusal as _forced)
+            _COMPILE_END_SINK as _sink_cell, _FORCED_REFUSAL as _refuse_cell,
+            forced_refusal as _forced)
         _refuse_was = _refuse_cell[0]
-        _refuse = None if refuse is None else _forced(refuse, timeout_s)
+        if refuse is None and refuse_static is not None:
+            raise ValueError(
+                "static bytes travel only with the forced refusal of a "
+                "killed call (refuse='deadline')")
+        _refuse = (None if refuse is None
+                   else _forced(refuse, timeout_s, static=refuse_static))
+        # static_to takes this call's static bytes when its compile ends (dsnn-dfw.302).
+        _sink_was = _sink_cell[0]
 
         if episode is not None:
             # A3 rotation, pooled path. One env-var write per call; `_walk_seed`
@@ -317,6 +327,7 @@ class CpuApproximationServer:
         self._last_was_oom = False
         try:
             _refuse_cell[0] = _refuse
+            _sink_cell[0] = static_to
             # env._callback takes face_specs / face_skips between the
             # per-vertex specs and `stop`. With no caller-supplied wires,
             # EMPTY (-1 / 0) is the documented per-vertex mode and is
@@ -522,6 +533,7 @@ class CpuApproximationServer:
             _env_slot_cell[0] = _slot_was
             _timeout_cell[0] = _timeout_was
             _refuse_cell[0] = _refuse_was
+            _sink_cell[0] = _sink_was
 
     def precompile(self, order: Any, sparsity_specs: Any, step: int) -> bool:
         """STAGE-2 async: compile-only warm of the shared cluster cache.
