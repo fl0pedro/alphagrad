@@ -46,6 +46,53 @@ def gpu_uuids(run=_run) -> dict[int, str]:
     return {int(r[0]): r[1] for r in rows}
 
 
+def _indices(text, what: str) -> list[int]:
+    parts = [p.strip() for p in str(text).split(",")]
+    if not all(p.isdigit() for p in parts):
+        raise ValueError(
+            f"{what} {text!r} is not a comma-separated list of GPU indices")
+    return [int(p) for p in parts]
+
+
+def measure_devices(n_actors: int, measure_gpus: str | None, *,
+                    trainer_gpus: str, visible: str | None = None,
+                    first_gpu: str | None = None) -> list[int]:
+    # Slot k of the measure pool runs on the k-th device (dsnn-dfw.245).
+    n = int(n_actors)
+    if measure_gpus is None:
+        first = 1 if first_gpu is None else int(first_gpu)
+        return [first + k for k in range(n)]
+    if first_gpu is not None:
+        raise ValueError(
+            f"--measure-gpus {measure_gpus} and ALPHAGRAD_MEASURE_FIRST_GPU="
+            f"{first_gpu} both name the measure devices; set one of them")
+    devs = _indices(measure_gpus, "--measure-gpus")
+    if len(devs) != n:
+        raise ValueError(
+            f"--measure-gpus {measure_gpus} names {len(devs)} devices for "
+            f"{n} measure actors")
+    if len(set(devs)) != len(devs):
+        raise ValueError(f"--measure-gpus {measure_gpus} names a device twice")
+    trainer = _indices(trainer_gpus, "--gpus")
+    shared = sorted(set(devs) & set(trainer))
+    if shared:
+        raise ValueError(
+            f"--measure-gpus {measure_gpus} names the trainer's device "
+            f"{shared} (--gpus {trainer_gpus})")
+    own = None if visible is None else _indices(visible, "CUDA_VISIBLE_DEVICES")
+    if trainer[0] != (0 if own is None else own[0]):
+        raise ValueError(
+            f"--gpus {trainer_gpus} is not the trainer's device: "
+            f"CUDA_VISIBLE_DEVICES={visible!r} puts the trainer on GPU "
+            f"{0 if own is None else own[0]}")
+    outside = [d for d in devs if own is not None and d not in own]
+    if outside:
+        raise ValueError(
+            f"--measure-gpus {measure_gpus} names {outside}, which the "
+            f"trainer's CUDA_VISIBLE_DEVICES={visible} does not hold")
+    return devs
+
+
 def owner_uid(pid: int):
     try:
         return os.stat(f"/proc/{int(pid)}").st_uid

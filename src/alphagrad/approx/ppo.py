@@ -5137,6 +5137,13 @@ def make_argparser() -> argparse.ArgumentParser:
     # Run / logging
     p.add_argument("--name", type=str, default="approx-ppo")
     p.add_argument("--gpus", type=str, default="0")
+    p.add_argument(
+        "--measure-gpus", type=str, default=None,
+        help="The GPU of each --ray-measure actor, comma-separated: slot k "
+             "takes the k-th (dsnn-dfw.245). The count must be --ray-measure, "
+             "no entry may be a --gpus device, and every entry must be in the "
+             "trainer's CUDA_VISIBLE_DEVICES. Needs --exec-on-gpu. Unset: "
+             "slot k takes GPU k + ALPHAGRAD_MEASURE_FIRST_GPU (1).")
     p.add_argument("--seed", type=int, default=250197)
     # Gate G1-G6 telemetry inputs (ticket .45): --gate-winners-table,
     # --gate-offline-contrast.
@@ -8362,6 +8369,19 @@ def main(args=None):
             "the delta observation is only wired for --dynamic-substeps."
         )
 
+    # The measure devices are checked while CUDA_VISIBLE_DEVICES is still the trainer's own (dsnn-dfw.245).
+    from alphagrad.approx.common.device_guard import (
+        measure_devices as _measure_devices)
+    if args.measure_gpus is not None and not args.exec_on_gpu:
+        raise ValueError(
+            f"--measure-gpus {args.measure_gpus} names GPUs, but without "
+            f"--exec-on-gpu the measure actors run on the CPU")
+    _measure_dev = _measure_devices(
+        int(getattr(args, "ray_measure", 0) or 0), args.measure_gpus,
+        trainer_gpus=str(args.gpus),
+        visible=os.environ.get("CUDA_VISIBLE_DEVICES"),
+        first_gpu=os.environ.get("ALPHAGRAD_MEASURE_FIRST_GPU"))
+
     main_device = _resolve_main_device(args)
     if args.no_jit:
         jax.config.update("jax_disable_jit", True)
@@ -9017,7 +9037,8 @@ def main(args=None):
             So: num_gpus=0 (Ray does not allocate) plus an explicit
             CUDA_VISIBLE_DEVICES, mirroring ray_vertex_ppo.py. Device 0 is
             reserved for the trainer; actors take 1..N in order, so no two
-            timed executions can ever share a device.
+            timed executions can ever share a device. With --measure-gpus the
+            row names the devices and slot k takes the k-th (dsnn-dfw.245).
             """
             rt = {"py_executable": _sys.executable}
             if _gpu:
@@ -9028,8 +9049,7 @@ def main(args=None):
                 # (owner question 4, 2026-09-14). It is a knob and not the
                 # default because two processes on one device destroy the
                 # timing isolation the measurement depends on.
-                _first = int(os.environ.get(
-                    "ALPHAGRAD_MEASURE_FIRST_GPU", "1"))
+                # measure_devices() applies it when --measure-gpus is unset.
                 # num_gpus=0 makes Ray MASK the GPUs (it sets
                 # CUDA_VISIBLE_DEVICES="" for workers that request none),
                 # which overrode our pin and dropped the actor to CPU. The
@@ -9037,7 +9057,7 @@ def main(args=None):
                 # our explicit pin stands; it must also be exported in the
                 # DRIVER environment so it reaches Ray's worker startup.
                 rt["env_vars"] = {
-                    "CUDA_VISIBLE_DEVICES": str(idx + _first),
+                    "CUDA_VISIBLE_DEVICES": str(_measure_dev[idx]),
                     "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
                     # Dedicated measure process: no trainer shares this
                     # actor, so its single pinned GPU IS the measure device
@@ -9100,7 +9120,6 @@ def main(args=None):
             ActorStartRefused as _ActorStartRefused,
             gpu_uuids as _gpu_uuids,
             wait_device_free as _wait_device_free)
-        _first_gpu = int(os.environ.get("ALPHAGRAD_MEASURE_FIRST_GPU", "1"))
         _gpu_uuid_of = _gpu_uuids() if _gpu else {}
 
         def _spawn(slot: int | None = None):
@@ -9122,7 +9141,7 @@ def main(args=None):
             if _gpu:
                 # The trainer's own pid is not a timed process: its JAX
                 # backend may hold an idle context on a measure device.
-                _dev = _slot + _first_gpu
+                _dev = _measure_dev[_slot]
                 _uuid = _gpu_uuid_of.get(_dev)
                 _wait_device_free(_dev, slot=_slot, uuid=_uuid,
                                   exclude_pids=(os.getpid(),))
@@ -9159,10 +9178,12 @@ def main(args=None):
             object.__setattr__(_GRAPHS[_k]["env"], "_remote_timeout_s",
                                float(args.ray_measure_timeout))
         env = _GRAPHS[_PRIMARY]["env"]
+        _trainer_gpu = str(args.gpus).split(",")[0].strip()
+        _shared = _gpu and _trainer_gpu in {str(d) for d in _measure_dev}
         print(f"[ray-measure] {_n_actors} actors on gpus "
-              f"{[i + _first_gpu for i in range(_n_actors)] if _gpu else 'cpu'}"
-              f" (trainer uses gpu 0"
-              f"{', SHARED with an actor' if _first_gpu == 0 else ''}), "
+              f"{list(_measure_dev) if _gpu else 'cpu'}"
+              f" (trainer uses gpu {_trainer_gpu}"
+              f"{', SHARED with an actor' if _shared else ''}), "
               f"timeout={args.ray_measure_timeout}s, "
               f"measure-pipeline={int(_MPIPE)}",
               flush=True)

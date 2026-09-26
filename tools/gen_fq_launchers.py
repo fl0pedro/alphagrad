@@ -2408,6 +2408,17 @@ THESIS_NODE_GPUS = {"pgi15-gpu15": 4, "pgi15-gpu16": 4, "pgi15-gpu17": 4,
                     "pgi15-gpu18": 4, "pgi15-gpu19": 8, "pgi15-gpu20": 8}
 #: --ray-measure by node size: every GPU the trainer does not hold.
 THESIS_RAY_MEASURE = {4: "3", 8: "7"}
+
+
+def thesis_device_cli(gpus: int, half: int = 0) -> dict:
+    # The trainer takes the first GPU of its half, and actor k the k-th after it (dsnn-dfw.245).
+    trainer = int(half) * int(gpus)
+    return {"--gpus": str(trainer),
+            "--measure-gpus": ",".join(
+                str(trainer + 1 + k)
+                for k in range(int(THESIS_RAY_MEASURE[gpus])))}
+
+
 #: THE UNIFORM ROW PROFILE, BY TARGET (owner ruling 2026-09-20).  A target
 #: named here renders the SAME hardware profile on every Blackwell node: the
 #: gres count, -c, --mem, --ray-measure and the core budget come from this
@@ -2901,6 +2912,8 @@ TARGET_KL_REQUIRED_FLAGS = ["--target-kl"]
 MEM_OBJECTIVE_REQUIRED_FLAGS = ["--mem-objective-weight"]
 GRAD_ORACLE_REQUIRED_FLAGS = ["--grad-oracle-cores", "--grad-oracle-batch",
                               "--grad-oracle-host-budget-gb"]
+#: dsnn-dfw.245's two flags, on the list of a row that names its devices.
+MEASURE_GPUS_REQUIRED_FLAGS = ["--gpus", "--measure-gpus"]
 
 _THESIS_SHARED_WATERMARK = f"""WHAT IS SHARED BY EVERY ARM.  Three trained channels -- paired log-difference
 latency, paired log-difference runtime watermark memory (both against
@@ -3068,7 +3081,8 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
                ray_measure_timeout: str = CAMPAIGN_RAY_MEASURE_TIMEOUT,
                cores_per_actor: str | None = None,
                mem_objective_weight: str | None = None,
-               whole_node: bool = False) -> dict:
+               whole_node: bool = False,
+               measure_gpus: bool = False) -> dict:
     """The `cli` override dict of one thesis run.
 
     Everything the owner fixed is HERE, once, so the block and the smoke
@@ -3136,6 +3150,7 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
         # --- the measurement, sized by the node
         "--ray-measure": THESIS_RAY_MEASURE[gpus],
         "--ray-measure-timeout": ray_measure_timeout,
+        **(thesis_device_cli(gpus) if measure_gpus else {}),
         # --- the node's core budget, disjoint by construction
         "--reserved-driver-cores": str(
             FROZEN_CORE_BUDGET["trainer"] if cores_per_actor is None
@@ -3246,7 +3261,8 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
                measure_path: bool = True,
                mem_objective_weight: str | None = THESIS_MEM_OBJECTIVE_WEIGHT,
                whole_node: bool = True,
-               batched: bool = True) -> dict:
+               batched: bool = True,
+               measure_gpus: bool = True) -> dict:
     """One thesis run -> one `arm(...)`.  Returns the arm."""
     _require(node in THESIS_NODES,
              f"node {node!r} is not one of the permitted thesis nodes "
@@ -3280,7 +3296,8 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
                      ray_measure_timeout=ray_measure_timeout,
                      cores_per_actor=cores_per_actor,
                      mem_objective_weight=mem_objective_weight,
-                     whole_node=whole_node)
+                     whole_node=whole_node,
+                     measure_gpus=measure_gpus)
     if extra_cli:
         cli.update(extra_cli)
     gpus = thesis_row_gpus(target, node)
@@ -3324,6 +3341,8 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
                         + (MEM_OBJECTIVE_REQUIRED_FLAGS
                            if mem_objective_weight is not None else [])
                         + (GRAD_ORACLE_REQUIRED_FLAGS if whole_node else [])
+                        + (MEASURE_GPUS_REQUIRED_FLAGS
+                           if measure_gpus else [])
                         + (RUNG1_REQUIRED_FLAGS
                            if rung1_row(arm, target) else [])),
         required_flags_file=" ".join(THESIS_FLAGS_FILES),
@@ -3538,11 +3557,14 @@ def thesis_pair_arm(rows: list[dict]) -> dict:
     halves = []
     for r in (a, b):
         h = r["half"]
+        _require("--measure-gpus" in r["cli"],
+                 f"{r['name']} names no measure GPUs, so its half cannot name "
+                 f"its own (dsnn-dfw.245)")
         halves.append(dict(
             name=r["name"], seed=r["thesis_seed"], half=h,
             devices=",".join(str(h * per + d) for d in range(per)),
             cores=f"{h * per_cpus}-{(h + 1) * per_cpus - 1}",
-            cli=r["cli"],
+            cli=dict(r["cli"], **thesis_device_cli(per, h)),
         ))
     name = thesis_pair_name(arm_name, target,
                             (a["thesis_seed"], b["thesis_seed"]))
@@ -3558,8 +3580,9 @@ def thesis_pair_arm(rows: list[dict]) -> dict:
         env=dict(a["env"]),
         required_flags=a["required_flags"],
         required_flags_file=a["required_flags_file"],
-        # The preflight reads ONE command line (the two differ in --seed and
-        # --name alone); the ARGS arrays are rendered from `halves`.
+        # The preflight reads ONE command line (the two differ in --seed,
+        # --name, --gpus and --measure-gpus alone); the ARGS arrays are
+        # rendered from `halves`.
         cli=a["cli"],
         purpose=a["purpose"] + f"\n\nPAIRED ON {node}: seeds "
                 f"{a['thesis_seed']} and {b['thesis_seed']} of arm "
@@ -3609,8 +3632,8 @@ for _i, (_arm, _target, _seed) in enumerate(thesis_submission_order()):
 # A slot that no sibling joined stays a whole single-node job of four GPUs on
 # an 8-GPU node: legal, one job on the node, the same profile as every other
 # NN256 row.  Only a node that carries TWO rows of one arm becomes a pair.
-# The pairs stay off until the pair fix lands (dsnn-dfw.245): each NN256 seed is a single 4-GPU row.
-THESIS_PAIRS = os.environ.get("THESIS_PAIRS", "0") == "1"
+# The pairs are on with the pair fix (dsnn-dfw.245): each half names its own GPUs. THESIS_PAIRS=0 turns them off.
+THESIS_PAIRS = os.environ.get("THESIS_PAIRS", "1") == "1"
 _rows: list[dict] = []
 for _rows in _HALVES.values():
     if THESIS_PAIRS and len(_rows) == 2:
@@ -4003,6 +4026,8 @@ for _sweepl_tag, _sweepl_overrides in sweepl_configs():
             measure_path=False,
             mem_objective_weight=None,
             whole_node=False,
+            # dsnn-dfw.245 moves the matrix rows; this round keeps its devices.
+            measure_gpus=False,
             # dsnn-dfw.191: same reason, keeps the unbatched target too.
             batched=False,
         )
@@ -4183,6 +4208,8 @@ for _sweepl2_tag, _sweepl2_overrides in sweepl2_configs():
             measure_path=False,
             mem_objective_weight=None,
             whole_node=False,
+            # dsnn-dfw.245 moves the matrix rows; this round keeps its devices.
+            measure_gpus=False,
             # dsnn-dfw.191: same reason, keeps the unbatched target too.
             batched=False,
         )
@@ -4350,6 +4377,8 @@ for _sweepl3_tag, _sweepl3_overrides in sweepl3_configs():
             measure_path=False,
             mem_objective_weight=None,
             whole_node=False,
+            # dsnn-dfw.245 moves the matrix rows; this round keeps its devices.
+            measure_gpus=False,
             # dsnn-dfw.191: same reason, keeps the unbatched target too.
             batched=False,
         )
@@ -5966,6 +5995,7 @@ def render(a: dict) -> str:
         # All GPUs of the node are visible: the trainer takes device 0
         # (--gpus 0, the ppo.py default) and the --ray-measure actor device 1
         # (ppo.py pins idx + 1 under RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES).
+        # A matrix row names both: --gpus 0 and --measure-gpus 1..n (dsnn-dfw.245).
         L.append(f"{py} \\")
     else:
         L.append(f"CUDA_VISIBLE_DEVICES=0,1,2,3 {py} \\")
