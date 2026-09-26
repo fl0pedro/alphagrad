@@ -35,6 +35,8 @@ NODES = ("pgi15-gpu14", "pgi15-gpu13", "pgi15-gpu14")
 PROFILE = "none"
 ORDER = "free"
 EPISODES = "1000"
+#: The NN256 baseline runs 2000 (owner, 2026-09-26). The finished tuning round and TLM keep EPISODES.
+FINAL_EPISODES = "2000"
 CHECKPOINT_EVERY = "50"
 PARETO_DUMP_EVERY = "10"
 TAU = "0.90"
@@ -626,11 +628,12 @@ def test_the_baseline_is_the_order_only_arm_at_the_latency_weight(
 
 def test_the_baseline_is_a_final_row_with_the_four_block_settings(
         gen, final_rows):
-    """A FINAL row: the full thousand episodes, no --auto-stop, and the four
-    settings of 2026-09-19 exactly as the A/B/C arms carry them."""
+    """A FINAL row: all its episodes (2000 on NN256 since 2026-09-26), no
+    --auto-stop, and the four settings of 2026-09-19 exactly as the A/B/C arms
+    carry them."""
     for a in final_rows:
         cli = _cli(gen, a)
-        assert cli["--episodes"] == EPISODES, a["name"]
+        assert cli["--episodes"] == FINAL_EPISODES, a["name"]
         assert cli["--checkpoint-every"] == CHECKPOINT_EVERY, a["name"]
         assert cli["--pareto-dump-every"] == PARETO_DUMP_EVERY, a["name"]
         assert cli["--plan-log"] == "auto", a["name"]

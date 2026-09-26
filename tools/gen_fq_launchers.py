@@ -2211,6 +2211,16 @@ arm_ = arm
 
 THESIS_SEEDS = ("250197", "250198", "250199", "250200", "250201")
 THESIS_EPISODES = "1000"
+#: THE NN256 ROWS RUN 2000 EPISODES (owner, 2026-09-26: "Actually I want 2000 episodes"). TLM and the
+#: recurrent target keep THESIS_EPISODES until the owner says otherwise, and the sweeps keep their own
+#: count. --episodes is also the cosine learning-rate horizon (dsnn-ddw).
+THESIS_EPISODES_BY_TARGET = {"nn256": "2000"}
+
+
+def thesis_episodes(target: str) -> str:
+    return THESIS_EPISODES_BY_TARGET.get(target, THESIS_EPISODES)
+
+
 THESIS_CHECKPOINT_EVERY = "50"
 THESIS_PARETO_DUMP_EVERY = "10"
 THESIS_PLAN_LOG = "auto"
@@ -2938,7 +2948,10 @@ slot 5 (--mem-channel {THESIS_MEM_CHANNEL}), logged and not trained (dsnn-mep,
 owner ruling 2026-09-25)."""
 
 
-def _thesis_head(shared: str) -> str:
+def _thesis_head(shared: str, *,
+                 episodes: str = f"--episodes {THESIS_EPISODES}",
+                 why: str = ("2026-09-19: a final row runs its full "
+                             "thousand episodes")) -> str:
     return f"""THE THESIS MATRIX (epic dsnn-dfw, ticket dsnn-dfw.4) under
 the owner's rulings of 2026-09-15 and 2026-09-16.  Data collection, not a
 comparison of reward designs: the campaign's phases 1-5 decided the class set,
@@ -2955,8 +2968,8 @@ earn a gain below parity), and THE SPATIAL ORDER FREE
 (--fixed-order {THESIS_ORDER}): the policy chooses the elimination order as
 well as the approximations.
 
-WHAT EACH RUN DOES.  --episodes {THESIS_EPISODES} WITHOUT --auto-stop (owner
-2026-09-19: a final row runs its full thousand episodes; the tuning rows keep
+WHAT EACH RUN DOES.  {episodes} WITHOUT --auto-stop (owner
+{why}; the tuning rows keep
 the early stop), --checkpoint-every
 {THESIS_CHECKPOINT_EVERY} so a killed run can be continued
 exactly, --pareto-dump-every {THESIS_PARETO_DUMP_EVERY} and --plan-log
@@ -2981,7 +2994,12 @@ writes, and marks a copy complete only after a checksum list verifies."""
 #: The header of a frozen round, as it ran.
 THESIS_HEAD = _thesis_head(_THESIS_SHARED_WATERMARK)
 #: The header of a row that trains the static memory objective.
-THESIS_MATRIX_HEAD = _thesis_head(_THESIS_SHARED_MEM_OBJECTIVE)
+THESIS_MATRIX_HEAD = _thesis_head(
+    _THESIS_SHARED_MEM_OBJECTIVE,
+    episodes=(f"--episodes {THESIS_EPISODES_BY_TARGET['nn256']} on NN256 and "
+              f"{THESIS_EPISODES} on TLM and the recurrent target"),
+    why=("2026-09-19: a final row runs all its episodes, and 2026-09-26: 2000 "
+         "on NN256"))
 
 _THESIS_ARM_WHAT = {
     "A": """CONTROL A: the fixed additive form at lambda_q """ + THESIS_LAMBDA_Q
@@ -3294,7 +3312,7 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
     # helper, and a run on an unruled seed is not part of the matrix.
     _require(seed in THESIS_SEEDS,
              f"seed {seed!r} is not one of {THESIS_SEEDS}")
-    episodes = THESIS_EPISODES if episodes is None else episodes
+    episodes = thesis_episodes(target) if episodes is None else episodes
     cli = thesis_cli(arm=arm, target=target, seed=seed, node=node, name=name,
                      episodes=episodes, checkpoint_every=checkpoint_every,
                      auto_stop=auto_stop,
@@ -4690,7 +4708,7 @@ ELIMINATION ORDER and nothing else -- at the weight pair
 --lambda-mem {ORDERONLY_FINAL_WEIGHTS[1]}), the latency-only scalarization,
 across all five matrix seeds.
 
---episodes {THESIS_EPISODES} WITHOUT --auto-stop, --checkpoint-every
+--episodes {thesis_episodes(ORDERONLY_TARGET)} WITHOUT --auto-stop, --checkpoint-every
 {THESIS_CHECKPOINT_EVERY}, --pareto-dump-every {THESIS_PARETO_DUMP_EVERY},
 --plan-log {THESIS_PLAN_LOG}, the four block settings of 2026-09-19
 (--paired-cost-floor {THESIS_PAIRED_COST_FLOOR}, --mem-channel
@@ -4743,7 +4761,8 @@ def orderonly_final_arm(*, seed: str) -> dict:
     lam_cmp, lam_mem = ORDERONLY_FINAL_WEIGHTS
     name = orderonly_final_run_name(seed)
     cli = thesis_cli(arm=ORDERONLY_ARM, target=ORDERONLY_TARGET, seed=seed,
-                     node=node, name=name, episodes=THESIS_EPISODES,
+                     node=node, name=name,
+                     episodes=thesis_episodes(ORDERONLY_TARGET),
                      checkpoint_every=THESIS_CHECKPOINT_EVERY,
                      auto_stop=THESIS_FINAL_AUTO_STOP)
     cli["--approx-profile"] = ORDERONLY_PROFILE

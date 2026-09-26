@@ -101,6 +101,14 @@ RSNN_FORM = {
         (RSNN_EXAMPLE, None),
 }
 EPISODES = "1000"
+#: The owner, 2026-09-26: 2000 episodes on NN256. TLM and the recurrent target keep EPISODES.
+EPISODES_BY_TARGET = {"nn256": "2000"}
+
+
+def _episodes(a) -> str:
+    return EPISODES_BY_TARGET.get(a["thesis_target"], EPISODES)
+
+
 CHECKPOINT_EVERY = "50"
 PARETO_DUMP_EVERY = "10"
 TAU = "0.90"
@@ -404,11 +412,28 @@ def test_every_thesis_arm_renders_to_valid_bash(gen, matrix, smoke):
 
 # -------------------------------------------------------------- 2. the flags
 
+def test_nn256_rows_run_2000_episodes_and_the_other_targets_1000(gen, matrix):
+    # The owner, 2026-09-26: "Actually I want 2000 episodes", on every NN256 row.
+    seen = {}
+    for a in matrix:
+        got = _cli(gen, a)["--episodes"]
+        assert got == _episodes(a), (a["name"], got)
+        seen.setdefault(a["thesis_target"], set()).add(got)
+    assert seen["nn256"] == {"2000"} and seen["tlm"] == {"1000"}
+    assert {t for t in seen if t.startswith("rsnn_")}, "the recurrent rows are in the matrix"
+    assert all(seen[t] == {"1000"} for t in seen if t.startswith("rsnn_"))
+    assert gen.thesis_episodes("nn256") == "2000" and gen.thesis_episodes("tlm") == "1000"
+    assert ("--episodes 2000 on NN256 and 1000 on TLM and the recurrent target"
+            in " ".join(gen.THESIS_MATRIX_HEAD.split()))
+    assert "--episodes 1000 WITHOUT --auto-stop" in " ".join(gen.THESIS_HEAD.split()), \
+        "a frozen round's header stays as it ran"
+
+
 def test_every_arm_carries_the_shared_thesis_flags(gen, matrix):
     for a in matrix:
         cli = _cli(gen, a)
         # the run
-        assert cli["--episodes"] == EPISODES, a["name"]
+        assert cli["--episodes"] == _episodes(a), a["name"]
         assert cli["--checkpoint-every"] == CHECKPOINT_EVERY, a["name"]
         assert cli["--grad-oracle-cadence"] == GRAD_ORACLE_CADENCE, a["name"]
         assert cli["--pareto-dump-every"] == PARETO_DUMP_EVERY, a["name"]
