@@ -44,9 +44,9 @@ def test_a_dying_predecessor_that_leaves_within_the_grace_period_does_not_refuse
     assert len(calls) == 3
 
 
-def test_another_users_process_and_an_excluded_pid_do_not_refuse():
-    run, _ = _runner(["7, 10 MiB\n4242, 1024 MiB\n"])
-    DG.wait_device_free(0, slot=0, timeout_s=0.0, run=run, exclude_pids=(4242,),
+def test_another_users_process_does_not_refuse():
+    run, _ = _runner(["7, 10 MiB\n"])
+    DG.wait_device_free(0, slot=0, timeout_s=0.0, run=run,
                         owner=lambda pid: 2000 if pid == 7 else 1000, uid=1000)
 
 

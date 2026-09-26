@@ -59,6 +59,32 @@ def _pin_driver_cores() -> None:
 
 _pin_driver_cores()
 
+
+def _argv_value(argv, flag):
+    val = None
+    for i, tok in enumerate(argv):
+        if tok == flag and i + 1 < len(argv):
+            val = argv[i + 1]
+        elif tok.startswith(flag + "="):
+            val = tok.split("=", 1)[1]
+    return val
+
+
+def _actors_measure(ray_measure) -> bool:
+    return (int(ray_measure or 0) > 0
+            and os.environ.get("ALPHAGRAD_POOL_TERMINAL_LOCAL", "0") != "1")
+
+
+def _own_gpus_before_jax() -> None:
+    # The imports below start the JAX backend, so the trainer's GPUs are narrowed here, off sys.argv (dsnn-dfw.288).
+    argv = sys.argv[1:]
+    if _actors_measure(_argv_value(argv, "--ray-measure")):
+        from alphagrad.approx.common.device_guard import own_gpus_only
+        own_gpus_only(_argv_value(argv, "--gpus") or "0")
+
+
+_own_gpus_before_jax()
+
 # tqdm allocates a multiprocessing.RLock on first use (`TqdmDefaultWriteLock`)
 # for cross-process bar coordination. The RLock is backed by a named POSIX
 # semaphore on macOS / Linux; if the process is signal-killed (SIGTERM from
@@ -6986,14 +7012,22 @@ def _resolve_num_envs(arg_value: int, example: str) -> int:
     return os.cpu_count() or 64
 
 
-def _resolve_main_device(args):
+def _resolve_main_device(args, own_only: bool = False):
     if not args.exec_on_gpu:
         return None
     try:
         gpus = jax.devices("gpu")
     except Exception:
         gpus = []
-    if len(gpus) < 2:
+    # With measure actors the trainer sees only --gpus; without them it measures on its other GPUs.
+    own = len(str(args.gpus).split(","))
+    if own_only and len(gpus) > own:
+        raise RuntimeError(
+            f"the trainer's JAX sees {len(gpus)} GPUs and --gpus {args.gpus} "
+            f"names {own}: its backend started before CUDA_VISIBLE_DEVICES "
+            f"was narrowed, so it holds the measure actors' cards "
+            f"(dsnn-dfw.288)")
+    if len(gpus) < (1 if own_only else 2):
         raise RuntimeError(
             f"--exec-on-gpu requested but only {len(gpus)} GPU(s) found. "
             "Check your --gpus argument and CUDA_VISIBLE_DEVICES."
@@ -8369,9 +8403,11 @@ def main(args=None):
             "the delta observation is only wired for --dynamic-substeps."
         )
 
-    # The measure devices are checked while CUDA_VISIBLE_DEVICES is still the trainer's own (dsnn-dfw.245).
+    # The measure devices are checked against the job's CUDA_VISIBLE_DEVICES, before the trainer narrowed its own (dsnn-dfw.245, dsnn-dfw.288).
     from alphagrad.approx.common.device_guard import (
-        measure_devices as _measure_devices)
+        job_visible_devices as _job_visible_devices,
+        measure_devices as _measure_devices,
+        own_gpus_only as _own_gpus_only)
     if args.measure_gpus is not None and not args.exec_on_gpu:
         raise ValueError(
             f"--measure-gpus {args.measure_gpus} names GPUs, but without "
@@ -8379,15 +8415,17 @@ def main(args=None):
     _measure_dev = _measure_devices(
         int(getattr(args, "ray_measure", 0) or 0), args.measure_gpus,
         trainer_gpus=str(args.gpus),
-        visible=os.environ.get("CUDA_VISIBLE_DEVICES"),
+        visible=_job_visible_devices(),
         first_gpu=os.environ.get("ALPHAGRAD_MEASURE_FIRST_GPU"))
 
-    main_device = _resolve_main_device(args)
+    # JAX's default preallocation, every process on its own GPUs only (owner ruling 2026-09-26, dsnn-dfw.288).
+    _own_only = _actors_measure(getattr(args, "ray_measure", 0))
+    if _own_only:
+        _own_gpus_only(str(args.gpus))
+    main_device = _resolve_main_device(args, own_only=_own_only)
     if args.no_jit:
         jax.config.update("jax_disable_jit", True)
 
-    # Preallocation stays off by the owner's ruling of 2026-09-25 (dsnn-dfw.238); the static peak gate reads the card, not this allocator.
-    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpus)
     # Persistent JIT disk cache. Off-by-env when investigating memory leaks:
     # the cache loader may retain in-memory references to every loaded
@@ -9048,36 +9086,23 @@ def main(args=None):
             row names the devices and slot k takes the k-th (dsnn-dfw.245).
             """
             rt = {"py_executable": _sys.executable}
-            if _gpu:
-                # THE FIRST MEASUREMENT DEVICE. 1 by default -- device 0 is
-                # the trainer's. ALPHAGRAD_MEASURE_FIRST_GPU=0 hands the
-                # trainer's own device to an actor as well, which is what the
-                # "one actor per GPU, the trainer's included" probe asks for
-                # (owner question 4, 2026-09-14). It is a knob and not the
-                # default because two processes on one device destroy the
-                # timing isolation the measurement depends on.
-                # measure_devices() applies it when --measure-gpus is unset.
-                # num_gpus=0 makes Ray MASK the GPUs (it sets
-                # CUDA_VISIBLE_DEVICES="" for workers that request none),
-                # which overrode our pin and dropped the actor to CPU. The
-                # NOSET flag tells Ray to leave CUDA_VISIBLE_DEVICES alone so
-                # our explicit pin stands; it must also be exported in the
-                # DRIVER environment so it reaches Ray's worker startup.
-                rt["env_vars"] = {
-                    "CUDA_VISIBLE_DEVICES": str(_measure_dev[idx]),
-                    "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
-                    # Dedicated measure process: no trainer shares this
-                    # actor, so its single pinned GPU IS the measure device
-                    # and env.py must not reserve one for a trainer.
-                    # Measurement semantics must not depend on the TRAINER process's
-                    # allocator: an inherited XLA_PYTHON_CLIENT_ALLOCATOR=platform puts
-                    # raw cudaMalloc/cudaFree in the timed region (154us -> 379us, 2.46x
-                    # flat, probe jobs 59598/59599) and breaks clear_memory_stats() so
-                    # peak_memory silently becomes the STATIC estimate. Pin the default
-                    # (BFC) allocator in every measure actor.
-                    "XLA_PYTHON_CLIENT_ALLOCATOR": "default",
-                    "ALPHAGRAD_MEASURE_ACTOR": "1",
-                }
+            # THE FIRST MEASUREMENT DEVICE. 1 by default -- device 0 is
+            # the trainer's. ALPHAGRAD_MEASURE_FIRST_GPU=0 hands the
+            # trainer's own device to an actor as well, which is what the
+            # "one actor per GPU, the trainer's included" probe asks for
+            # (owner question 4, 2026-09-14). It is a knob and not the
+            # default because two processes on one device destroy the
+            # timing isolation the measurement depends on.
+            # measure_devices() applies it when --measure-gpus is unset.
+            # num_gpus=0 makes Ray MASK the GPUs (it sets
+            # CUDA_VISIBLE_DEVICES="" for workers that request none),
+            # which overrode our pin and dropped the actor to CPU. The
+            # NOSET flag tells Ray to leave CUDA_VISIBLE_DEVICES alone so
+            # our explicit pin stands; it must also be exported in the
+            # DRIVER environment so it reaches Ray's worker startup.
+            # A CPU measure actor sees no GPU, so it cannot preallocate the trainer's (dsnn-dfw.288).
+            rt["env_vars"] = _measure_actor_env(
+                _measure_dev[idx] if _gpu else None)
             return {"runtime_env": rt, "num_gpus": 0}
         # The actor slices CPU cores by ``num_cpu_workers`` BEFORE importing
         # jax, so XLA sizes its Eigen pool to that slice. ppo.py never set it,
@@ -9126,6 +9151,7 @@ def main(args=None):
         from alphagrad.approx.common.device_guard import (
             ActorStartRefused as _ActorStartRefused,
             gpu_uuids as _gpu_uuids,
+            measure_actor_env as _measure_actor_env,
             wait_device_free as _wait_device_free)
         _gpu_uuid_of = _gpu_uuids() if _gpu else {}
 
@@ -9146,12 +9172,10 @@ def main(args=None):
                     f"slots; nothing is started (dsnn-dfw.229)")
             _uuid = None
             if _gpu:
-                # The trainer's own pid is not a timed process: its JAX
-                # backend may hold an idle context on a measure device.
+                # The trainer sees only --gpus, so a process of ours on a measure device, the trainer included, is a busy device (dsnn-dfw.288).
                 _dev = _measure_dev[_slot]
                 _uuid = _gpu_uuid_of.get(_dev)
-                _wait_device_free(_dev, slot=_slot, uuid=_uuid,
-                                  exclude_pids=(os.getpid(),))
+                _wait_device_free(_dev, slot=_slot, uuid=_uuid)
             _next_id[0] += 1
             return CpuApproximationActor.options(**_actor_opts(_slot)).remote(
                 _args_dict, variant=None, actor_id=_next_id[0],

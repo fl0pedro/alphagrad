@@ -44,11 +44,17 @@ def make_argparser() -> argparse.ArgumentParser:
 
 def main() -> int:
     a = make_argparser().parse_args()
-    from alphagrad.approx import ppo
     from alphagrad.approx.common import checkpoint as ckpt
-    from alphagrad.approx.common import preference_sweep as psweep
+    from alphagrad.approx.common.device_guard import own_gpus_only
 
     meta = ckpt.read_ppo_meta(a.checkpoint)
+    # The trainer's GPUs are narrowed before importing ppo starts the JAX backend (dsnn-dfw.288).
+    if (int(meta["args"].get("ray_measure") or 0) > 0
+            and os.environ.get("ALPHAGRAD_POOL_TERMINAL_LOCAL", "0") != "1"):
+        own_gpus_only(str(meta["args"].get("gpus", "0")))
+    from alphagrad.approx import ppo
+    from alphagrad.approx.common import preference_sweep as psweep
+
     parser = ppo.make_argparser()
     if not psweep.sweep_args_round_trip(meta, parser):
         raise ckpt.CheckpointError(
