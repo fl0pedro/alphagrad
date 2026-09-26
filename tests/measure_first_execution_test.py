@@ -37,6 +37,10 @@ SWELL = 20_000_000_000
 LAT = int(REWARD_INDEX["latency_ns"])
 QUALITY = int(REWARD_INDEX["quality"])
 PROBE = np.full(16, 0.375, dtype=np.float32)
+# Execution times that are binary fractions, so the fake clock reads them exactly and
+# ceil(window / t) does not move by a rounding error.
+FAST = 2.0 ** -9
+REF = 2.0 ** -11
 
 
 def test_the_warm_execution_sets_the_counts_or_is_the_whole_sample():
@@ -223,42 +227,42 @@ def _cold_then_warm(timed, samples):
 
 def test_the_quality_execution_is_the_cold_reading_and_the_warm_execution_sets_the_counts(
         paired, clock, monkeypatch):
-    # Both halves read 10x cold on their first execution: 20 ms and 5 ms.
-    hook = _Hook(monkeypatch, clock, cand=(0.002, 10.0), ref=(0.0005, 10.0))
+    # Both halves read 10x cold on their first execution.
+    hook = _Hook(monkeypatch, clock, cand=(FAST, 10.0), ref=(REF, 10.0))
     env = _toy_env()
     fwd, _rev = _orders(env)
     samples = _samples(POINTS)
     rec = _measure(env, fwd, samples)
-    # The candidate: counts from the warm 2 ms, not from the cold 20 ms.
-    inner = resolve_measure_inner(0.002, WINDOW, HI)
-    windows = resolve_measure_windows(0.002, inner, BUDGET, CAP)
-    assert (inner, windows) == (25, 20)
+    # The candidate: counts from the warm reading, not from the cold one.
+    inner = resolve_measure_inner(FAST, WINDOW, HI)
+    windows = resolve_measure_windows(FAST, inner, BUDGET, CAP)
+    assert (inner, windows) == (26, 20)
     assert (rec["measure_inner"], rec["measure_windows"]) == (inner, windows)
-    assert rec.get("measure_first_s") == pytest.approx(0.02)
+    assert rec.get("measure_first_s") == pytest.approx(10 * FAST)
     _cold_then_warm(hook.cand[-1], samples)
     assert hook.cand[-1].calls == 1 + 1 + inner * windows
     assert rec["ratio_log"]["latency"]["n"] == 1 + windows
-    assert rec["candidate_latency_ns"] == pytest.approx(2e6)
-    assert rec["measure_secs"] == pytest.approx(0.002 + inner * windows * 0.002)
+    assert rec["candidate_latency_ns"] == pytest.approx(FAST * 1e9)
+    assert rec["measure_secs"] == pytest.approx(FAST + inner * windows * FAST)
     # The reference: its quality run is its cold reading, the warm run its inner.
-    ref_inner = resolve_measure_inner(0.0005, WINDOW, HI)
+    ref_inner = resolve_measure_inner(REF, WINDOW, HI)
     assert ref_inner == HI
     assert rec["ref_measure_inner"] == ref_inner
     assert rec["ref_measure_windows"] == REF_POINTS * REF_REPS
-    assert rec.get("ref_measure_first_s") == pytest.approx(0.005)
+    assert rec.get("ref_measure_first_s") == pytest.approx(10 * REF)
     _cold_then_warm(hook.ref[-1], samples)
     assert hook.ref_calls() == 1 + 1 + ref_inner * REF_POINTS * REF_REPS
-    assert rec["ref_latency_ns"] == pytest.approx(5e5)
+    assert rec["ref_latency_ns"] == pytest.approx(REF * 1e9)
     assert rec["ref_measure_secs"] == pytest.approx(
-        0.0005 + ref_inner * REF_POINTS * REF_REPS * 0.0005)
+        REF + ref_inner * REF_POINTS * REF_REPS * REF)
     assert rec["ref_timing"] == "timed"
-    assert rec["rewards"][LAT] == pytest.approx(-np.log(2e6 / 5e5))
+    assert rec["rewards"][LAT] == pytest.approx(-np.log(FAST / REF))
     assert rec["rewards"][QUALITY] == pytest.approx(1.0, abs=1e-5)
 
 
 def test_a_slow_plan_is_two_executions_and_its_sample_is_the_warm_one(
         paired, clock, monkeypatch):
-    hook = _Hook(monkeypatch, clock, cand=(1.2, 2.0), ref=(0.0005,))
+    hook = _Hook(monkeypatch, clock, cand=(1.2, 2.0), ref=(REF,))
     env = _toy_env()
     fwd, _rev = _orders(env)
     samples = _samples(POINTS)
@@ -274,25 +278,25 @@ def test_a_slow_plan_is_two_executions_and_its_sample_is_the_warm_one(
 
 def test_a_plan_slow_cold_but_fast_warm_takes_the_window_rule_not_one_run(
         paired, clock, monkeypatch):
-    # The cold reading is 1.2 s, past the budget; the warm one is 2 ms.
-    hook = _Hook(monkeypatch, clock, cand=(0.002, 600.0), ref=(0.0005,))
+    # The cold reading is 1.25 s, past the budget; the warm one is 1.95 ms.
+    hook = _Hook(monkeypatch, clock, cand=(FAST, 640.0), ref=(REF,))
     env = _toy_env()
     fwd, _rev = _orders(env)
     samples = _samples(POINTS)
     rec = _measure(env, fwd, samples)
-    inner = resolve_measure_inner(0.002, WINDOW, HI)
-    windows = resolve_measure_windows(0.002, inner, BUDGET, CAP)
+    inner = resolve_measure_inner(FAST, WINDOW, HI)
+    windows = resolve_measure_windows(FAST, inner, BUDGET, CAP)
     assert (rec["measure_inner"], rec["measure_windows"]) == (inner, windows)
     assert (inner, windows) != (1, 1)
-    assert rec.get("measure_first_s") == pytest.approx(1.2)
+    assert rec.get("measure_first_s") == pytest.approx(1.25)
     assert hook.cand[-1].calls == 1 + 1 + inner * windows
     assert rec["ratio_log"]["latency"]["n"] == 1 + windows
-    assert rec["candidate_latency_ns"] == pytest.approx(2e6)
+    assert rec["candidate_latency_ns"] == pytest.approx(FAST * 1e9)
 
 
 def test_a_plan_between_keeps_the_floor_of_five_and_its_warm_reading(
         paired, clock, monkeypatch):
-    hook = _Hook(monkeypatch, clock, cand=(0.3,), ref=(0.0005,))
+    hook = _Hook(monkeypatch, clock, cand=(0.3,), ref=(REF,))
     env = _toy_env()
     fwd, _rev = _orders(env)
     rec = _measure(env, fwd, _samples(POINTS))
@@ -307,17 +311,19 @@ def test_a_plan_between_keeps_the_floor_of_five_and_its_warm_reading(
 
 def test_a_reference_slow_cold_but_fast_warm_takes_its_windows_once_per_process(
         paired, clock, monkeypatch):
-    hook = _Hook(monkeypatch, clock, cand=(0.002,), ref=(0.0005, 2400.0))
+    # The reference's cold reading is 1.25 s, past the budget; its warm one is
+    # 0.49 ms.
+    hook = _Hook(monkeypatch, clock, cand=(FAST,), ref=(REF, 2560.0))
     env = _toy_env()
     fwd, rev = _orders(env)
     samples = _samples(POINTS)
     rec_a = _measure(env, fwd, samples)
     _cold_then_warm(hook.ref[-1], samples)
-    assert rec_a.get("ref_measure_first_s") == pytest.approx(1.2)
+    assert rec_a.get("ref_measure_first_s") == pytest.approx(1.25)
     assert (rec_a["ref_measure_inner"], rec_a["ref_measure_windows"]) == (
         HI, REF_POINTS * REF_REPS)
     assert hook.ref_calls() == 1 + 1 + HI * REF_POINTS * REF_REPS
-    assert rec_a["ref_latency_ns"] == pytest.approx(5e5)
+    assert rec_a["ref_latency_ns"] == pytest.approx(REF * 1e9)
     assert rec_a["ref_timing"] == "timed"
     calls = hook.ref_calls()
     rec_b = _measure(env, rev, samples)
@@ -330,7 +336,7 @@ def test_a_reference_slow_cold_but_fast_warm_takes_its_windows_once_per_process(
 
 def test_a_slow_reference_is_two_executions_and_its_sample_is_the_warm_one(
         paired, clock, monkeypatch):
-    hook = _Hook(monkeypatch, clock, cand=(0.002,), ref=(1.2, 1.5))
+    hook = _Hook(monkeypatch, clock, cand=(FAST,), ref=(1.2, 1.5))
     env = _toy_env()
     fwd, rev = _orders(env)
     samples = _samples(POINTS)
@@ -350,7 +356,7 @@ def test_a_slow_reference_is_two_executions_and_its_sample_is_the_warm_one(
 def test_a_refused_plan_times_the_reference_under_the_same_rule(
         paired, clock, monkeypatch):
     # No quality run: the reference's cold reading is one run on its inputs.
-    hook = _Hook(monkeypatch, clock, cand=(0.002, 1.0, SWELL), ref=(1.2, 1.5))
+    hook = _Hook(monkeypatch, clock, cand=(FAST, 1.0, SWELL), ref=(1.2, 1.5))
     env = _toy_env()
     fwd, _rev = _orders(env)
     samples = _samples(POINTS)
@@ -369,18 +375,18 @@ def test_a_refused_plan_times_the_reference_under_the_same_rule(
 def test_without_a_quality_execution_the_first_run_on_the_inputs_is_the_cold_reading(
         paired, clock, monkeypatch):
     monkeypatch.setenv("ALPHAGRAD_QUALITY_METRIC", "none")
-    hook = _Hook(monkeypatch, clock, cand=(0.002, 10.0), ref=(0.0005, 10.0))
+    hook = _Hook(monkeypatch, clock, cand=(FAST, 10.0), ref=(REF, 10.0))
     env = _toy_env()
     fwd, _rev = _orders(env)
     samples = _samples(POINTS)
     rec = _measure(env, fwd, samples)
-    inner = resolve_measure_inner(0.002, WINDOW, HI)
-    windows = resolve_measure_windows(0.002, inner, BUDGET, CAP)
+    inner = resolve_measure_inner(FAST, WINDOW, HI)
+    windows = resolve_measure_windows(FAST, inner, BUDGET, CAP)
     assert (rec["measure_inner"], rec["measure_windows"]) == (inner, windows)
-    assert rec.get("measure_first_s") == pytest.approx(0.02)
+    assert rec.get("measure_first_s") == pytest.approx(10 * FAST)
     assert hook.cand[-1].calls == 1 + 1 + inner * windows
     assert [np.array_equal(a, np.asarray(samples[0][0]))
             for a in hook.cand[-1].args] == [True, True]
-    assert rec.get("ref_measure_first_s") == pytest.approx(0.005)
+    assert rec.get("ref_measure_first_s") == pytest.approx(10 * REF)
     assert rec["ref_measure_inner"] == HI
     assert hook.ref_calls() == 1 + 1 + HI * REF_POINTS * REF_REPS
