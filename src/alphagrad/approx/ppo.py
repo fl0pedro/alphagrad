@@ -8360,12 +8360,37 @@ def main(args=None, *, readout_checkpoint=None, readout_out=None,
     _CKPT_KEEP_AT = _validate_checkpoint_keep_at(
         _CKPT_EVERY, getattr(args, "checkpoint_keep_at", None))
     _RESUME_PATH = str(getattr(args, "resume", "") or "")
+    _INIT_WEIGHTS_PATH = str(getattr(args, "init_weights", "") or "")
+    if _INIT_WEIGHTS_PATH and _RESUME_PATH:
+        raise ValueError(
+            "--init-weights and --resume are mutually exclusive: --init-weights "
+            "starts a fresh run from network parameters, while --resume continues "
+            "an existing run with its optimiser, archive, and duals intact.")
+    if _INIT_WEIGHTS_PATH and (getattr(args, "readout", 0) or readout_checkpoint):
+        raise ValueError(
+            "--init-weights cannot be combined with --readout: readouts evaluate "
+            "an existing checkpoint without initialising new training runs.")
     _RESUME_META = None
     if _RESUME_PATH:
         _RESUME_META = _ckpt.read_ppo_meta(_RESUME_PATH)
         _ckpt.check_resume_args(_RESUME_META["args"], args)
         print(f"[checkpoint] resuming {_RESUME_PATH} at episode "
               f"{int(_RESUME_META['episode'])} of {int(args.episodes)}",
+              flush=True)
+    _INIT_WEIGHTS_META = None
+    _INIT_WEIGHTS_SOURCE = None
+    if _INIT_WEIGHTS_PATH:
+        _INIT_WEIGHTS_META = _ckpt.read_ppo_meta(_INIT_WEIGHTS_PATH)
+        _iw_args = _INIT_WEIGHTS_META.get("args", {})
+        _INIT_WEIGHTS_SOURCE = {
+            "checkpoint_path": os.path.realpath(_INIT_WEIGHTS_PATH),
+            "run_name": str(_iw_args.get("name") or _INIT_WEIGHTS_META.get("wandb_run_id") or ""),
+            "episode": int(_INIT_WEIGHTS_META.get("episode", 0)),
+            "target": str(_iw_args.get("example") or ""),
+        }
+        print(f"[checkpoint] init-weights: will warm start network weights from "
+              f"{_INIT_WEIGHTS_PATH} (target: {_INIT_WEIGHTS_SOURCE['target']}, "
+              f"episode: {_INIT_WEIGHTS_SOURCE['episode']}, run: {_INIT_WEIGHTS_SOURCE['run_name']})",
               flush=True)
     # ---- THE PREFERENCE SWEEP (ticket dsnn-dfw.86), REFUSED HERE ---------
     # Beside the resume's own refusal and for the same reason: a sweep that
@@ -8378,6 +8403,9 @@ def main(args=None, *, readout_checkpoint=None, readout_out=None,
     _PSWEEP_META = None
     _PSWEEP_PLAN = []
     if _PSWEEP:
+        if _INIT_WEIGHTS_PATH:
+            raise ValueError(
+                "--preference-sweep-checkpoint and --init-weights are mutually exclusive.")
         if _RESUME_PATH:
             raise ValueError(
                 "--preference-sweep-checkpoint and --resume are two different "
@@ -8417,6 +8445,9 @@ def main(args=None, *, readout_checkpoint=None, readout_out=None,
         raise ValueError(
             f"--readout must be 0 (off) or positive, got {_READOUT_N}.")
     if _READOUT_PATH:
+        if _INIT_WEIGHTS_PATH:
+            raise ValueError(
+                "a readout reads a checkpoint and --init-weights trains a new run from one: pass one.")
         if _READOUT_N == 0:
             raise ValueError(
                 "a readout of a checkpoint samples --readout N plans, and "
@@ -15063,6 +15094,8 @@ def main(args=None, *, readout_checkpoint=None, readout_out=None,
     # the sparse flag, beside the repo SHAs _repo_commits put here.
     _wandb_config.update(_gate_telemetry.toolchain_fingerprint(
         sparse=getattr(getattr(env, "config", None), "sparse", None)))
+    if _INIT_WEIGHTS_SOURCE is not None:
+        _wandb_config["init_weights_source"] = dict(_INIT_WEIGHTS_SOURCE)
     # CHECKPOINT (4 of 8). A RESUME ATTACHES TO THE SAME WANDB RUN. The
     # checkpoint carries the run id, and `resume="must"` refuses to create a
     # new run: a resumed leg that quietly started its own run would split one
@@ -18269,6 +18302,8 @@ def main(args=None, *, readout_checkpoint=None, readout_out=None,
             # about whether it is on.
             "auto_stop": (None if _AUTO_STOP is None
                           else _AUTO_STOP.to_json()),
+            "init_weights_source": (dict(_INIT_WEIGHTS_SOURCE) if _INIT_WEIGHTS_SOURCE is not None
+                                    else None),
         }
 
     _CKPT_DIR = (_ckpt.run_directory(args.wandb != "disabled")
@@ -18407,6 +18442,15 @@ def main(args=None, *, readout_checkpoint=None, readout_out=None,
               f"window bin 2^{_WIN_BIN.log2}, "
               f"{len(pareto_archive.pts)} Pareto points, "
               f"lambda={lag_lambda:g}, kl_ref_coef={_kl_ref_coef:g}",
+              flush=True)
+    elif _INIT_WEIGHTS_PATH:
+        agent = _ckpt.load_ppo_agent(_INIT_WEIGHTS_PATH, agent)
+        opt_state = optimizer.init(eqx.filter(agent, eqx.is_inexact_array))
+        print(f"[checkpoint] init-weights: successfully loaded network parameters from "
+              f"{_INIT_WEIGHTS_PATH} (source run: {_INIT_WEIGHTS_SOURCE['run_name']}, "
+              f"target: {_INIT_WEIGHTS_SOURCE['target']}, "
+              f"episode: {_INIT_WEIGHTS_SOURCE['episode']}). "
+              f"Optimiser, PopArt, duals, and archive start fresh.",
               flush=True)
 
     # ---- THE PREFERENCE SWEEP'S OWN RESTORE (ticket dsnn-dfw.86) --------

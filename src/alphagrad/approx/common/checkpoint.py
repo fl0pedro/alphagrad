@@ -318,6 +318,13 @@ def add_checkpoint_args(p) -> None:
              "trainer GPU of another model than the one the checkpoint "
              "records. When wandb "
              "is on the resumed run attaches to the SAME wandb run by id.")
+    p.add_argument(
+        "--init-weights", type=str, default="", metavar="PATH",
+        help="Initialise network parameters from a checkpoint written by "
+             "--checkpoint-every on any target. Only network weights carry over; "
+             "optimiser, schedules, PopArt statistics, Lagrange multipliers, "
+             "and Pareto archive start fresh. Refuses with --resume, --readout, "
+             "or preference sweeps.")
 
 
 def run_directory(wandb_on: bool = True) -> str:
@@ -870,3 +877,91 @@ def load_ppo_tree(path: str, template):
             f"  in the checkpoint: {saved_manifest}\n"
             f"  on this run:       {live_manifest}")
     return eqx.tree_deserialise_leaves(state_path, template)
+
+
+def _map_leaf_to_argument(keystr: str) -> str:
+    """Heuristic mapping from PyTree leaf key path to likely CLI argument."""
+    k = keystr.lower()
+    if "embedding.weight" in k:
+        return "--vocab-size or --embd-dim"
+    if "pos_enc" in k:
+        return "--embd-dim or ALPHAGRAD_POS_ENC"
+    if "encoder" in k:
+        return "--num-layers, --hidden-dim, --embd-dim, --num-heads, or ALPHAGRAD_POLICY"
+    if "vertex_policy" in k:
+        return "--set-pointer, --set-pointer-blocks, --embd-dim, or --num-heads"
+    if "value_head_flops" in k or "value_head_mem" in k or "value_head_cos" in k:
+        return "--value-dims or --embd-dim"
+    if "value_head_fid" in k:
+        return "--fidelity or --value-dims"
+    if "value_head_spars" in k:
+        return "--sparsity or --value-dims"
+    if "value_head_memobj" in k:
+        return "--mem-objective-weight or --value-dims"
+    if "op_embedding" in k:
+        return "--op-embd-dim"
+    if "pref_proj" in k:
+        return "--embd-dim"
+    if "micro_action_policy" in k:
+        return "--dynamic-substeps, --unified-head, or --max-substeps"
+    if "face_path_policy" in k:
+        return "--face-actions, --unified-face-head, --approx-add, --face-edge-mem, or --face-endpoint-read"
+    return "model architecture flags (--embd-dim, --hidden-dim, etc.)"
+
+
+def load_ppo_agent(path: str, template_agent):
+    """The network parameters of a checkpoint, against a live `template_agent`.
+
+    Loads only the network policy and value parameters from `path/state.eqx`.
+    All other state (optimiser, schedule, PopArt statistics, Lagrange multiplier,
+    archive) starts fresh.
+
+    Validates that the checkpoint's parameter PyTree matches `template_agent` in
+    structure, leaf shapes, and dtypes. If any leaf mismatches, raises
+    CheckpointError naming the first mismatching leaf and the likely argument behind it.
+    """
+    import equinox as eqx
+    import jax
+    import jax.numpy as jnp
+    import jax.tree_util as jtu
+    import numpy as np
+
+    state_path = os.path.join(path, "state.eqx")
+    if not os.path.exists(state_path):
+        raise CheckpointError(
+            f"--init-weights {path!r} holds no state.eqx, so it is not a complete "
+            f"checkpoint.")
+
+    with open(state_path, "rb") as f:
+        for path_tuple, leaf in jtu.tree_flatten_with_path(template_agent)[0]:
+            if eqx.is_array_like(leaf):
+                try:
+                    if isinstance(leaf, (jax.Array, jax.ShapeDtypeStruct)):
+                        arr = jnp.load(f)
+                    else:
+                        arr = np.load(f)
+                except Exception as e:
+                    arg_hint = _map_leaf_to_argument(jtu.keystr(path_tuple))
+                    raise CheckpointError(
+                        f"--init-weights {path!r}: unexpected EOF or error reading leaf "
+                        f"'{jtu.keystr(path_tuple)}' from checkpoint: {e}. Likely argument: {arg_hint}"
+                    ) from e
+                if hasattr(leaf, "shape") and arr.shape != leaf.shape:
+                    arg_hint = _map_leaf_to_argument(jtu.keystr(path_tuple))
+                    raise CheckpointError(
+                        f"--init-weights {path!r}: parameter shape mismatch at leaf '{jtu.keystr(path_tuple)}': "
+                        f"checkpoint has shape {arr.shape} but current model expects {leaf.shape}. "
+                        f"Likely argument: {arg_hint}"
+                    )
+                if hasattr(leaf, "dtype") and arr.dtype != leaf.dtype:
+                    if not (str(arr.dtype) == "|V2" and str(leaf.dtype) == "bfloat16"):
+                        arg_hint = _map_leaf_to_argument(jtu.keystr(path_tuple))
+                        raise CheckpointError(
+                            f"--init-weights {path!r}: parameter dtype mismatch at leaf '{jtu.keystr(path_tuple)}': "
+                            f"checkpoint has dtype {arr.dtype} but current model expects {leaf.dtype}. "
+                            f"Likely argument: {arg_hint}"
+                        )
+
+    with open(state_path, "rb") as f:
+        loaded_agent = eqx.tree_deserialise_leaves(f, template_agent)
+    return loaded_agent
