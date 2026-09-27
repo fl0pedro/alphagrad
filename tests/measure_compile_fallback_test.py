@@ -104,7 +104,8 @@ def test_fallback_turns_off_the_triton_softmax_rewriter():
 
 # ---------------------------------------------------------------------------
 # THE ALLOWED LIST (owner ruling 2026-09-25): one constant, one fixed try
-# order, and each tuple's options on top of the live ones.
+# order, and each tuple's options on their own -- no live options merged in
+# (owner ruling 2026-09-26, Q5 b).
 # ---------------------------------------------------------------------------
 def test_the_allowed_list_and_its_try_order():
     assert env_mod.measure_compile_layout() == [
@@ -112,23 +113,21 @@ def test_the_allowed_list_and_its_try_order():
         "xla_gpu_disable_gpuasm_optimizations=True"]
     assert _LIVE == (0, 0)
     assert _TRY == ((1, 0), (1, 1))
-    assert env_mod.measure_compile_options(_LIVE) == (
-        env_mod._measure_compiler_options())
+    assert env_mod.measure_compile_options(_LIVE) is None
     for bad in ((1,), (1, 0, 0), (2, 0)):
         with pytest.raises(ValueError, match="allowed list"):
             env_mod.measure_compile_options(bad)
 
 
-def test_a_tuple_sets_its_entries_on_top_of_the_live_options(monkeypatch):
-    live = {"xla_gpu_autotune_level": 0, "xla_gpu_enable_triton_gemm": False,
-            "xla_gpu_enable_llvm_module_compilation_parallelism": True}
-    monkeypatch.setattr(env_mod, "_measure_compiler_options",
-                        lambda: dict(live))
-    assert env_mod.measure_compile_options((0, 0)) == live
+def test_a_tuple_sets_only_its_own_entries_no_live_options():
+    """Owner ruling 2026-09-26, Q5 b: no live options, so an allowed tuple's
+    entries are the whole compiler_options dict, not additions on top of a
+    base one."""
+    assert env_mod.measure_compile_options((0, 0)) is None
     assert env_mod.measure_compile_options((1, 0)) == {
-        **live, "xla_disable_hlo_passes": "triton-softmax-rewriter"}
+        "xla_disable_hlo_passes": "triton-softmax-rewriter"}
     assert env_mod.measure_compile_options((1, 1)) == {
-        **live, "xla_disable_hlo_passes": "triton-softmax-rewriter",
+        "xla_disable_hlo_passes": "triton-softmax-rewriter",
         "xla_gpu_disable_gpuasm_optimizations": True}
 
 
@@ -149,7 +148,7 @@ class _OnlyWith:
 def test_the_live_compile_is_unchanged_when_it_compiles():
     lo = _OkLowered()
     assert env_mod._compile_measure(lo) == "EXE"
-    assert lo.calls == [env_mod._measure_compiler_options()]
+    assert lo.calls == [None]                 # no live options
     assert env_mod._LAST_COMPILE_NOTE[0] == {
         "used": list(_LIVE), "tried": [list(_LIVE)]}
 
@@ -157,7 +156,7 @@ def test_the_live_compile_is_unchanged_when_it_compiles():
 def test_the_try_order_is_walked_until_a_tuple_compiles():
     lo = _OnlyWith(env_mod.measure_compile_options(_TRY[-1]))
     assert env_mod._compile_measure(lo) == "EXE"
-    assert lo.calls == [env_mod._measure_compiler_options()] + [
+    assert lo.calls == [None] + [
         env_mod.measure_compile_options(t) for t in _TRY]
     assert env_mod._LAST_COMPILE_NOTE[0] == {
         "used": list(_TRY[-1]),

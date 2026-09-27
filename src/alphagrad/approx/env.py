@@ -8964,39 +8964,6 @@ def _face_dict_for_vertex(config, ij, v, face_row, face_skip,
     return per_face
 
 
-def _measure_compiler_options():
-    """Per-executable XLA options for MEASURE compiles only
-    (ALPHAGRAD_MEASURE_COMPILER_OPTS=0 to disable). GEMM autotuning +
-    Triton fusion work dominated cold variant compiles (measured 3.55s ->
-    0.09s, 39x, with ZERO latency change on the bandwidth-bound nn256
-    target — the 3.5s recurs per new GEMM config, it is not process
-    warmup). Values must be typed int/bool: the string "false" is rejected
-    with INVALID_ARGUMENT. Scoped per executable so the TRAINER jit keeps
-    full optimization once the global XLA_FLAGS are dropped. Re-validate
-    once on compute-bound targets (TLM): autotune-off can change kernel
-    choice there."""
-    if os.environ.get("ALPHAGRAD_MEASURE_COMPILER_OPTS", "1") == "0":
-        return None
-    try:
-        if jax.default_backend() == "cpu":
-            return None
-    except Exception:
-        pass
-    return {
-        "xla_gpu_autotune_level": 0,
-        "xla_gpu_enable_triton_gemm": False,
-        # Parallel LLVM-module compilation. OFF by default in this jax build
-        # (gated behind a persistent-cache setting nobody enables), so every
-        # run to date compiled serially. Isolated benchmark 61445 (12 random
-        # TLM plans, paired on the SAME lowered object, arm order alternated):
-        # median compile 14.46 -> 12.71 s (-12%), heaviest plans -29..-35%
-        # (45.6 -> 32.7 s), no plan slower. Passed per-executable here rather
-        # than via JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES so it does not
-        # depend on cache state and never touches trainer compiles.
-        "xla_gpu_enable_llvm_module_compilation_parallelism": True,
-    }
-
-
 # ---------------------------------------------------------------------------
 # MEASURE TOOLCHAIN GATE (finding 03, ticket dsnn-3qm.21).
 #
@@ -9011,8 +8978,9 @@ def _measure_compiler_options():
 # 97% of w1c and was found only in post-hoc log analysis. gpu15 and gpu16 run
 # the SAME driver (580.178.04): it was never a driver mismatch.
 #
-# The gate compiles a tiny throwaway module with the LIVE measure options at
-# the first measure compile of every measuring process (trainer, every
+# The gate compiles a tiny throwaway module the same way a measure compile
+# does (no compiler options, owner ruling 2026-09-26, Q5 b) at the first
+# measure compile of every measuring process (trainer, every
 # CpuApproximationActor, every respawn), which is the one site no call path
 # can bypass. Measured cost 0.07 s; a 4-op probe trips the fault as reliably
 # as a 40-op one (job 62796).
@@ -9169,8 +9137,9 @@ def _venv_ptxas_version() -> str:
 
 
 def _toolchain_probe_compile():
-    """Compile a tiny throwaway executable with the LIVE measure options,
-    BYPASSING the persistent compile cache. Returns the lowered object.
+    """Compile a tiny throwaway executable the way a measure compile does
+    (no compiler options), BYPASSING the persistent compile cache. Returns
+    the lowered object.
 
     Two mechanisms, both needed:
 
@@ -9201,7 +9170,7 @@ def _toolchain_probe_compile():
     with _jcfg.persistent_cache_min_compile_time_secs(1e9):
         lowered = jax.jit(_probe).lower(
             jax.ShapeDtypeStruct((16, 16), jnp.float32))
-        lowered.compile(compiler_options=_measure_compiler_options())
+        lowered.compile()
     return lowered
 
 
@@ -9210,10 +9179,10 @@ def _toolchain_fault_message(where: str, detail: str) -> str:
     host = socket.gethostname()
     detail = " ".join(str(detail).split())[:400]
     return (
-        f"[measure] TOOLCHAIN FAULT on {host} ({where}): the live measure "
-        f"compile options do not produce a working executable, so every "
-        f"measurement on this node would silently be a degraded-fusion "
-        f"FALLBACK and not comparable with the other nodes.\n"
+        f"[measure] TOOLCHAIN FAULT on {host} ({where}): the measure compile "
+        f"does not produce a working executable, so every measurement on "
+        f"this node would silently be a degraded-fusion FALLBACK and not "
+        f"comparable with the other nodes.\n"
         f"  fault:  {detail}\n"
         f"  ptxas:  {_tool_version('ptxas')} (PATH); "
         f"{_venv_ptxas_version()} (venv)\n"
@@ -9288,7 +9257,8 @@ def measure_compile_live_tuple() -> tuple:
     return (0,) * len(MEASURE_COMPILE_FALLBACK_OPTIONS)
 
 
-# The live options plus the allowed entries the tuple sets; the live tuple gives the live options.
+# No live options (owner ruling 2026-09-26, Q5 b): only the allowed entries
+# the tuple sets, if any; the live tuple (all zero) sets none.
 def measure_compile_options(compile_tuple):
     tup = tuple(int(b) for b in compile_tuple)
     if (len(tup) != len(MEASURE_COMPILE_FALLBACK_OPTIONS)
@@ -9296,10 +9266,9 @@ def measure_compile_options(compile_tuple):
         raise ValueError(
             f"compile tuple {tuple(compile_tuple)} does not fit the allowed "
             f"list {measure_compile_layout()}: one 0 or 1 per option")
-    live = _measure_compiler_options()
     if not any(tup):
-        return live
-    opts = dict(live or {})
+        return None
+    opts = {}
     for bit, (name, value) in zip(tup, MEASURE_COMPILE_FALLBACK_OPTIONS):
         if not bit:
             continue
@@ -9316,12 +9285,13 @@ _LAST_COMPILE_NOTE: list = [None]
 
 
 def _compile_measure(lowered, compile_tuple=None):
-    """Compile a MEASURE executable with the live options. On an INTERNAL
-    GPU-compiler failure (Triton fusion verification or compile errors,
-    Blackwell's shared-memory limit, ptxas exit-139) try the tuples of
-    MEASURE_COMPILE_TRY_ORDER, in order, instead of refusing the plan at
-    once. Every fallback is printed and counted, and the tuple that compiled
-    goes on the plan's record. ALPHAGRAD_MEASURE_COMPILE_FALLBACK=0 disables.
+    """Compile a MEASURE executable with no compiler options (owner ruling
+    2026-09-26, Q5 b). On an INTERNAL GPU-compiler failure (Triton fusion
+    verification or compile errors, Blackwell's shared-memory limit, ptxas
+    exit-139) try the tuples of MEASURE_COMPILE_TRY_ORDER, in order, instead
+    of refusing the plan at once. Every fallback is printed and counted, and
+    the tuple that compiled goes on the plan's record.
+    ALPHAGRAD_MEASURE_COMPILE_FALLBACK=0 disables.
 
     ``compile_tuple`` is a replay: exactly those options, no search.
 
@@ -9341,7 +9311,7 @@ def _compile_measure(lowered, compile_tuple=None):
     _live = measure_compile_live_tuple()
     _LAST_COMPILE_NOTE[0] = {"used": None, "tried": [list(_live)]}
     try:
-        exe = lowered.compile(compiler_options=_measure_compiler_options())
+        exe = lowered.compile(compiler_options=measure_compile_options(_live))
         _LAST_COMPILE_NOTE[0] = {"used": list(_live), "tried": [list(_live)]}
         return exe
     except Exception as _e:
@@ -9380,7 +9350,7 @@ def _compile_measure(lowered, compile_tuple=None):
             raise MeasureCompileFailure(_m, tried=[_live]) from _e
         _MEASURE_COMPILE_FALLBACKS["n"] += 1
         _n = _MEASURE_COMPILE_FALLBACKS["n"]
-        print(f"[measure] compile FALLBACK #{_n}: the live options failed: "
+        print(f"[measure] compile FALLBACK #{_n}: the plain compile failed: "
               f"{_m[:200]}", flush=True)
         _tried, _last = [_live], _e
         for _tup in MEASURE_COMPILE_TRY_ORDER:

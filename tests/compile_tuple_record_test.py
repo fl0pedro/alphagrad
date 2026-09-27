@@ -126,10 +126,11 @@ def test_a_fallback_tuple_lands_on_the_record_the_bundle_and_a_replay(
     assert rec["compile_options_tried"] == [_LIVE, _FIRST]
     assert rec["ref_compile_options"] == _LIVE
     assert rec["compile_fallbacks"] == 1
-    # The candidate: the live options, then the first tuple. The reference: the live options.
-    assert stub["seen"] == [E._measure_compiler_options(),
+    # The candidate: no live options, then the first tuple. The reference:
+    # no live options (owner ruling 2026-09-26, Q5 b).
+    assert stub["seen"] == [None,
                             E.measure_compile_options(_FIRST),
-                            E._measure_compiler_options()]
+                            None]
 
     # A cache hit compiles nothing and names the tuple of the compile that made it.
     stub["seen"].clear()

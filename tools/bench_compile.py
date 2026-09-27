@@ -21,9 +21,10 @@ DESIGN, deliberately minimal:
     + tracing + MLIR emission (single-threaded, no flag can touch it);
     .compile() is the XLA backend (where the flag acts). If lower dominates,
     THAT is the finding -- cores cannot help and the fix is elsewhere.
-  * BASE_OPTS mirrors the production measure path (autotune 0, no Triton
-    GEMM -- env._measure_compiler_options), so times are representative of
-    what training actually pays, not of a default-flags strawman.
+  * BASE_OPTS is autotune 0, no Triton GEMM: what the measure path compiled
+    with before the owner's no-compiler-options ruling (2026-09-26, Q5 b,
+    dsnn-dfw.287). Kept fixed here so the isolated A/B measures only what
+    LLVM parallelism adds on top, not a moving baseline.
   * plans = random elimination orders; half also carry random QUANT-bf16
     approximations on ~8 vertices via jacve's per-vertex `transforms`
     (the same construction campaign_scratch/apxaudit_matrix2.py uses). QUANT is used because

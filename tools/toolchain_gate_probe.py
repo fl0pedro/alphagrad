@@ -5,10 +5,10 @@ The verification tool for finding 03 / ticket dsnn-3qm.21, and the thing to
 run on a node before trusting its measurements. It does exactly what the
 first measure compile of every measuring process does -- ``env.
 _measure_toolchain_check`` -- plus one CONTROL: a fixed (cacheable) module
-compiled with the same live options. On a node whose link toolchain is
-broken, a warm persistent cache written on a clean node makes the control
-pass (finding 03 sec 5a) while the gate still refuses: that is the
-cache-immunity proof.
+compiled the same way (no compiler options, owner ruling 2026-09-26, Q5 b).
+On a node whose link toolchain is broken, a warm persistent cache written on
+a clean node makes the control pass (finding 03 sec 5a) while the gate still
+refuses: that is the cache-immunity proof.
 
     python tools/toolchain_gate_probe.py [abort|warn|off]
 
@@ -54,7 +54,7 @@ def _control(x):
 t0 = time.perf_counter()
 try:
     jax.jit(_control).lower(jax.ShapeDtypeStruct((16, 16), jnp.float32)) \
-        .compile(compiler_options=env._measure_compiler_options())
+        .compile()
     print(f"[probe] CONTROL (fixed, cacheable module) compiled OK in "
           f"{time.perf_counter() - t0:.2f}s", flush=True)
 except Exception as exc:
