@@ -7,8 +7,10 @@ from __future__ import annotations
 import os
 import pickle
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -58,10 +60,17 @@ def _start(work: Path, tag: str, *extra: str):
     env = {k: v for k, v in os.environ.items() if not k.startswith("ALPHAGRAD_")}
     env.update(_ENV)
     env["ALPHAGRAD_EQ_DUMP"] = str(work / tag)
-    env["RAY_TMPDIR"] = str(work / f"ray_{tag}")
-    return subprocess.run(
-        [sys.executable, str(_TRAINER), *_COMMON, "--name", "overlap", *extra],
-        cwd=str(cwd), env=env, capture_output=True, text=True, timeout=5400)
+    # Ray's socket paths must fit the 107 bytes of AF_UNIX, and pytest's tmp_path is too deep
+    # for them, so the Ray session lives in a short directory under /tmp, as the launchers'
+    # /tmp/ray_$SLURM_JOB_ID does, and goes when the run ends.
+    ray_tmp = tempfile.mkdtemp(prefix=f"ray_{tag}_", dir="/tmp")
+    env["RAY_TMPDIR"] = ray_tmp
+    try:
+        return subprocess.run(
+            [sys.executable, str(_TRAINER), *_COMMON, "--name", "overlap", *extra],
+            cwd=str(cwd), env=env, capture_output=True, text=True, timeout=5400)
+    finally:
+        shutil.rmtree(ray_tmp, ignore_errors=True)
 
 
 def _run(work: Path, tag: str, *extra: str) -> list:
