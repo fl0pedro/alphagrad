@@ -10175,12 +10175,15 @@ def _callback_measured(
     # RECORD keeps the policy's own order and wires, which is what the reader
     # of the log needs: the plan the policy emitted, plus the container it
     # implied.
-    # A PLAN TRAVELS BY POSITION, NOT BY FACE KEY. A face key is a pair of
-    # stable var indices on the LIVE graph, and every elimination rewires it,
-    # so the keys a body vertex shows depend on what the carry block left
-    # behind -- which is exactly what the container changes. The wire arrays
-    # move to the transported order's positions and the faces are enumerated
-    # again on the variant's own replay, the way the policy's graph enumerates
+    # A FACE DECISION TRAVELS BY THE FACE'S IDENTITY, NOT BY ITS POSITION OR
+    # ITS KEY (owner ruling 2026-09-25, dsnn-rbjh). A face key is a pair of
+    # stable var indices on the LIVE graph, and a face position is an index
+    # into what that graph shows, so both depend on what the carry block left
+    # behind -- which is exactly what the container changes. The transport
+    # reads each decision as the (vertex, predecessor, successor) triple it
+    # was made on, writes it at that triple's counterpart on the variant's
+    # own replay, and raises when there is none; the faces are then
+    # enumerated again on that replay, the way the policy's graph enumerates
     # them.
     _rec_order = o_list
     # THE GRAPH THE POLICY ACTED ON, held before the variant replaces

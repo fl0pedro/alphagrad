@@ -18,13 +18,16 @@ Pinned here, end to end:
    two dtypes, before graphax sees a face.
 5. THE TRANSPORT keeps the bit on the carry faces: a plan with a Quant on a
    carried face lands two-sided QUANT rows on every face of every carry
-   vertex of the measured graph, while its Diag stays in the value.
+   vertex of the measured graph, while its Diag stays in the value and a
+   step-body decision moves by its face's identity (on the two-program toy
+   of ``_carry_transport_toy``).
 6. THE PLAN RECORD's carry bytes count the given blocks, not the reference
    weights.
 """
 from __future__ import annotations
 
 import os
+import sys
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("ALPHAGRAD_SKIP_COST_ANALYSIS", "1")
@@ -52,6 +55,9 @@ from alphagrad.approx.unified_face_head import (                # noqa: E402
     FACE_SLOTS, O_QUANT, QUANT_SLOTS, head_layout)
 from alphagrad.approx.unified_face_policy import (              # noqa: E402
     UnifiedFacePolicy, _NARROW_SLOT)
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _carry_transport_toy as toy                              # noqa: E402
 
 MODES = list(REC.ALL_MODES)
 E, F = 32, 4
@@ -237,66 +243,83 @@ def test_the_face_dict_builder_refuses_a_one_sided_plan(monkeypatch):
 
 # ================================================== 5. the carry transport
 def _variant():
-    return {"container": "quant",
-            "vertex_map": {1: 1, 2: 2, 4: 4},
-            "alt_carry": (3,),
-            "valid": {1, 2, 3, 4}}
+    # the two-program toy: its measured block rewrites the policy's
+    # contractions (vertices 3 and 5) into row sums, and the step body is the
+    # same
+    return toy.variant("quant")
+
+
+#: the reverse order of the toy's policy graph: the step body 10 to 7, then
+#: the carry block 6 to 1, whose contraction 3 sits at step 7
+REVERSE = [10, 9, 8, 7, 6, 5, 4, 3, 2, 1]
+K_CARRY = REVERSE.index(3)
 
 
 def _plan(quant_on_carry, diag_on_carry=True):
-    T, Fm, S = 4, 2, 3
-    o_list = [4, 3, 2, 1]                     # vertex 3 is the carry
+    o_list = list(REVERSE)
+    T, Fm, S = len(o_list), 4, 3
     rs = np.full((T, 2, 3), -1, np.int32)
     rs[:, :, 2] = 0
     fs = np.full((T, Fm, S, 3), -1, np.int32)
     fs[..., 2] = 0
     sk = np.zeros((T, Fm), np.int32)
-    fs[0, 0, 2] = (0, 0, 2)                   # a Diag on the body vertex 4
+    fs[0, 0, 2] = (0, 0, 2)                   # a Diag on the body vertex 10
     if diag_on_carry:
-        fs[1, 1, 2] = (0, 0, 2)               # a Diag on the carry vertex 3
+        fs[K_CARRY, 0, 2] = (0, 0, 2)         # a Diag on the carry vertex 3
     if quant_on_carry:
         for s in QUANT_SLOTS:
-            fs[1, 0, s] = (QUANT_SENTINEL, NARROW, 7)
+            fs[K_CARRY, 0, s] = (QUANT_SENTINEL, NARROW, 7)
     return o_list, rs, fs, sk
 
 
 @pytest.mark.parametrize("quant_on_carry", [True, False])
 def test_the_transport_keeps_the_plans_quant_bit_on_the_carry_faces(
         quant_on_carry):
+    var = _variant()
     o_list, rs, fs, sk = _plan(quant_on_carry)
-    order, rs2, fs2, sk2, jn2 = CP.transport_wires(o_list, _variant(), rs, fs,
-                                                   sk, None)
-    assert sorted(order) == [1, 2, 3, 4] and jn2 is None
+    order, rs2, fs2, sk2, jn2 = CP.transport_wires(o_list, var, rs, fs, sk,
+                                                   None)
+    assert sorted(order) == sorted(var["valid"]) and jn2 is None
     pos = {int(v): k for k, v in enumerate(order)}
-    # the body rows travel by position
-    np.testing.assert_array_equal(fs2[pos[4]], fs[0])
-    np.testing.assert_array_equal(fs2[pos[2]], fs[2])
-    np.testing.assert_array_equal(fs2[pos[1]], fs[3])
-    carry = fs2[pos[3]]
-    # Diag on the carry face never travels: it is in the value
-    assert carry[1, 2, 0] == -1
-    assert not (carry[..., 0] >= 0).any()
-    assert int(sk2[pos[3]].max()) == 0
-    if quant_on_carry:
-        # ... and the Quant bit lands two-sided on EVERY carry face, the
-        # plan's own row copied dtype column and all
-        for f in range(carry.shape[0]):
-            for s in QUANT_SLOTS:
-                assert carry[f, s].tolist() == [QUANT_SENTINEL, NARROW, 7], (
-                    f, s, carry[f])
-            assert carry[f, 2, 0] == -1
-            check_face_quant_rows(carry[f], where=f"carry face {f}")
-    else:
-        assert int(carry[..., 0].max()) == -1
+    # the body decision travels by its face's identity (owner ruling
+    # 2026-09-25, dsnn-rbjh): the Diag on (sin -> 10 -> out) of the policy's
+    # graph lands on (sin -> 14 -> out) of the measured one, and nothing else
+    # of the step body carries a decision
+    np.testing.assert_array_equal(fs2[pos[toy.BODY[10]], 0], fs[0, 0])
+    for i, j in toy.BODY.items():
+        decided = np.any(fs2[pos[j]][..., 0] != -1, axis=-1)
+        assert decided.tolist() == [i == 10] + [False] * (len(decided) - 1), (
+            i, fs2[pos[j]])
+    carry = [j for j in var["alt_carry"] if j in var["valid"]]
+    assert carry
+    for j in carry:
+        rows = fs2[pos[j]]
+        # Diag on the carry face never travels: it is in the value
+        assert not (rows[..., 0] >= 0).any(), (j, rows)
+        assert int(sk2[pos[j]].max()) == 0
+        if quant_on_carry:
+            # ... and the Quant bit lands two-sided on EVERY face of EVERY
+            # carry vertex, the plan's own row copied dtype column and all
+            for f in range(rows.shape[0]):
+                for s in QUANT_SLOTS:
+                    assert rows[f, s].tolist() == [QUANT_SENTINEL, NARROW, 7], (
+                        j, f, s, rows[f])
+                assert rows[f, 2, 0] == -1
+                check_face_quant_rows(rows[f], where=f"carry {j} face {f}")
+        else:
+            assert int(rows[..., 0].max()) == -1
 
 
 def test_a_skipped_carry_face_does_not_lend_its_quant_row():
+    var = _variant()
     o_list, rs, fs, sk = _plan(True)
-    sk[1, 0] = 1
-    order, _rs2, fs2, _sk2, _ = CP.transport_wires(o_list, _variant(), rs, fs,
-                                                   sk, None)
+    sk[K_CARRY, 0] = 1
+    order, _rs2, fs2, _sk2, _ = CP.transport_wires(o_list, var, rs, fs, sk,
+                                                   None)
     pos = {int(v): k for k, v in enumerate(order)}
-    assert int(fs2[pos[3]][..., 0].max()) == -1
+    for j in var["alt_carry"]:
+        if j in var["valid"]:
+            assert int(fs2[pos[j]][..., 0].max()) == -1, j
 
 
 # ============================================ 6. the container's bytes

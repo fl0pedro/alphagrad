@@ -1678,14 +1678,41 @@ def test_the_eval_tag_never_pulls_a_big_slot_off_the_device():
     assert isinstance(tag, bytes) and len(tag) == 16
 
 
-@pytest.mark.parametrize("container", ["diag", "reduce", "skip"])
-def test_the_wires_travel_by_position_and_the_carry_rows_are_exact(container):
-    """A PLAN IS INDEXED BY (ELIMINATION STEP, FACE POSITION). A face KEY is a
-    pair of stable var indices on the LIVE graph and every elimination
-    rewires it, so the keys a body vertex shows depend on what the carry
-    block left behind, which is exactly what the container changes. The wires
-    therefore move to the transported order's positions and the faces are
-    enumerated again on the variant's own replay."""
+def _live_faces(lm, env, order):
+    """vertex -> how many faces it has along ``order`` on the policy's graph.
+    A row past them is read by neither graph."""
+    n: dict = {}
+    for e in lm.face_inventory(env, np.asarray(order, dtype=np.int32)):
+        n[int(e["vertex"])] = n.get(int(e["vertex"]), 0) + 1
+    return n
+
+
+def _assert_body_rows_arrive_whole(lm, env, order, var, faces, f2, o2):
+    # under the reverse order every step-body face of the policy's graph is
+    # on the measured one at the same position (the carry block is still
+    # whole when the step body goes), so each live row arrives as it left
+    live = _live_faces(lm, env, order)
+    pos2 = {int(v): i for i, v in enumerate(o2)}
+    for k, v in enumerate(order):
+        j = var["vertex_map"].get(v)
+        if j is None:
+            continue
+        n = live.get(v, 0)
+        np.testing.assert_array_equal(f2[pos2[j]][:n], faces[k][:n])
+        assert int(f2[pos2[j]][n:][..., 0].max(initial=-1)) == -1, v
+
+
+@pytest.mark.parametrize("container", ["diag", "reduce"])
+def test_the_wires_travel_by_face_identity_and_the_carry_rows_are_exact(
+        container):
+    """A FACE DECISION MOVES BY THE FACE'S IDENTITY (owner ruling 2026-09-25,
+    dsnn-rbjh). A face KEY is a pair of stable var indices on the LIVE graph
+    and a face POSITION an index into what that graph shows, and every
+    elimination rewires it, so both depend on what the carry block left
+    behind, which is exactly what the container changes. The transport reads
+    each decision as the (vertex, predecessor, successor) triple it sits on,
+    writes it at the triple of the counterparts on the variant's own replay,
+    and the faces are enumerated again there."""
     import alphagrad.approx.env as envmod
     lm, CP, env = _env_for("rtrl")
     jx = env.config.jaxpr
@@ -1705,13 +1732,8 @@ def test_the_wires_travel_by_position_and_the_carry_rows_are_exact(container):
         order, var, specs, faces, skips, None)
     assert sorted(o2) == sorted(var["valid"])
     assert f2.shape[1:] == faces.shape[1:]
-    vmap = var["vertex_map"]
     pos2 = {int(v): i for i, v in enumerate(o2)}
-    for k, v in enumerate(order):
-        j = vmap.get(v)
-        if j is None:
-            continue
-        np.testing.assert_array_equal(f2[pos2[j]], faces[k])
+    _assert_body_rows_arrive_whole(lm, env, order, var, faces, f2, o2)
     # every CARRY vertex of the variant carries an all-exact row: its
     # approximation is what chose the container
     for v in var["alt_carry"]:
@@ -1722,12 +1744,36 @@ def test_the_wires_travel_by_position_and_the_carry_rows_are_exact(container):
         assert int(k2[pos2[int(v)]].max()) == 0, v
 
 
+def test_a_decision_the_truncated_program_does_not_have_raises():
+    """The skip container's program is the truncated one: no attached state
+    and no state rows. A Diag on face 0 of every vertex names faces that
+    program does not have, and the transport raises with the face named
+    instead of moving the Diag to whatever it lists at the same position
+    (owner ruling 2026-09-25, dsnn-rbjh)."""
+    import alphagrad.approx.env as envmod
+    lm, CP, env = _env_for("rtrl")
+    valid = sorted(int(v) for v in env.valid_vertices)
+    order = [int(v) for v in sorted(valid, reverse=True)]
+    T = len(order)
+    mf = envmod.MAX_FACES
+    specs = np.full((T, envmod.MAX_RULES_PER_VERTEX, 3), -1, dtype=np.int32)
+    specs[:, :, 2] = 0
+    faces = np.full((T, mf, envmod.FACE_SLOTS, 3), -1, dtype=np.int32)
+    skips = np.zeros((T, mf), dtype=np.int32)
+    faces[:, 0, 0] = np.array([0, 0, -1], dtype=np.int32)
+    var = CP.measurement_env("skip")
+    with pytest.raises(ValueError, match=r"decides face 0, the face .*"
+                                         r"(no counterpart|has no such face)"):
+        CP.transport_wires(order, var, specs, faces, skips, None)
+
+
 @pytest.mark.parametrize("container", ["quant", "diag+quant"])
 def test_the_carry_faces_keep_the_plans_quant_bit(container):
     """A Quant on the carried face is the narrow container AND the narrow
     contraction (owner ruling 2026-09-23): every carry vertex of the measured
     graph gets the plan's own QUANT row on lhs and rhs of every face, while
-    its Diag stays in the value and every body row travels by position."""
+    its Diag stays in the value and every body decision travels by its face's
+    identity (owner ruling 2026-09-25, dsnn-rbjh)."""
     import alphagrad.approx.env as envmod
     from alphagrad.approx.unified_face_head import QUANT_SLOTS
     from alphagrad.approx.unified_face_policy import _NARROW_SLOT
@@ -1749,13 +1795,8 @@ def test_the_carry_faces_keep_the_plans_quant_bit(container):
     var = CP.measurement_env(container)
     o2, s2, f2, k2, j2 = CP.transport_wires(order, var, specs, faces, skips,
                                             None)
-    vmap = var["vertex_map"]
     pos2 = {int(v): i for i, v in enumerate(o2)}
-    for k, v in enumerate(order):
-        j = vmap.get(v)
-        if j is None:
-            continue
-        np.testing.assert_array_equal(f2[pos2[j]], faces[k])
+    _assert_body_rows_arrive_whole(lm, env, order, var, faces, f2, o2)
     n_carry = 0
     for v in var["alt_carry"]:
         if int(v) not in pos2:
