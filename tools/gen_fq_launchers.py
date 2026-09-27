@@ -1683,6 +1683,11 @@ CAMPAIGN_ENV = [
     # exports it into the actor's runtime_env too; the driver copy is what
     # reaches Ray's worker startup).
     ("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", "1"),
+    # Ray's memory monitor counts the node's ZFS ARC, a cache the kernel
+    # reclaims, as used memory, and kills workers at 95 % of the node
+    # (dsnn-dfw.246). It is off; the job's --mem limit and the kernel's OOM
+    # killer guard the node (owner ruling 2026-09-27).
+    ("RAY_memory_monitor_refresh_ms", "0"),
 ]
 
 # (var, value, evidence) -- see NO_FLAG_ENV above.  Promote to a flag and

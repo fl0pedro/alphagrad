@@ -518,9 +518,12 @@ def test_every_export_in_a_campaign_launcher_is_allowed(gen, campaign):
     assert campaign_env == {"ALPHAGRAD_TLM_SEQ", "ALPHAGRAD_TLM_DMODEL",
                             "ALPHAGRAD_TLM_VOCAB", "ALPHAGRAD_BATCHED_CALLBACK",
                             "RAY_TMPDIR",
-                            "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"}
+                            "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
+                            "RAY_memory_monitor_refresh_ms"}
     assert dict(gen.CAMPAIGN_ENV)["ALPHAGRAD_BATCHED_CALLBACK"] == "1"
     assert dict(gen.CAMPAIGN_ENV)["RAY_TMPDIR"] == "/tmp/ray_$SLURM_JOB_ID"
+    # Ray's memory monitor is off: it counts the ZFS ARC as used (dsnn-dfw.246)
+    assert dict(gen.CAMPAIGN_ENV)["RAY_memory_monitor_refresh_ms"] == "0"
 
 
 def test_no_flag_knobs_are_exported_and_named_in_the_todo_header(gen, campaign):
