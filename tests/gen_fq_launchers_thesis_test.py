@@ -236,8 +236,9 @@ def matrix(gen):
     them -- but they are not matrix coordinates.  They are out of this
     fixture and pinned by tests/gen_fq_launchers_orderonly_test.py and
     tests/gen_fq_launchers_snnsweep_test.py instead.  So are the four rows
-    of the update-overlap test (dsnn-dfw.190), pinned by
-    tests/gen_fq_launchers_overlap_test.py.
+    of the update-overlap test (dsnn-dfw.190) and the NN256 pace probe,
+    pinned by tests/gen_fq_launchers_overlap_test.py and
+    tests/gen_fq_launchers_probe_test.py.
     """
     arms = [a for a in gen.thesis_arms()
             if not a.get("smoke") and not a.get("orderonly")
@@ -246,7 +247,7 @@ def matrix(gen):
             and not a.get("orderonly_tlm_final")
             and not a.get("paired") and not a.get("sweepl")
               and not a.get("sweepl2") and not a.get("sweepl3")
-            and not a.get("overlap")]
+            and not a.get("overlap") and not a.get("pace_probe")]
     assert arms, "the generator emits no thesis arm"
     return arms
 
@@ -1308,15 +1309,15 @@ def test_target_nodes_routing(monkeypatch):
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     # The order-only tuning rows and the order-only BASELINE (the five
-    # Blackwell rows of 2026-09-19) pin their own node by seed, and the
-    # update-overlap test pins pgi15-gpu20; the target switch pins the
-    # MATRIX and must not reach any of them.
+    # Blackwell rows of 2026-09-19) pin their own node by seed, the
+    # update-overlap test pins pgi15-gpu20 and the pace probe pgi15-gpu15;
+    # the target switch pins the MATRIX and must not reach any of them.
     matrix = [a for a in mod.thesis_arms()
               if not a.get("smoke") and not a.get("orderonly")
               and not a.get("orderonly_final")
               and not a.get("orderonly_tlm_final") and not a.get("sweepl")
               and not a.get("sweepl2") and not a.get("sweepl3")
-              and not a.get("overlap")]
+              and not a.get("overlap") and not a.get("pace_probe")]
     for a in matrix:
         if a["thesis_target"] == "tlm":
             assert a["node"] in ("pgi15-gpu20", "pgi15-gpu16"), a["name"]

@@ -262,8 +262,17 @@ LANDSCAPE_FLAGS = [
 WANDB_MODE = "online"
 WANDB_ENTITY = "dll-streetview"
 WANDB_PROJECT = "dsnn-vertex"
-WANDB = (f"--wandb {WANDB_MODE} --wandb-entity {WANDB_ENTITY}"
-         f" --wandb-project {WANDB_PROJECT}")
+
+
+def wandb_cli(a: dict) -> str:
+    """The wandb arguments of arm `a`: WANDB_MODE, or the arm's own
+    `wandb_mode` (a probe runs offline, AGENTS.md), with the one entity and
+    project."""
+    return (f"--wandb {a.get('wandb_mode', WANDB_MODE)}"
+            f" --wandb-entity {WANDB_ENTITY} --wandb-project {WANDB_PROJECT}")
+
+
+WANDB = wandb_cli({})
 
 # Flags whose ABSENCE from ppo.py must abort the job before any setup noise.
 # The R1-R4 battery shipped with this guard and it caught three missing flags.
@@ -3526,7 +3535,7 @@ def thesis_block1_arms() -> list[dict]:
             and not a.get("sweepl3")
             and not a.get("orderonly_final")
             and not a.get("orderonly_tlm_final")
-            and not a.get("overlap")]
+            and not a.get("overlap") and not a.get("pace_probe")]
 
 
 def thesis_snn_arms() -> list[dict]:
@@ -3546,13 +3555,13 @@ def thesis_snn_arms() -> list[dict]:
 def thesis_core_arms() -> list[dict]:
     """The 40 NN256/TLM rows: the matrix without the recurrent target, the
     defense arms, the smoke, the order-only tuning rows, the order-only
-    baseline and the update-overlap test."""
+    baseline, the update-overlap test and the NN256 pace probe."""
     return [a for a in thesis_arms()
             if not a.get("smoke") and not a.get("thesis_rule")
             and not a.get("orderonly") and not a.get("orderonly_final")
             and not a.get("orderonly_tlm_final") and not a.get("paired")
             and not a.get("sweepl") and not a.get("sweepl2") and not a.get("sweepl3")
-            and not a.get("overlap")
+            and not a.get("overlap") and not a.get("pace_probe")
             and a.get("thesis_arm") not in THESIS_DEFENSE_ARMS]
 
 
@@ -5268,6 +5277,63 @@ def overlap_arms() -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# THE NN256 PACE PROBE (the orchestrator, 2026-09-27).  A launcher bakes its
+# arguments in and takes no episode override, so timing the NN256 thesis row
+# needs a row of its own: the thesis row C_popart_nn256_s250197, argument for
+# argument and variable for variable, but --episodes 3 and --wandb offline
+# (AGENTS.md: probes run offline), released, on pgi15-gpu15 as a whole 4-GPU
+# row like the NN256 rows.  --name stays the thesis row's, as every other
+# argument does; the launcher and its slurm log are PACE_PROBE_NAME.  An
+# offline run writes an offline-run-* directory, which the nightly copy
+# (run-* only) does not read.
+#
+# NOT A MATRIX COORDINATE: `thesis_core_arms` and `thesis_block1_arms`
+# exclude the row marked `pace_probe=True`.
+# ---------------------------------------------------------------------------
+PACE_PROBE_ARM = "C_popart"
+PACE_PROBE_TARGET = "nn256"
+PACE_PROBE_SEED = "250197"
+PACE_PROBE_EPISODES = "3"
+PACE_PROBE_NODE = "pgi15-gpu15"
+PACE_PROBE_WANDB_MODE = "offline"
+PACE_PROBE_NAME = (f"probe{PACE_PROBE_EPISODES}_"
+                   + thesis_run_name(PACE_PROBE_ARM, PACE_PROBE_TARGET,
+                                     PACE_PROBE_SEED))
+
+_PACE_PROBE_WHAT = """THE NN256 PACE PROBE, not a result.  The thesis row
+C_popart_nn256_s250197 -- every argument and every exported variable -- at
+--episodes 3 and --wandb offline (AGENTS.md: probes run offline), as a whole
+4-GPU row on pgi15-gpu15.  It times an NN256 episode on this stack; the
+per-phase wall of every episode is in the slurm log (ALPHAGRAD_PROFILE=1).
+--name is the thesis row's; the run directory is offline-run-*, which the
+nightly copy does not read.  3 episodes, so the cosine learning rate decays
+over 3 (dsnn-ddw)."""
+
+_PACE_PROBE_PREDICTION = """REGISTERED BEFORE THE RUN: the probe reaches
+episode 3 and prints the per-phase wall of each of its three episodes.  No
+claim is made about learning."""
+
+_PACE_PROBE_FALSIFIER = """If the probe does not reach episode 3, the pace of
+the NN256 row on this stack is not known, and the failure is reported as it
+stands."""
+
+thesis_arm(
+    arm=PACE_PROBE_ARM, target=PACE_PROBE_TARGET, seed=PACE_PROBE_SEED,
+    node=PACE_PROBE_NODE, episodes=PACE_PROBE_EPISODES,
+    what=_PACE_PROBE_WHAT, prediction=_PACE_PROBE_PREDICTION,
+)
+ARMS[-1]["pace_probe"] = True
+ARMS[-1]["falsifier"] = _PACE_PROBE_FALSIFIER
+ARMS[-1]["wandb_mode"] = PACE_PROBE_WANDB_MODE
+# The FILE name differs while --name does not, as on the smoke's resume leg.
+ARMS[-1]["name"] = PACE_PROBE_NAME
+
+
+def pace_probe_arms() -> list[dict]:
+    return [a for a in ARMS if a.get("pace_probe")]
+
+
+# ---------------------------------------------------------------------------
 # RENDERING
 # ---------------------------------------------------------------------------
 
@@ -5565,7 +5631,7 @@ def cli_tokens(a: dict) -> list[str]:
             toks.append(val)
         else:
             toks.extend(val.split())   # "--rewards cmp mem acc" is 3 words
-    toks.extend(WANDB.split())
+    toks.extend(wandb_cli(a).split())
     return toks
 
 
@@ -5940,7 +6006,10 @@ def _render(a: dict, stack: str) -> str:
 
     # --- pre-flight
     L.append("# ---------------------- PRE-FLIGHT ----------------------------")
-    _has_wandb = not (kind == "probe" or a.get("needs_tool"))
+    # Layer 3 is the round trip an ONLINE run needs.  An offline row (a
+    # probe, AGENTS.md) writes its run locally and has no layer 3.
+    _has_wandb = (not (kind == "probe" or a.get("needs_tool"))
+                  and a.get("wandb_mode", WANDB_MODE) == "online")
     L.append("# %s layers, each failing LOUDLY with its own exit code before"
              % ("FOUR" if _has_wandb else "THREE"))
     L.append("# any setup noise reaches the log.  The R1-R4 battery shipped the")
@@ -6009,41 +6078,43 @@ def _render(a: dict, stack: str) -> str:
         L.append(a["body"])
         return "\n".join(L) + "\n"
 
-    # --- Layer 3: wandb.  Every arm past this point carries `--wandb online`
-    #     (the WANDB constant), and an online run whose backend is unreachable
-    #     -- expired credentials, a firewalled node, a typo'd entity -- trains
-    #     for hours and lands NOWHERE the owner can see.  That is the "is the
-    #     wandb syncing?  I don't see it on the dashboard" failure, and like
-    #     the two-op form above it is SILENT.  Prove the authenticated
-    #     round-trip HERE, from THIS node, against the SAME entity the command
-    #     line will use, and print the dashboard URL into the slurm log.
-    L.append("# Layer 3: wandb credentials + a real authenticated round-trip")
-    L.append("# from THIS node to THIS entity, before hours are spent.  ~2 s.")
-    L.append('if [ "${FQ_SKIP_WANDB_CHECK:-0}" != "1" ]; then')
-    L.append(f"  JAX_PLATFORMS=cpu {py} - "
-             "<<'FQ_WANDB_EOF' || {")
-    L.append("import sys, wandb")
-    L.append(f"ENT, PROJ = {WANDB_ENTITY!r}, {WANDB_PROJECT!r}")
-    L.append("api = wandb.Api(timeout=30)")
-    L.append("teams = list(api.viewer.teams)")
-    L.append("if ENT not in teams:")
-    L.append("    sys.exit('wandb entity %r not available to these"
-             " credentials (viewer teams: %r)' % (ENT, teams))")
-    L.append("print('[preflight] wandb reachable and authenticated:"
-             " entity %s, project %s' % (ENT, PROJ))")
-    L.append("FQ_WANDB_EOF")
-    L.append('  echo "ABORT(71): --wandb online but this node cannot reach'
-             ' or authenticate to wandb."')
-    L.append('  echo "          A run started here would train blind.'
-             '  Set FQ_SKIP_WANDB_CHECK=1"')
-    L.append('  echo "          to override, or fix credentials with'
-             ' wandb login."')
-    L.append("  exit 71")
-    L.append("}")
-    L.append(f'  echo "[preflight] dashboard:'
-             f' https://wandb.ai/{WANDB_ENTITY}/{WANDB_PROJECT}"')
-    L.append("fi")
-    L.append("")
+    # --- Layer 3: wandb.  Every online arm past this point carries `--wandb
+    #     online` (the WANDB constant), and an online run whose backend is
+    #     unreachable -- expired credentials, a firewalled node, a typo'd
+    #     entity -- trains for hours and lands NOWHERE the owner can see.  That
+    #     is the "is the wandb syncing?  I don't see it on the dashboard"
+    #     failure, and like the two-op form above it is SILENT.  Prove the
+    #     authenticated round-trip HERE, from THIS node, against the SAME
+    #     entity the command line will use, and print the dashboard URL into
+    #     the slurm log.
+    if _has_wandb:
+        L.append("# Layer 3: wandb credentials + a real authenticated round-trip")
+        L.append("# from THIS node to THIS entity, before hours are spent.  ~2 s.")
+        L.append('if [ "${FQ_SKIP_WANDB_CHECK:-0}" != "1" ]; then')
+        L.append(f"  JAX_PLATFORMS=cpu {py} - "
+                 "<<'FQ_WANDB_EOF' || {")
+        L.append("import sys, wandb")
+        L.append(f"ENT, PROJ = {WANDB_ENTITY!r}, {WANDB_PROJECT!r}")
+        L.append("api = wandb.Api(timeout=30)")
+        L.append("teams = list(api.viewer.teams)")
+        L.append("if ENT not in teams:")
+        L.append("    sys.exit('wandb entity %r not available to these"
+                 " credentials (viewer teams: %r)' % (ENT, teams))")
+        L.append("print('[preflight] wandb reachable and authenticated:"
+                 " entity %s, project %s' % (ENT, PROJ))")
+        L.append("FQ_WANDB_EOF")
+        L.append('  echo "ABORT(71): --wandb online but this node cannot reach'
+                 ' or authenticate to wandb."')
+        L.append('  echo "          A run started here would train blind.'
+                 '  Set FQ_SKIP_WANDB_CHECK=1"')
+        L.append('  echo "          to override, or fix credentials with'
+                 ' wandb login."')
+        L.append("  exit 71")
+        L.append("}")
+        L.append(f'  echo "[preflight] dashboard:'
+                 f' https://wandb.ai/{WANDB_ENTITY}/{WANDB_PROJECT}"')
+        L.append("fi")
+        L.append("")
 
     # --- the command line, ONCE, as an array: the dry-parse and the real run
     #     cannot disagree because they are the same tokens.
@@ -6067,7 +6138,7 @@ def _render(a: dict, stack: str) -> str:
         L.append(f"{arr}=(")
         for flag, val in _merge_cli(src):
             L.append(f"  {flag}" + (f" {val}" if val is not None else ""))
-        L.append(f"  {WANDB}")
+        L.append(f"  {wandb_cli(a)}")
         L.append(")")
         L.append("")
     L.append("# Layer 2: run the EXACT token list through ppo.py's own argparse.")
