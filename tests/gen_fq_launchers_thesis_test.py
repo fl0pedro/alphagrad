@@ -143,6 +143,11 @@ DUAL_CLIP = "3.0"
 #: rollout policy.  The order-only tuning rows and the sweep
 #: sections call `thesis_cli` directly and keep the flag off.
 TARGET_KL = "0.1"
+#: THE READOUT (owner ruling 2026-09-26 Q2 c, dsnn-dfw.291): every row
+#: `thesis_arm` emits reads its final policy out after training, 64 sampled
+#: plans and the argmax plan -- four rollouts of the row's 16 environments.
+#: The order-only tuning rows and the three sweep rounds keep it off.
+READOUT = "64"
 #: THE MEASURE ACTORS' EXECUTABLE RETENTION BOUND (dsnn-dfw.99): every
 #: row `thesis_arm` emits exports the clear cadence, so the actor drops
 #: its in-process JAX caches every 100 measurements instead of holding
@@ -588,6 +593,56 @@ def test_target_kl_reaches_every_row_thesis_arm_emits_and_no_other(gen,
         assert "--target-kl" in a["required_flags"], a["name"]
     for a in off:
         assert "--target-kl" not in a["required_flags"], a["name"]
+
+
+def test_the_readout_reaches_every_row_thesis_arm_emits_and_no_other(
+        gen, matrix, smoke, pairs):
+    """dsnn-dfw.291 (owner ruling 2026-09-26, Q2 c).  After training every
+    run reads its final policy out: --readout 64, 64 sampled plans and the
+    argmax plan, next to the archive front.  It is on the matrix -- A, B, C,
+    C_popart and the defense arms, on every target -- on the smoke, which has
+    to start the same command line the matrix runs, on both halves of every
+    pair launcher, and on the update-overlap test and the NN256 pace probe,
+    which are matrix rows argument for argument.  64 is a whole number of
+    rollouts of the row's environments, which ppo.py refuses otherwise.
+
+    It is OFF on the order-only tuning rows and on the three Lagrangian
+    sweep rounds, and the absence is asserted rather than trusted, for the
+    same reason dual-clip is off there: those are frozen running comparisons
+    and a launcher that moved under them would invalidate the round.
+    """
+    on = matrix + smoke + gen.overlap_arms() + gen.pace_probe_arms()
+    for a in on:
+        cli = _cli(gen, a)
+        assert cli["--readout"] == READOUT, a["name"]
+        assert int(READOUT) % (int(cli["--num-envs"])
+                               * int(cli["--rollout-shards"])) == 0, a["name"]
+        assert f"--readout {READOUT}" in gen.render(a, STACK), a["name"]
+    assert pairs
+    for p in pairs:
+        assert gen.render(p, STACK).count(f"--readout {READOUT}") == 2, \
+            p["name"]
+    off = (gen.orderonly_arms() + gen.orderonly_rsnn_arms()
+           + gen.orderonly_final_arms() + gen.orderonly_tlm_final_arms()
+           + gen.sweepl_arms() + gen.sweepl2_arms() + gen.sweepl3_arms())
+    assert off
+    for a in off:
+        assert "--readout" not in _cli(gen, a), a["name"]
+        assert "--readout" not in gen.render(a, STACK), a["name"]
+    # Named by the rows that pass it and by no other, as dual-clip is.
+    assert gen.READOUT_REQUIRED_FLAGS == ["--readout"]
+    assert "--readout" not in gen.THESIS_REQUIRED_FLAGS
+    for a in on + pairs:
+        assert "--readout" in a["required_flags"], a["name"]
+    for a in off:
+        assert "--readout" not in a["required_flags"], a["name"]
+
+
+def test_thesis_arm_refuses_a_readout_no_whole_rollout_count_measures(gen):
+    with pytest.raises(gen.CampaignRowError, match="--readout 60"):
+        gen.thesis_arm(arm="C", target="tlm", seed=SEEDS[0],
+                       node=gen.THESIS_NODES[0], name="readout_60_probe",
+                       readout="60")
 
 
 def test_the_targets_are_the_ones_the_owner_named(gen, matrix):

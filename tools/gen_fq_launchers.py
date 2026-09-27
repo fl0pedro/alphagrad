@@ -2298,6 +2298,18 @@ def thesis_episodes(target: str) -> str:
 THESIS_CHECKPOINT_EVERY = "50"
 THESIS_PARETO_DUMP_EVERY = "10"
 THESIS_PLAN_LOG = "auto"
+#: THE READOUT (owner ruling 2026-09-26, Q2 c; dsnn-dfw.291).  After training
+#: the run loads its final checkpoint, samples 64 plans and the argmax plan
+#: from the policy with no update, measures them with the training
+#: measurement and writes one record per plan next to the archive front: the
+#: front says what the search found, the readout what the policy learned.
+#: EVERY ROW `thesis_arm` EMITS reads this, exactly as THESIS_DUAL_CLIP below:
+#: the matrix on all targets, the defense rows, the pair launchers, the smoke,
+#: the update-overlap test and the pace probe.  The three Lagrangian sweep
+#: rounds pass `readout=None` and the order-only rows call `thesis_cli`
+#: directly, so both keep it off: they are FROZEN running comparisons.  Off
+#: is ppo.py's own default.  64 is four rollouts of --num-envs 16.
+THESIS_READOUT = "64"
 #: Spatial order FREE in every thesis arm (owner: "order is free in every arm,
 #: spatial and temporal").  The campaign's Markowitz pin is a campaign answer.
 THESIS_ORDER = "free"
@@ -2995,6 +3007,10 @@ DUAL_CLIP_REQUIRED_FLAGS = ["--dual-clip"]
 #: and to no other row's, exactly as DUAL_CLIP_REQUIRED_FLAGS above.
 TARGET_KL_REQUIRED_FLAGS = ["--target-kl"]
 
+#: dsnn-dfw.291's flag, added to the list a row that PASSES it greps for
+#: and to no other row's, exactly as DUAL_CLIP_REQUIRED_FLAGS above.
+READOUT_REQUIRED_FLAGS = ["--readout"]
+
 #: dsnn-mep's flag and the three oracle flags (dsnn-dfw.208, report
 #: dsnn-dfw.237), each added to the list of a row that passes it and to no
 #: other row's, exactly as DUAL_CLIP_REQUIRED_FLAGS above.
@@ -3181,7 +3197,8 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
                cores_per_actor: str | None = None,
                mem_objective_weight: str | None = None,
                whole_node: bool = False,
-               measure_gpus: bool = False) -> dict:
+               measure_gpus: bool = False,
+               readout: str | None = None) -> dict:
     """The `cli` override dict of one thesis run.
 
     Everything the owner fixed is HERE, once, so the block and the smoke
@@ -3303,6 +3320,11 @@ def thesis_cli(*, arm: str, target: str, seed: str, node: str, name: str,
         # a direct `thesis_cli` caller leaves the flag off, which is
         # ppo.py's own default.
         cli["--target-kl"] = target_kl
+    if readout is not None:
+        # dsnn-dfw.291.  A row `thesis_arm` emits renders THESIS_READOUT; a
+        # direct `thesis_cli` caller leaves the flag off, which is ppo.py's
+        # own default.
+        cli["--readout"] = readout
     if auto_stop:
         cli["--auto-stop"] = None
     if form == "L":
@@ -3362,7 +3384,8 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
                mem_objective_weight: str | None = THESIS_MEM_OBJECTIVE_WEIGHT,
                whole_node: bool = True,
                batched: bool = True,
-               measure_gpus: bool = True) -> dict:
+               measure_gpus: bool = True,
+               readout: str | None = THESIS_READOUT) -> dict:
     """One thesis run -> one `arm(...)`.  Returns the arm."""
     _require(node in THESIS_NODES,
              f"node {node!r} is not one of the permitted thesis nodes "
@@ -3401,9 +3424,17 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
                      cores_per_actor=cores_per_actor,
                      mem_objective_weight=mem_objective_weight,
                      whole_node=whole_node,
-                     measure_gpus=measure_gpus)
+                     measure_gpus=measure_gpus,
+                     readout=readout)
     if extra_cli:
         cli.update(extra_cli)
+    if readout is not None:
+        # ppo.py refuses a readout that no whole number of rollouts measures.
+        _envs = (int(cli.get("--num-envs", dict(SHARED_CLI)["--num-envs"]))
+                 * int(cli.get("--rollout-shards", "1")))
+        _require(int(readout) % _envs == 0,
+                 f"{name}: --readout {readout} is not a multiple of the "
+                 f"{_envs} environments of one rollout (dsnn-dfw.291)")
     gpus = thesis_row_gpus(target, node)
     if whole_node:
         b = THESIS_CORE_BUDGET[gpus]
@@ -3445,6 +3476,8 @@ def thesis_arm(*, arm: str, target: str, seed: str, node: str,
                            if dual_clip is not None else [])
                         + (TARGET_KL_REQUIRED_FLAGS
                            if target_kl is not None else [])
+                        + (READOUT_REQUIRED_FLAGS
+                           if readout is not None else [])
                         + (MEM_OBJECTIVE_REQUIRED_FLAGS
                            if mem_objective_weight is not None else [])
                         + (GRAD_ORACLE_REQUIRED_FLAGS if whole_node else [])
@@ -4109,6 +4142,8 @@ for _sweepl_tag, _sweepl_overrides in sweepl_configs():
             dual_clip=None,
             # dsnn-dfw.98: same reason, keeps --target-kl off too.
             target_kl=None,
+            # dsnn-dfw.291: same reason, keeps --readout off too.
+            readout=None,
             # dsnn-dfw.99: same reason, keeps the retention bound off too.
             cache_clear_every=None,
             # dsnn-dfw.99: same reason, keeps the process recycle off too.
@@ -4293,6 +4328,8 @@ for _sweepl2_tag, _sweepl2_overrides in sweepl2_configs():
             dual_clip=None,
             # dsnn-dfw.98: same reason, keeps --target-kl off too.
             target_kl=None,
+            # dsnn-dfw.291: same reason, keeps --readout off too.
+            readout=None,
             # dsnn-dfw.99: same reason, keeps the retention bound off too.
             cache_clear_every=None,
             # dsnn-dfw.99: same reason, keeps the process recycle off too.
@@ -4464,6 +4501,8 @@ for _sweepl3_tag, _sweepl3_overrides in sweepl3_configs():
             dual_clip=None,
             # dsnn-dfw.98: same reason, keeps --target-kl off too.
             target_kl=None,
+            # dsnn-dfw.291: same reason, keeps --readout off too.
+            readout=None,
             # dsnn-dfw.99: same reason, keeps the retention bound off too.
             cache_clear_every=None,
             # dsnn-dfw.99: same reason, keeps the process recycle off too.
