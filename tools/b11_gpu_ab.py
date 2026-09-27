@@ -241,8 +241,13 @@ def cmd_compile(a):
             digest = hashlib.sha256(b"".join(x.tobytes() for x in host)).hexdigest()[:16]
             args_file = Path(a.out) / "args" / a.target / f"{p['pid']}.npz"
             if not args_file.exists():
+                # The three trees compile side by side and export the same inputs (one args_sha).
+                # Each writes a file of its own and renames it into place, so the timing never
+                # reads a file two writers interleaved (job 68485: Bad CRC-32 in nn256 quant_reduce).
                 args_file.parent.mkdir(parents=True, exist_ok=True)
-                np.savez(args_file, *host)
+                tmp = args_file.with_name(f".{args_file.stem}.{os.getpid()}.npz")
+                np.savez(tmp, *host)
+                os.replace(tmp, args_file)
             hlo = ex.as_text()
             with gzip.open(hlo_dir / f"{a.target}.{p['pid']}.{a.variant}.hlo.txt.gz", "wt") as fh:
                 fh.write(hlo)
