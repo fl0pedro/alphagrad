@@ -8965,8 +8965,36 @@ def _face_dict_for_vertex(config, ij, v, face_row, face_skip,
 
 
 def _measure_compiler_options():
-    # Per owner ruling 2026-09-26 Q5 b and probe dsnn-dfw.309: no compiler options are set.
-    return None
+    """Per-executable XLA options for MEASURE compiles only
+    (ALPHAGRAD_MEASURE_COMPILER_OPTS=0 to disable). GEMM autotuning +
+    Triton fusion work dominated cold variant compiles (measured 3.55s ->
+    0.09s, 39x, with ZERO latency change on the bandwidth-bound nn256
+    target — the 3.5s recurs per new GEMM config, it is not process
+    warmup). Values must be typed int/bool: the string "false" is rejected
+    with INVALID_ARGUMENT. Scoped per executable so the TRAINER jit keeps
+    full optimization once the global XLA_FLAGS are dropped. Re-validate
+    once on compute-bound targets (TLM): autotune-off can change kernel
+    choice there."""
+    if os.environ.get("ALPHAGRAD_MEASURE_COMPILER_OPTS", "1") == "0":
+        return None
+    try:
+        if jax.default_backend() == "cpu":
+            return None
+    except Exception:
+        pass
+    return {
+        "xla_gpu_autotune_level": 0,
+        "xla_gpu_enable_triton_gemm": False,
+        # Parallel LLVM-module compilation. OFF by default in this jax build
+        # (gated behind a persistent-cache setting nobody enables), so every
+        # run to date compiled serially. Isolated benchmark 61445 (12 random
+        # TLM plans, paired on the SAME lowered object, arm order alternated):
+        # median compile 14.46 -> 12.71 s (-12%), heaviest plans -29..-35%
+        # (45.6 -> 32.7 s), no plan slower. Passed per-executable here rather
+        # than via JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES so it does not
+        # depend on cache state and never touches trainer compiles.
+        "xla_gpu_enable_llvm_module_compilation_parallelism": True,
+    }
 
 
 # ---------------------------------------------------------------------------
