@@ -1,5 +1,6 @@
-# The GPU A/B of merge batch 11: graphax core-v2 against the batch-11 head and its candidate fix of dsnn-dfw.304,
-# on the same plans, timed in ONE process with the measurement's own compile and timing instrument.
+# The GPU A/B of merge batch 11: graphax trees (core-v2 as the base, the batch-11 head, the head without the
+# barrier at narrow private sums) on the same plans, timed in ONE process with the measurement's own compile and
+# timing instrument.
 # tools/b11_gpu_ab.sbatch runs the three steps; each step can run alone:
 #   plans   --target T --out DIR                     the plan set of target T (under the head graphax)
 #   compile --target T --variant V --out DIR         each plan's executable under graphax V, through _compile_measure
@@ -194,6 +195,13 @@ def cmd_plans(a):
             name = f"{op}_join{len({(w['k'], w['f']) for w in wires})}"
         if wires:
             plans.append({"pid": name, "order": okind, "wires": wires})
+    if a.target == "nn256":
+        # Quant and Reduce together, the kind of compress_e993: its batch sums read narrow edges.
+        q = next(p for p in plans if p["pid"].startswith("quant_all"))
+        r = next(p for p in plans if p["pid"].startswith("reduce_join"))
+        taken = {(w["k"], w["f"], w["slot"]) for w in q["wires"]}
+        plans.append({"pid": "quant_reduce", "order": okind,
+                      "wires": q["wires"] + [w for w in r["wires"] if (w["k"], w["f"], w["slot"]) not in taken]})
     for p in plans:
         print(f"[plans] {a.target} {p['pid']}: {p['order']} order, {len(p['wires'])} wires", flush=True)
     out = Path(a.out) / "plans"
@@ -209,16 +217,6 @@ def cmd_compile(a):
     import numpy as np
     import graphax
     from jax.experimental.serialize_executable import serialize
-    mm = importlib.import_module("graphax.sparse.ops.matmul")
-    if a.tie_min_bytes is not None:
-        mm._TIE_MIN_BYTES = int(a.tie_min_bytes)
-    if a.tie_both:
-        # The variant in which the contraction reads both barrier outputs, the large operand's too.
-        def _tie_both(x, y):
-            if max(x.size * x.dtype.itemsize, y.size * y.dtype.itemsize) < mm._TIE_MIN_BYTES:
-                return x, y
-            return jax.lax.optimization_barrier((x, y))
-        mm._tie_to_large = _tie_both
     lm, env, ev = _build(a.target, dict(kv.split("=", 1) for kv in a.cli))
     plans = json.loads((Path(a.out) / "plans" / f"{a.target}.json").read_text())
     out = Path(a.out) / "exe" / a.variant / a.target
@@ -431,8 +429,6 @@ def main(argv=None):
             s.add_argument("--join", type=int, default=4)
         else:
             s.add_argument("--variant", required=True)
-            s.add_argument("--tie-min-bytes", default=None)
-            s.add_argument("--tie-both", action="store_true")
     s = sub.add_parser("time")
     s.add_argument("--out", required=True)
     s.add_argument("--variants", required=True)

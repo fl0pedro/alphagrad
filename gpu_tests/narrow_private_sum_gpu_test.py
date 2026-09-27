@@ -1,7 +1,7 @@
-# The value check of graphax tests/core/sparse_tensor/narrow_private_sum_test.py on the GPU (dsnn-dfw.305).
-# On XLA:CPU the rounding follows the size of the array, with or without the barrier (jaxlib 0.10.2: rounded
-# up to 2048 elements, unrounded from 43690 on), so the check runs where the plans run. An sbatch job on a GPU
-# node runs it:
+# The barrier at a narrow private sum makes the sum read the stored bf16 edge (graphax 01d5393, dsnn-dfw.273):
+# the values on the GPU, on an edge of 65536 elements. On XLA:CPU the rounding follows the size of the array,
+# with or without the barrier (jaxlib 0.10.2: rounded up to 2048 elements, unrounded from 43690 on), so the
+# check runs where the plans run. An sbatch job on a GPU node runs it:
 #   JAX_PLATFORMS=cuda python -m pytest -q -s gpu_tests/narrow_private_sum_gpu_test.py
 from __future__ import annotations
 
