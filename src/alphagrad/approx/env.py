@@ -2696,7 +2696,8 @@ def _plan_compile_fields() -> dict:
            "compile_options": _PLAN_COMPILE.get("compile_options"),
            "compile_options_tried": _PLAN_COMPILE.get(
                "compile_options_tried", []),
-           "ref_compile_options": _PLAN_COMPILE.get("ref_compile_options")}
+           "ref_compile_options": _PLAN_COMPILE.get("ref_compile_options"),
+           "actor_replaced": _PLAN_COMPILE.get("actor_replaced")}
     return out
 
 
@@ -9066,6 +9067,8 @@ def _reference_errors(what: str):
     except MeasureToolchainFault:
         raise
     except Exception as _exc:
+        if is_cuda_poison_error(_exc):
+            raise CudaContextPoisoned(f"{what}: {_exc}", exc=_exc) from _exc
         raise ReferenceFault(
             f"{what}: {type(_exc).__name__}: "
             f"{' '.join(str(_exc).split())[:300]}. A failure of the "
@@ -9238,15 +9241,47 @@ _MEASURE_COMPILE_FALLBACKS = {"n": 0}
 _MEASURE_FALLBACKS_AT_LAST_RECORD = [0]
 _MEASURE_FALLBACKS_AT_LAST_DRAIN = [0]
 
-# The allowed fallback options in order, one 0/1 tuple entry each, tried only after the live compile fails (owner ruling 2026-09-25).
+# The allowed fallback options in order, one 0/1 tuple entry each, tried only after the live compile fails (owner ruling 2026-09-25, 2026-09-27).
 MEASURE_COMPILE_FALLBACK_OPTIONS = (
     # The softmax rewriter's __triton fusions fail verification, Triton compile or shared memory on Blackwell (dsnn-dfw.212).
     ("xla_disable_hlo_passes", "triton-softmax-rewriter"),
     # ptxas -O0: ptxas 12.9 exits 139 on some TLM programs (dsnn-6k9, dsnn-dfw.212).
     ("xla_gpu_disable_gpuasm_optimizations", True),
+    # Blanket fallback on GPU crash / autotune failure: autotune level 0 and no Triton GEMM (owner ruling 2026-09-27)
+    ("xla_gpu_autotune_level", 0),
+    ("xla_gpu_enable_triton_gemm", False),
 )
 # Each fallback adds the next allowed option to the ones before it.
-MEASURE_COMPILE_TRY_ORDER = ((1, 0), (1, 1))
+MEASURE_COMPILE_TRY_ORDER = (
+    (1, 0, 0, 0),
+    (1, 1, 0, 0),
+    (0, 0, 1, 1),
+    (1, 1, 1, 1),
+)
+# The blanket fallback tuple for recovering from Triton crash / autotuning illegal address:
+MEASURE_COMPILE_FALLBACK_BLANKET = (0, 0, 1, 1)
+
+
+def is_cuda_poison_error(exc: BaseException) -> bool:
+    """True for sticky CUDA errors that leave the process CUDA context unusable."""
+    txt = f"{type(exc).__name__}: {exc}"
+    return any(sig in txt for sig in (
+        "CUDA_ERROR_ILLEGAL_ADDRESS",
+        "an illegal memory access was encountered",
+        "CUDA_ERROR_LAUNCH_FAILED",
+        "CUDA_ERROR_HARDWARE_STACK_ERROR",
+        "CUDA_ERROR_ILLEGAL_INSTRUCTION",
+        "CUDA_ERROR_MISALIGNED_ADDRESS",
+        "CudaContextPoisoned",
+    ))
+
+
+class CudaContextPoisoned(Exception):
+    """Raised when an operation poisons or detects a poisoned CUDA context."""
+    def __init__(self, message: str, tried=None, exc=None):
+        super().__init__(message)
+        self.tried = tried
+        self.original_exc = exc
 
 
 def measure_compile_layout() -> list:
@@ -9305,6 +9340,10 @@ def _compile_measure(lowered, compile_tuple=None):
         try:
             exe = lowered.compile(compiler_options=opts)
         except Exception as _e:
+            if is_cuda_poison_error(_e):
+                _LAST_COMPILE_NOTE[0] = {"used": None, "tried": [list(tup)]}
+                raise CudaContextPoisoned(f"measure compile poisoned CUDA context: {_e}",
+                                          tried=[list(tup)], exc=_e) from _e
             raise MeasureCompileFailure(str(_e), tried=[tup]) from _e
         _LAST_COMPILE_NOTE[0] = {"used": list(tup), "tried": [list(tup)]}
         return exe
@@ -9316,6 +9355,10 @@ def _compile_measure(lowered, compile_tuple=None):
         return exe
     except Exception as _e:
         _m = str(_e)
+        if is_cuda_poison_error(_e):
+            _LAST_COMPILE_NOTE[0] = {"used": None, "tried": [list(_live)]}
+            raise CudaContextPoisoned(f"measure compile poisoned CUDA context: {_m}",
+                                      tried=[list(_live)], exc=_e) from _e
         # A LINK-toolchain fault is an ENVIRONMENT fault, not a plan-specific
         # compiler bug: it recurs on every plan for the whole job and
         # silently degrades every latency on this node. Absorbing it into
@@ -9730,6 +9773,7 @@ def _callback(
     init: bool = False,
     face_joins=None,
     compile_tuple=None,
+    actor_replaced=None,
 ):
     """THE PLAN LOG'S LAST GUARANTEE: a counted terminal is a record.
 
@@ -9753,8 +9797,10 @@ def _callback(
         return _callback_measured(
             config, args, consts, order, sparsity_specs, face_specs,
             face_skips, stop, *eval_samples, init=init, face_joins=face_joins,
-            compile_tuple=compile_tuple)
+            compile_tuple=compile_tuple, actor_replaced=actor_replaced)
     except BaseException as _exc:
+        if is_cuda_poison_error(_exc):
+            raise
         # Owner ruling 2026-09-24 Q42: a raise inside the terminal
         # measurement is a refused plan and is scored; an apparatus fault
         # and a raise before the measurement began still propagate.
@@ -9813,6 +9859,7 @@ def _callback_measured(
     init: bool = False,
     face_joins=None,
     compile_tuple=None,
+    actor_replaced=None,
 ):
     """Stage A reward harness: returns `(tokens, rewards)` where `rewards` is
     the canonical `(NUM_REWARDS,)` float32 vector documented at the top of this
@@ -9833,6 +9880,8 @@ def _callback_measured(
     _PLAN_CARRY[0] = None
     _PLAN_CARRY_BYTES[0] = None
     _PLAN_COMPILE.clear()
+    if actor_replaced is not None:
+        _PLAN_COMPILE["actor_replaced"] = str(actor_replaced)
     partial_order, partial_specs = _get_partials(order, sparsity_specs, stop)
     is_terminal = int(stop) >= len(order)
     # SPARSITY (reward slot 10). Read ONCE per callback, like `_fid_on`
@@ -10786,6 +10835,10 @@ def _callback_measured(
         except MeasureToolchainFault:
             raise
         except Exception as _exc:
+            if is_cuda_poison_error(_exc):
+                raise CudaContextPoisoned(
+                    f"the reference ({_ref_kind}) compile hit a poisoned CUDA context: {_exc}",
+                    exc=_exc) from _exc
             raise ReferenceFault(
                 f"the reference ({_ref_kind}) could not be compiled, so no "
                 f"plan can be scored: {type(_exc).__name__}: "
@@ -10920,6 +10973,10 @@ def _callback_measured(
             except MeasureToolchainFault:
                 raise
             except Exception as _exc:
+                if is_cuda_poison_error(_exc):
+                    raise CudaContextPoisoned(
+                        f"the reference ({_ref_kind}) could not be measured: {_exc}",
+                        exc=_exc) from _exc
                 raise ReferenceFault(
                     f"the reference ({_ref_kind}) could not be measured, so "
                     f"the refused plan cannot be scored: "
@@ -11052,6 +11109,8 @@ def _callback_measured(
         _c_note = _LAST_COMPILE_NOTE[0] or {"used": None, "tried": []}
         _PLAN_COMPILE.update(compile_options=_c_note["used"],
                              compile_options_tried=_c_note["tried"])
+        if is_cuda_poison_error(_exc):
+            raise CudaContextPoisoned(str(_exc), tried=_c_note.get("tried"), exc=_exc) from _exc
         if _is_graphax_trace_failure(_exc):
             return _trace_truncate("approx compile", _exc, None)
         if _is_oom(_exc):
@@ -11780,6 +11839,8 @@ def _callback_measured(
     except Exception as _exc:
         if isinstance(_exc, MeasureToolchainFault):
             raise
+        if is_cuda_poison_error(_exc):
+            raise CudaContextPoisoned(str(_exc), exc=_exc) from _exc
         if _is_graphax_trace_failure(_exc):
             return _trace_truncate("measurement", _exc, compiled_cost)
         if not _is_oom(_exc):

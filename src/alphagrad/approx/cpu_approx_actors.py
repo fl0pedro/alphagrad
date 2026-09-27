@@ -266,6 +266,8 @@ class CpuApproximationActor:
         refuse: str | None = None,
         refuse_static: Any = None,
         static_to: Any = None,
+        compile_tuple: Any = None,
+        actor_replaced: Any = None,
     ):
         # ``rule`` IS THE GRAPH THIS PLAN WAS ACTED ON (owner ruling
         # 2026-09-22). A run that alternates sends it on every dispatch and
@@ -309,6 +311,7 @@ class CpuApproximationActor:
             face_specs=face_specs, face_skips=face_skips,
             episode=episode, env_row=env_row, timeout_s=timeout_s,
             refuse=refuse, refuse_static=refuse_static, static_to=static_to,
+            compile_tuple=compile_tuple, actor_replaced=actor_replaced,
         )
 
     def _server(self, rule: str | None):

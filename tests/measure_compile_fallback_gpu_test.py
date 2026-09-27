@@ -13,13 +13,13 @@ _GOLDEN = os.path.join(os.path.dirname(__file__), "golden")
 # class: (record, example, ALPHAGRAD_NN_BATCH, the tuple that compiles it, the live options' error)
 _CASES = {
     "verify": ("compile_fallback_tlm_b1_verify_plan.json", "TransformerLM",
-               "-", (1, 0), "Failed to verify Triton module"),
+               "-", (1, 0, 0, 0), "Failed to verify Triton module"),
     "shmem": ("compile_fallback_tlm_b1_shmem_plan.json", "TransformerLM",
-              "-", (1, 0), "Shared memory size limit exceeded"),
+              "-", (1, 0, 0, 0), "Shared memory size limit exceeded"),
     "tkernel": ("compile_fallback_tlm_b1_tkernel_plan.json", "TransformerLM",
-                "-", (1, 0), "Failed to compile Triton kernel"),
+                "-", (1, 0, 0, 0), "Failed to compile Triton kernel"),
     "ptxas": ("compile_fallback_tlm_b4_ptxas_plan.json",
-              "VmappedTransformerLM", "4", (1, 1),
+              "VmappedTransformerLM", "4", (1, 1, 0, 0),
               "ptxas exited with non-zero error code 139"),
 }
 

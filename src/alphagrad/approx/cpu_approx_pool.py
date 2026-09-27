@@ -152,6 +152,20 @@ def _sentinel_callback_output(
     return tokens, eqn_ids, reward
 
 
+def is_cuda_poison_error(exc: BaseException) -> bool:
+    """True for sticky CUDA errors that leave the process CUDA context unusable."""
+    txt = f"{type(exc).__name__}: {exc}"
+    return any(sig in txt for sig in (
+        "CUDA_ERROR_ILLEGAL_ADDRESS",
+        "illegal memory access",
+        "CUDA_ERROR_LAUNCH_FAILED",
+        "CUDA_ERROR_HARDWARE_STACK_ERROR",
+        "CUDA_ERROR_ILLEGAL_INSTRUCTION",
+        "CUDA_ERROR_MISALIGNED_ADDRESS",
+        "CudaContextPoisoned",
+    ))
+
+
 def _is_toolchain_fault(exc: BaseException) -> bool:
     """True for env.MeasureToolchainFault, however Ray wrapped it."""
     try:
@@ -811,6 +825,8 @@ class CpuApproxPool:
         rule: str | None = None,
         refuse: str | None = None,
         refuse_static: Any = None,
+        compile_tuple: Any = None,
+        actor_replaced: str | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Dispatch one ``(order, specs, step)`` request to a pool
         actor and return ``(tokens, eqn_ids, reward)`` as numpy arrays.
@@ -909,6 +925,8 @@ class CpuApproxPool:
                 refuse_static=(None if refuse_static is None
                                else [float(x) for x in refuse_static]),
                 static_to=static_to,
+                compile_tuple=compile_tuple,
+                actor_replaced=actor_replaced,
             )
             # An actor runs calls in send order: the flag of the call above.
             flag = actor.pop_oom_flag.remote()
@@ -984,6 +1002,43 @@ class CpuApproxPool:
                     face_skips=face_skips, reward=_sv[-1])
             return _sv
         except Exception as _exc:
+            if is_cuda_poison_error(_exc):
+                self._n_actor_errors += 1
+                print(
+                    f"[POOL] cuda-poison error step={int(step)}: {_exc}; "
+                    f"replacing actor and retrying plan with fallback options",
+                    flush=True,
+                )
+                fresh = self._recycle_actor(actor)
+                if compile_tuple is not None:
+                    # Already retried with fallback options! Score as refused plan.
+                    print(f"[POOL] plan step={int(step)} failed fallback retry too; scoring as refused plan", flush=True)
+                    if fresh is not None:
+                        self._put_back(fresh)
+                    _sv = _sentinel_callback_output(
+                        self._max_tokens, self._num_rewards, self._cosine_sim_idx,
+                        self._frob_residual_idx, self._fidelity_idx, self._sparsity_idx,
+                        self._token_dtype, self._eqn_dtype, self._emit_eqn_ids,
+                    )
+                    return _sv
+                if fresh is not None:
+                    try:
+                        return self.evaluate(
+                            order_np, specs_np, step, eval_samples, init=init,
+                            face_specs=face_specs, face_skips=face_skips,
+                            episode=episode, env_row=env_row, rule=rule,
+                            refuse=refuse, refuse_static=refuse_static,
+                            compile_tuple=(0, 0, 1, 1),
+                            actor_replaced="cuda_illegal_address",
+                        )
+                    except Exception as _retry_exc:
+                        print(f"[POOL] fallback retry failed on fresh actor: {_retry_exc}; scoring as refused plan", flush=True)
+                _sv = _sentinel_callback_output(
+                    self._max_tokens, self._num_rewards, self._cosine_sim_idx,
+                    self._frob_residual_idx, self._fidelity_idx, self._sparsity_idx,
+                    self._token_dtype, self._eqn_dtype, self._emit_eqn_ids,
+                )
+                return _sv
             # Apparatus faults stop the run, as in evaluate_batch (Q53).
             if _is_toolchain_fault(_exc) or isinstance(_exc, ActorStartRefused):
                 raise
@@ -1303,6 +1358,9 @@ class CpuApproxPool:
         # The slots the deadline killed, waiting for a free actor to score them as "deadline" (dsnn-dfw.292).
         redo: collections.deque = collections.deque()
         rescoring: set = set()
+        # The slots that hit a sticky CUDA error, waiting for a fresh actor to retry with fallback options.
+        retry_fallback: collections.deque = collections.deque()
+        in_retry_fallback: set = set()
         # dsnn-dfw.302: the token of each terminal slot, and the static bytes a killed slot reported.
         tokens: dict = {}
         redo_static: dict = {}
@@ -1330,7 +1388,9 @@ class CpuApproxPool:
                 reward=rewards_out[i])
 
         def _dispatch(j: int, i: int, refuse: str | None = None,
-                      refuse_static: Any = None) -> None:
+                      refuse_static: Any = None,
+                      compile_tuple: Any = None,
+                      actor_replaced: str | None = None) -> None:
             actor = held[j]
             self._n_calls += 1
             if refuse is not None:
@@ -1368,6 +1428,8 @@ class CpuApproxPool:
                     refuse_static=(None if refuse_static is None
                                    else [float(x) for x in refuse_static]),
                     static_to=_rep,
+                    compile_tuple=compile_tuple,
+                    actor_replaced=actor_replaced,
                 )
                 # An actor runs calls in send order: the flag of this call.
                 flags[i] = actor.pop_oom_flag.remote()
@@ -1486,6 +1548,31 @@ class CpuApproxPool:
                 if i in rescoring:
                     _unscored(i, "its scoring actor died")
             except Exception as _exc:
+                if is_cuda_poison_error(_exc):
+                    self._n_actor_errors += 1
+                    print(
+                        f"[POOL] batch cuda-poison error slot={i} "
+                        f"step={int(step_batch[i])}: {_exc}; "
+                        f"replacing actor and retrying slot with fallback options",
+                        flush=True,
+                    )
+                    fresh = self._recycle_actor(actor)
+                    held[j] = fresh
+                    takes.pop(i, None)
+                    flags.pop(i, None)
+                    if i in in_retry_fallback:
+                        print(f"[POOL] slot={i} failed fallback retry too; scoring as refused plan", flush=True)
+                        _sentinel_slot(i)
+                        if fresh is not None:
+                            free.append(j)
+                        return
+                    in_retry_fallback.add(i)
+                    if fresh is not None:
+                        free.append(j)
+                        retry_fallback.append(i)
+                    else:
+                        _sentinel_slot(i)
+                    return
                 # The actor's measure toolchain gate fired (finding 03).
                 # Ray re-raises the actor's exception as a RayTaskError
                 # that is ALSO an instance of the original class; the
@@ -1515,10 +1602,14 @@ class CpuApproxPool:
                 if i in rescoring:
                     _unscored(i, "its scoring call raised")
 
-        while nxt < N or redo or pending:
-            while (redo or nxt < N) and (free or _adopt()):
+        while nxt < N or redo or retry_fallback or pending:
+            while (retry_fallback or redo or nxt < N) and (free or _adopt()):
                 j = free.popleft()
-                if redo:
+                if retry_fallback:
+                    k = retry_fallback.popleft()
+                    _dispatch(j, k, compile_tuple=(0, 0, 1, 1),
+                              actor_replaced="cuda_illegal_address")
+                elif redo:
                     k = redo.popleft()
                     _dispatch(j, k, refuse="deadline",
                               refuse_static=redo_static.pop(k, None))
@@ -1526,7 +1617,7 @@ class CpuApproxPool:
                     _dispatch(j, nxt)
                     nxt += 1
             if not pending:
-                if redo and self._await_actor(self._deadline()):
+                if (retry_fallback or redo) and self._await_actor(self._deadline()):
                     continue
                 # Every actor of the batch is dead and nothing is in flight.
                 for i in range(nxt, N):
@@ -1536,6 +1627,9 @@ class CpuApproxPool:
                         flush=True,
                     )
                     _sentinel_slot(i)
+                for i in retry_fallback:
+                    _sentinel_slot(i)
+                retry_fallback.clear()
                 for i in redo:
                     _unscored(i, "no live actor")
                 redo.clear()

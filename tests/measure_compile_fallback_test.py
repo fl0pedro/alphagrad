@@ -110,11 +110,14 @@ def test_fallback_turns_off_the_triton_softmax_rewriter():
 def test_the_allowed_list_and_its_try_order():
     assert env_mod.measure_compile_layout() == [
         "xla_disable_hlo_passes=triton-softmax-rewriter",
-        "xla_gpu_disable_gpuasm_optimizations=True"]
-    assert _LIVE == (0, 0)
-    assert _TRY == ((1, 0), (1, 1))
+        "xla_gpu_disable_gpuasm_optimizations=True",
+        "xla_gpu_autotune_level=0",
+        "xla_gpu_enable_triton_gemm=False",
+    ]
+    assert _LIVE == (0, 0, 0, 0)
+    assert _TRY == ((1, 0, 0, 0), (1, 1, 0, 0), (0, 0, 1, 1), (1, 1, 1, 1))
     assert env_mod.measure_compile_options(_LIVE) is None
-    for bad in ((1,), (1, 0, 0), (2, 0)):
+    for bad in ((1,), (1, 0, 0), (2, 0, 0, 0)):
         with pytest.raises(ValueError, match="allowed list"):
             env_mod.measure_compile_options(bad)
 
@@ -123,12 +126,20 @@ def test_a_tuple_sets_only_its_own_entries_no_live_options():
     """Owner ruling 2026-09-26, Q5 b: no live options, so an allowed tuple's
     entries are the whole compiler_options dict, not additions on top of a
     base one."""
-    assert env_mod.measure_compile_options((0, 0)) is None
-    assert env_mod.measure_compile_options((1, 0)) == {
+    assert env_mod.measure_compile_options((0, 0, 0, 0)) is None
+    assert env_mod.measure_compile_options((1, 0, 0, 0)) == {
         "xla_disable_hlo_passes": "triton-softmax-rewriter"}
-    assert env_mod.measure_compile_options((1, 1)) == {
+    assert env_mod.measure_compile_options((1, 1, 0, 0)) == {
         "xla_disable_hlo_passes": "triton-softmax-rewriter",
         "xla_gpu_disable_gpuasm_optimizations": True}
+    assert env_mod.measure_compile_options((0, 0, 1, 1)) == {
+        "xla_gpu_autotune_level": 0,
+        "xla_gpu_enable_triton_gemm": False}
+    assert env_mod.measure_compile_options((1, 1, 1, 1)) == {
+        "xla_disable_hlo_passes": "triton-softmax-rewriter",
+        "xla_gpu_disable_gpuasm_optimizations": True,
+        "xla_gpu_autotune_level": 0,
+        "xla_gpu_enable_triton_gemm": False}
 
 
 class _OnlyWith:
@@ -374,5 +385,41 @@ def test_probe_bypasses_the_persistent_compile_cache():
     # no write: two probes added NOTHING to the persistent cache...
     assert res["added_by_probe"] == [], res["added_by_probe"]
     # ...while an ordinary compile in the same process DID write, so the
-    # cache was live and the silence above is the probe's doing.
     assert len(res["added_by_control"]) == 1, res["added_by_control"]
+
+
+def test_cuda_illegal_address_raises_cuda_context_poisoned():
+    msg = (
+        "INTERNAL: Autotuning failed for HLO: %gemm_fusion_dot.15 = f32[1,200704]{1,0} "
+        "Failed to profile configs: CUDA error: Failed to enqueue async memset operation: "
+        "CUDA_ERROR_ILLEGAL_ADDRESS: an illegal memory access was encountered"
+    )
+    lo = _Lowered(msg)
+    with pytest.raises(env_mod.CudaContextPoisoned) as exc_info:
+        env_mod._compile_measure(lo)
+    assert len(lo.calls) == 1
+    assert "CUDA_ERROR_ILLEGAL_ADDRESS" in str(exc_info.value)
+    assert env_mod._LAST_COMPILE_NOTE[0]["used"] is None
+    assert env_mod._LAST_COMPILE_NOTE[0]["tried"] == [list(_LIVE)]
+
+
+def test_blanket_fallback_tuple_compiles_with_autotune0_and_triton_gemm_off():
+    want_opts = env_mod.measure_compile_options(env_mod.MEASURE_COMPILE_FALLBACK_BLANKET)
+    assert want_opts == {
+        "xla_gpu_autotune_level": 0,
+        "xla_gpu_enable_triton_gemm": False,
+    }
+    lo = _OnlyWith(want_opts)
+    assert env_mod._compile_measure(lo, compile_tuple=env_mod.MEASURE_COMPILE_FALLBACK_BLANKET) == "EXE"
+    assert lo.calls == [want_opts]
+    assert env_mod._LAST_COMPILE_NOTE[0]["used"] == list(env_mod.MEASURE_COMPILE_FALLBACK_BLANKET)
+
+
+def test_is_cuda_poison_error_signatures():
+    assert env_mod.is_cuda_poison_error(RuntimeError("CUDA_ERROR_ILLEGAL_ADDRESS"))
+    assert env_mod.is_cuda_poison_error(RuntimeError("an illegal memory access was encountered"))
+    assert env_mod.is_cuda_poison_error(RuntimeError("CUDA_ERROR_LAUNCH_FAILED"))
+    assert env_mod.is_cuda_poison_error(env_mod.CudaContextPoisoned("poisoned"))
+    assert not env_mod.is_cuda_poison_error(RuntimeError("INTERNAL: ptxas exit 139"))
+    assert not env_mod.is_cuda_poison_error(MemoryError("OOM"))
+

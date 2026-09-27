@@ -227,6 +227,8 @@ class CpuApproximationServer:
         refuse: str | None = None,
         refuse_static: Any = None,
         static_to: Any = None,
+        compile_tuple: Any = None,
+        actor_replaced: Any = None,
     ):
         """Run the per-step reward pipeline once.
 
@@ -355,6 +357,8 @@ class CpuApproximationServer:
                 int(step),
                 *es,
                 init=bool(init),
+                compile_tuple=compile_tuple,
+                actor_replaced=actor_replaced,
             )
             self._n_calls += 1
             self._maybe_print_profile()
@@ -369,8 +373,9 @@ class CpuApproximationServer:
             # A broken link toolchain on this node is not a bad action: a
             # sentinel here would let the run continue measuring nothing (or
             # degraded executables) while exiting 0 -- finding 03. Escalate.
-            from alphagrad.approx.env import MeasureToolchainFault
-            if isinstance(exc, MeasureToolchainFault):
+            # A poisoned CUDA context must also escalate so the pool replaces the actor.
+            from alphagrad.approx.env import MeasureToolchainFault, is_cuda_poison_error
+            if isinstance(exc, MeasureToolchainFault) or is_cuda_poison_error(exc):
                 raise
             # graphax can raise on transforms that produce shape-incompatible
             # edges (e.g. a DIAG whose factor doesn't divide some primal axis,
