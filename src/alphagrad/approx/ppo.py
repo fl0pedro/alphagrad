@@ -15069,7 +15069,10 @@ def main(args=None, *, readout_checkpoint=None, readout_out=None,
     # training curve across two panels with no way to tell from the data.
     # Empty when wandb is disabled, or when the checkpoint has no id.
     # A READOUT OF A CHECKPOINT ATTACHES THE SAME WAY (dsnn-dfw.291), so the
-    # readout lands in the summary of the run it reads out.
+    # readout lands in the summary of the run it reads out. It hands wandb no
+    # config when it attaches: the run keeps the configuration it trained
+    # under, and the readout's build, its oracle switch and its --readout do
+    # not overwrite the run's own.
     _wandb_resume = {}
     _attach_meta = (_RESUME_META if _RESUME_META is not None
                     else _READOUT_META)
@@ -15082,7 +15085,7 @@ def main(args=None, *, readout_checkpoint=None, readout_out=None,
         project=getattr(args, "wandb_project", None) or "dsnn-vertex",
         entity=getattr(args, "wandb_entity", None) or None,
         name=args.name,
-        config=_wandb_config,
+        config=(None if _READOUT_PATH and _wandb_resume else _wandb_config),
         mode="disabled" if args.wandb == "disabled" else args.wandb,
         **_wandb_resume,
     )
