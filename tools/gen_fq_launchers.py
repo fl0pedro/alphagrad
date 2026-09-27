@@ -9,11 +9,15 @@ edit-a-file-by-hand failures.  Here the SHARED stack exists exactly once, each
 arm is a dict of DIFFERENCES from it, and regenerating is the only supported
 way to change a launcher.
 
-    python3 tools/gen_fq_launchers.py --out ~/dsnn            # write
-    python3 tools/gen_fq_launchers.py --out ~/dsnn --check    # diff only
-    python3 tools/gen_fq_launchers.py --dry-run --out /Scratch/.../t43_launchers \
-                                      --against ~/dsnn        # write OUTSIDE the
+    python3 tools/gen_fq_launchers.py --stack DIR --out ~/dsnn            # write
+    python3 tools/gen_fq_launchers.py --stack DIR --out ~/dsnn --check    # diff only
+    python3 tools/gen_fq_launchers.py --stack DIR --dry-run \
+            --out /Scratch/.../t43_launchers --against ~/dsnn  # write OUTSIDE the
                                       # tree, diff against the tree, touch nothing
+
+--stack is REQUIRED and has no default (owner ruling 2026-09-27): DIR holds
+the alphagrad/ and graphax/ checkouts, and every launcher names it (see THE
+STACK below).  --out is where the launchers go, so a playground keeps its own.
 
 Every emitted file is `bash -n` checked before it is written (a previous bulk
 edit silently uncommented ~40 launchers; syntax is verified, never eyeballed).
@@ -38,6 +42,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -59,28 +64,83 @@ REPO = "/Users/assmuth/dsnn/alphagrad"
 HOME_DSNN = "/Users/assmuth/dsnn"
 
 # ---------------------------------------------------------------------------
-# THE CAMPAIGN STACK (finding 57).  The pgi15 GPU nodes mount NO home
-# directory (/Users/assmuth is ENOENT on gpu15..20 and cpu2); /Scratch is the
-# one writable filesystem every node and the head share.  So no launcher
+# THE STACK (finding 57).  The pgi15 GPU nodes mount NO home directory
+# (/Users/assmuth is ENOENT on gpu15..20 and cpu2); /Scratch is the one
+# writable filesystem every node and the head share.  So no launcher
 # generated here -- campaign arm or wave arm alike -- `cd`s to ~/dsnn/alphagrad
 # or runs `uv run`: every one of them runs the relocated venv of finding 57
-# against alphagrad/graphax worktrees staged under CAMPAIGN_STACK, with a
-# node-local $HOME that receives the two wandb credential files.  The
-# pre-flight refuses (exit 66) when any of these is missing.  Moved above
-# REPO/HOME_DSNN (owner ruling 2026-09-14, ticket dsnn-3qm.45.wave): the wave
-# 0-4 arms and fq_face_attrib used to `cd ~/dsnn/alphagrad` too, back when
-# that checkout was current; it is now 281 commits stale AND the home export
-# it lives on is read-only, so every arm moved onto this stack instead.  The
-# owner stages the stack once per campaign commit:
-#   git -C ~/dsnn/alphagrad worktree add --detach CAMPAIGN_STACK/alphagrad <sha>
-#   git -C ~/dsnn/graphax   worktree add --detach CAMPAIGN_STACK/graphax   <sha>
+# against alphagrad/graphax worktrees staged under a STACK directory on
+# /Scratch, with a node-local $HOME that receives the two wandb credential
+# files.  The pre-flight refuses (exit 66) when any of these is missing.
+# Moved above REPO/HOME_DSNN (owner ruling 2026-09-14, ticket
+# dsnn-3qm.45.wave): the wave 0-4 arms and fq_face_attrib used to `cd
+# ~/dsnn/alphagrad` too, back when that checkout was current; it is now 281
+# commits stale AND the home export it lives on is read-only, so every arm
+# moved onto the stack instead.
+#
+# THE STACK IS AN INPUT (owner ruling 2026-09-27): each launcher names its own
+# code.  The stack used to be RETIRED_STACK below, two symlinks that agents
+# repointed at a different staged directory for each batch (mrg/s93,
+# mrg/blockprep/stack, mrg/rtrlrerun2, mrg/stack-b8), so what a launcher ran
+# was whatever the links said when its job started.  `--stack DIR` is now
+# required at generation and has no default, and DIR is written into every
+# launcher: -D, cd, PYTHONPATH, the pre-flight and the provenance lines.
+# `render` refuses without it.  A stack is staged once per commit:
+#   git -C ~/dsnn/alphagrad worktree add --detach DIR/alphagrad <sha>
+#   git -C ~/dsnn/graphax   worktree add --detach DIR/graphax   <sha>
+#
+# THE RUN TREE (the same ruling).  A launcher `cd`s into DIR/alphagrad, and
+# wandb puts its run directories under the working directory unless WANDB_DIR
+# says otherwise, so the runs used to land in the stack's own checkout.  Every
+# launcher exports WANDB_DIR=CAMPAIGN_WANDB_DIR, so every run directory -- and
+# the plan log, the front dumps, the checkpoints and auto_stop.json in it
+# (common/checkpoint.run_directory) -- lands in CAMPAIGN_WANDB_RUNS, beside
+# the slurm logs, whatever stack ran it.
 # ---------------------------------------------------------------------------
 CAMPAIGN_ROOT = "/Scratch/assmuth/campaign"
-CAMPAIGN_STACK = f"{CAMPAIGN_ROOT}/stack"
 CAMPAIGN_RUNS = f"{CAMPAIGN_ROOT}/runs"
+CAMPAIGN_WANDB_DIR = CAMPAIGN_RUNS                     # WANDB_DIR of every launcher
+CAMPAIGN_WANDB_RUNS = f"{CAMPAIGN_WANDB_DIR}/wandb"    # where wandb puts run-*/
 CAMPAIGN_PY = "/Scratch/assmuth/t57/stack/venv/bin/python"
 CAMPAIGN_WANDB_HOME = "/Scratch/assmuth/t57/home"     # .netrc + .config/wandb
 CAMPAIGN_CACHE = "/Scratch/assmuth/mrg/cache"          # dsnn_wikitext, dsnn_mnist, dsnn_shd
+#: The retired symlinks.  `check_stack` refuses a stack whose path contains
+#: this one, so no launcher can name it again.
+RETIRED_STACK = f"{CAMPAIGN_ROOT}/stack"
+#: A stack is written into the launcher unquoted (#SBATCH -D takes no quotes),
+#: so it is an absolute path of plain characters.
+_STACK_PATH = re.compile(r"/[A-Za-z0-9._+/-]+")
+
+
+class StackError(ValueError):
+    """The stack a launcher is rendered for is missing or unusable."""
+
+
+def check_stack(stack: str | None) -> str:
+    """The stack directory a launcher runs, normalised; else StackError.
+
+    The stack holds the `alphagrad/` and `graphax/` checkouts (owner ruling
+    2026-09-27).  It has no default, and a path containing RETIRED_STACK is
+    refused: that is the symlink pair the ruling retired.
+    """
+    if not stack:
+        raise StackError(
+            "no stack: every launcher names the directory holding the "
+            "alphagrad/ and graphax/ checkouts it runs (owner ruling "
+            "2026-09-27).  Pass --stack DIR, e.g. --stack "
+            "/Scratch/assmuth/mrg/stack-b8; there is no default.")
+    path = os.path.normpath(stack)
+    if not _STACK_PATH.fullmatch(path):
+        raise StackError(
+            f"--stack {stack!r} is not an absolute path of letters, digits "
+            f"and . _ + - /; the launcher writes it unquoted (#SBATCH -D, cd, "
+            f"PYTHONPATH).")
+    if RETIRED_STACK in path:
+        raise StackError(
+            f"--stack {stack!r} names {RETIRED_STACK}, the symlinks that were "
+            f"repointed for each batch (owner ruling 2026-09-27: a monkey "
+            f"patch).  Name the staged directory itself.")
+    return path
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(os.path.dirname(_HERE), "src")
@@ -152,8 +212,11 @@ FACE_HEAD_WIDTH, FACE_QUANT_DTYPES = _face_head_geometry(APPROX_ADD)
 # (sha256 cb7c7667bcbd588b, the blob those rows are stamped with), graphax
 # 4ea0bf8 -- which is recorded in UNBIASED_PARETO_AND_MEASUREMENT.md.  They are
 # loss_drop rows and are NOT comparable with anything this arm produces.
+#
+# @AG_REPO@ is the alphagrad checkout of the stack a launcher is rendered for;
+# `render` resolves it, and @GX_REPO@ beside it (THE STACK, above).
 # ---------------------------------------------------------------------------
-LANDSCAPE_TOOL = f"{CAMPAIGN_STACK}/alphagrad/src/alphagrad/approx/tools/landscape_map.py"
+LANDSCAPE_TOOL = "@AG_REPO@/src/alphagrad/approx/tools/landscape_map.py"
 
 # GATE G1 (ticket .45) reads the sweep winners from a table that depends on
 # the arm's ELIMINATION ORDER: a plan applied at vertex v on the Markowitz
@@ -352,7 +415,8 @@ _DELETE = _Delete()
 SHARED_ENV = [
     ("RAY_TMPDIR", "/tmp/ray_$SLURM_JOB_ID"),
     ("PATH", '"$HOME/.local/bin:$PATH"'),
-    ("PYTHONPATH", f'"{CAMPAIGN_STACK}/graphax/src:{CAMPAIGN_STACK}/alphagrad/src"'),
+    # The stack's two checkouts, resolved by `render` (THE STACK, above).
+    ("PYTHONPATH", '"@GX_REPO@/src:@AG_REPO@/src"'),
     ("PYTHONDONTWRITEBYTECODE", "1"),
     # NO XLA FLAGS, and no preallocation switch (owner ruling 2026-09-12 on
     # ticket .43): the arms measure with temp memory, so a preallocation
@@ -1658,7 +1722,8 @@ NO_FLAG_ENV = [
 
 STACK_ENV_NAMES = ("HOME", "PYTHONPATH", "DSNN_WIKITEXT_DIR", "DSNN_MNIST_DIR",
                    "DSNN_SHD_DIR",  # a row thesis_arm emits (dsnn-dfw.264)
-                   "PATH")   # PATH: the measure toolchain block (finding 03)
+                   "PATH",   # PATH: the measure toolchain block (finding 03)
+                   "WANDB_DIR")  # the run tree (owner ruling 2026-09-27)
 
 #: Every `export NAME=` a campaign launcher may contain.  The test derives the
 #: rendered set and asserts equality with this one.
@@ -5175,7 +5240,8 @@ NOTE="ag=$AG_SHA gx=$GX_SHA live tool=$(sha256sum $TOOL | cut -c1-8)"
 # well, so pooling is prevented twice.)
 OUT=@OUT_ROOT@/run_analysis/landscape_gradcos
 mkdir -p $OUT
-W=@AG_REPO@/wandb
+# The run tree (WANDB_DIR, owner ruling 2026-09-27), not the stack's checkout.
+W=@WANDB_RUNS@
 ARCH="--archive v57=$W/run-20260817_113827-it05ku34/files/pareto_front.json \
  --archive v60=$W/run-20260817_181647-ygm8n2jy/files/pareto_front.json \
  --archive v63=$W/run-20260822_165942-as9s5yrl/files/pareto_front.json \
@@ -5232,9 +5298,9 @@ echo "=========================================================="
 echo "FACE ATTRIBUTION DONE $(date). alphagrad $AG_SHA graphax $GX_SHA"
 ls -la $OUT
 echo "=========================================================="
-""".replace("@TOOL@", LANDSCAPE_TOOL).replace("@AG_REPO@", f"{CAMPAIGN_STACK}/alphagrad") \
-   .replace("@GX_REPO@", f"{CAMPAIGN_STACK}/graphax").replace("@OUT_ROOT@", CAMPAIGN_ROOT) \
-   .replace("@APPROX_ADD@", APPROX_ADD)
+""".replace("@TOOL@", LANDSCAPE_TOOL).replace("@WANDB_RUNS@", CAMPAIGN_WANDB_RUNS) \
+   .replace("@OUT_ROOT@", CAMPAIGN_ROOT).replace("@APPROX_ADD@", APPROX_ADD)
+# @AG_REPO@ and @GX_REPO@ stay: `render` resolves them for its stack.
 
 
 arm(
@@ -5416,38 +5482,44 @@ def is_scratch(a: dict) -> bool:
 
 def _python(a: dict) -> str:
     """The interpreter invocation of this arm's runtime.  Every arm -- wave,
-    cpu, tool or campaign -- runs the campaign stack's venv now (owner ruling
+    cpu, tool or campaign -- runs the campaign venv now (owner ruling
     2026-09-14): $HOME/dsnn is 281 commits stale and the export it lives on
     is read-only.  `$PY` is bound by `_stack_exists_check` below."""
     return "$PY"
 
 
-def _repo_paths(a: dict) -> tuple[str, str]:
-    """(alphagrad checkout, graphax checkout) the launcher runs against.
+def _repo_paths(stack: str) -> tuple[str, str]:
+    """(alphagrad checkout, graphax checkout) of the stack a launcher runs.
 
-    Every arm runs the same staged worktrees under CAMPAIGN_STACK (owner
-    ruling 2026-09-14); there is no longer a second, ~/dsnn-rooted tree."""
-    return f"{CAMPAIGN_STACK}/alphagrad", f"{CAMPAIGN_STACK}/graphax"
+    Every arm runs the worktrees staged under the stack it is rendered for
+    (owner rulings 2026-09-14 and 2026-09-27); there is no ~/dsnn-rooted tree
+    and no default stack."""
+    return f"{stack}/alphagrad", f"{stack}/graphax"
 
 
-def _stack_exists_check() -> list[str]:
-    """ABORT(66) if the campaign stack (finding 57) is not staged, then bind
-    a node-local $HOME carrying the wandb credentials.  Every arm now runs
-    from CAMPAIGN_STACK (owner ruling 2026-09-14: the wave 0-4 arms and
-    fq_face_attrib used to `cd ~/dsnn/alphagrad`, but that checkout is 281
-    commits stale and the home export it lives on is read-only), so this is
-    shared by the campaign arms and the wave/cpu/tool arms alike."""
+def _stack_exists_check(stack: str) -> list[str]:
+    """Name the stack, ABORT(66) if it (finding 57) is not staged, then bind
+    a node-local $HOME carrying the wandb credentials and point wandb's run
+    tree at CAMPAIGN_WANDB_DIR.  Every arm runs from its stack (owner rulings
+    2026-09-14 and 2026-09-27: the wave 0-4 arms and fq_face_attrib used to
+    `cd ~/dsnn/alphagrad`, but that checkout is 281 commits stale and the
+    home export it lives on is read-only), so this is shared by the campaign
+    arms and the wave/cpu/tool arms alike."""
+    ag_repo, gx_repo = _repo_paths(stack)
     return [
         "# ---------------------- THE STACK (finding 57) ------------------------",
-        "# The pgi15 GPU nodes mount NO home directory; /Scratch is the one",
+        "# The code this job runs: the alphagrad and graphax checkouts of the",
+        "# stack it was generated for (--stack, owner ruling 2026-09-27).  The",
+        "# pgi15 GPU nodes mount NO home directory; /Scratch is the one",
         "# filesystem every node and the head share.  66 = the stack, the venv,",
         "# the data cache or the wandb credentials are not staged on it.",
+        f'echo "[cfg] stack {stack}"',
         f"PY={CAMPAIGN_PY}",
-        f'for P in "$PY" {CAMPAIGN_STACK}/alphagrad/src/alphagrad/approx/ppo.py \\',
-        f"         {CAMPAIGN_STACK}/graphax/src/graphax {CAMPAIGN_WANDB_HOME}/.netrc \\",
+        f'for P in "$PY" {ag_repo}/src/alphagrad/approx/ppo.py \\',
+        f"         {gx_repo}/src/graphax {CAMPAIGN_WANDB_HOME}/.netrc \\",
         f"         {CAMPAIGN_CACHE}/dsnn_wikitext; do",
-        '  [ -e "$P" ] || { echo "ABORT(66): $P does not exist -- stage the'
-        ' campaign stack (finding 57; CAMPAIGN_STACK in'
+        '  [ -e "$P" ] || { echo "ABORT(66): $P does not exist -- stage it'
+        ' (finding 57; the stack is the --stack of'
         ' tools/gen_fq_launchers.py) before submitting"; exit 66; }',
         "done",
         "# A node-local HOME with the two wandb credential files copied in",
@@ -5456,14 +5528,19 @@ def _stack_exists_check() -> list[str]:
         'mkdir -p "$HOME"',
         f'cp -r {CAMPAIGN_WANDB_HOME}/. "$HOME/"',
         'chmod 600 "$HOME/.netrc"',
+        "# THE RUN TREE (owner ruling 2026-09-27): wandb writes its run",
+        "# directories under $WANDB_DIR/wandb, never into the stack's checkout.",
+        f"export WANDB_DIR={CAMPAIGN_WANDB_DIR}",
     ]
 
 
-def _scratch_stack_block(target_env: dict | None = None,
+def _scratch_stack_block(stack: str, target_env: dict | None = None,
                          jax_cache: bool = True,
                          shd_dir: bool = False) -> list[str]:
     """The environment of a campaign arm: the stack, the plumbing, the TLM
     shape, the measurement vars, the no-flag knobs.  Nothing else.
+
+    ``stack`` is the directory of the two checkouts (THE STACK, above).
 
     ``target_env`` is the thesis matrix's one addition: the target-shape
     variable a NeuralNetwork arm needs at import time (THESIS_TARGET_ENV).
@@ -5473,12 +5550,13 @@ def _scratch_stack_block(target_env: dict | None = None,
     bound, which is rendered in its own block above the target shape.
     """
     target_env = dict(target_env or {})
-    L = _stack_exists_check() + [
-        f"export PYTHONPATH={CAMPAIGN_STACK}/graphax/src:{CAMPAIGN_STACK}/alphagrad/src",
+    ag_repo, gx_repo = _repo_paths(stack)
+    L = _stack_exists_check(stack) + [
+        f"export PYTHONPATH={gx_repo}/src:{ag_repo}/src",
         f"export DSNN_WIKITEXT_DIR={CAMPAIGN_CACHE}/dsnn_wikitext",
         f"export DSNN_MNIST_DIR={CAMPAIGN_CACHE}/dsnn_mnist",
     ] + ([f"export DSNN_SHD_DIR={CAMPAIGN_CACHE}/dsnn_shd"] if shd_dir else []) + [
-        f"cd {CAMPAIGN_STACK}/alphagrad",
+        f"cd {ag_repo}",
         "",
         "# ---------------------- THE ENVIRONMENT (args only) -------------------",
         "# Owner ruling 2026-09-13: every knob is an ARGUMENT.  Exported here:",
@@ -5554,12 +5632,26 @@ def _scratch_stack_block(target_env: dict | None = None,
     return L
 
 
-def render(a: dict) -> str:
+def render(a: dict, stack: str | None = None) -> str:
+    """The launcher of arm `a`, running the code of `stack`.
+
+    The stack is REQUIRED (owner ruling 2026-09-27): `check_stack` refuses a
+    missing, relative or retired one, so no launcher is rendered without
+    naming its code.  An arm's own text names the stack's two checkouts
+    @AG_REPO@ and @GX_REPO@; they are resolved here, once, for every arm.
+    """
+    stack = check_stack(stack)
+    ag_repo, gx_repo = _repo_paths(stack)
+    return (_render(a, stack)
+            .replace("@AG_REPO@", ag_repo).replace("@GX_REPO@", gx_repo))
+
+
+def _render(a: dict, stack: str) -> str:
     kind = a["kind"]
     gpus = a.get("gpus", 0)
     scratch = is_scratch(a)
     py = _python(a)
-    ag_repo, gx_repo = _repo_paths(a)
+    ag_repo, gx_repo = _repo_paths(stack)
     L = ["#!/bin/bash"]
     # The partition is keyed on the NODE, not the kind: pgi15-cpu1 is a
     # member only of the pgi15-cpu partition, never of pgi15 (a head node is
@@ -5598,10 +5690,11 @@ def render(a: dict) -> str:
         L.append("#SBATCH --dependency=singleton")
     # -D and -o on /Scratch, for every arm (owner ruling 2026-09-14): a
     # launcher whose -o names the missing/stale home fails at launch with
-    # ExitCode 0:53 (finding 57).  CAMPAIGN_RUNS must exist before sbatch
-    # (slurm opens the log first): the owner creates it once when staging
-    # the stack.
-    L.append(f"#SBATCH -D {CAMPAIGN_STACK}/alphagrad")
+    # ExitCode 0:53 (finding 57).  -D is the stack's own checkout (owner
+    # ruling 2026-09-27).  CAMPAIGN_RUNS must exist before sbatch (slurm
+    # opens the log first): the owner created it once, and it is also
+    # WANDB_DIR, the root of the run tree.
+    L.append(f"#SBATCH -D {ag_repo}")
     L.append(f"#SBATCH -o {CAMPAIGN_RUNS}/{a['name']}_%j.log")
     L.append("#")
     L.append("# " + "=" * 72)
@@ -5685,10 +5778,10 @@ def render(a: dict) -> str:
 
     if kind == "cpu" and not a.get("needs_tool"):
         L.append("export RAY_TMPDIR=/tmp/ray_$SLURM_JOB_ID")
-        L.extend(_stack_exists_check())
-        L.append(f"export PYTHONPATH={CAMPAIGN_STACK}/graphax/src:{CAMPAIGN_STACK}/alphagrad/src")
+        L.extend(_stack_exists_check(stack))
+        L.append(f"export PYTHONPATH={gx_repo}/src:{ag_repo}/src")
         L.append("export PYTHONDONTWRITEBYTECODE=1")
-        L.append(f"cd {CAMPAIGN_STACK}/alphagrad")
+        L.append(f"cd {ag_repo}")
         L.append("")
         L.append(_toolchain_block(kind, a["node"]))
         L.append("")
@@ -5717,15 +5810,15 @@ def render(a: dict) -> str:
                 f"{'set' if _jc else 'unset'}; a row without the JAX compile "
                 f"cache sets it, a row with the cache does not (dsnn-dfw.247)")
         L.extend(_scratch_stack_block(
-            a.get("env") or {}, jax_cache=a.get("jax_cache", True),
+            stack, a.get("env") or {}, jax_cache=a.get("jax_cache", True),
             shd_dir=bool(a.get("shd_dir", False))))
     else:
         # A wave/cpu/tool arm (owner ruling 2026-09-14): the same stack, the
         # same node-local $HOME for wandb, and the same ABORT(66) check as a
         # campaign arm, but its OWN per-arm environment -- not args-only.
         L.append("export RAY_TMPDIR=/tmp/ray_$SLURM_JOB_ID")
-        L.extend(_stack_exists_check())
-        L.append(f"cd {CAMPAIGN_STACK}/alphagrad")
+        L.extend(_stack_exists_check(stack))
+        L.append(f"cd {ag_repo}")
         over = a.get("env", {})
         for k, v in SHARED_ENV:
             if k == "RAY_TMPDIR":
@@ -5997,6 +6090,12 @@ def _diff(old: str | None, text: str, path: str) -> tuple[str, str]:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--stack", required=True, metavar="DIR",
+                    help="REQUIRED, no default (owner ruling 2026-09-27): the "
+                         "directory holding the alphagrad/ and graphax/ "
+                         "checkouts every launcher runs.  Each launcher names "
+                         "it (-D, cd, PYTHONPATH, the pre-flight) and echoes "
+                         "it at start.")
     ap.add_argument("--out", default=HOME_DSNN,
                     help="where the launchers are written (default: the tree)")
     ap.add_argument("--check", action="store_true",
@@ -6012,6 +6111,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="the tree a --dry-run diffs against (default: the tree)")
     ns = ap.parse_args(argv)
 
+    try:
+        stack = check_stack(ns.stack)
+    except StackError as exc:
+        raise SystemExit(str(exc)) from None
     if ns.check and ns.dry_run:
         raise SystemExit("--check and --dry-run are exclusive: --check writes "
                          "nothing, --dry-run writes outside the tree")
@@ -6029,7 +6132,7 @@ def main(argv: list[str] | None = None) -> int:
     summary: list[str] = []
     diffs: list[str] = []
     for a in ARMS:
-        text = render(a)
+        text = render(a, stack)
         fname = f"fq_{a['name']}.sbatch"
         path = os.path.join(out, fname)
         err = _bash_n(text)
@@ -6070,7 +6173,8 @@ def main(argv: list[str] | None = None) -> int:
         n_drift = sum(1 for s in summary if s.startswith("DRIFT"))
         n_ok = sum(1 for s in summary if s.startswith("ok"))
         head = (f"gen_fq_launchers --dry-run: {len(ARMS)} launchers rendered to "
-                f"{out}; against {against}: {n_ok} ok, {n_drift} DRIFT, "
+                f"{out} for the stack {stack}; against {against}: "
+                f"{n_ok} ok, {n_drift} DRIFT, "
                 f"{n_miss} MISSING; {sum(d.count(chr(10)) for d in diffs)} "
                 f"diff lines in DRIFT.diff")
         with open(os.path.join(out, "SUMMARY.txt"), "w") as fh:

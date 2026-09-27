@@ -62,6 +62,9 @@ import pytest
 
 _ALPHAGRAD = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _GEN = os.path.join(_ALPHAGRAD, "tools", "gen_fq_launchers.py")
+#: The stack every launcher here is rendered for: a generation-time input
+#: with no default (owner ruling 2026-09-27).
+STACK = "/Scratch/assmuth/mrg/test-stack"
 
 # THE OWNER'S NUMBERS, TYPED HERE ON PURPOSE.  A change to any of them must be
 # a deliberate edit in this file as well as in the generator; that is the
@@ -383,7 +386,7 @@ def test_only_the_first_block_is_submittable_the_rest_is_held(gen, matrix):
     # every defense row
     assert len(held) == 16 + 40 + 9 == 65
     for a in held:
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert "*** HELD" in text and "ABORT(73)" in text, a["name"]
     # every held CORE row is an A or B row at a seed other than the first
     core_held = [a for a in held if not a.get("thesis_rule")
@@ -406,7 +409,7 @@ def test_only_the_first_block_is_submittable_the_rest_is_held(gen, matrix):
 
 def test_every_thesis_arm_renders_to_valid_bash(gen, matrix, smoke):
     for a in matrix + smoke:
-        err = _bash_n(gen.render(a))
+        err = _bash_n(gen.render(a, STACK))
         assert err is None, (a["name"], err)
 
 
@@ -531,14 +534,14 @@ def test_dual_clip_reaches_every_row_thesis_arm_emits_and_no_other(gen,
     for a in matrix + smoke:
         cli = _cli(gen, a)
         assert cli["--dual-clip"] == DUAL_CLIP, a["name"]
-        assert f"--dual-clip {DUAL_CLIP}" in gen.render(a), a["name"]
+        assert f"--dual-clip {DUAL_CLIP}" in gen.render(a, STACK), a["name"]
     off = (gen.orderonly_arms() + gen.orderonly_rsnn_arms()
            + gen.orderonly_final_arms() + gen.orderonly_tlm_final_arms()
            + gen.sweepl_arms() + gen.sweepl2_arms() + gen.sweepl3_arms())
     assert off
     for a in off:
         assert "--dual-clip" not in _cli(gen, a), a["name"]
-        assert "--dual-clip" not in gen.render(a), a["name"]
+        assert "--dual-clip" not in gen.render(a, STACK), a["name"]
     # Layer 1 of a launcher greps ppo.py for every flag its OWN command line
     # uses, so the flag is named by the rows that pass it and by no other --
     # a running comparison's launcher does not change for a guard its row
@@ -567,14 +570,14 @@ def test_target_kl_reaches_every_row_thesis_arm_emits_and_no_other(gen,
     for a in matrix + smoke:
         cli = _cli(gen, a)
         assert cli["--target-kl"] == TARGET_KL, a["name"]
-        assert f"--target-kl {TARGET_KL}" in gen.render(a), a["name"]
+        assert f"--target-kl {TARGET_KL}" in gen.render(a, STACK), a["name"]
     off = (gen.orderonly_arms() + gen.orderonly_rsnn_arms()
            + gen.orderonly_final_arms() + gen.orderonly_tlm_final_arms()
            + gen.sweepl_arms() + gen.sweepl2_arms() + gen.sweepl3_arms())
     assert off
     for a in off:
         assert "--target-kl" not in _cli(gen, a), a["name"]
-        assert "--target-kl" not in gen.render(a), a["name"]
+        assert "--target-kl" not in gen.render(a, STACK), a["name"]
     assert gen.TARGET_KL_REQUIRED_FLAGS == ["--target-kl"]
     assert "--target-kl" not in gen.THESIS_REQUIRED_FLAGS
     for a in matrix + smoke:
@@ -593,7 +596,7 @@ def test_the_targets_are_the_ones_the_owner_named(gen, matrix):
                                 "ALPHAGRAD_NN_BATCH": "4096",
                                 **MATRIX_ENV}, a["name"]
             assert cli["--face-wire-faces"] == FACE_WIRE_FACES, a["name"]
-            text = gen.render(a)
+            text = gen.render(a, STACK)
             assert "export ALPHAGRAD_NN_HIDDEN=256\n" in text, a["name"]
             assert "export ALPHAGRAD_NN_BATCH=4096\n" in text, a["name"]
         elif a["thesis_target"] == "tlm":
@@ -602,7 +605,7 @@ def test_the_targets_are_the_ones_the_owner_named(gen, matrix):
             assert a["env"] == {"ALPHAGRAD_NN_BATCH": "64",
                                 **MATRIX_ENV}, a["name"]
             assert cli["--face-wire-faces"] == TLM_FACE_WIRE_FACES, a["name"]
-            text = gen.render(a)
+            text = gen.render(a, STACK)
             assert "ALPHAGRAD_NN_HIDDEN" not in text, a["name"]
             assert "export ALPHAGRAD_NN_BATCH=64\n" in text, a["name"]
         else:
@@ -614,7 +617,7 @@ def test_the_targets_are_the_ones_the_owner_named(gen, matrix):
             # common/rsnn_shd.py, not an environment variable
             assert a["env"] == _rsnn_env(a["thesis_rule"]), a["name"]
             assert cli["--face-wire-faces"] == FACE_WIRE_FACES, a["name"]
-            text = gen.render(a)
+            text = gen.render(a, STACK)
             assert "ALPHAGRAD_NN_HIDDEN" not in text, a["name"]
             assert (f"export ALPHAGRAD_NN_BATCH={batch}\n" in text if batch
                     else "ALPHAGRAD_NN_BATCH" not in text), a["name"]
@@ -637,7 +640,7 @@ def test_a_vmapped_row_carries_its_batch_and_no_frozen_round_moves(
     for a in _frozen_rounds(gen):
         assert not _cli(gen, a)["--example"].startswith("Vmapped"), a["name"]
         assert var not in (a.get("env") or {}), a["name"]
-        assert var not in gen.render(a), a["name"]
+        assert var not in gen.render(a, STACK), a["name"]
     assert var in gen.THESIS_ENV_ALLOWED
     assert var not in gen.CAMPAIGN_ENV_ALLOWED
     ds = open(os.path.join(_ALPHAGRAD, "src", "alphagrad", "approx", "common",
@@ -651,7 +654,7 @@ def test_a_batched_row_passes_no_gate_winners_table(gen, matrix, smoke,
     assert table == "/Scratch/assmuth/sweep64/runs/markowitz/winners.csv"
     for a in matrix + smoke + pairs:
         cli = _cli(gen, a)
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         batched = cli["--example"].startswith("Vmapped")
         passed = f"  --gate-winners-table {table}\n" in text
         assert passed is not batched, a["name"]
@@ -686,7 +689,7 @@ def test_arms_a_and_b_are_the_fixed_form_with_no_quality_floor(gen, matrix):
         assert cli["--face-none-bias"] == ("0" if a["thesis_arm"] == "A"
                                            else "4"), a["name"]
         # and the launcher says so, in the rendered command line
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert "\n  --quality-floor" not in text, a["name"]
 
 
@@ -789,7 +792,7 @@ def test_rung1_asks_for_the_approximation_count_and_skip_fraction_per_family(
         assert "--face-none-bias" not in cli, a["name"]
         assert "--face-skip-bias" not in cli, a["name"]
         # and the rendered command line carries both
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert f"--face-init-approx-per-plan {want_a}" in text, a["name"]
         assert f"--face-init-skips-per-plan {RUNG1_KAPPA}" in text, a["name"]
     assert gen.RUNG1_APPROX_PER_PLAN == RUNG1_A
@@ -805,7 +808,7 @@ def test_only_a_normalized_init_launcher_greps_for_the_two_new_flags(gen,
     rendered into the file and a running comparison's launcher does not
     change for a guard its row does not need."""
     for a in matrix:
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         line = [ln for ln in text.splitlines()
                 if ln.startswith("for F in --quality-metric")][0]
         greps = set(line[len("for F in "):].rstrip("; do").split())
@@ -968,7 +971,7 @@ def test_no_thesis_launcher_exports_an_xla_flag_or_a_promoted_var(gen,
     jax_cache_exports = {f"export {k}={v}" for k, v in gen.JAX_CACHE_ENV}
     jax_cache_mkdir = f"mkdir -p {gen.JAX_CACHE_DIR_EXPR}"
     for a in matrix + smoke:
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         for var in gen.PROMOTED_ENV_VARS:
             assert f"export {var}=" not in text, (a["name"], var)
         assert "ALPHAGRAD_FORCE_REV_ORDER" not in text, a["name"]
@@ -988,7 +991,7 @@ def test_every_export_in_a_thesis_launcher_is_allowed(gen, matrix, smoke):
                        | {"ALPHAGRAD_NN_HIDDEN", "ALPHAGRAD_NN_BATCH"}
                        | set(MATRIX_ENV))
     for a in matrix + smoke:
-        exported = set(_EXPORT.findall(gen.render(a)))
+        exported = set(_EXPORT.findall(gen.render(a, STACK)))
         assert exported <= allowed, (a["name"], sorted(exported - allowed))
         # the campaign's whole set is always there but the compile cache,
         # which a free-order row does not export (owner ruling 2026-09-23);
@@ -1005,7 +1008,7 @@ def test_a_thesis_arm_with_an_unlisted_env_key_is_refused_at_render(gen):
     a = dict(gen.thesis_arms()[0])
     a["env"] = {"ALPHAGRAD_NN_HIDDEN": "256", "XLA_FLAGS": "--nope"}
     with pytest.raises(gen.CampaignRowError) as e:
-        gen.render(a)
+        gen.render(a, STACK)
     assert "XLA_FLAGS" in str(e.value)
 
 
@@ -1017,7 +1020,7 @@ def test_every_thesis_job_is_a_per_node_singleton(gen, matrix, smoke):
     the matrix's old `thesis-<node>` serialized the matrix against itself and
     let an order-only row hold the same node -- the epilog then kills both."""
     for a in matrix + smoke:
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert a["job"] == f"node-{a['node']}", a["name"]
         assert f"#SBATCH -J node-{a['node']}\n" in text, a["name"]
         assert f"#SBATCH -J thesis-{a['node']}\n" not in text, a["name"]
@@ -1037,7 +1040,7 @@ def test_every_thesis_job_is_a_per_node_singleton(gen, matrix, smoke):
     for a in gen.ARMS:
         if a.get("thesis"):
             continue
-        assert "--dependency=singleton" not in gen.render(a), a["name"]
+        assert "--dependency=singleton" not in gen.render(a, STACK), a["name"]
 
 
 def test_the_nodes_and_the_actors_per_node_size(gen, matrix, smoke):
@@ -1061,7 +1064,7 @@ def test_the_nodes_and_the_actors_per_node_size(gen, matrix, smoke):
         # ONE PPO GPU, every other GPU a measure actor
         assert cli["--ray-measure"] == str(gpus - 1), a["name"]
         assert cli["--ray-measure"] == gen.THESIS_RAY_MEASURE[gpus], a["name"]
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert (f"#SBATCH --gres=gpu:nvidia_rtx_pro_6000_blackwell_max-q_"
                 f"workstation_edition:{gpus}\n") in text, a["name"]
         assert f"#SBATCH -c {gen.BLACKWELL_CPUS[gpus]}\n" in text, a["name"]
@@ -1124,7 +1127,7 @@ def test_the_campaign_hardware_did_not_move(gen):
     assert gen.BLACKWELL_CPUS[8] == gen.CAMPAIGN_CPUS == 128
     assert gen.BLACKWELL_MEM[8] == gen.CAMPAIGN_MEM == "800G"
     for a in gen.campaign_arms():
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert ("#SBATCH --gres=gpu:nvidia_rtx_pro_6000_blackwell_max-q_"
                 "workstation_edition:8\n") in text, a["name"]
         assert "#SBATCH -c 128\n" in text and "#SBATCH --mem=800G\n" in text
@@ -1173,7 +1176,7 @@ def test_the_resume_leg_differs_in_resume_alone(gen, smoke):
     assert a["--name"] == b["--name"] == "smoke_C_tlm"
     assert resume["name"] == "smoke_C_tlm_resume"     # the FILE differs
     assert _PLACEHOLDER.match(b["--resume"]), b["--resume"]
-    text = gen.render(resume)
+    text = gen.render(resume, STACK)
     assert "THESIS_RESUME" in text
     ck = open(os.path.join(_ALPHAGRAD, "src", "alphagrad", "approx", "common",
                            "checkpoint.py")).read()
@@ -1198,7 +1201,7 @@ def test_the_preflight_greps_the_files_that_define_the_new_flags(gen, matrix,
     for flag in gen.THESIS_REQUIRED_FLAGS:
         assert f'"{flag}"' in src, flag
     for a in matrix + smoke:
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert " ".join(gen.THESIS_FLAGS_FILES) in text, a["name"]
         for flag in ("--auto-stop", "--checkpoint-every", "--resume"):
             assert flag in text, (a["name"], flag)
@@ -1353,7 +1356,7 @@ def test_every_recurrent_row_is_the_rsnn_shd_target(gen, snn):
         assert cli["--temporal-rule"] == a["thesis_rule"], a["name"]
         assert a["thesis_rule"] in TEMPORAL_RULES, a["name"]
         # and the flag really is spelled that way on the rendered command line
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert f"\n  --temporal-rule {a['thesis_rule']}\n" in text, a["name"]
         assert (f"\n  --example {RSNN_FORM[a['thesis_rule']][0]}\n"
                 in text), a["name"]
@@ -1491,7 +1494,7 @@ def test_no_recurrent_row_carries_an_xla_flag(gen, snn):
     jax_cache_mkdir = f"mkdir -p {gen.JAX_CACHE_DIR_EXPR}"
     for a in snn:
         assert a["env"] == _rsnn_env(a["thesis_rule"]), a["name"]
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert "XLA_FLAGS" not in text, a["name"]
         for line in text.splitlines():
             if line.lstrip().startswith("#"):
@@ -1517,7 +1520,7 @@ def test_the_recurrent_scheduling_matches_the_rest_of_the_matrix(gen, snn):
         cli = _cli(gen, a)
         assert cli["--ray-measure"] == gen.THESIS_RAY_MEASURE[gpus], a["name"]
         assert cli["--ray-measure"] == str(gpus - 1), a["name"]
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert "#SBATCH --dependency=singleton\n" in text, a["name"]
         assert f"#SBATCH -w {a['node']}\n" in text, a["name"]
     # 40 rows, NOT one even round robin any more (owner ruling 2026-09-21):
@@ -1575,7 +1578,7 @@ def test_every_recurrent_row_is_generated_and_held_never_submitted(gen, snn):
     sbatch path at all -- so "not submitted" is the HELD guard in the file."""
     for a in snn:
         assert a.get("held"), a["name"]
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert "*** HELD" in text, a["name"]
         assert f'ABORT(73): {a["name"]} is HELD' in text, a["name"]
         assert "exit 73" in text, a["name"]
@@ -1642,7 +1645,7 @@ def test_the_retention_bound_reaches_every_row_thesis_arm_emits(
     assert gen.THESIS_MEASURE_CACHE_CLEAR_EVERY == CACHE_CLEAR_EVERY
     for a in matrix + smoke:
         assert a["env"][var] == CACHE_CLEAR_EVERY, a["name"]
-        assert f"export {var}={CACHE_CLEAR_EVERY}" in gen.render(a), \
+        assert f"export {var}={CACHE_CLEAR_EVERY}" in gen.render(a, STACK), \
             a["name"]
     off = (gen.orderonly_arms() + gen.orderonly_rsnn_arms()
            + gen.orderonly_final_arms() + gen.orderonly_tlm_final_arms()
@@ -1650,7 +1653,7 @@ def test_the_retention_bound_reaches_every_row_thesis_arm_emits(
     assert off
     for a in off:
         assert var not in (a.get("env") or {}), a["name"]
-        assert var not in gen.render(a), a["name"]
+        assert var not in gen.render(a, STACK), a["name"]
     # The export is admitted by the thesis allow-list only: a campaign arm
     # carries no per-arm environment at all.
     assert var in gen.THESIS_TARGET_ENV_ALLOWED
@@ -1674,18 +1677,18 @@ def test_the_process_recycle_reaches_every_row_thesis_arm_emits(
     assert not hasattr(gen, "THESIS_RECYCLE_RETRY_ON_OOM")
     for a in gen.ARMS:
         assert retry_var not in (a.get("env") or {}), a["name"]
-        assert retry_var not in gen.render(a), a["name"]
+        assert retry_var not in gen.render(a, STACK), a["name"]
     for a in matrix + smoke:
         assert a["env"][every_var] == PROACTIVE_RECYCLE_EVERY, a["name"]
         assert (f"export {every_var}={PROACTIVE_RECYCLE_EVERY}"
-               in gen.render(a)), a["name"]
+               in gen.render(a, STACK)), a["name"]
     off = (gen.orderonly_arms() + gen.orderonly_rsnn_arms()
            + gen.orderonly_final_arms() + gen.orderonly_tlm_final_arms()
            + gen.sweepl_arms() + gen.sweepl2_arms() + gen.sweepl3_arms())
     assert off
     for a in off:
         assert every_var not in (a.get("env") or {}), a["name"]
-        assert every_var not in gen.render(a), a["name"]
+        assert every_var not in gen.render(a, STACK), a["name"]
     assert every_var in gen.THESIS_TARGET_ENV_ALLOWED
     assert every_var in gen.THESIS_ENV_ALLOWED
     assert retry_var not in gen.THESIS_ENV_ALLOWED
@@ -1711,7 +1714,7 @@ def test_the_measure_timeout_and_the_actor_cores_of_a_thesis_row(
         cli = _cli(gen, a)
         assert cli["--ray-measure-timeout"] == "300", a["name"]
         assert cli["--cpu-cores-per-actor"] == "8", a["name"]
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert "--ray-measure-timeout 300" in text, a["name"]
         assert "--cpu-cores-per-actor 8" in text, a["name"]
     assert gen.FROZEN_CORE_BUDGET == {"trainer": 8, "per_actor": 2}
@@ -1748,12 +1751,12 @@ def test_no_row_thesis_arm_emits_exports_the_compile_cache(
         assert _cli(gen, a)["--fixed-order"] == "free", a["name"]
         for order in ("free", "markowitz", "reverse"):
             b = dict(a, cli=dict(a["cli"], **{"--fixed-order": order}))
-            text = gen.render(b)
+            text = gen.render(b, STACK)
             assert _jax_cache_lines_in(gen, text) == [], (a["name"], order)
             assert "JAX_COMPILATION_CACHE_DIR" not in text, (a["name"], order)
             assert "JAX_PERSISTENT_CACHE_" not in text, (a["name"], order)
     for a in _frozen_rounds(gen):
-        assert len(_jax_cache_lines_in(gen, gen.render(a))) == 5, a["name"]
+        assert len(_jax_cache_lines_in(gen, gen.render(a, STACK))) == 5, a["name"]
 
 
 def test_the_tlm_face_wire_budget_reaches_every_tlm_row_and_no_other(
@@ -1774,11 +1777,11 @@ def test_the_tlm_face_wire_budget_reaches_every_tlm_row_and_no_other(
         if a["thesis_target"] == "tlm":
             assert cli["--face-wire-faces"] == TLM_FACE_WIRE_FACES, a["name"]
             assert (f"--face-wire-faces {TLM_FACE_WIRE_FACES}"
-                   in gen.render(a)), a["name"]
+                   in gen.render(a, STACK)), a["name"]
         else:
             assert cli["--face-wire-faces"] == FACE_WIRE_FACES, a["name"]
             assert (f"--face-wire-faces {FACE_WIRE_FACES}"
-                   in gen.render(a)), a["name"]
+                   in gen.render(a, STACK)), a["name"]
     # the order-only row that also targets TLM is a DIFFERENT round (its
     # own record) and keeps the campaign's 64, exactly as its rung-1 init
     # and PopArt form stay off too.

@@ -34,6 +34,9 @@ import pytest
 
 _ALPHAGRAD = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _GEN = os.path.join(_ALPHAGRAD, "tools", "gen_fq_launchers.py")
+#: The stack every launcher here is rendered for: a generation-time input
+#: with no default (owner ruling 2026-09-27).
+STACK = "/Scratch/assmuth/mrg/test-stack"
 
 # THE OWNER'S NUMBERS, TYPED HERE ON PURPOSE (bead dsnn-dfw.45).
 RULES = ("bptt", "rtrl")
@@ -128,7 +131,7 @@ def test_the_submission_order_is_seed_major_per_rule(gen):
 
 def test_every_order_only_recurrent_arm_renders_to_valid_bash(gen, rows):
     for a in rows:
-        assert gen._bash_n(gen.render(a)) is None, a["name"]
+        assert gen._bash_n(gen.render(a, STACK)) is None, a["name"]
 
 
 # ---------------------------------------------------------------- 2. the arm
@@ -203,7 +206,7 @@ def test_the_run_shape_is_the_matrix_row(gen, rows):
         assert cli["--paired-cost-floor"] == gen.THESIS_PAIRED_COST_FLOOR \
             == "byte", a["name"]
         assert cli["--grad-oracle-cadence"] == "50", a["name"]
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert f"--wandb {gen.WANDB_MODE}" in text, a["name"]
         assert f"--wandb-project {gen.WANDB_PROJECT}" in text, a["name"]
 
@@ -226,7 +229,7 @@ def test_the_node_is_the_rule(gen, rsnn_rows):
 def test_every_order_only_recurrent_job_is_a_cross_agent_per_node_singleton(
         gen, rows):
     for a in rows:
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert a["job"] == f"node-{a['node']}", a["name"]
         assert f"#SBATCH -J node-{a['node']}\n" in text, a["name"]
         assert "#SBATCH --dependency=singleton\n" in text, a["name"]
@@ -256,7 +259,7 @@ def test_pgi15_gpu8_is_now_a_node_the_generator_knows(gen):
 
 def test_the_hardware_lines_follow_the_node(gen, rsnn_rows):
     for a in rsnn_rows:
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         node, gpus = a["node"], a["gpus"]
         assert gpus == gen.node_gpu_count(node), a["name"]
         assert f"#SBATCH -p {gen.node_partition(node)}\n" in text, a["name"]
@@ -272,7 +275,7 @@ def test_the_gpu8_toolchain_wants_12_8_not_the_venvs_12_9(gen, rows):
     a block that still asked for 12.9 there would abort 72 on a node the
     owner just cleared."""
     for a in rows:
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         if a["node"] == "pgi15-gpu8":
             assert "FQ_CUDA_WANT=12.8" in text, a["name"]
             assert "FQ_CUDA_WANT=12.9" not in text, a["name"]
@@ -288,7 +291,7 @@ def test_the_gpu8_toolchain_wants_12_8_not_the_venvs_12_9(gen, rows):
 def test_the_toolchain_block_still_searches_usr_local_for_every_row(gen, rows):
     marker = re.compile(r"@[A-Z][A-Z0-9_]*@")
     for a in rows:
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert "\nfor d in /usr/local/cuda-*/bin; do\n" in text, a["name"]
         left = marker.findall(text)
         assert not left, (a["name"], sorted(set(left)))
@@ -300,7 +303,7 @@ def test_no_order_only_recurrent_launcher_exports_an_xla_flag(gen, rows):
     jax_cache_exports = {f"export {k}={v}" for k, v in gen.JAX_CACHE_ENV}
     jax_cache_mkdir = f"mkdir -p {gen.JAX_CACHE_DIR_EXPR}"
     for a in rows:
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         for var in gen.PROMOTED_ENV_VARS:
             assert f"export {var}=" not in text, (a["name"], var)
         assert "ALPHAGRAD_FORCE_REV_ORDER" not in text, a["name"]
@@ -318,7 +321,7 @@ def test_every_export_in_an_order_only_recurrent_launcher_is_allowed(gen,
                                                                      rows):
     allowed = set(gen.THESIS_ENV_ALLOWED)
     for a in rows:
-        exported = set(_EXPORT.findall(gen.render(a)))
+        exported = set(_EXPORT.findall(gen.render(a, STACK)))
         assert exported <= allowed, (a["name"], sorted(exported - allowed))
         # dsnn-dfw.264: DSNN_SHD_DIR is on the rows thesis_arm emits only;
         # a frozen round keeps the environment it ran with.
@@ -332,7 +335,7 @@ def test_the_preflight_greps_the_swept_flags(gen, rows):
     assert "--lambda-mem" in gen.ORDERONLY_REQUIRED_FLAGS
     assert "--temporal-rule" in gen.ORDERONLY_REQUIRED_FLAGS
     for a in rows:
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert " ".join(gen.THESIS_FLAGS_FILES) in text, a["name"]
 
 

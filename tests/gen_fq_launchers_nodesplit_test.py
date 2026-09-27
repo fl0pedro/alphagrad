@@ -29,6 +29,9 @@ import pytest
 
 _ALPHAGRAD = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _GEN = os.path.join(_ALPHAGRAD, "tools", "gen_fq_launchers.py")
+#: The stack every launcher here is rendered for: a generation-time input
+#: with no default (owner ruling 2026-09-27).
+STACK = "/Scratch/assmuth/mrg/test-stack"
 
 #: The owner's numbers, typed here on purpose.
 NODES = ("pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu18", "pgi15-gpu19",
@@ -100,7 +103,7 @@ def test_no_row_of_the_generator_targets_gpu17(gen):
     offenders = [a["name"] for a in gen.ARMS if a.get("node") == "pgi15-gpu17"]
     assert not offenders, offenders
     for a in gen.ARMS:
-        assert "#SBATCH -w pgi15-gpu17\n" not in gen.render(a), a["name"]
+        assert "#SBATCH -w pgi15-gpu17\n" not in gen.render(a, STACK), a["name"]
 
 
 def test_every_nn256_row_renders_the_four_gpu_profile_on_every_node(gen):
@@ -126,7 +129,7 @@ def test_every_nn256_row_renders_the_four_gpu_profile_on_every_node(gen):
         want = (str(b["per_actor"]) if frozen
                 else gen.THESIS_CORES_PER_ACTOR)
         assert cli["--cpu-cores-per-actor"] == want, a["name"]
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert f"#SBATCH --gres={gen.blackwell_gres(NN256_GPUS)}\n" in text, \
             a["name"]
         assert f"#SBATCH -c {NN256_CPUS}\n" in text, a["name"]
@@ -167,7 +170,7 @@ def test_every_half_row_names_the_pair_it_runs_inside(gen):
         assert a["paired_into"] in pairs, a["name"]
         assert a["node"] in EIGHT_GPU, a["name"]
         # the file is still the readable record of the row, and it refuses
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert f"ABORT(74): {a['name']} runs as one half" in text, a["name"]
         assert 'if [ "${FQ_RELEASE_HALF:-0}" != "1" ]; then' in text, a["name"]
         assert "  exit 74" in text, a["name"]
@@ -205,7 +208,7 @@ def test_a_pair_is_two_seeds_of_one_arm_on_one_eight_gpu_node(gen):
 
 def test_the_paired_launcher_asks_for_the_whole_node(gen):
     for p in gen.thesis_pair_arms():
-        text = gen.render(p)
+        text = gen.render(p, STACK)
         assert f"#SBATCH -w {p['node']}\n" in text, p["name"]
         assert f"#SBATCH --gres={gen.blackwell_gres(8)}\n" in text, p["name"]
         assert f"#SBATCH -c {gen.BLACKWELL_CPUS[8]}\n" in text, p["name"]
@@ -216,7 +219,7 @@ def test_the_paired_launcher_asks_for_the_whole_node(gen):
 
 def test_the_two_halves_hold_disjoint_gpus_and_disjoint_cores(gen):
     for p in gen.thesis_pair_arms():
-        text = gen.render(p)
+        text = gen.render(p, STACK)
         devices, cores = [], []
         for h in p["halves"]:
             d = [int(x) for x in h["devices"].split(",")]
@@ -238,7 +241,7 @@ def test_the_two_halves_hold_disjoint_gpus_and_disjoint_cores(gen):
 
 def test_each_half_gets_its_own_ray_dir_log_file_and_wandb_run(gen):
     for p in gen.thesis_pair_arms():
-        text = gen.render(p)
+        text = gen.render(p, STACK)
         rays, logs, names = set(), set(), set()
         for tag, h in zip(("A", "B"), p["halves"]):
             ray = "/tmp/ray_${SLURM_JOB_ID}_s%s" % h["seed"]
@@ -266,7 +269,7 @@ def test_the_pair_exits_with_the_worse_of_the_two_trainer_codes(gen):
     a single launcher exit with its trainer's code; this is the same rule for
     two)."""
     for p in gen.thesis_pair_arms():
-        text = gen.render(p)
+        text = gen.render(p, STACK)
         assert 'wait "$PID_A"' in text and "STATUS_A=$?" in text, p["name"]
         assert 'wait "$PID_B"' in text and "STATUS_B=$?" in text, p["name"]
         assert "TRAINER_STATUS=$STATUS_A" in text, p["name"]
@@ -291,7 +294,7 @@ def test_the_paired_launcher_dumps_jax_devices_inside_each_half(gen):
     jax.devices() reads CUDA_VISIBLE_DEVICES, which is the thing under test.
     """
     for p in gen.thesis_pair_arms():
-        text = gen.render(p)
+        text = gen.render(p, STACK)
         # the old call is gone from the halves
         assert "  nvidia-smi" not in text, p["name"]
         for tag, h in zip(("A", "B"), p["halves"]):
@@ -316,7 +319,7 @@ def test_the_half_device_dump_runs_on_a_node_with_no_gpu(gen):
     print a device list rather than raise when no GPU is visible.  Run the
     real snippet here, in a child with CUDA_VISIBLE_DEVICES empty."""
     p = gen.thesis_pair_arms()[0]
-    text = gen.render(p)
+    text = gen.render(p, STACK)
     snippet = [ln for ln in text.splitlines() if "jax devices: " in ln][0]
     code = snippet.split(' -c "', 1)[1].rstrip('"')
     env = dict(os.environ)
@@ -369,9 +372,9 @@ def test_with_the_pairs_off_every_nn256_seed_is_a_single_row(gen, gen_off):
     assert set(off) == set(on) - {p["name"] for p in gen.thesis_pair_arms()}
     n_halves = 0
     for name, a in off.items():
-        text = gen_off.render(a)
+        text = gen_off.render(a, STACK)
         assert "ABORT(74)" not in text and "exit 74" not in text, name
-        ref = gen.render(on[name])
+        ref = gen.render(on[name], STACK)
         if on[name].get("paired_into"):
             n_halves += 1
             # the off file is the half's file without its stub, line for line
@@ -419,7 +422,7 @@ def test_each_half_names_its_own_trainer_gpu_and_measure_gpus(gen):
     pairs = gen.thesis_pair_arms()
     assert pairs
     for p in pairs:
-        text = gen.render(p)
+        text = gen.render(p, STACK)
         for tag, h in zip(("A", "B"), p["halves"]):
             cli = dict(gen._merge_cli(h["cli"]))
             assert (cli["--gpus"], cli["--measure-gpus"]) == want[tag], \
@@ -454,11 +457,11 @@ def test_every_single_row_names_gpu_0_and_the_measure_gpus_after_it(gen):
             str(k) for k in range(1, n + 1)), a["name"]
         for flag in ("--gpus", "--measure-gpus"):
             assert flag in a["required_flags"], (a["name"], flag)
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert f"\n  --measure-gpus {cli['--measure-gpus']}\n" in _args(text), \
             a["name"]
     for a in frozen:
         cli = dict(gen._merge_cli(a["cli"]))
         assert "--measure-gpus" not in cli and "--gpus" not in cli, a["name"]
         assert "--measure-gpus" not in a["required_flags"], a["name"]
-        assert "--measure-gpus" not in gen.render(a), a["name"]
+        assert "--measure-gpus" not in gen.render(a, STACK), a["name"]

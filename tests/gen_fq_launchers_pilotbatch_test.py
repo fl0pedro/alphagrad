@@ -29,6 +29,9 @@ import pytest
 
 _ALPHAGRAD = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _GEN = os.path.join(_ALPHAGRAD, "tools", "gen_fq_launchers.py")
+#: The stack every launcher here is rendered for: a generation-time input
+#: with no default (owner ruling 2026-09-27).
+STACK = "/Scratch/assmuth/mrg/test-stack"
 
 # THE OWNER'S NUMBERS, TYPED HERE ON PURPOSE.
 SEEDS = ("250197", "250198", "250199", "250200", "250201")
@@ -127,13 +130,13 @@ def _profile(gen, a) -> int:
 def test_every_row_thesis_arm_emits_exports_the_measure_path(gen, emitted,
                                                              frozen):
     for a in emitted:
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         for k, v in MEASURE_PATH_ENV.items():
             assert f"\nexport {k}={v}\n" in text, (a["name"], k)
             assert text.count(f"export {k}=") == 1, (a["name"], k)
             assert (a.get("env") or {}).get(k) == v, (a["name"], k)
     for a in frozen:
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         for k in MEASURE_PATH_ENV:
             assert k not in (a.get("env") or {}), (a["name"], k)
             assert f"export {k}=" not in text, (a["name"], k)
@@ -158,7 +161,7 @@ def test_no_rendered_row_turns_the_block_diagonal_off(gen):
     off = re.compile(r"GRAPHAX_KEEP_BLOCKDIAG=[\"']?0\b")
     for a in gen.ARMS:
         assert str((a.get("env") or {}).get("GRAPHAX_KEEP_BLOCKDIAG")) != "0"
-        for line in gen.render(a).splitlines():
+        for line in gen.render(a, STACK).splitlines():
             if line.lstrip().startswith("#"):
                 continue
             assert not off.search(line), (a["name"], line)
@@ -181,7 +184,7 @@ def test_every_row_thesis_arm_emits_trains_the_static_memory_objective(
         assert cli["--mem-type"] == "peak_memory", a["name"]
         assert cli["--cost-form"] == "paired-log", a["name"]
         assert "--mem-objective-weight" in a["required_flags"], a["name"]
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert f"\n  --rewards {REWARDS}\n" in text, a["name"]
         assert (f"\n  --mem-objective-weight {MEM_OBJECTIVE_WEIGHT}\n"
                 in text), a["name"]
@@ -213,14 +216,14 @@ def test_no_row_thesis_arm_emits_sets_a_compile_cache_under_any_order(
                 b["halves"] = [dict(h, cli=dict(h["cli"],
                                                 **{"--fixed-order": order}))
                                for h in a["halves"]]
-            text = gen.render(b)
+            text = gen.render(b, STACK)
             assert "JAX_COMPILATION_CACHE_DIR" not in text, (a["name"], order)
             assert "JAX_PERSISTENT_CACHE_" not in text, (a["name"], order)
             assert f"mkdir -p {gen.JAX_CACHE_DIR_EXPR}" not in text, \
                 (a["name"], order)
         assert a.get("jax_cache") is False, a["name"]
     for a in frozen:
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert (f"export JAX_COMPILATION_CACHE_DIR={gen.JAX_CACHE_DIR_EXPR}\n"
                 in text), a["name"]
 
@@ -242,7 +245,7 @@ def test_the_oracle_takes_every_core_the_trainer_and_the_actors_leave(
         assert ns.reserved_driver_cores == TRAINER_CORES, a["name"]
         assert ns.cpu_cores_per_actor == CORES_PER_ACTOR, a["name"]
         assert ns.ray_measure == g - 1, a["name"]
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         if a.get("halves"):
             # a pair holds the node; each half is a 4-GPU row on its own half
             # of the cores, which is the affinity mask ppo.py reads
@@ -291,7 +294,7 @@ def test_the_oracle_batch_and_host_budget_follow_the_target_and_the_node(
         assert cli.get("--grad-oracle-batch") == want, a["name"]
         assert cli.get("--grad-oracle-host-budget-gb") == \
             HOST_BUDGET_GB[_profile(gen, a)], a["name"]
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert f"#SBATCH --mem={ROW_MEM[a['gpus']]}\n" in text, a["name"]
         ns = _parse(gen, a)
         assert ns.grad_oracle_batch == int(want), a["name"]
@@ -301,7 +304,7 @@ def test_the_oracle_batch_and_host_budget_follow_the_target_and_the_node(
         cli = _cli(gen, a)
         for flag in ORACLE_FLAGS:
             assert flag not in cli, (a["name"], flag)
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert (f"#SBATCH --mem={gen.node_mem(a['node'], a['gpus'])}\n"
                 in text), a["name"]
     for g in (4, 8):
@@ -399,7 +402,7 @@ def test_the_defense_arms_are_arm_a_on_popart_at_three_lambdas(gen):
                          "--symlog-channels"}
                         | ({"--lambda-acc"} if lq != "16" else set())), \
             (a["name"], sorted(diff))
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert "*** HELD" in text and f"ABORT(73): {a['name']} is HELD" in text
         for line in (f"--lambda-acc {lq}", "--advantage-norm popart",
                      "--no-symlog", "--symlog-channels none",
@@ -421,24 +424,24 @@ def test_the_defense_arms_are_arm_a_on_popart_at_three_lambdas(gen):
 def test_every_row_thesis_arm_emits_turns_the_code_s_disk_cache_off(
         gen, emitted, frozen):
     for a in emitted:
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert f"\nexport {NO_DISK_CACHE_VAR}=1\n" in text, a["name"]
         assert text.count(f"export {NO_DISK_CACHE_VAR}=") == 1, a["name"]
         assert (a.get("env") or {}).get(NO_DISK_CACHE_VAR) == "1", a["name"]
         assert a.get("jax_cache") is False, a["name"]
     for a in frozen:
         assert NO_DISK_CACHE_VAR not in (a.get("env") or {}), a["name"]
-        assert NO_DISK_CACHE_VAR not in gen.render(a), a["name"]
+        assert NO_DISK_CACHE_VAR not in gen.render(a, STACK), a["name"]
     assert gen.THESIS_NO_DISK_CACHE_ENV == {NO_DISK_CACHE_VAR: "1"}
     assert NO_DISK_CACHE_VAR in gen.THESIS_TARGET_ENV_ALLOWED
     assert NO_DISK_CACHE_VAR not in gen.CAMPAIGN_ENV_ALLOWED
     row, old = emitted[0], frozen[0]
     with pytest.raises(gen.CampaignRowError):
         gen.render(dict(row, env={k: v for k, v in row["env"].items()
-                                  if k != NO_DISK_CACHE_VAR}))
+                                  if k != NO_DISK_CACHE_VAR}), STACK)
     with pytest.raises(gen.CampaignRowError):
         gen.render(dict(old, env=dict(old.get("env") or {},
-                                      **{NO_DISK_CACHE_VAR: "1"})))
+                                      **{NO_DISK_CACHE_VAR: "1"})), STACK)
     # ppo.py and the measure worker call the cache setup once, under the switch.
     approx = os.path.join(_ALPHAGRAD, "src", "alphagrad", "approx")
     call = re.compile(r"^\s+_setup_jax_compile_cache\(\)\s*$", re.M)

@@ -21,6 +21,9 @@ import pytest
 
 _GEN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                     "tools", "gen_fq_launchers.py")
+#: The stack every launcher here is rendered for: a generation-time input
+#: with no default (owner ruling 2026-09-27).
+STACK = "/Scratch/assmuth/mrg/test-stack"
 
 
 @pytest.fixture(scope="module")
@@ -54,7 +57,7 @@ def test_shared_cli_declares_the_one_value_and_the_preflight_greps_for_it(gen):
 def test_every_launcher_names_lossless_once_and_no_other_value(gen):
     train = 0
     for a in gen.ARMS:
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert "NEW_SLOT_JOIN" not in text, a["name"]
         assert "--approx-old" not in text, a["name"]
         body = "\n".join(_argv_lines(text))
@@ -79,7 +82,7 @@ def test_the_two_op_preflight_runs_on_every_gpu_arm(gen):
     """#73: lossless is the two-op face form with an all-None join triple, so
     graphax must accept the form before any plan is measured."""
     for a in gen.ARMS:
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         if a["kind"] == "cpu":
             assert "test_face_two_op_form.py" not in text, a["name"]
             continue

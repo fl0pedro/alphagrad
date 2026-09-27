@@ -49,7 +49,9 @@ def target_setup(target):
         return dict(_STATIC), {**_MEMOBJ, "--temporal-rule": target.split("_")[1]}
     gen = _generator()
     node = "pgi15-gpu19" if target in ("tlm", "rsnn_rtrl") else "pgi15-gpu18"
-    txt = gen.render(gen.thesis_arm(arm="C_popart", target=_THESIS[target], seed="250197", node=node))
+    # The stack a launcher needs (owner ruling 2026-09-27) is the directory of this clone; only the exports are read.
+    txt = gen.render(gen.thesis_arm(arm="C_popart", target=_THESIS[target], seed="250197", node=node),
+                     str(_HERE.parent.parent))
     env = {k: v.strip('"') for k, v in re.findall(r"^export ([A-Z_][A-Z0-9_]*)=(\S+)", txt, re.M)
            if _KEEP_ENV.match(k)}
     env.update(_STATIC)

@@ -20,6 +20,9 @@ import os
 
 _ALPHAGRAD = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _GEN = os.path.join(_ALPHAGRAD, "tools", "gen_fq_launchers.py")
+#: The stack every launcher here is rendered for: a generation-time input
+#: with no default (owner ruling 2026-09-27).
+STACK = "/Scratch/assmuth/mrg/test-stack"
 
 FORBIDDEN = ("pgi15-gpu17",)
 #: Released back to us on 2026-09-20 and expected to CARRY rows again.
@@ -49,7 +52,7 @@ def test_no_rendered_sbatch_line_names_a_forbidden_node():
     gen = _gen()
     checked = 0
     for a in gen.ARMS:
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         for node in FORBIDDEN:
             assert f"#SBATCH -w {node}\n" not in text, (a["name"], node)
         checked += 1

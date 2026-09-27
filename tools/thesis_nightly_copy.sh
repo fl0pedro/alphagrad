@@ -3,12 +3,15 @@
 # Ticket dsnn-dfw.4, owner ruling 2026-09-16: "/Scratch is not persistent.
 # Nightly checksum-verified copy to /Users/assmuth/thesis-runs/."
 #
-# WHAT IT COPIES.  Every wandb run directory of the campaign stack whose run
-# name is a thesis run name: the run directory itself, which is where the
+# WHAT IT COPIES.  Every wandb run directory of the run tree whose run name
+# is a thesis run name: the run directory itself, which is where the
 # trainer puts the plan log (plan_log_<name>.jsonl), the front dumps
 # (pareto_front.json, best_sequences.json), the checkpoints
 # (ppo_ckpt_ep000000NNN/) and auto_stop.json -- common/checkpoint.run_directory
-# is the one rule all four follow -- plus the slurm log of the job.
+# is the one rule all four follow -- plus the slurm log of the job.  The run
+# tree is /Scratch/assmuth/campaign/runs/wandb: every launcher exports
+# WANDB_DIR=/Scratch/assmuth/campaign/runs (owner ruling 2026-09-27), so the
+# runs no longer land in the checkout of whatever stack ran them.
 #
 # THE RULES IT KEEPS.
 #   1. A STALLED EXPORT MUST NOT BREAK IT.  The pgi15 home export refused
@@ -21,7 +24,7 @@
 #   3. IT NEVER DELETES ANYTHING on the destination.
 set -uo pipefail
 
-SRC_WANDB=${SRC_WANDB:-/Scratch/assmuth/campaign/stack/alphagrad/wandb}
+SRC_WANDB=${SRC_WANDB:-/Scratch/assmuth/campaign/runs/wandb}
 SRC_LOGS=${SRC_LOGS:-/Scratch/assmuth/campaign/runs}
 DEST=${DEST:-/Users/assmuth/thesis-runs}
 STATE=${STATE:-/Scratch/assmuth/thesis_copy}

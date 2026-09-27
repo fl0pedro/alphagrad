@@ -41,6 +41,9 @@ import pytest
 
 _ALPHAGRAD = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _GEN = os.path.join(_ALPHAGRAD, "tools", "gen_fq_launchers.py")
+#: The stack every launcher here is rendered for: a generation-time input
+#: with no default (owner ruling 2026-09-27).
+STACK = "/Scratch/assmuth/mrg/test-stack"
 _PPO = os.path.join(_ALPHAGRAD, "src", "alphagrad", "approx", "ppo.py")
 
 # THE APPROVED REWARD, PINNED (owner ruling 2026-09-13, priced in finding
@@ -142,14 +145,14 @@ def test_no_campaign_arm_is_held(gen, campaign):
     # hold on ticket .25 is named in its DEPENDS line, not enforced.
     for a in campaign:
         assert not a.get("held"), a["name"]
-        assert "ABORT(73)" not in gen.render(a), a["name"]
+        assert "ABORT(73)" not in gen.render(a, STACK), a["name"]
     diag = _by_name(campaign, f"p1d_diag_{REWARD_TOKEN}")
     assert ".25" in diag["depends"]
 
 
 def test_every_campaign_arm_renders_to_valid_bash(gen, campaign):
     for a in campaign:
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert text.startswith("#!/bin/bash\n"), a["name"]
         err = _bash_n(text)
         assert err is None, (a["name"], err)
@@ -170,12 +173,12 @@ def test_the_face_head_width_is_derived_from_head_layout(gen, campaign):
     # generator's
     assert gen.FACE_HEAD_WIDTH == 2 + 3 * 29
     for a in campaign:
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert f"{gen.FACE_HEAD_WIDTH} logits" in text, a["name"]
         for dt in FACE_QUANT_DTYPES:
             assert dt in text, (a["name"], dt)
     for a in gen.ARMS:
-        assert "94 logits" not in gen.render(a), a["name"]
+        assert "94 logits" not in gen.render(a, STACK), a["name"]
     src = open(_GEN).read()
     assert "94 logits" not in src
     assert "103 logits" not in src
@@ -212,7 +215,7 @@ def test_every_flag_a_campaign_arm_passes_is_defined(gen, campaign,
         flags = [t for t in _tokens(gen, a) if t.startswith("--")]
         undefined = [f for f in flags if f'"{f}"' not in flag_sources]
         assert not undefined, (a["name"], undefined)
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         # The launcher's own pre-flight greps the same two files.
         assert 'FLAGSRC="src/alphagrad/approx/ppo.py ' \
                'src/alphagrad/approx/common/gate_telemetry.py"' in text, a["name"]
@@ -288,9 +291,9 @@ def test_every_campaign_arm_carries_the_required_flags(gen, campaign):
         assert toks.count("--seed") == 1, a["name"]
         assert toks.count("--fixed-order") == 1, a["name"]
         # no quality gate anywhere in the campaign
-        assert "QUALITY_GATE" not in gen.render(a), a["name"]
+        assert "QUALITY_GATE" not in gen.render(a, STACK), a["name"]
         # registered prediction and falsifier in the header
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert "# REGISTERED PREDICTION" in text, a["name"]
         assert "# FALSIFICATION CRITERION:" in text, a["name"]
         assert "REGISTERED BEFORE THE RUN" in text, a["name"]
@@ -300,7 +303,7 @@ def test_every_campaign_arm_carries_the_required_flags(gen, campaign):
 def test_the_order_is_markowitz_except_on_the_two_order_arms(gen, campaign):
     for a in campaign:
         cli = _cli(gen, a)
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert "ALPHAGRAD_FORCE_REV_ORDER" not in text, a["name"]
         if a["name"] in (f"p1e_none_free_{REWARD_TOKEN}", f"p1f_all_free_{REWARD_TOKEN}"):
             assert cli["--fixed-order"] == "free", a["name"]
@@ -356,7 +359,7 @@ def test_no_arm_carries_the_retired_lambda_five(gen, campaign):
         cli = _cli(gen, a)
         assert cli.get("--lambda-acc") != "5", a["name"]
         assert "lq5" not in a["name"], a["name"]
-        assert "lq5" not in gen.render(a), a["name"]
+        assert "lq5" not in gen.render(a, STACK), a["name"]
 
 
 def test_gate_g1_points_at_the_sweep64_table_for_this_arms_order(gen, campaign):
@@ -370,7 +373,7 @@ def test_gate_g1_points_at_the_sweep64_table_for_this_arms_order(gen, campaign):
         want = gen.CAMPAIGN_GATE_WINNERS_TABLES[cli["--fixed-order"]]
         assert cli["--gate-winners-table"] == want, a["name"]
         assert "sweep64" in want
-        assert "sweep41" not in gen.render(a), a["name"]
+        assert "sweep41" not in gen.render(a, STACK), a["name"]
 
 
 def test_gate_g6_carries_the_pre_run_contrast_of_this_arms_order(gen, campaign):
@@ -394,7 +397,7 @@ def test_every_arm_passes_the_approved_cost_floor(gen, campaign):
     for a in campaign:
         cli = _cli(gen, a)
         assert cli["--paired-cost-floor"] == "reference", a["name"]
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert "--paired-cost-floor reference" in text, a["name"]
         assert "-13.4" in text, (a["name"], "the header must price the old floor")
 
@@ -417,7 +420,7 @@ def test_the_cost_floor_flag_exists_in_the_trainer(gen):
 
 def test_no_campaign_arm_exports_a_promoted_var_or_an_xla_flag(gen, campaign):
     for a in campaign:
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert a.get("env", {}) == {}, a["name"]
         for var in gen.PROMOTED_ENV_VARS:
             assert f"{var}=" not in text, (a["name"], var)
@@ -483,7 +486,7 @@ def test_jax_cache_is_per_node_and_the_autotune_race_is_disabled(gen):
     # (owner rulings 2026-09-23 and 2026-09-25, dsnn-dfw.230): a row
     # `thesis_arm` emits exports none of it, under any order.
     for a in gen.ARMS:
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         if a.get("jax_cache") is False:
             assert "export JAX_" not in text, a["name"]
             continue
@@ -499,7 +502,7 @@ def test_jax_cache_is_per_node_and_the_autotune_race_is_disabled(gen):
 def test_every_export_in_a_campaign_launcher_is_allowed(gen, campaign):
     allowed = set(gen.CAMPAIGN_ENV_ALLOWED)
     for a in campaign:
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         exported = set(_EXPORT.findall(text))
         assert exported <= allowed, (a["name"], sorted(exported - allowed))
         # and the allowed set is exactly what is exported (nothing dormant)
@@ -528,7 +531,7 @@ def test_no_flag_knobs_are_exported_and_named_in_the_todo_header(gen, campaign):
     for k, v, why in gen.NO_FLAG_ENV:
         assert why and len(why) > 40, k
     for a in campaign:
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert "*** TODO (ticket .43): ENV VARS WITHOUT A FLAG" in text, a["name"]
         for k, v, _why in gen.NO_FLAG_ENV:
             assert f"export {k}={v}\n" in text, (a["name"], k)
@@ -547,7 +550,7 @@ def test_one_eight_gpu_blackwell_job_per_node_on_gpu20(gen, campaign):
     assert gen.CAMPAIGN_NODES == ("pgi15-gpu20",)
     assert gen.CAMPAIGN_GPUS == 8 and gen.CAMPAIGN_CPUS == 128
     for a in campaign:
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert a["kind"] == "train" and a["gpus"] == 8, a["name"]
         assert gen.is_scratch(a), a["name"]
         assert a["node"] in gen.CAMPAIGN_NODES, (a["name"], a["node"])
@@ -555,7 +558,7 @@ def test_one_eight_gpu_blackwell_job_per_node_on_gpu20(gen, campaign):
                 "workstation_edition:8\n") in text, a["name"]
         assert "#SBATCH -c 128\n" in text, a["name"]
         assert f"#SBATCH -w {a['node']}\n" in text
-        assert f"#SBATCH -D {gen.CAMPAIGN_STACK}/alphagrad\n" in text
+        assert f"#SBATCH -D {STACK}/alphagrad\n" in text
         assert f"#SBATCH -o {gen.CAMPAIGN_RUNS}/" in text
         for bad in ("pgi15-gpu15", "pgi15-gpu16", "pgi15-gpu17", "pgi15-gpu18",
                     "pgi15-gpu19"):
@@ -568,7 +571,7 @@ def test_one_eight_gpu_blackwell_job_per_node_on_gpu20(gen, campaign):
             assert "~/dsnn" not in line and "$HOME/dsnn" not in line, (a["name"], line)
             assert "/Users/assmuth" not in line, (a["name"], line)
         assert f"PY={gen.CAMPAIGN_PY}\n" in text
-        assert f"cd {gen.CAMPAIGN_STACK}/alphagrad\n" in text
+        assert f"cd {STACK}/alphagrad\n" in text
         assert "ABORT(66)" in text
         assert 'src/alphagrad/approx/ppo.py "${ARGS[@]}"' in text
         assert "CUDA_VISIBLE_DEVICES=0,1,2,3" not in text, a["name"]
@@ -603,7 +606,7 @@ def test_gate_telemetry_has_no_switch_and_its_input_is_passed(gen, campaign):
                 == gen.CAMPAIGN_GATE_WINNERS_TABLES[cli["--fixed-order"]])
         assert (cli["--gate-offline-contrast"]
                 == gen.GATE_OFFLINE_CONTRAST[cli["--fixed-order"]])
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert "gate G1 winners table" in text, a["name"]
         assert "episode_fields" in text, a["name"]   # the header says where
         assert "measure/drain/" in text, a["name"]   # the .7 audit is named
@@ -673,7 +676,7 @@ def test_a_campaign_arm_with_a_per_arm_env_is_refused_at_render(gen):
     a = dict(next(x for x in gen.ARMS if x.get("phase")))
     a["env"] = {"ALPHAGRAD_MAX_FACES": "2538"}
     with pytest.raises(gen.CampaignRowError):
-        gen.render(a)
+        gen.render(a, STACK)
 
 
 def test_setting_the_winner_constant_puts_the_profile_in_the_name(gen):
@@ -686,7 +689,7 @@ def test_setting_the_winner_constant_puts_the_profile_in_the_name(gen):
                              prediction="x", falsifier="x")
         assert a["name"] == f"p9z_skip_{REWARD_TOKEN}"
         assert a["cli"]["--approx-profile"] == "skip"
-        assert "P1_PROFILE" not in gen.render(a)
+        assert "P1_PROFILE" not in gen.render(a, STACK)
     finally:
         gen.P1_WINNER_PROFILE = saved
         del gen.ARMS[n0:]
@@ -819,7 +822,7 @@ def test_the_wave_arms_keep_their_own_env_but_run_the_campaign_stack(gen):
     """Owner ruling 2026-09-14: the wave arms and fq_face_attrib no longer
     `cd ~/dsnn/alphagrad` or `uv run` -- $HOME/dsnn is 281 commits stale and
     the export it lives on is read-only, so every arm now stages against
-    CAMPAIGN_STACK like the campaign arms.  They keep their OWN per-arm
+    the stack like the campaign arms.  They keep their OWN per-arm
     SHARED_ENV (not args-only: `is_scratch` -- and the full-node Blackwell
     hardware and env-purity check that comes with it -- stays False), and
     their own 4-GPU hardware request."""
@@ -833,12 +836,12 @@ def test_the_wave_arms_keep_their_own_env_but_run_the_campaign_stack(gen):
     assert waves
     for a in waves:
         assert not gen.is_scratch(a), a["name"]
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert "uv run" not in text, a["name"]
         assert "$HOME/dsnn" not in text and "~/dsnn" not in text, a["name"]
         assert f"PY={gen.CAMPAIGN_PY}\n" in text, a["name"]
-        assert f"cd {gen.CAMPAIGN_STACK}/alphagrad\n" in text, a["name"]
-        assert f"#SBATCH -D {gen.CAMPAIGN_STACK}/alphagrad\n" in text, a["name"]
+        assert f"cd {STACK}/alphagrad\n" in text, a["name"]
+        assert f"#SBATCH -D {STACK}/alphagrad\n" in text, a["name"]
         assert f"#SBATCH -o {gen.CAMPAIGN_RUNS}/" in text, a["name"]
         assert "ABORT(66)" in text, a["name"]
         assert "#SBATCH --gres=gpu:4\n" in text, a["name"]
@@ -863,7 +866,7 @@ def test_no_rendered_launcher_of_any_kind_references_home_dsnn(gen):
     The stale checkout itself stays forbidden everywhere, comments included,
     because naming it is how a launcher comes back to it."""
     for a in gen.ARMS:
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert "$HOME/dsnn" not in text, a["name"]
         assert "~/dsnn" not in text, a["name"]
         assert "/Users/assmuth/dsnn" not in text, a["name"]
@@ -883,14 +886,15 @@ def test_dry_run_writes_outside_the_tree_and_diffs_against_it(gen, tmp_path):
     # one launcher "in the tree" that drifted, one identical, the rest missing
     arms = gen.ARMS
     (tree / f"fq_{arms[0]['name']}.sbatch").write_text("#!/bin/bash\n# stale\n")
-    (tree / f"fq_{arms[1]['name']}.sbatch").write_text(gen.render(arms[1]))
-    rc = gen.main(["--dry-run", "--out", str(out), "--against", str(tree)])
+    (tree / f"fq_{arms[1]['name']}.sbatch").write_text(gen.render(arms[1], STACK))
+    rc = gen.main(["--stack", STACK, "--dry-run", "--out", str(out), "--against", str(tree)])
     assert rc == 0
     written = sorted(p.name for p in out.glob("fq_*.sbatch"))
     assert written == sorted(f"fq_{a['name']}.sbatch" for a in arms)
     assert (out / "DRIFT.diff").exists() and (out / "SUMMARY.txt").exists()
     summary = (out / "SUMMARY.txt").read_text()
     assert f"{len(arms)} launchers rendered" in summary
+    assert f"for the stack {STACK};" in summary
     assert "1 ok, 1 DRIFT" in summary and f"{len(arms) - 2} MISSING" in summary
     assert f"DRIFT    {tree / ('fq_' + arms[0]['name'] + '.sbatch')}" in summary
     assert "# stale" in (out / "DRIFT.diff").read_text()
@@ -900,11 +904,11 @@ def test_dry_run_writes_outside_the_tree_and_diffs_against_it(gen, tmp_path):
     assert (tree / f"fq_{arms[0]['name']}.sbatch").read_text() == "#!/bin/bash\n# stale\n"
     # refuses to write INTO the tree
     with pytest.raises(SystemExit):
-        gen.main(["--dry-run", "--out", str(tree), "--against", str(tree)])
+        gen.main(["--stack", STACK, "--dry-run", "--out", str(tree), "--against", str(tree)])
     with pytest.raises(SystemExit):
-        gen.main(["--dry-run", "--out", str(tree / "sub"), "--against", str(tree)])
+        gen.main(["--stack", STACK, "--dry-run", "--out", str(tree / "sub"), "--against", str(tree)])
     with pytest.raises(SystemExit):
-        gen.main(["--dry-run", "--check", "--out", str(out), "--against", str(tree)])
+        gen.main(["--stack", STACK, "--dry-run", "--check", "--out", str(out), "--against", str(tree)])
 
 
 # --------------------------------- 11. ppo.py's own argparse accepts them

@@ -27,6 +27,9 @@ import pytest
 
 _ALPHAGRAD = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _GEN = os.path.join(_ALPHAGRAD, "tools", "gen_fq_launchers.py")
+#: The stack every launcher here is rendered for: a generation-time input
+#: with no default (owner ruling 2026-09-27).
+STACK = "/Scratch/assmuth/mrg/test-stack"
 
 # THE OWNER'S NUMBERS, TYPED HERE ON PURPOSE (bead dsnn-dfw.29).
 SEEDS = ("250197", "250198", "250199")
@@ -115,7 +118,7 @@ def test_the_submission_order_is_seed_major_with_the_conditioned_row_last(gen):
 
 def test_every_order_only_arm_renders_to_valid_bash(gen, rows):
     for a in rows:
-        assert gen._bash_n(gen.render(a)) is None, a["name"]
+        assert gen._bash_n(gen.render(a, STACK)) is None, a["name"]
 
 
 # ---------------------------------------------------------------- 2. the arm
@@ -202,7 +205,7 @@ def test_the_run_shape_is_the_matrix_row(gen, rows):
         assert "--terminal-rewards-only" in cli, a["name"]
         assert cli["--grad-oracle-cadence"] == "50", a["name"]
         # wandb online, to the project the matrix already writes to
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert f"--wandb {gen.WANDB_MODE}" in text, a["name"]
         assert f"--wandb-project {gen.WANDB_PROJECT}" in text, a["name"]
 
@@ -277,7 +280,7 @@ def test_every_order_only_job_is_a_cross_agent_per_node_singleton(gen, rows):
     pgi15-gpu14, and a name only one agent uses serializes nothing -- two
     jobs of this user on one node and the epilog kills both."""
     for a in rows:
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert a["job"] == f"node-{a['node']}", a["name"]
         assert f"#SBATCH -J node-{a['node']}\n" in text, a["name"]
         assert f"#SBATCH -J thesis-{a['node']}\n" not in text, a["name"]
@@ -306,7 +309,7 @@ def test_the_hardware_lines_follow_the_node(gen, rows):
                              "pgi15-gpu14": 8}
     assert gen.NODE_PARTITION == {"pgi15-gpu14": "pgi15-h100"}
     for a in rows:
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         node, gpus = a["node"], a["gpus"]
         assert gpus == gen.node_gpu_count(node), a["name"]
         assert f"#SBATCH -p {gen.node_partition(node)}\n" in text, a["name"]
@@ -339,7 +342,7 @@ def test_the_node_whose_toolkit_is_outside_usr_local_puts_it_on_path(gen,
     bin_dir = gen.NODE_CUDA_BIN["pgi15-gpu14"]
     assert "12.9" in bin_dir and "13.2" not in bin_dir
     for a in rows:
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         export_line = f'export PATH="{bin_dir}:$PATH"'
         if a["node"] == "pgi15-gpu14":
             assert a["cuda_bin"] == bin_dir, a["name"]
@@ -368,7 +371,7 @@ def test_the_toolchain_block_still_searches_usr_local(gen):
     """
     marker = re.compile(r"@[A-Z][A-Z0-9_]*@")
     for a in gen.ARMS:
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         if a["kind"] != "cpu" or a.get("needs_tool"):
             assert "\nfor d in /usr/local/cuda-*/bin; do\n" in text, a["name"]
         left = marker.findall(text)
@@ -382,7 +385,7 @@ def test_no_order_only_launcher_exports_an_xla_flag_or_a_promoted_var(gen,
     jax_cache_exports = {f"export {k}={v}" for k, v in gen.JAX_CACHE_ENV}
     jax_cache_mkdir = f"mkdir -p {gen.JAX_CACHE_DIR_EXPR}"
     for a in rows:
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         for var in gen.PROMOTED_ENV_VARS:
             assert f"export {var}=" not in text, (a["name"], var)
         assert "ALPHAGRAD_FORCE_REV_ORDER" not in text, a["name"]
@@ -399,7 +402,7 @@ def test_no_order_only_launcher_exports_an_xla_flag_or_a_promoted_var(gen,
 def test_every_export_in_an_order_only_launcher_is_allowed(gen, rows):
     allowed = set(gen.THESIS_ENV_ALLOWED)
     for a in rows:
-        exported = set(_EXPORT.findall(gen.render(a)))
+        exported = set(_EXPORT.findall(gen.render(a, STACK)))
         assert exported <= allowed, (a["name"], sorted(exported - allowed))
         # dsnn-dfw.264: DSNN_SHD_DIR is on the rows thesis_arm emits only;
         # a frozen round keeps the environment it ran with.
@@ -422,7 +425,7 @@ def test_the_preflight_greps_the_swept_flags(gen, rows):
     for flag in gen.ORDERONLY_REQUIRED_FLAGS:
         assert f'"{flag}"' in src, flag
     for a in rows:
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert " ".join(gen.THESIS_FLAGS_FILES) in text, a["name"]
         for flag in _cli(gen, a):
             assert f'"{flag}"' in src, (a["name"], flag)
@@ -494,7 +497,7 @@ def test_no_arm_that_existed_before_this_round_moved(gen):
         if a.get("orderonly") or a.get("orderonly_rsnn"):
             continue
         node, gpus = a["node"], a.get("gpus", 0)
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         # the fallbacks are the old expressions, exactly
         assert gen.node_partition(node) == (
             "pgi15-cpu" if node == "pgi15-cpu1" else "pgi15"), a["name"]
@@ -645,7 +648,7 @@ def test_the_baseline_is_a_final_row_with_the_four_block_settings(
         assert cli["--lag-max"] == gen.THESIS_DUAL_LAMBDA_MAX == "64", a["name"]
         assert cli["--lag-min"] == gen.DUAL_LAMBDA_MIN == "12", a["name"]
         assert cli["--lag-init"] == gen.THESIS_LAMBDA_Q == "16", a["name"]
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert f"--wandb {gen.WANDB_MODE}" in text and gen.WANDB_MODE == "online"
         assert f"--wandb-project {gen.WANDB_PROJECT}" in text, a["name"]
 
@@ -673,7 +676,7 @@ def test_the_baseline_runs_one_seed_per_blackwell_node(gen, final_rows):
         cli = _cli(gen, a)
         assert cli["--ray-measure"] == gen.THESIS_RAY_MEASURE[gpus] \
             == str(gpus - 1), a["name"]
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert f"#SBATCH -w {node}\n" in text, a["name"]
         assert f"#SBATCH -J node-{node}\n" in text, a["name"]
         assert "#SBATCH --dependency=singleton\n" in text, a["name"]
@@ -764,7 +767,7 @@ def test_the_tlm_final_row_is_named_and_shaped_as_ruled(gen, tlm_final_row):
 def test_the_tlm_final_row_carries_the_tlm_env_and_the_block_settings(
         gen, tlm_final_row):
     a = tlm_final_row
-    text = gen.render(a)
+    text = gen.render(a, STACK)
     assert "export ALPHAGRAD_TLM_SEQ=" in text, a["name"]
     assert "export ALPHAGRAD_TLM_DMODEL=" in text, a["name"]
     assert "export ALPHAGRAD_TLM_VOCAB=" in text, a["name"]
@@ -793,7 +796,7 @@ def test_the_tlm_final_row_is_on_gpu15_with_the_singleton(gen, tlm_final_row):
     cli = _cli(gen, a)
     assert cli["--ray-measure"] == gen.THESIS_RAY_MEASURE[gpus] \
         == str(gpus - 1), a["name"]
-    text = gen.render(a)
+    text = gen.render(a, STACK)
     assert f"#SBATCH -w {node}\n" in text, a["name"]
     assert f"#SBATCH -J node-{node}\n" in text, a["name"]
     assert "#SBATCH --dependency=singleton\n" in text, a["name"]

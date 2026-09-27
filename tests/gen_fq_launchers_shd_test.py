@@ -9,6 +9,9 @@ import pytest
 
 _ALPHAGRAD = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _GEN = os.path.join(_ALPHAGRAD, "tools", "gen_fq_launchers.py")
+#: The stack every launcher here is rendered for: a generation-time input
+#: with no default (owner ruling 2026-09-27).
+STACK = "/Scratch/assmuth/mrg/test-stack"
 
 SEEDS = ("250197", "250198", "250199", "250200", "250201")
 ARMS = ("A", "B", "C", "C_popart")
@@ -59,7 +62,7 @@ def test_no_row_runs_a_deprecated_rule(gen):
     for a in gen.ARMS:
         assert a.get("thesis_rule") not in DEPRECATED_RULES, a["name"]
         assert a.get("thesis_target") not in DEPRECATED_TARGETS, a["name"]
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert not set(_TEMPORAL_RULE.findall(text)) & set(DEPRECATED_RULES), \
             a["name"]
         assert "RSNN_SHD_W2" not in text, a["name"]
@@ -91,7 +94,7 @@ def test_thesis_arm_refuses_the_deprecated_rules(gen):
 def test_every_row_thesis_arm_emits_exports_the_shd_directory(gen, emitted,
                                                               frozen):
     for a in emitted:
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert MNIST_LINE + SHD_LINE in text, a["name"]
         assert text.count("export DSNN_SHD_DIR=") == 1, a["name"]
         assert a.get("shd_dir") is True, a["name"]
@@ -100,7 +103,7 @@ def test_every_row_thesis_arm_emits_exports_the_shd_directory(gen, emitted,
     others = [a for a in gen.ARMS if id(a) not in ids]
     assert len(others) > len(frozen)
     for a in others:
-        assert "DSNN_SHD_DIR" not in gen.render(a), a["name"]
+        assert "DSNN_SHD_DIR" not in gen.render(a, STACK), a["name"]
     names = {a["name"] for a in emitted}
     assert {"C_popart_rsnn_rtrl_s250197", "C_popart_nn256_s250197",
             "smoke_C_tlm"} <= names
@@ -114,9 +117,9 @@ def test_the_shd_directory_goes_through_the_stack_allow_lists(gen):
     assert "DSNN_SHD_DIR" in gen.THESIS_ENV_ALLOWED
     assert "DSNN_SHD_DIR" not in gen.THESIS_TARGET_ENV_ALLOWED
     assert f"{gen.CAMPAIGN_CACHE}/dsnn_shd" == SHD_DIR
-    on = "\n".join(gen._scratch_stack_block({}, jax_cache=False,
+    on = "\n".join(gen._scratch_stack_block(STACK, {}, jax_cache=False,
                                             shd_dir=True)) + "\n"
-    off = "\n".join(gen._scratch_stack_block({}, jax_cache=False)) + "\n"
+    off = "\n".join(gen._scratch_stack_block(STACK, {}, jax_cache=False)) + "\n"
     assert MNIST_LINE + SHD_LINE in on
     assert "DSNN_SHD_DIR" not in off
     ds = open(os.path.join(_ALPHAGRAD, "src", "alphagrad", "approx", "common",

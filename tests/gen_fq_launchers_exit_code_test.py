@@ -19,6 +19,9 @@ import subprocess
 
 _ALPHAGRAD = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _GEN = os.path.join(_ALPHAGRAD, "tools", "gen_fq_launchers.py")
+#: The stack every launcher here is rendered for: a generation-time input
+#: with no default (owner ruling 2026-09-27).
+STACK = "/Scratch/assmuth/mrg/test-stack"
 
 _TRAINER_LINE = re.compile(
     r'^\s*src/alphagrad/approx/ppo\.py "\$\{ARGS\[@\]\}"\s*$', re.M)
@@ -51,7 +54,7 @@ def test_the_tail_exits_with_the_trainers_captured_code():
     fall through to the echo's own exit status of 0."""
     gen = _gen()
     a = _one_row(gen)
-    text = gen.render(a)
+    text = gen.render(a, STACK)
 
     m = _TRAINER_LINE.search(text)
     assert m, "the trainer invocation line is missing from the rendered tail"
@@ -94,7 +97,7 @@ def test_the_tail_never_ends_on_a_bare_echo():
     must not be the echo itself (that is the un-captured-$? bug verbatim)."""
     gen = _gen()
     for a in (gen.thesis_core_arms()[0], gen.orderonly_final_arms()[0]):
-        text = gen.render(a).rstrip("\n")
+        text = gen.render(a, STACK).rstrip("\n")
         last_line = text.splitlines()[-1]
         assert not last_line.strip().startswith('echo "TRAINER exited'), (
             f"{a['name']}: the rendered script's last line is the trainer "
@@ -117,7 +120,7 @@ def _bash(script):
 def test_a_crashed_trainer_is_the_exit_code_of_the_rendered_launcher():
     gen = _gen()
     for a in (gen.thesis_core_arms()[0], gen.orderonly_final_arms()[0]):
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         m = _TRAINER_LINE.search(text)
         assert m, a["name"]
         r = _bash(_shell_options(text) + "(exit 3)" + text[m.end():])
@@ -129,7 +132,7 @@ def test_a_paired_launcher_exits_with_the_worse_of_its_two_trainers():
     gen = _gen(pairs=True)
     pairs = gen.thesis_pair_arms()
     assert pairs, "the generator emits no paired launcher"
-    text = gen.render(pairs[0])
+    text = gen.render(pairs[0], STACK)
     tail = text[text.index('wait "$PID_A"'):]
     for code_a, code_b in ((0, 3), (5, 3), (0, 0)):
         stub = (f"(exit {code_a}) &\nPID_A=$!\n"

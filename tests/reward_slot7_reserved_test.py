@@ -56,6 +56,9 @@ LAYOUT = (
 )
 _HERE = pathlib.Path(__file__).resolve().parent
 _ALPHAGRAD = _HERE.parent
+#: The stack every launcher here is rendered for: a generation-time input
+#: with no default (owner ruling 2026-09-27).
+STACK = "/Scratch/assmuth/mrg/test-stack"
 
 
 # ------------------------------------------------------------- 1. the layout
@@ -211,7 +214,7 @@ def test_launcher_generator_emits_none_of_the_removed_flags():
     assert gen.ARMS
     for a in gen.ARMS:
         assert a["name"] != "w0_x2_screen"
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         for line in text.splitlines():
             if line.lstrip().startswith("#"):
                 continue

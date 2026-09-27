@@ -17,6 +17,9 @@ import pytest
 
 _ALPHAGRAD = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _GEN = os.path.join(_ALPHAGRAD, "tools", "gen_fq_launchers.py")
+#: The stack every launcher here is rendered for: a generation-time input
+#: with no default (owner ruling 2026-09-27).
+STACK = "/Scratch/assmuth/mrg/test-stack"
 
 SEEDS = ("250197", "250198", "250199")
 CENTER = {"--lag-eta": "2.0", "--lag-max": "64", "--lag-init": "16",
@@ -164,5 +167,5 @@ def test_every_row_lands_on_a_permitted_thesis_node(gen):
 
 def test_every_launcher_bash_n_checks(gen):
     for a in gen.sweepl_arms():
-        text = gen.render(a)
+        text = gen.render(a, STACK)
         assert gen._bash_n(text) is None, a["name"]

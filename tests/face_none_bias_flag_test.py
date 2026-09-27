@@ -55,6 +55,9 @@ from alphagrad.approx.unified_face_head import (                # noqa: E402
     _cat_logp_ent, slot_base)
 
 _ALPHAGRAD = pathlib.Path(__file__).resolve().parents[1]
+#: The stack every launcher here is rendered for: a generation-time input
+#: with no default (owner ruling 2026-09-27).
+STACK = "/Scratch/assmuth/mrg/test-stack"
 _ENV = "ALPHAGRAD_FACE_NONE_BIAS"
 
 
@@ -225,7 +228,7 @@ def test_generator_passes_the_flag_and_never_the_env_var():
     with_flag = []
     for a in g.ARMS:
         assert _ENV not in a.get("env", {}), a["name"]
-        text = g.render(a)
+        text = g.render(a, STACK)
         assert f"export {_ENV}" not in text, a["name"]
         if "--face-none-bias" in a.get("cli", {}):
             with_flag.append(a["name"])
