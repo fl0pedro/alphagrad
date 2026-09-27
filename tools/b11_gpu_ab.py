@@ -2,7 +2,7 @@
 # barrier at narrow private sums) on the same plans, timed in ONE process with the measurement's own compile and
 # timing instrument.
 # tools/b11_gpu_ab.sbatch runs the three steps; each step can run alone:
-#   plans   --target T --out DIR                     the plan set of target T (under the head graphax)
+#   plans   --target T --out DIR [--only PID ...]    the plan set of target T (under the head graphax)
 #   compile --target T --variant V --out DIR         each plan's executable under graphax V, through _compile_measure
 #                                                    on the measurement's own lowering, serialized with its HLO
 #   time    --out DIR --variants base,v2,... [...]   load every variant of every plan and time them paired
@@ -204,6 +204,11 @@ def cmd_plans(a):
         taken = {(w["k"], w["f"], w["slot"]) for w in q["wires"]}
         plans.append({"pid": "quant_reduce", "order": okind,
                       "wires": q["wires"] + [w for w in r["wires"] if (w["k"], w["f"], w["slot"]) not in taken]})
+    if a.only:
+        missing = sorted(set(a.only) - {p["pid"] for p in plans})
+        if missing:
+            raise SystemExit(f"[plans] {a.target} has no plan {missing}; it has {[p['pid'] for p in plans]}")
+        plans = [p for p in plans if p["pid"] in a.only]
     for p in plans:
         print(f"[plans] {a.target} {p['pid']}: {p['order']} order, {len(p['wires'])} wires", flush=True)
     out = Path(a.out) / "plans"
@@ -434,6 +439,8 @@ def main(argv=None):
         s.add_argument("--cli", action="append", default=[], metavar="FLAG=V")
         if name == "plans":
             s.add_argument("--join", type=int, default=4)
+            s.add_argument("--only", action="append", default=[], metavar="PID",
+                           help="keep only this plan (repeatable); the others are built and dropped")
         else:
             s.add_argument("--variant", required=True)
     s = sub.add_parser("time")
