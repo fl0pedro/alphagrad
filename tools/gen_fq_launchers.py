@@ -3157,8 +3157,8 @@ _THESIS_DEFENSE_HELD = """The defense arms run in the full experiments only
 (owner ruling 2026-09-25, round 3 Q1 b): not in block 1 and not in the pilot.
 They are GENERATED so that the 2x2 {fixed, L} x {symlog, PopArt} is
 reviewable, and HELD so that a stray `sbatch fq_*.sbatch` cannot start one.
-Remove `held=` from the row in tools/gen_fq_launchers.py and regenerate when
-the owner releases them."""
+Name the row's target in THESIS_RELEASED_TARGETS in tools/gen_fq_launchers.py
+and regenerate when the owner releases them."""
 
 _THESIS_FALSIFIER = """If the arm neither collapses nor produces a front but
 drifts (approx_prob/none > 0.99 with no plan outside the drift floor by
@@ -3170,9 +3170,9 @@ _THESIS_HELD = """The owner authorised the FIRST BLOCK only: C and C_popart on
 both targets at all five seeds, then A and B at seed """ + THESIS_SEEDS[0] + """
 only (condC left the matrix on 2026-09-25).  The remaining A and B
 seeds are GENERATED so that the matrix is complete and reviewable, and they
-are HELD so that a stray `sbatch fq_*.sbatch` cannot start one.  Remove
-`held=` from the row in tools/gen_fq_launchers.py and regenerate when the
-owner releases them."""
+are HELD so that a stray `sbatch fq_*.sbatch` cannot start one.  Name the
+row's target in THESIS_RELEASED_TARGETS in tools/gen_fq_launchers.py and
+regenerate when the owner releases them."""
 
 
 def thesis_run_name(arm: str, target: str, seed: str) -> str:
@@ -3542,8 +3542,14 @@ def thesis_submission_order() -> list[tuple[str, str, str]]:
 
 #: How many entries of `thesis_submission_order` the owner authorised to
 #: start after the smoke: C and C_popart (20), A and B at one seed (4).  The
-#: rest are held.
+#: rest are held, except on THESIS_RELEASED_TARGETS.
 THESIS_BLOCK1 = 20 + 4
+
+#: Targets whose every row is released (owner ruling 2026-09-27): the NN256
+#: rows past block 1, the remaining A and B seeds and the defense arms, are
+#: submitted once block 1's first rows have run healthy.  TLM and the
+#: recurrent target keep the rest of their rows held.
+THESIS_RELEASED_TARGETS = ("nn256",)
 
 
 def thesis_arms() -> list[dict]:
@@ -3561,19 +3567,40 @@ def thesis_pair_arms() -> list[dict]:
             and not a.get("sweepl2") and not a.get("sweepl3")]
 
 
-def thesis_block1_arms() -> list[dict]:
-    # The order-only tuning rows (tickets dsnn-dfw.29 and dsnn-dfw.45) are
-    # thesis arms but not matrix coordinates: block 1 is the 24 runs of the
-    # matrix the owner authorised (2026-09-16, without condC since
-    # 2026-09-25) and nothing else.
+def _thesis_order_rows(order: list[tuple[str, str, str]]) -> list[dict]:
+    """The rows that stand for entries of `order`, and none that only share
+    a coordinate with one: the smoke, the paired launchers, the order-only
+    tuning rows (tickets dsnn-dfw.29 and dsnn-dfw.45), the update-overlap
+    test and the NN256 pace probe are thesis arms but not matrix rows."""
+    want = set(order)
     return [a for a in thesis_arms()
-            if not a.get("held") and not a.get("smoke") and not a.get("paired")
+            if (a.get("thesis_arm"), a.get("thesis_target"),
+                a.get("thesis_seed")) in want
+            and not a.get("smoke") and not a.get("paired")
             and not a.get("orderonly") and not a.get("orderonly_rsnn")
             and not a.get("sweepl") and not a.get("sweepl2")
             and not a.get("sweepl3")
             and not a.get("orderonly_final")
             and not a.get("orderonly_tlm_final")
             and not a.get("overlap") and not a.get("pace_probe")]
+
+
+def thesis_block1_arms() -> list[dict]:
+    # Block 1 is the 24 runs of the matrix the owner authorised (2026-09-16,
+    # without condC since 2026-09-25) and nothing else.  Not being held does
+    # not make a row block 1: the rows of THESIS_RELEASED_TARGETS are not
+    # held either.
+    return [a for a in
+            _thesis_order_rows(thesis_submission_order()[:THESIS_BLOCK1])
+            if not a.get("held")]
+
+
+def thesis_released_arms() -> list[dict]:
+    """The rows past block 1 that are not held: the ones on
+    THESIS_RELEASED_TARGETS (owner ruling 2026-09-27)."""
+    return [a for a in
+            _thesis_order_rows(thesis_submission_order()[THESIS_BLOCK1:])
+            if not a.get("held")]
 
 
 def thesis_snn_arms() -> list[dict]:
@@ -3765,7 +3792,7 @@ for _i, (_arm, _target, _seed) in enumerate(thesis_submission_order()):
     thesis_arm(
         arm=_arm, target=_target, seed=_seed,
         node=_node,
-        held=(None if _i < THESIS_BLOCK1
+        held=(None if _i < THESIS_BLOCK1 or _target in THESIS_RELEASED_TARGETS
               else _THESIS_DEFENSE_HELD if _arm in THESIS_DEFENSE_ARMS
               else _THESIS_HELD),
     )

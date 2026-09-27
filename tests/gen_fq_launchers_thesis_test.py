@@ -386,23 +386,38 @@ def test_the_priority_order_is_the_owners(gen):
     assert gen.THESIS_BLOCK1 == 24
 
 
-def test_only_the_first_block_is_submittable_the_rest_is_held(gen, matrix):
+def test_block_1_and_the_released_nn256_rows_are_submittable_the_rest_held(
+        gen, matrix):
     block = gen.thesis_block1_arms()
     assert len(block) == gen.THESIS_BLOCK1 == 24
     assert not any(a.get("held") for a in block)
+    # The owner released every NN256 row on 2026-09-27, to be submitted once
+    # block 1's first rows have run healthy: A and B at the four later seeds
+    # and the defense arms.  None of them is block 1.
+    assert gen.THESIS_RELEASED_TARGETS == ("nn256",)
+    released = gen.thesis_released_arms()
+    assert len(released) == 8 + 9 == 17
+    assert not {a["name"] for a in released} & {a["name"] for a in block}
+    got = {(a["thesis_arm"], a["thesis_target"], a["thesis_seed"])
+           for a in released}
+    want = {(arm, "nn256", s) for arm in ("A", "B") for s in SEEDS[1:]}
+    want |= {(arm, "nn256", s) for arm in DEFENSE_ARMS for s in DEFENSE_SEEDS}
+    assert got == want
+    for a in released:
+        text = gen.render(a, STACK)
+        assert "*** HELD" not in text and "ABORT(73)" not in text, a["name"]
     held = [a for a in matrix if a.get("held")]
-    # 16 core rows (A and B at the four later seeds), every recurrent row and
-    # every defense row
-    assert len(held) == 16 + 40 + 9 == 65
+    # 8 TLM rows (A and B at the four later seeds) and every recurrent row
+    assert len(held) == 8 + 40 == 48
     for a in held:
         text = gen.render(a, STACK)
         assert "*** HELD" in text and "ABORT(73)" in text, a["name"]
-    # every held CORE row is an A or B row at a seed other than the first
-    core_held = [a for a in held if not a.get("thesis_rule")
-                 and a["thesis_arm"] not in DEFENSE_ARMS]
-    assert len(core_held) == 16
+    # every held CORE row is a TLM A or B row at a seed other than the first
+    core_held = [a for a in held if not a.get("thesis_rule")]
+    assert len(core_held) == 8
     for a in core_held:
         assert a["thesis_arm"] in ("A", "B"), a["name"]
+        assert a["thesis_target"] == "tlm", a["name"]
         assert a["thesis_seed"] != SEEDS[0], a["name"]
     # the released block is the CORE block and nothing else: no recurrent row
     # is submittable, whatever its arm or seed
@@ -414,6 +429,8 @@ def test_only_the_first_block_is_submittable_the_rest_is_held(gen, matrix):
             for t in TARGETS for s in SEEDS}
     want |= {(arm, t, SEEDS[0]) for arm in ("A", "B") for t in TARGETS}
     assert got == want
+    # every row of the matrix is block 1, released or held, and one only
+    assert len(block) + len(released) + len(held) == len(matrix) == 89
 
 
 def test_every_thesis_arm_renders_to_valid_bash(gen, matrix, smoke):

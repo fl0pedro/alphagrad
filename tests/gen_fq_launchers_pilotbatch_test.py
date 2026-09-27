@@ -375,14 +375,17 @@ def test_the_defense_arms_are_arm_a_on_popart_at_three_lambdas(gen):
     assert [a["name"] for a in gen.thesis_defense_arms()] == \
         [a["name"] for a in rows]
     block = {a["name"] for a in gen.thesis_block1_arms()}
+    released = {a["name"] for a in gen.thesis_released_arms()}
     a_rows = {a["thesis_seed"]: a for a in gen.thesis_core_arms()
               if a["thesis_arm"] == "A" and a["thesis_target"] == "nn256"}
     for a in rows:
         lq = DEFENSE_LAMBDA_Q[a["thesis_arm"]]
         assert a["name"] == f"{a['thesis_arm']}_nn256_s{a['thesis_seed']}"
-        # the full experiments only: held, not in block 1, not the pilot
-        assert a.get("held"), a["name"]
+        # the full experiments only: not in block 1 and not the pilot, and
+        # released with every NN256 row since 2026-09-27
+        assert not a.get("held"), a["name"]
         assert a["name"] not in block, a["name"]
+        assert a["name"] in released, a["name"]
         cli = _cli(gen, a)
         assert cli["--face-none-bias"] == "0", a["name"]
         assert cli["--reward-mode"] == "additive", a["name"]
@@ -403,7 +406,7 @@ def test_the_defense_arms_are_arm_a_on_popart_at_three_lambdas(gen):
                         | ({"--lambda-acc"} if lq != "16" else set())), \
             (a["name"], sorted(diff))
         text = gen.render(a, STACK)
-        assert "*** HELD" in text and f"ABORT(73): {a['name']} is HELD" in text
+        assert "*** HELD" not in text and "ABORT(73)" not in text, a["name"]
         for line in (f"--lambda-acc {lq}", "--advantage-norm popart",
                      "--no-symlog", "--symlog-channels none",
                      "--face-none-bias 0", "--reward-mode additive"):
