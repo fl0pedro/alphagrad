@@ -3525,7 +3525,8 @@ def thesis_block1_arms() -> list[dict]:
             and not a.get("sweepl") and not a.get("sweepl2")
             and not a.get("sweepl3")
             and not a.get("orderonly_final")
-            and not a.get("orderonly_tlm_final")]
+            and not a.get("orderonly_tlm_final")
+            and not a.get("overlap")]
 
 
 def thesis_snn_arms() -> list[dict]:
@@ -3544,13 +3545,14 @@ def thesis_snn_arms() -> list[dict]:
 
 def thesis_core_arms() -> list[dict]:
     """The 40 NN256/TLM rows: the matrix without the recurrent target, the
-    defense arms, the smoke, the order-only tuning rows and the order-only
-    baseline."""
+    defense arms, the smoke, the order-only tuning rows, the order-only
+    baseline and the update-overlap test."""
     return [a for a in thesis_arms()
             if not a.get("smoke") and not a.get("thesis_rule")
             and not a.get("orderonly") and not a.get("orderonly_final")
             and not a.get("orderonly_tlm_final") and not a.get("paired")
             and not a.get("sweepl") and not a.get("sweepl2") and not a.get("sweepl3")
+            and not a.get("overlap")
             and a.get("thesis_arm") not in THESIS_DEFENSE_ARMS]
 
 
@@ -5170,6 +5172,99 @@ del _rule, _seed, _lc, _lm
 
 def orderonly_rsnn_arms() -> list[dict]:
     return [a for a in ARMS if a.get("orderonly_rsnn")]
+
+
+# ---------------------------------------------------------------------------
+# THE UPDATE-OVERLAP TEST (dsnn-dfw.190; owner rulings 2026-09-25, "yes, with
+# a test before it is finished", and 2026-09-27).  --update-overlap 1 (commit
+# 18cb005) runs the PPO update of episode e-2 on a helper thread beside the
+# rollout of e: the rollout draws under parameters one update older than at
+# --update-overlap 0, a policy lag of one update, for up to 27 s per TLM
+# episode (report dsnn-8krf).  The test is four rows: arm C_popart on TLM,
+# seeds 250197 and 250198, 100 episodes, each seed at --update-overlap 1 and
+# at --update-overlap 0, on pgi15-gpu20, holding the whole node the way a TLM
+# thesis row does (8 GPUs, --ray-measure 7).
+#
+# THE TWO ARMS OF A SEED DIFFER IN --update-overlap ALONE, beside their own
+# --name.  Each row is a `thesis_arm` row, so it carries the matrix's TLM
+# C_popart command line and environment; --update-overlap is named in both
+# arms (0 is ppo.py's default and is named anyway).  ppo.py refuses
+# --update-overlap 1 without the deep pipeline (--measure-pipeline 1 with
+# --tokenize-where local or cpu-actors), with more than one rollout shard or
+# temporal rule, under a preference sweep, or without the jitted update; the
+# TLM C_popart row meets all five, and the overlap test pins that.
+#
+# RELEASED, NOT A MATRIX COORDINATE: `thesis_core_arms` and
+# `thesis_block1_arms` exclude every row marked `overlap=True`.  The name is
+# `ovl<value>_` before the matrix's own `<arm>_<target>_s<seed>`.
+# ---------------------------------------------------------------------------
+OVERLAP_ARM = "C_popart"
+OVERLAP_TARGET = "tlm"
+OVERLAP_SEEDS = THESIS_SEEDS[:2]
+OVERLAP_EPISODES = "100"
+OVERLAP_NODE = "pgi15-gpu20"
+#: --update-overlap of the two arms of a seed, in generation order.
+OVERLAP_VALUES = ("1", "0")
+#: dsnn-dfw.190's flag, on the list of a row that passes it and of no other
+#: row, exactly as DUAL_CLIP_REQUIRED_FLAGS.
+OVERLAP_REQUIRED_FLAGS = ["--update-overlap"]
+
+_OVERLAP_WHAT = """THE UPDATE-OVERLAP TEST (dsnn-dfw.190), not a matrix row.
+At --update-overlap 1 the PPO update of episode e-2 runs on a helper thread,
+on the trainer's GPU, while episode e rolls out: rollout k draws under the
+parameters that have absorbed the update of k-3 instead of k-2, and the two
+host duals move one episode later.  At --update-overlap 0 the deep pipeline
+keeps its order.  Arm C_popart on TLM, seeds 250197 and 250198, each at both
+values: four rows that differ in --update-overlap and their own --name alone.
+100 episodes, so the cosine learning rate decays over 100 (dsnn-ddw).
+
+READ-OUT, per seed, the ovl1 row against its ovl0 twin: the episode wall
+time, the [update-overlap] line of every ovl1 episode (the update's seconds,
+the wait after the rollout, the trainer GPU's peak memory), and the two
+learning curves (the feasible fraction at q >= 0.9 and the multiplier)."""
+
+_OVERLAP_PREDICTION = """REGISTERED BEFORE THE RUN: all four rows reach episode
+100.  An ovl1 row prints an [update-overlap] line for every episode whose
+update it overlapped, and its episodes are shorter than its ovl0 twin's by at
+most the update's own time (report dsnn-8krf: up to 27 s per TLM episode).
+The one-update policy lag leaves each seed's two learning curves within the
+spread of the two seeds."""
+
+_OVERLAP_FALSIFIER = """If an ovl1 row raises, runs out of trainer GPU
+memory, or is not faster than its ovl0 twin, or if a seed's two learning
+curves part by more than the two seeds do, --update-overlap is not finished
+(dsnn-dfw.190) and the result is reported as it stands."""
+
+
+def overlap_run_name(value: str, seed: str) -> str:
+    """`ovl<value>_<arm>_<target>_s<seed>`, e.g. ovl1_C_popart_tlm_s250197."""
+    if value not in OVERLAP_VALUES:
+        raise CampaignRowError(
+            f"--update-overlap {value!r} is not one of {OVERLAP_VALUES}")
+    if seed not in OVERLAP_SEEDS:
+        raise CampaignRowError(
+            f"seed {seed!r} is not one of {OVERLAP_SEEDS}")
+    return f"ovl{value}_" + thesis_run_name(OVERLAP_ARM, OVERLAP_TARGET, seed)
+
+
+for _seed in OVERLAP_SEEDS:
+    for _value in OVERLAP_VALUES:
+        thesis_arm(
+            arm=OVERLAP_ARM, target=OVERLAP_TARGET, seed=_seed,
+            node=OVERLAP_NODE, name=overlap_run_name(_value, _seed),
+            episodes=OVERLAP_EPISODES,
+            extra_cli={"--update-overlap": _value},
+            what=_OVERLAP_WHAT, prediction=_OVERLAP_PREDICTION,
+        )
+        ARMS[-1]["overlap"] = True
+        ARMS[-1]["falsifier"] = _OVERLAP_FALSIFIER
+        ARMS[-1]["required_flags"] = (ARMS[-1]["required_flags"]
+                                      + OVERLAP_REQUIRED_FLAGS)
+del _seed, _value
+
+
+def overlap_arms() -> list[dict]:
+    return [a for a in ARMS if a.get("overlap")]
 
 
 # ---------------------------------------------------------------------------

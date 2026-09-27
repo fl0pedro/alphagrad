@@ -530,14 +530,17 @@ def test_the_matrix_and_the_campaign_still_have_their_own_counts(gen):
     # 2026-09-19 ruling added the five-seed BASELINE (`orderonly_final`),
     # excluded the same way, and the same evening added the one-row TLM
     # order-only final (`orderonly_tlm_final`, owner: "run a TLM run for 1k
-    # episodes") -- also a final row, not a matrix coordinate.
+    # episodes") -- also a final row, not a matrix coordinate.  The four
+    # rows of the update-overlap test (`overlap`, dsnn-dfw.190) are not
+    # matrix coordinates either.
     matrix = [a for a in gen.thesis_arms()
               if not a.get("smoke") and not a.get("orderonly")
               and not a.get("orderonly_rsnn")
               and not a.get("orderonly_final")
               and not a.get("orderonly_tlm_final")
               and not a.get("paired") and not a.get("sweepl")
-              and not a.get("sweepl2") and not a.get("sweepl3")]
+              and not a.get("sweepl2") and not a.get("sweepl3")
+              and not a.get("overlap")]
     assert len(gen.thesis_core_arms()) == 40
     assert len(gen.thesis_snn_arms()) == 40
     assert len(gen.thesis_defense_arms()) == 9

@@ -397,14 +397,16 @@ def test_the_nn256_order_only_round_did_not_move(gen):
 
 def test_the_matrix_and_the_campaign_still_have_their_own_counts(gen):
     # `orderonly_final`, the five-seed order-only baseline of 2026-09-19, is
-    # excluded here exactly as the two tuning rounds are.
+    # excluded here exactly as the two tuning rounds are, and so is the
+    # update-overlap test (`overlap`, dsnn-dfw.190).
     matrix = [a for a in gen.thesis_arms()
               if not a.get("smoke") and not a.get("orderonly")
               and not a.get("orderonly_rsnn")
               and not a.get("orderonly_final")
               and not a.get("orderonly_tlm_final")
               and not a.get("paired") and not a.get("sweepl")
-              and not a.get("sweepl2") and not a.get("sweepl3")]
+              and not a.get("sweepl2") and not a.get("sweepl3")
+              and not a.get("overlap")]
     # condC left the matrix and the 9 defense rows joined it (2026-09-25);
     # the tbptt and window2 rows left it too (dsnn-dfw.232)
     assert len(gen.thesis_core_arms()) == 40
