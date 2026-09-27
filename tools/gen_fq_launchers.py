@@ -5282,10 +5282,10 @@ def overlap_arms() -> list[dict]:
 # needs a row of its own: the thesis row C_popart_nn256_s250197, argument for
 # argument and variable for variable, but --episodes 3 and --wandb offline
 # (AGENTS.md: probes run offline), released, on pgi15-gpu15 as a whole 4-GPU
-# row like the NN256 rows.  --name stays the thesis row's, as every other
-# argument does; the launcher and its slurm log are PACE_PROBE_NAME.  An
-# offline run writes an offline-run-* directory, which the nightly copy
-# (run-* only) does not read.
+# row like the NN256 rows.  --name is PACE_PROBE_NAME, as are the launcher
+# and its slurm log, so nothing that looks a thesis row up by its name (a plan
+# log glob, the wandb run name) finds the probe.  An offline run writes an
+# offline-run-* directory, which the nightly copy (run-* only) does not read.
 #
 # NOT A MATRIX COORDINATE: `thesis_core_arms` and `thesis_block1_arms`
 # exclude the row marked `pace_probe=True`.
@@ -5305,7 +5305,7 @@ C_popart_nn256_s250197 -- every argument and every exported variable -- at
 --episodes 3 and --wandb offline (AGENTS.md: probes run offline), as a whole
 4-GPU row on pgi15-gpu15.  It times an NN256 episode on this stack; the
 per-phase wall of every episode is in the slurm log (ALPHAGRAD_PROFILE=1).
---name is the thesis row's; the run directory is offline-run-*, which the
+--name is the probe's own; the run directory is offline-run-*, which the
 nightly copy does not read.  3 episodes, so the cosine learning rate decays
 over 3 (dsnn-ddw)."""
 
@@ -5319,14 +5319,12 @@ stands."""
 
 thesis_arm(
     arm=PACE_PROBE_ARM, target=PACE_PROBE_TARGET, seed=PACE_PROBE_SEED,
-    node=PACE_PROBE_NODE, episodes=PACE_PROBE_EPISODES,
+    node=PACE_PROBE_NODE, name=PACE_PROBE_NAME, episodes=PACE_PROBE_EPISODES,
     what=_PACE_PROBE_WHAT, prediction=_PACE_PROBE_PREDICTION,
 )
 ARMS[-1]["pace_probe"] = True
 ARMS[-1]["falsifier"] = _PACE_PROBE_FALSIFIER
 ARMS[-1]["wandb_mode"] = PACE_PROBE_WANDB_MODE
-# The FILE name differs while --name does not, as on the smoke's resume leg.
-ARMS[-1]["name"] = PACE_PROBE_NAME
 
 
 def pace_probe_arms() -> list[dict]:

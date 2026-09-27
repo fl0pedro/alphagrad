@@ -5,10 +5,11 @@ its own:
 
   1. ONE ROW, probe3_C_popart_nn256_s250197: released, on pgi15-gpu15 as a
      whole 4-GPU row like the NN256 rows.
-  2. IT DIFFERS FROM ITS THESIS ROW, C_popart_nn256_s250197, IN --episodes 3
-     AND --wandb offline ALONE (AGENTS.md: probes run offline): every other
-     argument, in order, and every exported variable are the thesis row's,
-     --name included.
+  2. IT DIFFERS FROM ITS THESIS ROW, C_popart_nn256_s250197, IN --name,
+     --episodes 3 AND --wandb offline ALONE (AGENTS.md: probes run offline):
+     every other argument, in order, and every exported variable are the
+     thesis row's.  Its own --name keeps it out of anything that looks the
+     thesis row up by name.
   3. An offline row carries no online round trip (pre-flight layer 3), and
      no other row is offline.
   4. ppo.py's own argparse accepts it.
@@ -116,17 +117,17 @@ def test_the_probe_is_one_released_whole_four_gpu_row(gen, probe):
 
 # ----------------------------------- 2. the thesis row, but for two things
 
-def test_the_probe_differs_from_its_thesis_row_in_episodes_and_wandb_alone(
+def test_the_probe_differs_from_its_thesis_row_in_name_episodes_and_wandb_alone(
         gen, probe, row):
     tp, tr = gen.cli_tokens(probe), gen.cli_tokens(row)
     assert len(tp) == len(tr)
     diff = [(i, tr[i], tp[i]) for i in range(len(tp)) if tp[i] != tr[i]]
-    assert diff == [
+    assert diff == sorted([
+        (tr.index("--name") + 1, ROW, NAME),
         (tr.index("--episodes") + 1, _cli(gen, row)["--episodes"], EPISODES),
-        (tr.index("--wandb") + 1, "online", "offline")], diff
+        (tr.index("--wandb") + 1, "online", "offline")]), diff
     assert _cli(gen, row)["--episodes"] != EPISODES
-    # --name is an argument like any other: the thesis row's
-    assert _cli(gen, probe)["--name"] == ROW == _cli(gen, row)["--name"]
+    assert _cli(gen, probe)["--name"] == NAME and _cli(gen, row)["--name"] == ROW
     # every exported variable, in order, and what decides them
     assert probe["env"] == row["env"]
     assert _EXPORT.findall(gen.render(probe, STACK)) \
@@ -164,7 +165,7 @@ def test_ppo_argparse_accepts_the_probe(gen, probe):
     ns = make_argparser().parse_args(gen.cli_tokens(probe))
     assert ns.episodes == int(EPISODES)
     assert ns.wandb == "offline"
-    assert ns.name == ROW and ns.seed == int(SEED)
+    assert ns.name == NAME and ns.seed == int(SEED)
     assert ns.example == "VmappedNeuralNetwork"
     assert ns.ray_measure == GPUS - 1
 
