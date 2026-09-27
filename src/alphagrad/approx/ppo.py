@@ -5741,6 +5741,19 @@ def make_argparser() -> argparse.ArgumentParser:
              "overlaps episode e's measurement with the ROLLOUT of e+1 "
              "instead of only with the update of e-1.")
     p.add_argument(
+        "--update-overlap", type=int, default=0, choices=(0, 1),
+        metavar="0|1",
+        help="OVERLAP THE PPO UPDATE WITH THE NEXT ROLLOUT (owner ruling "
+             "2026-09-25, dsnn-dfw.190). 0 (default) keeps the deep "
+             "pipeline's order. 1 runs the update of episode e-2 on a "
+             "helper thread, on the trainer's GPU, while episode e rolls "
+             "out, so rollout k draws under the parameters that have "
+             "absorbed the update of k-3 instead of k-2, and the two host "
+             "duals move one episode later too. The update is compiled on "
+             "the main thread before it is started. Needs --measure-pipeline "
+             "1 with --tokenize-where local or cpu-actors, one rollout "
+             "shard and one temporal rule.")
+    p.add_argument(
         "--face-wire-faces", type=int, default=0, metavar="N",
         help="HOW MANY FACE COLUMNS THE HOST CALLBACKS CARRY. The four "
              "per-step face callbacks AND the env step callback each take "
@@ -9109,6 +9122,20 @@ def main(args=None):
     # pool` the actors still serve every step, so the pipeline keeps the
     # shallower overlap it had: e's measurement against e-1's UPDATE.
     _PIPE_DEEP = bool(_MPIPE) and _TWHERE != "pool"
+    _OVERLAP = bool(int(getattr(args, "update_overlap", 0) or 0))
+    if _OVERLAP:
+        _ov_refusals = [
+            (not _PIPE_DEEP, "it needs the deep pipeline: --measure-pipeline "
+                             "1 with --tokenize-where local or cpu-actors"),
+            (int(getattr(args, "rollout_shards", 1) or 1) != 1,
+             "it needs --rollout-shards 1"),
+            (_TWO_GRAPH, "it needs one temporal rule"),
+            (_PSWEEP, "a preference sweep runs no update"),
+            (bool(args.no_jit), "it needs the jitted update"),
+        ]
+        for _ov_bad, _ov_why in _ov_refusals:
+            if _ov_bad:
+                raise ValueError(f"--update-overlap 1 refused: {_ov_why}.")
 
     # ---- --ray-measure: fan the measurement callback out over Ray actors ----
     if int(getattr(args, "ray_measure", 0) or 0) > 0:
@@ -17851,12 +17878,54 @@ def main(args=None):
         # partner `_pipe_finish` puts the graph back.
         if _TWO_GRAPH:
             _swap_graph(_GSTATES.rule_for(int(prev["ctx"]["ep"])))
-        (_fm, _ovr, _vm, _pin, _mm, _kl, _e2, _w2) = prev["args"]
+        if _OVERLAP:
+            return _overlap_update(prev)()
         return _repro_guard(_episode_update_jit, "update",
-                            int(prev["ctx"]["ep"]))(
-            agent, opt_state, prev["roll"], global_step, _fm, _ovr, _vm,
-            _pin, _mm, popart_m1, popart_m2, popart_w, probes,
-            probe_opt_state, vprobes, vprobe_opt_state, _kl, _e2, _w2)
+                            int(prev["ctx"]["ep"]))(*_pipe_update_args(prev))
+
+    def _pipe_update_args(prev):
+        (_fm, _ovr, _vm, _pin, _mm, _kl, _e2, _w2) = prev["args"]
+        return (agent, opt_state, prev["roll"], global_step, _fm, _ovr, _vm,
+                _pin, _mm, popart_m1, popart_m2, popart_w, probes,
+                probe_opt_state, vprobes, vprobe_opt_state, _kl, _e2, _w2)
+
+    # ---- --update-overlap: the update of e-2 beside the rollout of e ------
+    _UPD_PENDING = [None]
+    _UPD_SECONDS = [0.0]
+    _OV_COMPILED: dict = {}
+    _OV_POOL = [None]
+
+    # The update compiles on the main thread, because a trace reads process globals such as the read path.
+    def _overlap_update(prev):
+        _ep_u = int(prev["ctx"]["ep"])
+        _args_u = _pipe_update_args(prev)
+        _leaves, _tdef = jax.tree_util.tree_flatten(_args_u)
+        _key = (_tdef, tuple((tuple(_x.shape), str(_x.dtype))
+                             if eqx.is_array(_x) else _x for _x in _leaves))
+        _exe = _OV_COMPILED.get(_key)
+        if _exe is None:
+            _t0 = _prof_time.perf_counter()
+            _exe = _repro_guard(
+                lambda *_a: _episode_update_jit.lower(*_a).compile(),
+                "update compile", _ep_u)(*_args_u)
+            _OV_COMPILED[_key] = _exe
+            print(f"[update-overlap] ep{_ep_u}: compiled update program "
+                  f"{len(_OV_COMPILED)} on the main thread in "
+                  f"{_prof_time.perf_counter() - _t0:.1f}s", flush=True)
+
+        def _call():
+            _t0 = _prof_time.perf_counter()
+            _out = jax.block_until_ready(_exe(*_args_u))
+            _UPD_SECONDS[0] = _prof_time.perf_counter() - _t0
+            return _out
+        return _repro_guard(_call, "update", _ep_u)
+
+    def _overlap_start(prev):
+        if _OV_POOL[0] is None:
+            import concurrent.futures as _cf
+            _OV_POOL[0] = _cf.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="update-overlap")
+        return _OV_POOL[0].submit(_overlap_update(prev))
 
     def _pipe_finish(prev, out):
         """Rebind from the pending episode's update and run its epilogue.
@@ -17928,9 +17997,17 @@ def main(args=None):
         the run always had; it is a function now so the end of the run and
         every checkpoint use the same one.
         """
+        _upd = _UPD_PENDING[0]
+        if _upd is not None:
+            # The older episode goes first: its update was due before the pending one's.
+            _UPD_PENDING[0] = None
+            _pipe_finish(_upd, _pipe_update_dispatch(_upd))
+            print(f"[update-overlap] ep={int(_upd['ctx']['ep'])} update "
+                  f"{_UPD_SECONDS[0]:.1f}s overlapped=nothing "
+                  f"(pipeline drained)", flush=True)
         _prev = _PIPE_PENDING[0]
         if not (_MPIPE and _prev is not None):
-            return False
+            return _upd is not None
         # (the graph is taken and put back by `_pipe_update_dispatch` and
         # `_pipe_finish`, which is where the per-graph state is read.)
         _PIPE_PENDING[0] = None
@@ -19025,6 +19102,13 @@ def main(args=None):
             # The policy lag is the same one `--measure-pipeline 1` already
             # had: rollout k runs under parameters that have absorbed the
             # update of k-2.
+            _upd = _UPD_PENDING[0]
+            _UPD_PENDING[0] = None
+            if _upd is not None:
+                # 0. Under --update-overlap, start the update of e-2 beside this rollout.
+                _t_ov0 = _prof_time.perf_counter()
+                _upd_fut = _overlap_start(_upd)
+                _t_ov1 = _prof_time.perf_counter()
             _roll, _tkt = _epstream.run_episode(
                 _EP_BIN,
                 "episode %d" % ep,
@@ -19081,8 +19165,24 @@ def main(args=None):
             #    this one's.
             _ep_env_mod.start_measurement(_tkt)
             # 6. Now the previous episode's update, and its epilogue.
+            if _upd is not None:
+                _t_ov2 = _prof_time.perf_counter()
+                _upd_out = _upd_fut.result()
+                _t_ov3 = _prof_time.perf_counter()
+                _mstat = _train_dev.memory_stats() or {}
+                print(f"[update-overlap] ep={int(_upd['ctx']['ep'])} update "
+                      f"{_UPD_SECONDS[0]:.1f}s overlapped=rollout{ep} "
+                      f"compile={_t_ov1 - _t_ov0:.1f}s "
+                      f"rollout_to_collect={_t_ov2 - _t_ov1:.1f}s "
+                      f"wait={_t_ov3 - _t_ov2:.1f}s "
+                      f"peak_gib={_mstat.get('peak_bytes_in_use', 0) / 2**30:.2f}"
+                      f"/{_mstat.get('bytes_limit', 0) / 2**30:.2f}", flush=True)
+                _pipe_finish(_upd, _upd_out)
             if _prev is not None:
-                _pipe_finish(_prev, _pipe_update_dispatch(_prev))
+                if _OVERLAP:
+                    _UPD_PENDING[0] = _prev
+                else:
+                    _pipe_finish(_prev, _pipe_update_dispatch(_prev))
             _PIPE_PENDING[0] = {
                 "roll": _roll,
                 "ctx": _EP_CTX,
