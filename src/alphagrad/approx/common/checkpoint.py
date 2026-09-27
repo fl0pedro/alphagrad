@@ -278,6 +278,13 @@ PPO_CKPT_PREFIX = "ppo_ckpt_ep"
 PPO_RESUME_EXEMPT_ARGS = frozenset(
     {"episodes", "resume", "checkpoint_keep_at", "gpus", "measure_gpus"})
 
+#: The arguments a READOUT of a checkpoint may carry differently from the run
+#: that wrote it (owner ruling 2026-09-26, Q2 c; dsnn-dfw.291): the resume's,
+#: and `--readout` itself, which a run launched before the readout existed
+#: does not carry at all. A readout reads the state; every other difference
+#: raises, because the checkpoint is then not a state of this configuration.
+PPO_READOUT_EXEMPT_ARGS = PPO_RESUME_EXEMPT_ARGS | frozenset({"readout"})
+
 #: The meta.json field that names the GPU model of the trainer's device.
 PPO_GPU_MODEL_FIELD = "trainer_gpu_model"
 
@@ -610,19 +617,7 @@ def check_resume_args(saved: dict, args) -> None:
     of the state the checkpoint is a state OF.
     """
     live = args_to_json(args)
-    problems = []
-    for name in sorted(set(saved) | set(live)):
-        if name in PPO_RESUME_EXEMPT_ARGS:
-            continue
-        if name not in saved:
-            problems.append(f"  {name}: absent from the checkpoint, "
-                            f"{live[name]!r} on the command line")
-        elif name not in live:
-            problems.append(f"  {name}: {saved[name]!r} in the checkpoint, "
-                            f"absent on the command line")
-        elif saved[name] != live[name]:
-            problems.append(f"  {name}: {saved[name]!r} in the checkpoint, "
-                            f"{live[name]!r} on the command line")
+    problems = _namespace_problems(saved, live, PPO_RESUME_EXEMPT_ARGS)
     if problems:
         raise CheckpointError(
             "the command line does not match the checkpoint's argument "
@@ -637,6 +632,43 @@ def check_resume_args(saved: dict, args) -> None:
             f"resume may EXTEND a run; it cannot shorten one, because the "
             f"learning-rate schedule's horizon is built from --episodes and a "
             f"shorter horizon is a different schedule.")
+
+
+def _namespace_problems(saved: dict, live: dict, exempt) -> list:
+    """One line per argument the two namespaces disagree on, `exempt` aside."""
+    problems = []
+    for name in sorted(set(saved) | set(live)):
+        if name in exempt:
+            continue
+        if name not in saved:
+            problems.append(f"  {name}: absent from the checkpoint, "
+                            f"{live[name]!r} on the command line")
+        elif name not in live:
+            problems.append(f"  {name}: {saved[name]!r} in the checkpoint, "
+                            f"absent on the command line")
+        elif saved[name] != live[name]:
+            problems.append(f"  {name}: {saved[name]!r} in the checkpoint, "
+                            f"{live[name]!r} on the command line")
+    return problems
+
+
+def check_readout_args(saved: dict, args) -> None:
+    """RAISE unless the live arguments are the run the checkpoint is a state of.
+
+    The readout's twin of `check_resume_args`: the same comparison, with
+    `--readout` exempt beside the resume's exemptions (PPO_READOUT_EXEMPT_ARGS).
+    An argument this build defines and the checkpoint does not carry raises
+    too: the run would be completed from this build's defaults.
+    """
+    problems = _namespace_problems(saved, args_to_json(args),
+                                   PPO_READOUT_EXEMPT_ARGS)
+    if problems:
+        raise CheckpointError(
+            "the command line does not match the checkpoint's argument "
+            "namespace, so the checkpoint is not a state of this run and its "
+            "readout would read another configuration:\n"
+            + "\n".join(problems)
+            + f"\nOnly {sorted(PPO_READOUT_EXEMPT_ARGS)} may differ.")
 
 
 # ---------------------------------------------------------------------------

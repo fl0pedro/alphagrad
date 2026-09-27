@@ -269,6 +269,9 @@ from alphagrad.approx.common import auto_stop as _auto
 # grid and the front comparison live in that module; this file pins w and
 # rolls out.
 from alphagrad.approx.common import preference_sweep as _psweep
+# THE READOUT (owner ruling 2026-09-26 Q2 c, dsnn-dfw.291). The schedule, the
+# records and the file live in that module; `main` rolls out and measures.
+from alphagrad.approx.common import readout as _readout_mod
 from alphagrad.approx.common import repro_bundle as _repro
 
 # Same switch carry_stream reads, so one flag turns the whole fold on or
@@ -6953,6 +6956,22 @@ def make_argparser() -> argparse.ArgumentParser:
         help="Directory for the swept front and the per-rollout plan "
         "records. Defaults to the run directory.",
     )
+    # ---- THE READOUT (owner ruling 2026-09-26 Q2 c, dsnn-dfw.291) --------
+    p.add_argument(
+        "--readout",
+        type=int,
+        default=0,
+        metavar="N",
+        help="After the last episode, load the final checkpoint and read the "
+        "policy out: sample N plans and the argmax plan (the argmax at every "
+        "step) with no update and a fixed seed (--seed), measure each one as "
+        "a training episode measures its plans, and write one record per "
+        "plan to readout.jsonl in the run directory and the readout/* fields "
+        "to the wandb summary. N is a multiple of --num-envs; the run needs "
+        "--checkpoint-every above 0 and the plan log. tools/readout.py reads "
+        "out the checkpoint of a finished run the same way. 0 (default) runs "
+        "no readout.",
+    )
     p.add_argument(
         "--dirichlet-alpha",
         type=float,
@@ -7860,6 +7879,48 @@ def _ratio_dists(records, args, episode, n_envs, plan_states=None):
     return out, counts
 
 
+# ---------------------------------------------------------------------------
+# THE READOUT'S ARGMAX PLAN (owner ruling 2026-09-26 Q2 c, dsnn-dfw.291). The
+# rollout draws it itself, under a key whose every random bit is the middle of
+# its range: a uniform reads 0.5 and every Gumbel of a categorical reads one
+# constant, so each categorical draw is its argmax and each Bernoulli draw
+# (`uniform < p`) its likelier value. No sampler changes, so the sampled
+# rollouts run the program training runs. `main` refuses the one head with a
+# continuous draw, which has no argmax.
+# ---------------------------------------------------------------------------
+_ARGMAX_PRNG: list = [None]
+
+
+def _argmax_bits(key_data, bit_width, shape):
+    dtype = {8: jnp.uint8, 16: jnp.uint16, 32: jnp.uint32,
+             64: jnp.uint64}[int(bit_width)]
+    return jnp.full(tuple(shape), 1 << (int(bit_width) - 1), dtype=dtype)
+
+
+def argmax_key():
+    """The key under which every draw of the policy is its argmax."""
+    if _ARGMAX_PRNG[0] is None:
+        import jax.extend.random as _jxr
+        _ARGMAX_PRNG[0] = _jxr.define_prng_impl(
+            key_shape=(2,), seed=lambda s: jnp.zeros((2,), jnp.uint32),
+            split=lambda k, shape: jnp.zeros((*shape, 2), jnp.uint32),
+            random_bits=_argmax_bits, fold_in=lambda k, d: k,
+            name="argmax", tag="argmax")
+    return jrand.wrap_key_data(jnp.zeros((2,), jnp.uint32),
+                               impl=_ARGMAX_PRNG[0])
+
+
+def _params_digest(tree) -> str:
+    # sha256 over every array leaf of a pytree, its dtype and shape included.
+    import hashlib
+    h = hashlib.sha256()
+    for leaf in jax.tree_util.tree_leaves(eqx.filter(tree, eqx.is_array)):
+        a = np.ascontiguousarray(np.asarray(leaf))
+        h.update(f"{a.dtype}{a.shape}".encode())
+        h.update(a.tobytes())
+    return h.hexdigest()
+
+
 def _dump_pareto(archive, args, ep, *, final=False, rule=None):
     """Persist the front + a replayable best_sequences.json. Never raises.
 
@@ -8272,11 +8333,16 @@ def _plan_census_line(ep, rows, live, paired_log):
     return " | ".join(parts)
 
 
-def main(args=None):
+def main(args=None, *, readout_checkpoint=None, readout_out=None,
+         readout_seed=None):
     # `args` is given by `tools/preference_sweep.py`, which does not build a
     # command line at all: it rebuilds the namespace from the checkpoint's own
     # saved one (common/preference_sweep.load_sweep_args). None = the command
     # line, which is every training run.
+    # `readout_checkpoint` is given by `tools/readout.py` (dsnn-dfw.291), with
+    # the run's own arguments: the run is built as it was built, that
+    # checkpoint is read out, and no episode of training runs. `readout_out`
+    # and `readout_seed` replace the run directory and --seed for it.
     if args is None:
         args = make_argparser().parse_args()
     # CHECKPOINT (3 of 8). THE ARGUMENT NAMESPACE, TAKEN HERE AND NOWHERE
@@ -8338,6 +8404,54 @@ def main(args=None):
               f"points, {int(args.preference_sweep_plans)} plans each, "
               f"{len(_PSWEEP_PLAN)} episodes of {int(args.num_envs)} "
               f"environments", flush=True)
+    # ---- THE READOUT (owner ruling 2026-09-26 Q2 c, dsnn-dfw.291) --------
+    # REFUSED HERE when it cannot run, beside the resume's and the sweep's
+    # refusals, so a run never trains to an end it cannot read out. A readout
+    # of a finished run's checkpoint (tools/readout.py) is argument-checked
+    # like a resume: the command line is the run's own, and a checkpoint of
+    # another configuration raises before an array is built.
+    _READOUT_N = int(getattr(args, "readout", 0) or 0)
+    _READOUT_PATH = str(readout_checkpoint or "")
+    _READOUT_META = None
+    if _READOUT_N < 0:
+        raise ValueError(
+            f"--readout must be 0 (off) or positive, got {_READOUT_N}.")
+    if _READOUT_PATH:
+        if _READOUT_N == 0:
+            raise ValueError(
+                "a readout of a checkpoint samples --readout N plans, and "
+                "this command line carries --readout 0. Add --readout N (the "
+                "thesis rows run 64).")
+        if _RESUME_PATH:
+            raise ValueError(
+                "a readout reads a checkpoint and --resume trains one on: "
+                "pass the run's own arguments without --resume.")
+        _READOUT_META = _ckpt.read_ppo_meta(_READOUT_PATH)
+        _ckpt.check_readout_args(_READOUT_META["args"], args)
+        # A readout trains no episode, so the gradient oracle has no order to
+        # check. Normalised after the check, as main() normalises args.
+        args.grad_oracle = "off"
+        print(f"[readout] {_READOUT_PATH} at episode "
+              f"{int(_READOUT_META['episode'])}: {_READOUT_N} sampled plans "
+              f"and the argmax plan; no episode of training runs", flush=True)
+    elif _READOUT_N and not _CKPT_EVERY:
+        raise ValueError(
+            f"--readout {_READOUT_N} reads the final checkpoint, and "
+            f"--checkpoint-every 0 writes none. Pass --checkpoint-every "
+            f"above 0.")
+    if _READOUT_N:
+        for _ro_bad, _ro_why in (
+                (_PSWEEP, "a preference sweep reads a checkpoint of its own"),
+                (bool(getattr(args, "preference_conditioned", False)),
+                 "a preference-conditioned policy is read out by sweeping "
+                 "its preference (tools/preference_sweep.py)"),
+                (not (getattr(args, "plan_log", None)
+                      or bool(getattr(args, "record_all_plans", False))),
+                 "its paired ratios and failed plans are read off the plan "
+                 "records, so it needs the plan log (--plan-log auto)")):
+            if _ro_bad:
+                raise ValueError(
+                    f"--readout {_READOUT_N} refused: {_ro_why}.")
     # AUTO-STOP (3 of 8). THE REFUSAL, AND THE MONITOR. The refusal is made
     # here, beside the checkpoint's own, so a command line that cannot stop
     # correctly never builds an array. The monitor holds one row per episode
@@ -8392,6 +8506,10 @@ def main(args=None):
     _RULES = _rule_list(args.temporal_rule)
     _GRAPH_KEYS = list(_RULES) or [None]
     _TWO_GRAPH = len(_GRAPH_KEYS) > 1
+    if _READOUT_N and _TWO_GRAPH:
+        raise ValueError(
+            f"--readout {_READOUT_N} refused: it reads the policy out on one "
+            f"graph, and --temporal-rule {list(_RULES)} alternates two.")
     #: rule -> everything about that graph. Filled as the build reaches each
     #: piece, read by the swap at the top of the episode loop.
     _GRAPHS: dict = {_k: {"rule": _k} for _k in _GRAPH_KEYS}
@@ -8628,6 +8746,9 @@ def main(args=None):
         str(args.gpus).split(",")[0].strip())
     if _RESUME_META is not None:
         _ckpt.check_resume_gpu_model(_RESUME_META, _TRAINER_GPU_MODEL)
+    # A readout's paired ratios are the run's instrument only on the run's GPU model.
+    if _READOUT_META is not None:
+        _ckpt.check_resume_gpu_model(_READOUT_META, _TRAINER_GPU_MODEL)
 
     # Resolve example, build env, derive masks.
     dataset_arg = None if args.dataset == "none" else args.dataset
@@ -10885,6 +11006,20 @@ def main(args=None):
 
     agent_key, init_key, key = jrand.split(key, 3)
     agent = _build_agent(args, total_v, num_factors, max_rules, agent_key)
+    # THE READOUT'S PLANS, refused here when the rollouts cannot draw them.
+    # `schedule` raises unless --readout is a multiple of the environments.
+    # The argmax plan is the argmax of every categorical and Bernoulli draw;
+    # the per-vertex micro head also draws a continuous scale (a Beta), which
+    # has no argmax.
+    _READOUT_PLAN = (_readout_mod.schedule(_READOUT_N, num_envs)
+                     if _READOUT_N else [])
+    if _READOUT_N and isinstance(agent.micro_action_policy,
+                                 MicroActionPolicy):
+        raise ValueError(
+            f"--readout {_READOUT_N} refused: the per-vertex micro head draws "
+            f"a continuous quantisation scale, so the argmax plan is not "
+            f"defined. The face head (--live-faces) draws categorical and "
+            f"Bernoulli decisions only.")
     agent = apply_init_scheme(agent, init_key, args)
     print(f"[init] scheme={getattr(args, 'init_scheme', 'campaign')} "
           f"head_init_scale={float(getattr(args, 'head_init_scale', 0.1)):g} "
@@ -14933,9 +15068,13 @@ def main(args=None):
     # new run: a resumed leg that quietly started its own run would split one
     # training curve across two panels with no way to tell from the data.
     # Empty when wandb is disabled, or when the checkpoint has no id.
+    # A READOUT OF A CHECKPOINT ATTACHES THE SAME WAY (dsnn-dfw.291), so the
+    # readout lands in the summary of the run it reads out.
     _wandb_resume = {}
-    if _RESUME_META is not None and args.wandb != "disabled":
-        _rid = _RESUME_META.get("wandb_run_id")
+    _attach_meta = (_RESUME_META if _RESUME_META is not None
+                    else _READOUT_META)
+    if _attach_meta is not None and args.wandb != "disabled":
+        _rid = _attach_meta.get("wandb_run_id")
         if _rid:
             _wandb_resume = {"id": str(_rid), "resume": "must"}
             print(f"[checkpoint] attaching to wandb run {_rid}", flush=True)
@@ -18303,6 +18442,232 @@ def main(args=None):
               f"global_step={int(global_step)}, lambda={lag_lambda:g}. No "
               f"update runs from here.", flush=True)
 
+    # ---- THE READOUT (owner ruling 2026-09-26 Q2 c, dsnn-dfw.291) --------
+    # Plans sampled from the policy of a checkpoint with no update, measured
+    # as a training episode measures its plans: the pipelined trainer's own
+    # rollout program (`_episode_rollout_jit`) at the same bins, the same
+    # measure pool and ticket, and the archive front's join of plan records
+    # to environment rows and its paired log ratios. N sampled plans under a
+    # key stream of the readout's seed, then the argmax plan under
+    # `argmax_key()`, in one more rollout whose environments all draw it. It
+    # writes no checkpoint and updates nothing: the policy it reads is
+    # compared byte for byte before and after. The training run calls it at
+    # its end on the checkpoint it just wrote; tools/readout.py calls it on a
+    # finished run's checkpoint and trains nothing.
+    _READOUT_DIR = (str(readout_out) if readout_out
+                    else os.path.dirname(os.path.abspath(_READOUT_PATH))
+                    if _READOUT_PATH else _CKPT_DIR)
+    if _READOUT_N and os.path.exists(
+            os.path.join(_READOUT_DIR, _readout_mod.READOUT_FILE)):
+        raise FileExistsError(
+            f"{os.path.join(_READOUT_DIR, _readout_mod.READOUT_FILE)} "
+            f"exists: a readout does not overwrite another readout.")
+
+    def _readout_attempt(pol, base_m, prefs, key_r, pin, label, index):
+        """ONE readout rollout attempt, as `_ep_rollout_attempt` makes one."""
+        def _attempt(_ep_n, _win_n):
+            _ep_begin_attempt()
+            _tkt = _ep_env_mod.open_measure_ticket() if _MPIPE else None
+            try:
+                def _one(_s, _env_s):
+                    _dev = _SHARD_DEVS[_s]
+                    return _repro_guard(_episode_rollout_jit, label, index)(
+                        _to_device(pol, _dev),
+                        _to_device(reset_envs(_env_s), _dev),
+                        _env_s,
+                        _to_device(base_m, _dev),
+                        _to_device(prefs, _dev),
+                        _to_device(key_r, _dev),
+                        _to_device(op_legality_override, _dev),
+                        _to_device(pin, _dev),
+                        _ep_n,
+                        int(_win_n),
+                        _s,
+                    )
+                _roll = _shard_rollout(_one, int(_win_n))
+                _wov = _epstream.window_overflow_from(
+                    _roll[8], _roll[9], _win_n, _roll[10])
+                _ov = (_wov if _wov is not None
+                       else _epstream.overflow_from(
+                           _roll[6], _roll[7], _ep_n))
+            except BaseException:
+                if _tkt is not None:
+                    _ep_env_mod.close_measure_ticket()
+                    _ep_env_mod.drop_measurement(_tkt)
+                raise
+            if _tkt is not None:
+                _ep_env_mod.close_measure_ticket()
+            return (_roll, _tkt), _ov
+        return _attempt
+
+    def _readout_discard(result):
+        """Throw one readout attempt away, as `_ep_discard_rollout` does."""
+        _roll_d, _tkt_d = result
+        if _tkt_d is not None:
+            _ep_env_mod.drop_measurement(_tkt_d)
+        _ep_discard(_roll_d, pool_drain=not _PIPE_DEEP)
+
+    def _readout(path, meta, *, seed):
+        """Read the policy in checkpoint `path` out. Returns the records."""
+        nonlocal env_episode
+        _ro_ep = int(meta["episode"])
+        _ro = _ckpt.load_ppo_tree(path, _ckpt_tree())
+        pol = _ro["agent"]
+        if not _READOUT_PATH and _params_digest(pol) != _params_digest(agent):
+            raise _ckpt.CheckpointError(
+                f"the final checkpoint {path} does not hold the policy this "
+                f"run ended with, so its readout would read another policy.")
+        # The checkpoint's bins, so every readout of it rolls out at the same widths.
+        _ckpt.bin_policy_from_json(_EP_BIN, meta["episode_bin"])
+        _ckpt.bin_policy_from_json(_WIN_BIN, meta["window_bin"])
+        # Committed as the training episode commits its policy: the same compiled rollout.
+        pol = jax.tree_util.tree_map(
+            lambda _x: (jax.device_put(_x, _train_dev)
+                        if isinstance(_x, jax.Array) else _x), pol)
+        _before = _params_digest(pol)
+        prefs = static_pref
+        if args.reward_mode == "lagrangian":
+            prefs = _lag_preferences(
+                prefs, head_reward_weights_np, float(_ro["lag_lambda"]),
+                bool(args.preference_conditioned))
+        pin = jnp.asarray(args.pin_rules_to_exact, dtype=jnp.bool_)
+        base_m = _carry_stream.base_memory(
+            pol, _BASE_TOK, _BASE_N, window=_BASE_W, total_v=total_v,
+            embd_dim=args.embd_dim, base_owners=_BASE_OWN, path="rollout")
+        _pool = getattr(env, "_remote_pool", None)
+        rkey = jrand.fold_in(jrand.PRNGKey(int(seed)), _readout_mod.KEY_TAG)
+        provenance = {"checkpoint": os.path.realpath(path),
+                      "checkpoint_episode": _ro_ep, "seed": int(seed),
+                      "run_name": getattr(args, "name", None),
+                      "params_sha256": _before}
+        _sent_ch = np.asarray(COMPUTE_REWARD_INDICES, dtype=np.int64)
+        records = []
+        print(f"[readout] {path} at episode {_ro_ep}, seed {int(seed)}: "
+              f"{_READOUT_N} sampled plans in {len(_READOUT_PLAN) - 1} "
+              f"rollouts of {int(num_envs)} environments, then the argmax "
+              f"plan", flush=True)
+        for r, draw in enumerate(_READOUT_PLAN):
+            rkey, k_eval, k_roll = jrand.split(rkey, 3)
+            label = f"readout {draw} rollout {r}"
+            # The probe batch's episode index: the rollouts follow the checkpoint's episodes.
+            _ep_env_mod.set_walk_episode(_ro_ep + r)
+            eval_samples = generate_eval_samples(
+                env, k_eval, args.num_eval_samples)
+            env_episode = eqx.tree_at(
+                lambda e: e.eval_args_samples, env, eval_samples)
+            _SHARD_ENV_CACHE.clear()
+            _tok_env_mod.set_local_bound_operands(
+                env.args, env.consts, eval_samples)
+            if _pool is not None:
+                _pool.set_eval_samples(eval_samples)
+            key_r = (argmax_key() if draw == _readout_mod.ARGMAX
+                     else k_roll)
+            _ep_new_episode()
+            _roll, _tkt = _epstream.run_episode(
+                _EP_BIN, label,
+                _readout_attempt(pol, base_m, prefs, key_r, pin, label,
+                                 _ro_ep + r),
+                log=lambda line: print(line, flush=True),
+                on_discard=_readout_discard, window_policy=_WIN_BIN)
+            _EP_BIN.record(int(np.max(np.asarray(_roll[5]))))
+            _WIN_BIN.record(max(int(np.max(np.asarray(_roll[11]))),
+                                int(np.max(np.asarray(_roll[12])))))
+            if _tkt is not None:
+                _ep_env_mod.start_measurement(_tkt)
+                _roll = _pipe_fill_rewards(
+                    _roll, _ep_env_mod.collect_measurement(_tkt)["rewards"])
+            _drain = _drain_measure_telemetry(_tkt, park=True)
+            _recs = list((_drain.get("local_plan") or {}).get("records", ()))
+            _recs.extend((_drain.get("pool_plan") or {}).get("records", ()))
+            _es, _traj = _roll[0], _roll[1]
+            # dsnn-dfw.301: by environment row, as the archive front joins.
+            _rows, _join = _join_plan_records(_recs, _ro_ep + r, num_envs,
+                                              _es)
+            _hashes = _plan_hashes(_es, num_envs)
+            if _hashes is None:
+                raise RuntimeError(
+                    "the readout's rollout carries no terminal plan wires, "
+                    "so its plans cannot be told apart.")
+            _envs = range(int(num_envs))
+            if draw == _readout_mod.ARGMAX:
+                if len(set(_hashes)) != 1:
+                    raise RuntimeError(
+                        f"the argmax rollout drew {len(set(_hashes))} "
+                        f"different plans in its {int(num_envs)} "
+                        f"environments. Under argmax_key() every draw is its "
+                        f"argmax, so a sampler of this policy is not.")
+                _envs = [0]
+            _rets = np.asarray(_roll[2], dtype=np.float64)
+            _arr = [np.asarray(x) for x in (
+                _traj.vertex_idx, _traj.micro_op_seq, _traj.micro_i_seq,
+                _traj.micro_j_seq, _traj.micro_factor_seq,
+                _traj.micro_compress_kind_seq, _traj.micro_quant_dtype_seq)]
+            _faces = np.asarray(_es.face_specs)
+            _skips = np.asarray(_es.face_skips)
+            for e in _envs:
+                _seq = _action_to_pylist_dynamic(
+                    _arr[0][e], _arr[1][e], _arr[2][e], _arr[3][e],
+                    _arr[4][e], _arr[5][e], _arr[6][e], args.max_substeps)
+                _rec = _rows.get(e)
+                _smp, _src = ((None, None) if _rec is None
+                              else _band_sample(_rec, args))
+                _qs = None if _rec is None else _latency_quantiles(
+                    _rec, args)[0]
+                records.append(_readout_mod.record(
+                    draw=draw, index=len(records), rollout=r, env=e,
+                    provenance=provenance, plan_hash=_hashes[e],
+                    plan=_arch_plan_from_seq(_seq, _faces, _skips, e),
+                    rewards=_rets[e], quality=_rets[e][cosine_idx],
+                    numbers={
+                        "latency_log_ratio": (
+                            None if _smp is None
+                            else float(np.median(_smp[args.cmp_type]))),
+                        "memory_log_ratio": (
+                            None if _smp is None
+                            else float(np.median(_smp[args.mem_type]))),
+                        "memory_source": _src,
+                        "latency_quantiles": (
+                            None if _qs is None else _qs[args.cmp_type]),
+                    },
+                    plan_record=_rec,
+                    dropped=bool(np.all(
+                        _rets[e][_sent_ch] <= float(SENTINEL_COST) * 0.99))))
+            print(f"[readout] {label}: {len(_rows)} of {int(num_envs)} plan "
+                  f"records joined {_join}", flush=True)
+        if _params_digest(pol) != _before:
+            raise RuntimeError(
+                "the readout changed the policy it reads; a readout never "
+                "updates the policy.")
+        _ro_path = _readout_mod.write_records(
+            os.path.join(_READOUT_DIR, _readout_mod.READOUT_FILE), records)
+        _fields = _readout_mod.summary(records, args.quality_floor)
+        # Into the summary the way the archive front's pareto/* fields and tables reach it.
+        wandb.log({**_fields, "readout/table": wandb.Table(
+            columns=list(_readout_mod.TABLE_COLUMNS),
+            data=_readout_mod.table_rows(records))})
+        if wandb.run is not None and args.wandb != "disabled":
+            wandb.save(_ro_path, base_path=_READOUT_DIR, policy="now")
+        _am = records[-1]
+        print(f"[readout] {len(records)} records -> {_ro_path}: "
+              f"{_fields['readout/measured']} of {_fields['readout/sampled']} "
+              f"sampled plans measured, {_fields['readout/failed']} failed, "
+              f"{_fields['readout/dropped']} dropped, "
+              f"{_fields['readout/missing']} missing, "
+              f"{_fields['readout/distinct']} distinct; the argmax plan "
+              f"{_am['plan_hash']} is {_am['status']}"
+              + ("" if _am["quality"] is None
+                 else f" at quality {_am['quality']:.4f}")
+              + (", in the sample" if _fields["readout/argmax_in_sample"]
+                 else ", not in the sample"), flush=True)
+        return records
+
+    _READOUT_SEED = int(args.seed if readout_seed is None else readout_seed)
+    if _READOUT_PATH:
+        # tools/readout.py: the run is built, the checkpoint read out, no episode trained.
+        _readout(_READOUT_PATH, _READOUT_META, seed=_READOUT_SEED)
+        pbar.close()
+        return
+
     _LOOP_EPISODES = len(_PSWEEP_PLAN) if _PSWEEP else args.episodes
     #: The graph the RUNNING episode is on. Set at the top of every
     #: iteration; `_pipe_finish` puts the graph back to it after finishing a
@@ -19469,6 +19834,16 @@ def main(args=None):
     print_top_n(f"Memory (Lowest {args.mem_type})", host_state["top_n_mem"])
     print_top_n(f"Quality (Highest {_QUALITY_METRIC})", host_state["top_n_acc"])
     wandb.log({"Elimination order": elim_order_table})
+
+    # ---- THE READOUT (owner ruling 2026-09-26 Q2 c, dsnn-dfw.291) --------
+    # LAST: the final checkpoint, the oracle's accounting and the archive
+    # front are on disk whatever the readout does, and a readout that fails
+    # is run again by tools/readout.py from that checkpoint. It loads the
+    # checkpoint this run just wrote, at the episodes the run actually ran.
+    if _READOUT_N:
+        _ro_ckpt = os.path.join(
+            _CKPT_DIR, _ckpt.checkpoint_dir_name(_EPISODES_DONE[0]))
+        _readout(_ro_ckpt, _ckpt.read_ppo_meta(_ro_ckpt), seed=_READOUT_SEED)
 
 
 if __name__ == "__main__":
